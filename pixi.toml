@@ -1,0 +1,13 @@
+[workspace]
+name = "mojo-amx-internal"
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+max = "*"
+python = ">=3.11"
+
+[tasks]
+test = "mojo test_package.mojo"
+test-channelwise = "mojo test_package_channelwise.mojo"
+test-sliceable = "mojo test_sliceable.mojo"
