@@ -26,6 +26,7 @@ fn test_thread_constructor():
     var dst = IntPtr(unsafe_from_address=Int(UnsafePointer(to=output)))
 
     # We can use variable stack sizes for any given thread pool
+    # Currently ThreadPool[](1) is the abstraction you'd use for one thread.
     var t0 = ThreadPool[stack_size=1*4096](1)
     var t1 = ThreadPool[stack_size=2*4096](1)
     var t2 = ThreadPool[stack_size=3*4096](1)
