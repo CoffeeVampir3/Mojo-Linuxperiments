@@ -164,33 +164,36 @@ fn arena_writer(slot_idx: Int, buffer: IntPtr):
 
 fn test_numa_arena_buffer():
     var numa = NumaInfo()
-    alias BUFFER_SIZE = 32
+
+    var pools = HeapMoveArray[ThreadPool[]](numa.num_nodes)
+    var total_threads = 0
+    for node in range(numa.num_nodes):
+        pools.push(ThreadPool[].for_numa_node(numa, node))
+        total_threads += pools[node][].capacity
+
+    var buffer_size = min(total_threads, 32)
 
     var arena = NumaArena[](node=0, size=4096)
     if not arena:
         report("numa_arena_buffer", False, "arena allocation failed")
         return
 
-    var buffer = arena.alloc[Int](BUFFER_SIZE)
+    var buffer = arena.alloc[Int](buffer_size)
     if not buffer:
         report("numa_arena_buffer", False, "buffer allocation failed")
         return
 
-    for i in range(BUFFER_SIZE):
+    for i in range(buffer_size):
         buffer[i] = 0
 
-    var pools = HeapMoveArray[ThreadPool[]](numa.num_nodes)
-    for node in range(numa.num_nodes):
-        pools.push(ThreadPool[].for_numa_node(numa, node))
-
-    var threads_per_node = BUFFER_SIZE // numa.num_nodes
-    var remainder = BUFFER_SIZE % numa.num_nodes
+    var threads_per_node = buffer_size // numa.num_nodes
+    var remainder = buffer_size % numa.num_nodes
     var thread_idx = 0
 
     for node in range(numa.num_nodes):
         var count = threads_per_node + (1 if node < remainder else 0)
         for _ in range(count):
-            if thread_idx < BUFFER_SIZE:
+            if thread_idx < buffer_size:
                 _ = pools[node][].launch(arena_writer, thread_idx, buffer)
                 thread_idx += 1
 
@@ -198,7 +201,7 @@ fn test_numa_arena_buffer():
         pool[].wait_all()
 
     var errors = 0
-    for i in range(BUFFER_SIZE):
+    for i in range(buffer_size):
         var value = buffer[i]
         var expected_base = i * 100
         if value < expected_base or value >= expected_base + numa.num_nodes:
@@ -206,7 +209,7 @@ fn test_numa_arena_buffer():
 
     var placement_ok = arena.verify_placement()
     report("numa_arena_buffer", errors == 0 and placement_ok,
-           String(BUFFER_SIZE) + " slots, placement=" + ("OK" if placement_ok else "FAIL"))
+           String(buffer_size) + " slots, placement=" + ("OK" if placement_ok else "FAIL"))
 
 fn arena_writer_local(slot_idx: Int, expected_node: Int, buffer: IntPtr, err: AtomicPtr):
     import threading.linux as linux
