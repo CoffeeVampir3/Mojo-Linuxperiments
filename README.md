@@ -14,7 +14,7 @@ See the test_linux_threading.mojo file as it should contain fairly clear usage p
 
 ### Doing the thing:
 
-Recommended to run tests with line tables to verify if mojo throws any errors. Should address sanitize at some point.
+Recommended to run tests with line tables to verify if mojo throws any errors. We don't use jthread so ASAN will not work.
 
 To run the code:
 ```
