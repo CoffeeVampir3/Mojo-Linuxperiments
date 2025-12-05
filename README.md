@@ -3,14 +3,14 @@
 
 Currently this repo has an initial design for x86-64 linux threading on mojo, without any C interop or binding. This will, naturally, only work on linux systems.
 
-See the test_linux_threading.mojo file as it should contain fairly clear usage patterns. This is not intended to be a production level library but rather a proof of concept design.
+See the test_linux_threading.mojo file as it should contain fairly clear usage patterns. This is not intended to be a production level library but rather a proof of concept design. The threading has fairly detailed design motivation in the `linux_threading.mojo`
 
 ### Notable bits:
 
-Minimal NUMA library for querying basic numa topology.
-Move-only heap array in nostdcollections
-Numa aware arena allocator
-Numa aware threading (But not automatic)
+- Minimal NUMA library for querying basic numa topology.
+- Move-only heap array in nostdcollections
+- Numa aware arena allocator
+- Numa aware threading (But not automatic)
 
 ### Doing the thing:
 
