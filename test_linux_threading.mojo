@@ -25,9 +25,10 @@ fn test_thread_constructor():
     var output = InlineArray[Int, 4](0)
     var dst = IntPtr(unsafe_from_address=Int(UnsafePointer(to=output)))
 
-    var t0 = ThreadPool[1*4096](1)
-    var t1 = ThreadPool[2*4096](1)
-    var t2 = ThreadPool[3*4096](1)
+    # We can use variable stack sizes for any given thread pool
+    var t0 = ThreadPool[stack_size=1*4096](1)
+    var t1 = ThreadPool[stack_size=2*4096](1)
+    var t2 = ThreadPool[stack_size=3*4096](1)
     var t3 = ThreadPool[](1)
 
     if not (t0 and t1 and t2 and t3):
@@ -61,6 +62,7 @@ fn test_thread_pool():
         report("thread_pool", False, "pool creation failed")
         return
 
+    # Pool is reusable, it's fine to use on different tasks (functions) as well.
     for i in pool:
         _ = pool.launch(compute_square, i, dst)
     pool.wait_all()
