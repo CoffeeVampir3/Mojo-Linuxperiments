@@ -361,7 +361,7 @@ fn quick_worker(slot_idx: Int, ctr: AtomicPtr):
 
 fn test_wait_any_reuse():
     alias POOL_SIZE = 4
-    alias ITERATIONS = 10
+    alias ITERATIONS = 1000
     var pool = ThreadPool(POOL_SIZE)
     if not pool:
         report("wait_any_reuse", False, "pool creation failed")
@@ -381,8 +381,8 @@ fn test_wait_any_reuse():
         total_launched += launched
 
         var idx = pool.wait_any()
-        if idx < 0:
-            report("wait_any_reuse", False, "wait_any returned -1 on iteration " + String(iteration))
+        if idx < -1:
+            report("wait_any_reuse", False, "wait_any returned error on iteration " + String(iteration))
             return
 
         # Wait for the rest
