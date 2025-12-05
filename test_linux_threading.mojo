@@ -385,6 +385,9 @@ fn test_wait_any_reuse():
             report("wait_any_reuse", False, "wait_any returned error on iteration " + String(iteration))
             return
 
+        # Threads completed before it was possible to wait for any of them.
+        if idx == -1: continue
+
         # Wait for the rest
         pool.wait_all()
 
