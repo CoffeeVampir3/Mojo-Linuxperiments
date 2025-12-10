@@ -173,8 +173,8 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         self.numa_node = numa_node
         self.workers_alive = False
 
-        comptime base_flags = linux.Futex2.SIZE_U32 | linux.Futex2.PRIVATE
-        self.futex_flags = base_flags | linux.Futex2.NUMA if numa_node is not None else base_flags
+        # Use plain PRIVATE futexes (not NUMA-bucketed) to allow CHILD_CLEARTID to work
+        self.futex_flags = linux.Futex2.SIZE_U32 | linux.Futex2.PRIVATE
 
         var arena_size = Self.slot_size * capacity + size_of[SharedPoolState]()
         self.arena_base = linux.sys_mmap[
@@ -233,12 +233,15 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
             _ = linux.sys_futex_wake(Int(self.shared), self.capacity, self.futex_flags)
 
             # Wait for all workers to exit
+            # CHILD_CLEARTID does legacy futex(FUTEX_WAKE) without PRIVATE flag,
+            # so we must wait with shared (non-private) futex to match the hash bucket
+            comptime shared_futex_flags = linux.Futex2.SIZE_U32
             for i in range(self.capacity):
                 while self.slots[i][].is_alive():
                     _ = linux.sys_futex_wait(
                         Int(self.slots[i][].child_tid),
                         Int(self.slots[i][].child_tid[]),
-                        self.futex_flags)
+                        shared_futex_flags)
 
         _ = linux.sys_munmap(self.arena_base, Self.slot_size * self.capacity + size_of[SharedPoolState]())
 
@@ -411,6 +414,5 @@ fn worker_main[mask_size: Int](stack_head_ptr: Int):
                 _ = linux.sys_futex_wait(Int(shared), 0, futex_flags)
                 spins = 0  # Reset spin count after wake
 
-    child_tid_ptr[] = 0
-    _ = linux.sys_futex_wake(Int(child_tid_ptr), 1, futex_flags)
+    # CHILD_CLEARTID handles clearing child_tid and futex wake automatically
     linux.sys_exit()

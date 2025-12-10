@@ -51,7 +51,7 @@ struct CloneFlags:
     comptime THREAD_FLAGS = (
         Self.VM | Self.FS | Self.FILES | Self.SIGHAND |
         Self.THREAD | Self.SYSVSEM | Self.SETTLS |
-        Self.PARENT_SETTID
+        Self.PARENT_SETTID | Self.CHILD_CLEARTID
     )
 
 @register_passable("trivial")
