@@ -1,54 +1,54 @@
 from sys.intrinsics import inlined_assembly
 from memory import UnsafePointer
 
-alias KernelPtr = UInt64
-alias KernelFlags = UInt64
-alias KernelFlags32 = UInt32
+comptime KernelPtr = UInt64
+comptime KernelFlags = UInt64
+comptime KernelFlags32 = UInt32
 
 @register_passable("trivial")
 struct Syscall:
-    alias mmap = 9
-    alias munmap = 11
-    alias mprotect = 10
-    alias mbind = 237
-    alias move_pages = 279
-    alias madvise = 28
-    alias clone3 = 435
-    alias exit = 60
-    alias futex_waitv = 449
-    alias futex_wake = 454
-    alias futex_wait = 455
-    alias sched_setaffinity = 203
-    alias rseq = 334
-    alias gettid = 186
+    comptime mmap = 9
+    comptime munmap = 11
+    comptime mprotect = 10
+    comptime mbind = 237
+    comptime move_pages = 279
+    comptime madvise = 28
+    comptime clone3 = 435
+    comptime exit = 60
+    comptime futex_waitv = 449
+    comptime futex_wake = 454
+    comptime futex_wait = 455
+    comptime sched_setaffinity = 203
+    comptime rseq = 334
+    comptime gettid = 186
 
 @register_passable("trivial")
 struct CloneFlags:
-    alias VM = 0x00000100
-    alias FS = 0x00000200
-    alias FILES = 0x00000400
-    alias SIGHAND = 0x00000800
-    alias PIDFD = 0x00001000
-    alias PTRACE = 0x00002000
-    alias VFORK = 0x00004000
-    alias PARENT = 0x00008000
-    alias THREAD = 0x00010000
-    alias NEWNS = 0x00020000
-    alias SYSVSEM = 0x00040000
-    alias SETTLS = 0x00080000
-    alias PARENT_SETTID = 0x00100000
-    alias CHILD_CLEARTID = 0x00200000
-    alias DETACHED = 0x00400000
-    alias UNTRACED = 0x00800000
-    alias CHILD_SETTID = 0x01000000
-    alias NEWCGROUP = 0x02000000
-    alias NEWUTS = 0x04000000
-    alias NEWIPC = 0x08000000
-    alias NEWUSER = 0x10000000
-    alias NEWPID = 0x20000000
-    alias NEWNET = 0x40000000
-    alias IO = 0x80000000
-    alias THREAD_FLAGS = (
+    comptime VM = 0x00000100
+    comptime FS = 0x00000200
+    comptime FILES = 0x00000400
+    comptime SIGHAND = 0x00000800
+    comptime PIDFD = 0x00001000
+    comptime PTRACE = 0x00002000
+    comptime VFORK = 0x00004000
+    comptime PARENT = 0x00008000
+    comptime THREAD = 0x00010000
+    comptime NEWNS = 0x00020000
+    comptime SYSVSEM = 0x00040000
+    comptime SETTLS = 0x00080000
+    comptime PARENT_SETTID = 0x00100000
+    comptime CHILD_CLEARTID = 0x00200000
+    comptime DETACHED = 0x00400000
+    comptime UNTRACED = 0x00800000
+    comptime CHILD_SETTID = 0x01000000
+    comptime NEWCGROUP = 0x02000000
+    comptime NEWUTS = 0x04000000
+    comptime NEWIPC = 0x08000000
+    comptime NEWUSER = 0x10000000
+    comptime NEWPID = 0x20000000
+    comptime NEWNET = 0x40000000
+    comptime IO = 0x80000000
+    comptime THREAD_FLAGS = (
         Self.VM | Self.FS | Self.FILES | Self.SIGHAND |
         Self.THREAD | Self.SYSVSEM | Self.SETTLS |
         Self.PARENT_SETTID
@@ -56,12 +56,12 @@ struct CloneFlags:
 
 @register_passable("trivial")
 struct Futex2:
-    alias SIZE_U8 = 0x00
-    alias SIZE_U16 = 0x01
-    alias SIZE_U32 = 0x02
-    alias SIZE_U64 = 0x03
-    alias NUMA = 0x04
-    alias PRIVATE = 0x80
+    comptime SIZE_U8 = 0x00
+    comptime SIZE_U16 = 0x01
+    comptime SIZE_U32 = 0x02
+    comptime SIZE_U64 = 0x03
+    comptime NUMA = 0x04
+    comptime PRIVATE = 0x80
 
 @register_passable("trivial")
 struct FutexNuma32:
@@ -137,60 +137,60 @@ struct Rseq:
         self.mm_cid = 0
         self.padding = 0
 
-alias RSEQ_SIG = 0x53053053
+comptime RSEQ_SIG = 0x53053053
 
 @register_passable("trivial")
 struct Prot:
-    alias NONE = 0x0
-    alias READ = 0x1
-    alias WRITE = 0x2
-    alias EXEC = 0x4
-    alias RW = Self.READ | Self.WRITE
-    alias RWX = Self.READ | Self.WRITE | Self.EXEC
+    comptime NONE = 0x0
+    comptime READ = 0x1
+    comptime WRITE = 0x2
+    comptime EXEC = 0x4
+    comptime RW = Self.READ | Self.WRITE
+    comptime RWX = Self.READ | Self.WRITE | Self.EXEC
 
 @register_passable("trivial")
 struct MapFlag:
-    alias SHARED = 0x01
-    alias PRIVATE = 0x02
-    alias FIXED = 0x10
-    alias ANONYMOUS = 0x20
-    alias NORESERVE = 0x4000
-    alias POPULATE = 0x8000
-    alias HUGETLB = 0x40000
-    alias HUGE_2MB = 21 << 26
-    alias HUGE_1GB = 30 << 26
+    comptime SHARED = 0x01
+    comptime PRIVATE = 0x02
+    comptime FIXED = 0x10
+    comptime ANONYMOUS = 0x20
+    comptime NORESERVE = 0x4000
+    comptime POPULATE = 0x8000
+    comptime HUGETLB = 0x40000
+    comptime HUGE_2MB = 21 << 26
+    comptime HUGE_1GB = 30 << 26
 
 @register_passable("trivial")
 struct Mempolicy:
-    alias DEFAULT = 0
-    alias PREFERRED = 1
-    alias BIND = 2
-    alias INTERLEAVE = 3
-    alias LOCAL = 4
+    comptime DEFAULT = 0
+    comptime PREFERRED = 1
+    comptime BIND = 2
+    comptime INTERLEAVE = 3
+    comptime LOCAL = 4
 
 @register_passable("trivial")
 struct Madvise:
-    alias NORMAL = 0
-    alias RANDOM = 1
-    alias SEQUENTIAL = 2
-    alias WILLNEED = 3
-    alias DONTNEED = 4
-    alias HUGEPAGE = 14
-    alias NOHUGEPAGE = 15
+    comptime NORMAL = 0
+    comptime RANDOM = 1
+    comptime SEQUENTIAL = 2
+    comptime WILLNEED = 3
+    comptime DONTNEED = 4
+    comptime HUGEPAGE = 14
+    comptime NOHUGEPAGE = 15
 
 @register_passable("trivial")
 struct PageSize:
-    alias STANDARD = 4096
-    alias THP_2MB = 2 * 1024 * 1024
-    alias EXPLICIT_2MB = -2
-    alias EXPLICIT_1GB = -1
+    comptime STANDARD = 4096
+    comptime THP_2MB = 2 * 1024 * 1024
+    comptime EXPLICIT_2MB = -2
+    comptime EXPLICIT_1GB = -1
 
 fn syscall[count: Int](nr: Int64, *args: Int64) -> Int:
-    alias regs = ("", ",{rdi}", ",{rdi},{rsi}", ",{rdi},{rsi},{rdx}",
+    comptime regs = ("", ",{rdi}", ",{rdi},{rsi}", ",{rdi},{rsi},{rdx}",
                   ",{rdi},{rsi},{rdx},{rcx}", ",{rdi},{rsi},{rdx},{rcx},{r8}",
                   ",{rdi},{rsi},{rdx},{rcx},{r8},{r9}")
-    alias asm = "mov %rcx, %r10\nsyscall" if count > 3 else "syscall"
-    alias constraints = "={rax},{rax}" + regs[count] + ",~{rcx},~{r10},~{r11},~{memory}"
+    comptime asm = "mov %rcx, %r10\nsyscall" if count > 3 else "syscall"
+    comptime constraints = "={rax},{rax}" + regs[count] + ",~{rcx},~{r10},~{r11},~{memory}"
     @parameter
     if count == 0:
         return Int(inlined_assembly[asm, Int64, Int64, constraints=constraints](nr))
@@ -300,7 +300,7 @@ fn sys_mprotect(addr: Int, length: Int, prot: Int) -> Int:
     return syscall[3](Syscall.mprotect, Int64(addr), Int64(length), Int64(prot))
 
 # Lower 32 bits
-alias FUTEX_BITSET_MATCH_ANY: Int64 = 0xFFFFFFFF
+comptime FUTEX_BITSET_MATCH_ANY: Int64 = 0xFFFFFFFF
 
 fn sys_futex_wait(addr: Int, expected: Int, flags: Int = Futex2.SIZE_U32 | Futex2.PRIVATE) -> Int:
     """Wait on a futex. Returns 0 on wake, negative errno on failure."""

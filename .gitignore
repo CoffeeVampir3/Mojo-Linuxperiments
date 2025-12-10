@@ -1,3 +1,11 @@
 pixi.lock
 .pixi/
+
+# Compiled executables
 test_linux_threading
+test_burst
+test_debug
+test_theories
+bench_hot_cold
+bench_dispatch
+bench_numa_burst
