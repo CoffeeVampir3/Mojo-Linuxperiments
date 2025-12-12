@@ -1,8 +1,12 @@
 from threading.linux_threading import ThreadPool
-from threading.burst_threading import BurstPool
+from threading.burst_threading import BurstPool, ArgPack
+from notstdcollections import HeapMoveArray
 from time import perf_counter_ns
 
 fn empty_work():
+    pass
+
+fn empty_kernel():
     pass
 
 fn bench_clone[POOL_SIZE: Int, ITERATIONS: Int]():
@@ -35,13 +39,17 @@ fn bench_burst[POOL_SIZE: Int, ITERATIONS: Int]():
         print("BurstPool creation failed")
         return
 
+    var packs = HeapMoveArray[ArgPack](pool.capacity)
+    for _ in range(pool.capacity):
+        packs.push(ArgPack())
+
     # Warmup
-    pool.sync(empty_work)
+    pool.dispatch(empty_kernel, packs.ptr)
 
     # Benchmark
     var start = perf_counter_ns()
     for _ in range(ITERATIONS):
-        pool.sync(empty_work)
+        pool.dispatch(empty_kernel, packs.ptr)
     var end = perf_counter_ns()
 
     var total_ns = Int(end - start)

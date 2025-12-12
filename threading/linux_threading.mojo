@@ -106,7 +106,7 @@ struct ThreadPool[stack_size: Int = StackSize.DEFAULT, mask_size: Int = 128](Mov
                 var packed_args = InlineArray[Int64, 6](0)
                 @parameter
                 for j in range(args.__len__()):
-                    alias T = type_of(args[j])
+                    comptime T = type_of(args[j])
                     constrained[size_of[T]() == 8, "args must be 8 bytes"]()
                     var arg = args[j]
                     packed_args[j] = UnsafePointer(to=arg).bitcast[Int64]()[]

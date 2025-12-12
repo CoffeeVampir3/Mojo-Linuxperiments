@@ -1,11 +1,12 @@
 """Benchmark work queue dispatch latency with spin-then-sleep model."""
 
-from threading.burst_threading import BurstPool
+from threading.burst_threading import BurstPool, ArgPack
+from notstdcollections import HeapMoveArray
 from numa import NumaInfo, CpuMask
 import threading.linux as linux
 from time import perf_counter_ns
 
-fn empty_work():
+fn empty_kernel():
     pass
 
 fn bench[POOL_SIZE: Int, ITERATIONS: Int]():
@@ -15,13 +16,17 @@ fn bench[POOL_SIZE: Int, ITERATIONS: Int]():
         print("Pool creation failed")
         return
 
+    var packs = HeapMoveArray[ArgPack](pool.capacity)
+    for _ in range(pool.capacity):
+        packs.push(ArgPack())
+
     # Warmup
-    pool.sync(empty_work)
+    pool.dispatch(empty_kernel, packs.ptr)
 
     # Benchmark
     var start = perf_counter_ns()
     for _ in range(ITERATIONS):
-        pool.sync(empty_work)
+        pool.dispatch(empty_kernel, packs.ptr)
     var end = perf_counter_ns()
 
     var total_ns = Int(end - start)
@@ -50,11 +55,15 @@ fn bench_pinned[ITERATIONS: Int]():
 
     var pool_size = pool.capacity
 
+    var packs = HeapMoveArray[ArgPack](pool.capacity)
+    for _ in range(pool.capacity):
+        packs.push(ArgPack())
+
     # Benchmark
-    pool.sync(empty_work)  # warmup
+    pool.dispatch(empty_kernel, packs.ptr)  # warmup
     var start = perf_counter_ns()
     for _ in range(ITERATIONS):
-        pool.sync(empty_work)
+        pool.dispatch(empty_kernel, packs.ptr)
     var end = perf_counter_ns()
     var ns_per_iter = Int(end - start) // ITERATIONS
 

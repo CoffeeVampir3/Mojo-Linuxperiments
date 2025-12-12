@@ -1,12 +1,13 @@
 """Debug: Verify worker CPU affinity"""
 
-from threading.burst_threading import BurstPool
+from threading.burst_threading import BurstPool, ArgPack
+from notstdcollections import HeapMoveArray
 from numa import NumaInfo, CpuMask, get_current_cpu_and_node
 import threading.linux as linux
 
-fn report_cpu():
+fn report_cpu(worker: Int64):
     var cpu_node = get_current_cpu_and_node()
-    print("Worker on CPU", cpu_node[0])
+    print("Worker", worker, "on CPU", cpu_node[0])
 
 fn main():
     var numa = NumaInfo()
@@ -29,4 +30,7 @@ fn main():
         return
 
     print("Pool created, asking each worker to report its CPU:")
-    pool.sync(report_cpu)
+    var packs = HeapMoveArray[ArgPack](pool.capacity)
+    for _ in range(pool.capacity):
+        packs.push(ArgPack())
+    pool.dispatch(report_cpu, packs.ptr)
