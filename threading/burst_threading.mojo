@@ -1,10 +1,3 @@
-"""Persistent worker thread pool for low-latency burst dispatch.
-
-Workers spawn once at pool creation and persist until destruction.
-Hot mode: workers spin on PAUSE (zero syscall latency, burns CPU).
-Cold mode: workers futex_wait (syscall on wake, power efficient).
-"""
-
 from sys.intrinsics import inlined_assembly
 from sys.info import size_of
 from memory import UnsafePointer, memcpy
@@ -69,7 +62,7 @@ fn slot_size[stack_size: Int]() -> Int:
     return SlotLayout.HEADER + SlotLayout.GUARD + stack_size
 
 struct SharedPoolState:
-    # Cache line padding to avoid false-sharing across pages.
+    # Cache line padding to avoid false sharing between dispatch and completion fields.
     # Cache line 1: Work dispatch (main writes, workers read)
     var work_available: AtomicInt32  # Workers decrement to claim work
     var shutdown: AtomicInt32        # Shutdown signal
@@ -84,7 +77,7 @@ struct SharedPoolState:
     var pad0: InlineArray[UInt8, Self.DispatchPadBytes]
 
     # Cache line 2: Completion tracking (workers write, main reads)
-    var work_done: AtomicInt32       # Workers increment when done
+    var work_done: AtomicInt32       # Jobs remaining; workers decrement when done
 
     comptime DonePadBytes = 64 - size_of[type_of(Self().work_done)]()
     var pad1: InlineArray[UInt8, Self.DonePadBytes]
@@ -261,16 +254,26 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         return Self(cap, mask^, node)
 
     fn dispatch[F: AnyTrivialRegType](mut self, kernel: F, packs: UnsafePointer[ArgPack, MutAnyOrigin], num_jobs: Int = -1):
-        """Dispatch `num_jobs` packs to workers.
+        """Launch `num_jobs` packs to workers and return immediately.
 
         Each pack is 8×Int64 (64B). arg0..arg5 are user arguments; pad0/pad1 are reserved.
         Workers steal jobs via work_available and invoke the kernel using the uniform ABI
         `(worker_id, arg0..arg5)`. The user kernel may accept any prefix of these arguments.
+        Call `join()` to wait for completion.
         """
         var jobs = num_jobs if num_jobs >= 0 else self.capacity
         debug_assert(jobs <= self.capacity, "num_jobs must be <= pool capacity")
         if jobs <= 0:
             return
+
+        comptime KernelType = type_of(kernel)
+        constrained[size_of[KernelType]() == 8, "kernel must be an 8-byte function pointer"]()
+
+        var donePtr = UnsafePointer(to=self.shared[].work_done.value)
+        debug_assert(
+            AtomicInt32.load[ordering=Consistency.ACQUIRE](donePtr) == 0,
+            "previous dispatch still in flight; call join() first",
+        )
 
         # Copy per-job packs into fixed args arena (one ArgPack per job).
         for i in range(jobs):
@@ -282,16 +285,18 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         var kernel_ptr = UnsafePointer(to=kernel_copy).bitcast[Int64]()[]
         self.shared[].func_ptr = kernel_ptr
 
-        var donePtr = UnsafePointer(to=self.shared[].work_done.value)
         var workPtr = UnsafePointer(to=self.shared[].work_available.value)
 
-        # Reset done counter, then publish work_available with release semantics.
-        AtomicInt32.store[ordering=Consistency.MONOTONIC](donePtr, 0)
+        # Publish jobs remaining and work available with release semantics.
+        AtomicInt32.store[ordering=Consistency.MONOTONIC](donePtr, Int32(jobs))
         AtomicInt32.store[ordering=Consistency.RELEASE](workPtr, Int32(jobs))
 
         _ = linux.sys_futex_wake(Int(workPtr), jobs, self.futex_flags)
 
-        while AtomicInt32.load[ordering=Consistency.ACQUIRE](donePtr) < Int32(jobs):
+    fn join(mut self):
+        """Wait for the most recent dispatch to complete."""
+        var donePtr = UnsafePointer(to=self.shared[].work_done.value)
+        while AtomicInt32.load[ordering=Consistency.ACQUIRE](donePtr) > 0:
             pause()
 
     fn _spawn_workers(mut self):
@@ -342,7 +347,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
 
 fn clone3_with_entry(clone_args_ptr: UnsafePointer[linux.Clone3Args, MutAnyOrigin], clone_args_size: Int) -> Int:
     # Child diverges via ret to entry point on stack head.
-    # Take a typed pointer so the compiler tracks the argument's origin/lifetime.
+    # Take a typed pointer so the compiler tracks the argument's lifetime.
     return Int(inlined_assembly[
         "mov $$435, %rax\nsyscall\ntest %rax, %rax\njnz 1f\nmov %rsp, %rdi\nret\n1:",
         Int64, Int64, Int64,
@@ -385,7 +390,7 @@ fn worker_main[mask_size: Int](stack_head_ptr: Int):
             break
 
         # Try to claim work by atomically decrementing work_available
-        var avail = shared[].work_available.load[ordering=Consistency.ACQUIRE]()
+        var avail = shared[].work_available.load[ordering=Consistency.MONOTONIC]()
 
         if avail > 0:
             # Try to claim one unit of work
@@ -405,12 +410,13 @@ fn worker_main[mask_size: Int](stack_head_ptr: Int):
                     pack_ptr[].arg5,
                 )
 
-                # Signal completion
-                _ = shared[].work_done.fetch_add[ordering=Consistency.ACQUIRE_RELEASE](1)
+                # Signal completion by decrementing jobs remaining.
+                _ = shared[].work_done.fetch_sub[ordering=Consistency.ACQUIRE_RELEASE](1)
                 continue
             else:
-                # If we fetched and it's below 0, we need the last loser to set to 0.
-                # But only if it's still that value, to not screw up new dispatches.
+                # If we fetch <= 0 there's no more work, compare to lowest racing loser
+                # and have the lowest racing loser set to 0 only if it's still that value,
+                # to not screw up new dispatches.
                 var expected = old - 1
                 _ = shared[].work_available.compare_exchange(expected, 0)
 
