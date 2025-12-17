@@ -8,11 +8,14 @@ from numa import NumaInfo, CpuMask
 
 comptime AtomicInt32 = Atomic[DType.int32]
 # Uniform worker call ABI:
-#   workers always invoke as (worker_id, arg0..arg5) where each arg is a 64-bit
-#   integer-class value (pointers or Int64s).
-# User kernels may take any *prefix* of these arguments (0..7 total); extra
+#   workers always invoke as (arg0..arg5) where each arg is a 64-bit integer-class
+#   value (pointers or Int64s).
+# User kernels may take any *prefix* of these arguments (0..6 total); extra
 # trailing args are passed by the caller but ignored by the callee on x86-64 SysV.
-comptime KernelFn = fn(Int64, Int64, Int64, Int64, Int64, Int64, Int64)
+#
+# Per-worker metadata (like worker_id) is published via %fs-relative storage in
+# the worker slot. Call `current_worker_id()` from inside a kernel if needed.
+comptime KernelFn = fn(Int64, Int64, Int64, Int64, Int64, Int64)
 
 @fieldwise_init
 @register_passable("trivial")
@@ -45,8 +48,9 @@ fn get_fs_base() -> Int:
 fn pause():
     inlined_assembly["pause", NoneType, constraints="~{memory}"]()
 
-# Memory layout per worker slot:
-# [TLS 256B][TCB 64B][child_tid 4B][pad][Guard 4KB][Stack]
+# Memory layout per worker slot (slot_base points at the start of the TLS block;
+# FS base points at the TCB at slot_base + TCB):
+# [TLS 256B][TCB 64B][child_tid 4B][pad 4B][worker_id 8B][magic 8B][pad..HEADER][Guard 4KB][Stack stack_size][pad..slot_end]
 @register_passable("trivial")
 struct SlotLayout:
     comptime TLS_SIZE = 256
@@ -54,12 +58,39 @@ struct SlotLayout:
     comptime TCB_SELF_OFFSET = 0x10
     comptime TCB = Self.TLS_SIZE
     comptime CHILD_TID = Self.TCB + Self.TCB_SIZE
-    comptime HEADER = ((Self.CHILD_TID + 4 + 4095) // 4096) * 4096
+    comptime WORKER_ID = Self.CHILD_TID + 8
+    comptime WORKER_MAGIC = Self.WORKER_ID + 8
+    comptime WORKER_MAGIC_VALUE = Int64(0x4255525354574B52)  # "BURSTWKR"
+    comptime WORKER_ID_FROM_FS = Self.WORKER_ID - Self.TCB
+    comptime WORKER_MAGIC_FROM_FS = Self.WORKER_MAGIC - Self.TCB
+    comptime HEADER = ((Self.WORKER_MAGIC + 8 + 4095) // 4096) * 4096
     comptime GUARD = 4096
     comptime DEFAULT_STACK = 64 * 1024
 
 fn slot_size[stack_size: Int]() -> Int:
-    return SlotLayout.HEADER + SlotLayout.GUARD + stack_size
+    constrained[
+        stack_size >= SlotLayout.GUARD and stack_size % SlotLayout.GUARD == 0,
+        "stack_size must be a multiple of 4096 (>= 4096)",
+    ]()
+    # Must be page-aligned so each worker's guard page can be protected with mprotect.
+    var raw = SlotLayout.HEADER + SlotLayout.GUARD + stack_size
+    return ((raw + SlotLayout.GUARD - 1) // SlotLayout.GUARD) * SlotLayout.GUARD
+
+@always_inline
+fn current_worker_id() -> Int64:
+    """Return worker id when running in a BurstPool worker, else -1."""
+    var magic = inlined_assembly[
+        "mov %fs:" + String(SlotLayout.WORKER_MAGIC_FROM_FS) + ", $0",
+        Int64,
+        constraints="=r",
+    ]()
+    if magic != SlotLayout.WORKER_MAGIC_VALUE:
+        return -1
+    return inlined_assembly[
+        "mov %fs:" + String(SlotLayout.WORKER_ID_FROM_FS) + ", $0",
+        Int64,
+        constraints="=r",
+    ]()
 
 struct SharedPoolState:
     # Cache line padding to avoid false sharing between dispatch and completion fields.
@@ -164,7 +195,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         var arena_size = Self.slot_size * capacity + size_of[SharedPoolState]() + args_arena_size
         self.arena_base = linux.sys_mmap[
             prot=linux.Prot.RW,
-            flags=linux.MapFlag.PRIVATE | linux.MapFlag.ANONYMOUS | linux.MapFlag.NORESERVE
+            flags=linux.MapFlag.PRIVATE | linux.MapFlag.ANONYMOUS | linux.MapFlag.NORESERVE | linux.MapFlag.POPULATE
         ](0, arena_size)
         if self.arena_base < 0:
             return
@@ -258,7 +289,8 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
 
         Each pack is 8×Int64 (64B). arg0..arg5 are user arguments; pad0/pad1 are reserved.
         Workers steal jobs via work_available and invoke the kernel using the uniform ABI
-        `(worker_id, arg0..arg5)`. The user kernel may accept any prefix of these arguments.
+        `(arg0..arg5)`. The user kernel may accept any prefix of these arguments.
+        Use `current_worker_id()` inside a kernel if you need the worker id.
         Call `join()` to wait for completion.
         """
         var jobs = num_jobs if num_jobs >= 0 else self.capacity
@@ -302,20 +334,8 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
     fn _spawn_workers(mut self):
         var parent_fs = get_fs_base()
 
-        # Build list of CPUs from mask for 1:1 pinning
-        var cpu_list = InlineArray[Int, Self.mask_size * 8](-1)
-        var cpu_count = 0
-        if self.pinned:
-            for cpu in range(Self.mask_size * 8):
-                if self.cpu_mask.test(cpu):
-                    cpu_list[cpu_count] = cpu
-                    cpu_count += 1
-
         for i in range(self.capacity):
-            # Create per-worker mask with single CPU for 1:1 pinning
-            var worker_mask = CpuMask[Self.mask_size]()
-            if self.pinned and i < cpu_count:
-                worker_mask.set(cpu_list[i])
+            var worker_mask = self.cpu_mask.copy() if self.pinned else CpuMask[Self.mask_size]()
 
             var stack_top_addr = Int(self.slots[i][].stack_top) + Self.stack_size
             var stack_head_addr = (stack_top_addr - size_of[WorkerStackHead[Self.mask_size]]()) & ~15
@@ -375,6 +395,10 @@ fn worker_main[mask_size: Int](stack_head_ptr: Int):
     )
     ptr[Int64](tcb_addr + SlotLayout.TCB_SELF_OFFSET)[] = Int64(tcb_addr)
 
+    # Publish worker_id into %fs-relative storage for kernel access.
+    ptr[Int64](slot_base + SlotLayout.WORKER_ID)[] = worker_id
+    ptr[Int64](slot_base + SlotLayout.WORKER_MAGIC)[] = SlotLayout.WORKER_MAGIC_VALUE
+
     # Pin to CPU if mask has any bits set
     if head_ptr[].cpu_mask.count() > 0:
         var ret = linux.sys_sched_setaffinity(0, mask_size, Int(head_ptr[].cpu_mask.ptr()))
@@ -401,7 +425,6 @@ fn worker_main[mask_size: Int](stack_head_ptr: Int):
                 var pack_ptr = args_base + Int(job_idx)
                 var func_addr = shared[].func_ptr
                 UnsafePointer(to=func_addr).bitcast[KernelFn]()[](
-                    worker_id,
                     pack_ptr[].arg0,
                     pack_ptr[].arg1,
                     pack_ptr[].arg2,
@@ -419,6 +442,18 @@ fn worker_main[mask_size: Int](stack_head_ptr: Int):
                 # to not screw up new dispatches.
                 var expected = old - 1
                 _ = shared[].work_available.compare_exchange(expected, 0)
+
+        # A note, because it wasn't obvious to me. If you do not futex wait the scheduler
+        # on linux can absolutely deadlock spinning threads by not scheduling
+        # other (wanting to work) threads, leading to no-work on spinning threads and
+        # never re-scheduling waiting threads, so the work effectively deadlocks.
+        # (The threads look busy because they spin on the atomic.)
+        # Basically, we could go faster but it runs into stochastic failure
+        # unless we set up the system to specifically account for this number
+        # of physical threads to be dispatched by us.
+        # There's about a 6x penalty in latency cost (worst case) doing this VS pure spin
+        # however it guarantees work will always attempt to complete (in bounded time)
+        # and this doesn't need complex user/system configuration. But it's not optimal.
 
         # No work available - spin briefly then sleep
         var spins = 0

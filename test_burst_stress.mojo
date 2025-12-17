@@ -22,7 +22,12 @@ fn calc_result(iter: Int64, job_idx: Int64) -> Int64:
     return x
 
 
-fn stress_kernel(_worker: Int64, dst_addr: Int64, iter: Int64, job_idx: Int64):
+fn calc_scratch_sum(iter: Int64, job_idx: Int64) -> Int64:
+    # Sum_{i=0..127} (iter + job_idx + i)
+    return (iter + job_idx) * 128 + 8128
+
+
+fn stress_kernel(out_ptr: MutUnsafePointer[Int64, MutOrigin.external], iter: Int64, job_idx: Int64):
     # Heavy-ish stack usage to stress small worker stacks.
     var scratch = InlineArray[Int64, 128](uninitialized=True)  # 1KB
     for i in range(128):
@@ -30,14 +35,17 @@ fn stress_kernel(_worker: Int64, dst_addr: Int64, iter: Int64, job_idx: Int64):
 
     var x = calc_result(iter, job_idx)
 
-    var out_ptr = MutUnsafePointer[Int64, MutOrigin.external](unsafe_from_address=Int(dst_addr))
-    out_ptr[] = x
+    var scratch_sum = Int64(0)
+    for i in range(128):
+        scratch_sum += scratch[i]
+
+    out_ptr[] = x + scratch_sum
 
 
 fn main():
     comptime CAPACITY = 15
     comptime ITERATIONS = 5000
-    comptime STACK_BYTES = 4096  # small stack to stress guard/reset behavior
+    comptime STACK_BYTES = 4096  # small, page-aligned stack to stress guard/reset behavior
 
     var pool = BurstPool[STACK_BYTES](CAPACITY)
     if not pool:
@@ -87,7 +95,7 @@ fn main():
 
         for j in range(jobs):
             var got = (output.ptr + j)[]
-            var exp = calc_result(Int64(iter_i), Int64(j))
+            var exp = calc_result(Int64(iter_i), Int64(j)) + calc_scratch_sum(Int64(iter_i), Int64(j))
             if got != exp:
                 print("Mismatch at iter", iter_i, "job", j, "got", got, "expected", exp)
                 return
