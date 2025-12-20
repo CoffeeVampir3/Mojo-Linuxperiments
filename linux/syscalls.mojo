@@ -21,6 +21,11 @@ struct Syscall:
     comptime sched_setaffinity = 203
     comptime rseq = 334
     comptime gettid = 186
+    comptime openat = 257
+    comptime close = 3
+    comptime io_uring_setup = 425
+    comptime io_uring_enter = 426
+    comptime io_uring_register = 427
 
 @register_passable("trivial")
 struct CloneFlags:
@@ -78,7 +83,7 @@ struct FutexWaitv:
     var val: UInt64
     var uaddr: KernelPtr
     var flags: KernelFlags32
-    var __reserved: UInt32
+    var reserved: UInt32
 
 @register_passable("trivial")
 struct Clone3Args:
@@ -184,6 +189,294 @@ struct PageSize:
     comptime THP_2MB = 2 * 1024 * 1024
     comptime EXPLICIT_2MB = -2
     comptime EXPLICIT_1GB = -1
+
+# =============================================================================
+# io_uring types and constants
+# Reference: https://github.com/torvalds/linux/blob/master/include/uapi/linux/io_uring.h
+# =============================================================================
+
+@register_passable("trivial")
+struct IoUringSetup:
+    comptime IOPOLL = 1 << 0
+    comptime SQPOLL = 1 << 1
+    comptime SQ_AFF = 1 << 2
+    comptime CQSIZE = 1 << 3
+    comptime CLAMP = 1 << 4
+    comptime ATTACH_WQ = 1 << 5
+    comptime R_DISABLED = 1 << 6
+    comptime SUBMIT_ALL = 1 << 7
+    comptime COOP_TASKRUN = 1 << 8
+    comptime TASKRUN_FLAG = 1 << 9
+    comptime SQE128 = 1 << 10
+    comptime CQE32 = 1 << 11
+    comptime SINGLE_ISSUER = 1 << 12
+    comptime DEFER_TASKRUN = 1 << 13
+    comptime NO_MMAP = 1 << 14
+    comptime REGISTERED_FD_ONLY = 1 << 15
+    comptime NO_SQARRAY = 1 << 16
+
+@register_passable("trivial")
+struct IoUringEnter:
+    comptime GETEVENTS = 1 << 0
+    comptime SQ_WAKEUP = 1 << 1
+    comptime SQ_WAIT = 1 << 2
+    comptime EXT_ARG = 1 << 3
+    comptime REGISTERED_RING = 1 << 4
+
+@register_passable("trivial")
+struct IoUringSqeFlags:
+    comptime FIXED_FILE = 1 << 0
+    comptime IO_DRAIN = 1 << 1
+    comptime IO_LINK = 1 << 2
+    comptime IO_HARDLINK = 1 << 3
+    comptime ASYNC = 1 << 4
+    comptime BUFFER_SELECT = 1 << 5
+    comptime CQE_SKIP_SUCCESS = 1 << 6
+
+@register_passable("trivial")
+struct IoUringOp:
+    comptime NOP = 0
+    comptime READV = 1
+    comptime WRITEV = 2
+    comptime FSYNC = 3
+    comptime READ_FIXED = 4
+    comptime WRITE_FIXED = 5
+    comptime POLL_ADD = 6
+    comptime POLL_REMOVE = 7
+    comptime SYNC_FILE_RANGE = 8
+    comptime SENDMSG = 9
+    comptime RECVMSG = 10
+    comptime TIMEOUT = 11
+    comptime TIMEOUT_REMOVE = 12
+    comptime ACCEPT = 13
+    comptime ASYNC_CANCEL = 14
+    comptime LINK_TIMEOUT = 15
+    comptime CONNECT = 16
+    comptime FALLOCATE = 17
+    comptime OPENAT = 18
+    comptime CLOSE = 19
+    comptime FILES_UPDATE = 20
+    comptime STATX = 21
+    comptime READ = 22
+    comptime WRITE = 23
+    comptime FADVISE = 24
+    comptime MADVISE = 25
+    comptime SEND = 26
+    comptime RECV = 27
+    comptime OPENAT2 = 28
+    comptime EPOLL_CTL = 29
+    comptime SPLICE = 30
+    comptime PROVIDE_BUFFERS = 31
+    comptime REMOVE_BUFFERS = 32
+
+@register_passable("trivial")
+struct IoUringRegisterOp:
+    comptime REGISTER_BUFFERS = 0
+    comptime UNREGISTER_BUFFERS = 1
+    comptime REGISTER_FILES = 2
+    comptime UNREGISTER_FILES = 3
+    comptime REGISTER_EVENTFD = 4
+    comptime UNREGISTER_EVENTFD = 5
+    comptime REGISTER_FILES_UPDATE = 6
+    comptime REGISTER_EVENTFD_ASYNC = 7
+    comptime REGISTER_PROBE = 8
+    comptime REGISTER_PERSONALITY = 9
+    comptime UNREGISTER_PERSONALITY = 10
+
+@register_passable("trivial")
+struct IoUringCqeFlags:
+    comptime BUFFER = 1 << 0
+    comptime MORE = 1 << 1
+    comptime SOCK_NONEMPTY = 1 << 2
+    comptime NOTIF = 1 << 3
+
+@register_passable("trivial")
+struct SqRingOffsets:
+    var head: UInt32
+    var tail: UInt32
+    var ring_mask: UInt32
+    var ring_entries: UInt32
+    var flags: UInt32
+    var dropped: UInt32
+    var array: UInt32
+    var resv1: UInt32
+    var user_addr: UInt64
+
+    fn __init__(out self):
+        self.head = 0
+        self.tail = 0
+        self.ring_mask = 0
+        self.ring_entries = 0
+        self.flags = 0
+        self.dropped = 0
+        self.array = 0
+        self.resv1 = 0
+        self.user_addr = 0
+
+@register_passable("trivial")
+struct CqRingOffsets:
+    var head: UInt32
+    var tail: UInt32
+    var ring_mask: UInt32
+    var ring_entries: UInt32
+    var overflow: UInt32
+    var cqes: UInt32
+    var flags: UInt32
+    var resv1: UInt32
+    var user_addr: UInt64
+
+    fn __init__(out self):
+        self.head = 0
+        self.tail = 0
+        self.ring_mask = 0
+        self.ring_entries = 0
+        self.overflow = 0
+        self.cqes = 0
+        self.flags = 0
+        self.resv1 = 0
+        self.user_addr = 0
+
+@register_passable("trivial")
+struct IoUringParams:
+    var sq_entries: UInt32
+    var cq_entries: UInt32
+    var flags: UInt32
+    var sq_thread_cpu: UInt32
+    var sq_thread_idle: UInt32
+    var features: UInt32
+    var wq_fd: UInt32
+    var resv0: UInt32
+    var resv1: UInt32
+    var resv2: UInt32
+    var sq_off: SqRingOffsets
+    var cq_off: CqRingOffsets
+
+    fn __init__(out self, sq_entries: UInt32 = 0, flags: UInt32 = 0):
+        self.sq_entries = sq_entries
+        self.cq_entries = 0
+        self.flags = flags
+        self.sq_thread_cpu = 0
+        self.sq_thread_idle = 0
+        self.features = 0
+        self.wq_fd = 0
+        self.resv0 = 0
+        self.resv1 = 0
+        self.resv2 = 0
+        self.sq_off = SqRingOffsets()
+        self.cq_off = CqRingOffsets()
+
+@register_passable("trivial")
+struct IoUringSqe:
+    var opcode: UInt8
+    var flags: UInt8
+    var ioprio: UInt16
+    var fd: Int32
+    var off: UInt64       # File offset (union with addr2)
+    var addr: UInt64      # Buffer address (union with splice_off_in)
+    var len: UInt32       # Buffer size or iovec count
+    var op_flags: UInt32  # Operation-specific flags (rw_flags, fsync_flags, etc.)
+    var user_data: UInt64 # Passed back in CQE
+    var buf_index: UInt16 # Index into registered buffers (union with buf_group)
+    var personality: UInt16
+    var splice_fd_in: Int32  # Union with file_index
+    var addr3: UInt64
+    var pad: UInt64
+
+    fn __init__(out self):
+        self.opcode = 0
+        self.flags = 0
+        self.ioprio = 0
+        self.fd = 0
+        self.off = 0
+        self.addr = 0
+        self.len = 0
+        self.op_flags = 0
+        self.user_data = 0
+        self.buf_index = 0
+        self.personality = 0
+        self.splice_fd_in = 0
+        self.addr3 = 0
+        self.pad = 0
+
+    @staticmethod
+    fn read(fd: Int32, offset: UInt64, buf: UInt64, size: UInt32, user_data: UInt64) -> Self:
+        var sqe = Self()
+        sqe.opcode = IoUringOp.READ
+        sqe.fd = fd
+        sqe.off = offset
+        sqe.addr = buf
+        sqe.len = size
+        sqe.user_data = user_data
+        return sqe
+
+    @staticmethod
+    fn read_fixed(file_index: Int32, offset: UInt64, buf: UInt64, size: UInt32,
+                  buf_index: UInt16, user_data: UInt64) -> Self:
+        var sqe = Self()
+        sqe.opcode = IoUringOp.READ
+        sqe.flags = IoUringSqeFlags.FIXED_FILE
+        sqe.fd = file_index
+        sqe.off = offset
+        sqe.addr = buf
+        sqe.len = size
+        sqe.buf_index = buf_index
+        sqe.user_data = user_data
+        return sqe
+
+@register_passable("trivial")
+struct IoUringCqe:
+    var user_data: UInt64
+    var res: Int32
+    var flags: UInt32
+
+    fn __init__(out self):
+        self.user_data = 0
+        self.res = 0
+        self.flags = 0
+
+@register_passable("trivial")
+struct IoVec:
+    var base: UInt64
+    var len: UInt64
+
+    fn __init__(out self, base: Int, length: Int):
+        self.base = UInt64(base)
+        self.len = UInt64(length)
+
+comptime IORING_OFF_SQ_RING: Int = 0
+comptime IORING_OFF_CQ_RING: Int = 0x8000000
+comptime IORING_OFF_SQES: Int = 0x10000000
+
+comptime AT_FDCWD: Int = -100
+
+@register_passable("trivial")
+struct OpenFlags:
+    comptime RDONLY = 0
+    comptime WRONLY = 1
+    comptime RDWR = 2
+    comptime CREAT = 0o100
+    comptime EXCL = 0o200
+    comptime TRUNC = 0o1000
+    comptime APPEND = 0o2000
+    comptime NONBLOCK = 0o4000
+    comptime CLOEXEC = 0o2000000
+    comptime DIRECT = 0o40000
+
+@register_passable("trivial")
+struct IoUringFeat:
+    comptime SINGLE_MMAP = 1 << 0
+    comptime NODROP = 1 << 1
+    comptime SUBMIT_STABLE = 1 << 2
+    comptime RW_CUR_POS = 1 << 3
+    comptime CUR_PERSONALITY = 1 << 4
+    comptime FAST_POLL = 1 << 5
+    comptime POLL_32BITS = 1 << 6
+    comptime SQPOLL_NONFIXED = 1 << 7
+    comptime EXT_ARG = 1 << 8
+    comptime NATIVE_WORKERS = 1 << 9
+    comptime RSRC_TAGS = 1 << 10
+    comptime CQE_SKIP = 1 << 11
+    comptime LINKED_FILE = 1 << 12
 
 fn syscall[count: Int](nr: Int64, *args: Int64) -> Int:
     comptime regs = ("", ",{rdi}", ",{rdi},{rsi}", ",{rdi},{rsi},{rdx}",
@@ -330,3 +623,75 @@ fn sys_rseq(rseq_ptr: Int, len: Int, flags: Int, sig: Int) -> Int:
 fn sys_sched_setaffinity(tid: Int, mask_size: Int, mask_ptr: Int) -> Int:
     """Set CPU affinity for thread. tid=0 -> current thread."""
     return syscall[3](Syscall.sched_setaffinity, Int64(tid), Int64(mask_size), Int64(mask_ptr))
+
+fn sys_openat(dirfd: Int, mut pathname: String, flags: Int, mode: Int = 0) -> Int:
+    """Open file relative to directory fd. Use AT_FDCWD (-100) for cwd."""
+    var cstr = pathname.as_c_string_slice()
+    return syscall[4](Syscall.openat, Int64(dirfd), Int64(Int(cstr.unsafe_ptr())), Int64(flags), Int64(mode))
+
+fn sys_close(fd: Int) -> Int:
+    """Close file descriptor."""
+    return syscall[1](Syscall.close, Int64(fd))
+
+# =============================================================================
+# io_uring syscalls
+# =============================================================================
+
+fn sys_io_uring_setup(entries: UInt32, params: UnsafePointer[IoUringParams]) -> Int:
+    """Create an io_uring instance.
+    Returns ring file descriptor on success, negative errno on failure.
+    """
+    return syscall[2](Syscall.io_uring_setup, Int64(entries), Int64(Int(params)))
+
+fn sys_io_uring_enter(
+    fd: Int,
+    to_submit: UInt32,
+    min_complete: UInt32,
+    flags: UInt32,
+) -> Int:
+    """Submit SQEs and/or wait for completions.
+    Returns number of SQEs submitted, or negative errno on failure.
+    """
+    return syscall[4](
+        Syscall.io_uring_enter,
+        Int64(fd),
+        Int64(to_submit),
+        Int64(min_complete),
+        Int64(flags),
+    )
+
+fn sys_io_uring_enter_sig(
+    fd: Int,
+    to_submit: UInt32,
+    min_complete: UInt32,
+    flags: UInt32,
+    sig: Int,
+    sigsz: Int,
+) -> Int:
+    """Submit SQEs and/or wait for completions with signal mask."""
+    return syscall[6](
+        Syscall.io_uring_enter,
+        Int64(fd),
+        Int64(to_submit),
+        Int64(min_complete),
+        Int64(flags),
+        Int64(sig),
+        Int64(sigsz),
+    )
+
+fn sys_io_uring_register(
+    fd: Int,
+    opcode: UInt32,
+    arg: Int,
+    nr_args: UInt32,
+) -> Int:
+    """Register resources with an io_uring instance.
+    Returns 0 on success, or negative errno on failure.
+    """
+    return syscall[4](
+        Syscall.io_uring_register,
+        Int64(fd),
+        Int64(opcode),
+        Int64(arg),
+        Int64(nr_args),
+    )

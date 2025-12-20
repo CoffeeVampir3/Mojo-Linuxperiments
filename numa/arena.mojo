@@ -1,6 +1,6 @@
 from sys.info import size_of
 from memory import UnsafePointer
-import threading.linux as linux
+import linux.syscalls as linux
 
 @fieldwise_init
 struct NumaArena[alignment: Int = 8, page_size: Int = linux.PageSize.THP_2MB](Movable):

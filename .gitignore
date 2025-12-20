@@ -1,5 +1,6 @@
 pixi.lock
 .pixi/
+test_models/
 
 # Compiled executables
 test_linux_threading

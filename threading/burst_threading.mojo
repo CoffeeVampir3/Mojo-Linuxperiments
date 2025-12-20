@@ -2,7 +2,7 @@ from sys.intrinsics import inlined_assembly
 from sys.info import size_of
 from memory import UnsafePointer, memcpy
 from os.atomic import Atomic, Consistency
-import threading.linux as linux
+import linux.syscalls as linux
 from notstdcollections import HeapMoveArray
 from numa import NumaInfo, CpuMask
 
