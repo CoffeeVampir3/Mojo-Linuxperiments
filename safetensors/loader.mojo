@@ -10,22 +10,22 @@ struct ReadOp:
     var offset: Int64
     var length: Int32
     var dest: Int64
-    var user_data: Int64
+    var id: Int64  # Maps to io_uring SQE user_data
 
-    fn __init__(out self, file_idx: Int, offset: Int, length: Int, dest: Int, user_data: Int = 0):
+    fn __init__(out self, file_idx: Int, offset: Int, length: Int, dest: Int, id: Int = 0):
         self.file_idx = Int32(file_idx)
         self.offset = Int64(offset)
         self.length = Int32(length)
         self.dest = Int64(dest)
-        self.user_data = Int64(user_data)
+        self.id = Int64(id)
 
 @register_passable("trivial")
 struct Completion:
-    var user_data: Int64
+    var id: Int64  # Copied back from io_uring CQE user_data
     var result: Int32
 
-    fn __init__(out self, user_data: Int64 = 0, result: Int32 = 0):
-        self.user_data = user_data
+    fn __init__(out self, id: Int64 = 0, result: Int32 = 0):
+        self.id = id
         self.result = result
 
 
@@ -275,7 +275,7 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
             sqe[].off = UInt64(op.offset)
             sqe[].addr = UInt64(op.dest)
             sqe[].len = UInt32(op.length)
-            sqe[].user_data = UInt64(op.user_data)
+            sqe[].user_data = UInt64(op.id)
             sqe[].ioprio = 0
             sqe[].buf_index = 0
             sqe[].personality = 0
@@ -361,3 +361,61 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
 
     fn pending(self) -> Int:
         return self.pending_count
+
+    fn process_queue[
+        on_complete: fn(Completion) capturing -> None,
+    ](mut self, ops: List[ReadOp], min_complete: Int = 1) -> Int:
+        """Submit ops and invoke `on_complete` as each finishes.
+
+        `submit()` may partially submit when the SQ is full; this helper handles
+        re-submitting the remainder and draining CQEs until all ops complete.
+        """
+        var total = len(ops)
+        if total == 0:
+            return 0
+
+        var next_to_submit = 0
+        var completed = 0
+
+        while completed < total:
+            # Submit to fill SQ.
+            while next_to_submit < total:
+                var remaining = total - next_to_submit
+                var batch_size = remaining
+                var max_batch = Int(self.max_entries)
+                if batch_size > max_batch:
+                    batch_size = max_batch
+
+                var batch = List[ReadOp](capacity=batch_size)
+                for i in range(batch_size):
+                    batch.append(ops[next_to_submit + i])
+
+                var submitted = self.submit(batch)
+                if submitted < 0:
+                    return submitted
+                if submitted == 0:
+                    break
+                next_to_submit += submitted
+
+            # Drain any completions
+            var ready = self.poll()
+            for c in ready:
+                completed += 1
+                on_complete(c)
+
+            if completed >= total:
+                break
+
+            if self.pending_count <= 0:
+                # No in-flight ops to wait on, but not done.
+                return -1
+
+            # Block until at least one completion is available, then drain
+            var completions = self.wait(min_complete=min_complete)
+            if len(completions) == 0:
+                return -1
+            for c in completions:
+                completed += 1
+                on_complete(c)
+
+        return completed

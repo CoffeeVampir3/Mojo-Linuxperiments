@@ -3,7 +3,7 @@ from safetensors.loader import IoLoader, ReadOp, Completion
 from pathlib import Path
 from memory import UnsafePointer, alloc
 
-fn validate_f32_tensor(buf: UnsafePointer[UInt8], meta: TensorMeta, name: String) -> Bool:
+fn validate_f32_tensor(buf: UnsafePointer[UInt8, MutAnyOrigin], meta: TensorMeta, name: String) -> Bool:
     """Validate tensor values are sequential starting from base."""
     var ptr = buf.offset(meta.start).bitcast[Float32]()
 
@@ -49,34 +49,57 @@ fn main():
         return
 
     # Allocate buffer for entire data section
-    var buf = alloc[UInt8](data_size)
+    var buf: UnsafePointer[UInt8, MutAnyOrigin] = alloc[UInt8](data_size)
 
-    # Load entire data section
-    var ops = List[ReadOp]()
-    ops.append(ReadOp(
-        file_idx=0,
-        offset=header.data_offset,
-        length=data_size,
-        dest=Int(buf),
-        user_data=0,
-    ))
-    _ = loader.submit(ops)
-    var completions = loader.wait(min_complete=1)
-
-    if len(completions) == 0 or completions[0].result < 0:
-        print("Load failed")
+    # Build per-tensor read ops and print/validate as each completes.
+    var tensor_count = len(header.tensors)
+    if tensor_count == 0:
+        print("No tensors")
         buf.free()
         return
 
-    print("Loaded", completions[0].result, "bytes\n")
+    var ops = List[ReadOp](capacity=tensor_count)
+    var names = List[String](capacity=tensor_count)
+    var metas = List[TensorMeta](capacity=tensor_count)
 
-    # Validate tensor values
-    var passed = 0
-    var failed = 0
+    var op_idx = 0
     for item in header.tensors.items():
         var name = item.key
         var meta = item.value.copy()
-        print(name, "-", meta.dtype, meta.shape)
+        var length = meta.byte_size()
+        ops.append(ReadOp(
+            file_idx=0,
+            offset=header.data_offset + meta.start,
+            length=length,
+            dest=Int(buf) + meta.start,
+            id=op_idx,
+        ))
+        names.append(name.copy())
+        metas.append(meta^)
+        op_idx += 1
+
+    print("Submitting", len(ops), "tensor reads...\n")
+
+    var passed = 0
+    var failed = 0
+
+    @parameter
+    fn on_tensor_complete(c: Completion):
+        var idx = Int(c.id)
+        if idx < 0 or idx >= len(names):
+            print("Completion with unknown id:", c.id, "res", c.result)
+            return
+
+        var meta = metas[idx].copy()
+        var name = names[idx].copy()
+
+        if c.result < 0:
+            print("IO FAIL:", name, "-", meta.dtype, meta.shape, "errno:", c.result)
+            if meta.dtype == DType.float32:
+                failed += 1
+            return
+
+        print("IO DONE:", name, "-", meta.dtype, meta.shape, "-", c.result, "bytes")
         if meta.dtype == DType.float32:
             if validate_f32_tensor(buf, meta, name):
                 passed += 1
@@ -84,6 +107,12 @@ fn main():
                 failed += 1
         else:
             print("  (unsupported dtype)")
+
+    var done = loader.process_queue[on_tensor_complete](ops)
+    if done < 0:
+        print("Load failed")
+        buf.free()
+        return
 
     print()
     print("Validation:", passed, "passed,", failed, "failed")
