@@ -43,8 +43,9 @@ fn caller():
 fn abort_now() -> Never:
     abort()
 
-fn always_raises() raises Never -> Int:
-    raise Error("always")
+# Never as an error type means the function can't raise.
+fn doesnt_raise() raises Never -> Int:
+    return 123
 
 # Named results (out) vs -> return
 fn incr(a: Int) -> Int:
@@ -104,20 +105,21 @@ def main():
 
 | Type | Description |
 |------|-------------|
+| `Origin` | Origin token (comptime value) |
 | `ImmutOrigin` | Immutable origin (comptime value) |
 | `MutOrigin` | Mutable origin (comptime value) |
-| `Origin[is_mutable]` | Struct with parametric mutability |
 
 ```mojo
 struct ImmutRef[origin: ImmutOrigin]:
     pass
 
-struct ParametricRef[
-    is_mutable: Bool,
-    //,
-    origin: Origin[is_mutable]
-]:
+struct ParametricRef[origin: Origin]:
     pass
+
+# Origin conversion
+comptime o: MutOrigin = MutOrigin.external
+comptime immut: ImmutOrigin = ImmutOrigin(o)            # Safe: drop mutability
+comptime mut: MutOrigin = MutOrigin(unsafe_cast=immut)  # Unsafe: add mutability
 
 from memory import Pointer
 def use_pointer():
@@ -188,10 +190,8 @@ from collections import List
 from memory import Span
 
 def to_byte_span[
-    is_mutable: Bool,
-    //,
-    origin: Origin[is_mutable],
-](ref [origin]list: List[Byte]) -> Span[Byte, origin]:
+    origin: Origin,
+](ref [origin] list: List[Byte]) -> Span[Byte, origin]:
     return Span(list)
 
 def main():
@@ -327,32 +327,6 @@ Ownership transfer ≠ guaranteed move operation. Three mechanisms:
 
 ### SIMD Operations
 
-Provides high-performance SIMD primitives and abstractions for vectorized computation in Mojo. It enables efficient data-parallel operations by leveraging hardware vector processing units across different architectures.
-
-Key Features:
-
-    Architecture-agnostic SIMD abstractions with automatic hardware detection
-    Optimized vector operations for common numerical computations
-    Explicit control over vectorization strategies and memory layouts
-    Zero-cost abstractions that compile to efficient machine code
-    Support for different vector widths and element types
-
-Primary Components:
-
-    Vector types: Strongly-typed vector containers with element-wise operations
-    SIMD intrinsics: Low-level access to hardware SIMD instructions
-    Vectorized algorithms: Common algorithms optimized for SIMD execution
-    Memory utilities: Aligned memory allocation and vector load/store operations
-
-Performance Considerations:
-
-    Vector width selection should match target hardware capabilities
-    Memory alignment affects load/store performance
-    Data layout transformations may be necessary for optimal vectorization
-
-Integration: This module is designed to work seamlessly with other Mojo numerical computing components, including tensor operations, linear algebra routines, and domain-specific libraries for machine learning and scientific computing.
-
-
 ```mojo
 # Strided: extract every Nth element (e.g., R from RGB with stride=3)
 vals = ptr.offset(i).strided_load[width=8](stride)
@@ -361,13 +335,6 @@ ptr.offset(i).strided_store[width=8](vals, stride)
 # Gather/scatter: load/store from vector of offsets
 vals = ptr.gather[width=8](offsets)
 ptr.scatter[width=8](vals, offsets)
-```
-
-## Data Conversion
-
-```mojo
-new_ptr = ptr.bitcast[NewType]()        # Same address, new type
-swapped = byte_swap(ui32_ptr[i])        # Little ↔ big endian
 ```
 
 ## Safety Notes
@@ -504,6 +471,10 @@ struct Container[ElementType: Movable]:
 # Named compile-time constants
 comptime rows = 512
 comptime block_size = _calculate_block_size()
+
+# Force a subexpression to be evaluated at compile time
+fn takes_layout[a: Layout]():
+    print(comptime(a.size()))
 
 # Type aliases
 comptime Float16 = SIMD[DType.float16, 1]
@@ -887,6 +858,9 @@ cp1 < cp2 | cp1 == cp2 | cp1 <= cp2
 
 ### Collections
 ```mojo
+from collections import Set, Deque, Counter, LinkedList, BitSet
+from collections.interval import Interval
+
 # List (conforms to Equatable, Writable, Stringable, Representable)
 var list: List[Int] = [1, 2, 3]
 list = List[Int]() | List[Int](capacity=1024) | List[Int](length: Int=10, fill=0)
@@ -964,10 +938,6 @@ for item in opt: print(item)
 interval = Interval(start, end)
 interval.overlaps(other) | union(other) | intersection(other)
 val in interval
-
-tree = IntervalTree[Int, String]()
-tree.insert((start, end), data)
-tree.search((start, end))
 ```
 
 ### Comprehensions
@@ -1032,7 +1002,7 @@ ptr = UnsafePointer[Int, MutOrigin.external]()  # Null pointer
 ptr.init_pointee_copy(value)               # Copy value into memory
 ptr.init_pointee_move(value^)              # Move value into memory
 ptr = UnsafePointer(to=existing_value)     # Point to existing value (no alloc needed)
-ptr = UnsafePointer.unsafe_from_address(mmio_address)  # From raw address
+ptr = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=mmio_address)  # From raw address
 
 # Dereferencing (memory must be initialized)
 value = ptr[]                              # Read pointee
@@ -1040,11 +1010,13 @@ ptr[] = new_value                          # Write pointee
 ptr[3] = value                             # Subscript access for arrays
 
 # Destruction
-ptr.destroy_pointee()                      # Call destructor, leave uninitialized
+ptr.destroy_pointee()                      # Requires implicitly-destructible pointee
 value = ptr.take_pointee()                 # Move out, leave uninitialized
 ptr.init_pointee_move_from(src_ptr)        # Move from src to self, src uninitialized
 swap_pointees(ptr1, ptr2)
 ptr.free()                                 # Deallocate (no destructors called!)
+
+# Linear pointees: use destroy_pointee_with(dtor_fn_ptr)
 
 # Pointer arithmetic
 offset_ptr = ptr + 2
@@ -1063,7 +1035,7 @@ ptr.store[volatile=True](value)            # Volatile store (for MMIO)
 # Type casting
 new_ptr = ptr.bitcast[NewType]()           # Same address, different type
 safe_cast = ptr.as_any_origin() | as_immutable()
-unsafe_cast = ptr.unsafe_mut_cast() | unsafe_origin_cast[new_origin]()
+unsafe_cast = ptr.unsafe_mut_cast[True]() | unsafe_origin_cast[new_origin]()
 ```
 
 **Origin Tracking:**
@@ -1240,14 +1212,14 @@ var fragment = tensor.distribute[thread_layout](thread_id)
 # Accept any origin - caller's origin propagated
 fn process[
     layout: Layout,
-    origin: Origin[_]
+    origin: Origin
 ](tensor: LayoutTensor[DType.float32, layout, origin]):
     var val = tensor[0, 0][0]
 
 # Generic function for stdlib
 fn tensor_sum[
     layout: Layout,
-    origin: Origin[_]
+    origin: Origin
 ](tensor: LayoutTensor[DType.float32, layout, origin]) -> Float32:
     @parameter
     fn input_fn[dtype_: DType, width: Int](idx: Int) -> SIMD[dtype_, width]:
@@ -1840,12 +1812,40 @@ print[*Ts](*values, sep=" ", end="\n", flush=False, file=FileDescriptor(1))
 ## 11. Iterators
 
 ```mojo
-enumerate[IterableType](ref iterable, start=0)
+# Built-ins / prelude
+enumerate(ref iterable, start=0)
 zip(ref iterable_a, ref iterable_b)
+
+# Iterator adapters
 map[IterableType, ResultType, function](ref iterable)
-count(start=0, step=1)
-repeat[ElementType](element, times)
-product(ref iterable_a, ref iterable_b)
+
+# Extras
+from iter import peekable
+from itertools import count, repeat, product
+```
+
+```mojo
+from iter import Iterator, StopIteration
+
+# Iterator protocol:
+# - implement __next__ that raises StopIteration
+# - __has_next__ was removed
+# - if you want `for x in MyIter()`, implement a consuming __iter__
+struct MyIter(Iterator):
+    comptime Element = Int
+    var i: Int
+
+    fn __init__(out self):
+        self.i = 0
+
+    fn __iter__(var self) -> Self:
+        return self^
+
+    fn __next__(mut self) raises StopIteration -> Int:
+        if self.i >= 3:
+            raise StopIteration()
+        self.i += 1
+        return self.i
 ```
 
 ## 12. Logging
@@ -1880,8 +1880,7 @@ pi=3.14159265, tau=6.28318531, e=2.71828182, log2e=1.44269504
 ## 14. Random
 
 ```mojo
-from random import Random, NormalRandom
-from random.philox import Random, NormalRandom
+from random import Random, NormalRandom  # Philox-based RNG
 
 rng = Random[rounds=10](seed=0, subsequence=0, offset=0)
 val = rng.step() | step_uniform()
@@ -1981,19 +1980,48 @@ fn sum[*T: Intable](*args: *T) -> Int:
 ## 21. Compilation
 
 ```mojo
-info = compile_info[func, emission_kind="asm"|"llvm"|"llvm-opt"|"object",
-                    target=_current_target()]()
-get_function_name[func]()
+from compile import compile_info, get_linkage_name, get_type_name
+
+info = compile_info[func, emission_kind="asm"|"llvm"|"llvm-opt"|"object"]()
 get_linkage_name[func]()
 get_type_name[type]()
+```
 
-is_gpu[target]() | is_gpu(target)
-is_cpu[target]() | is_valid_target[target]()
+### Reflection
+
+```mojo
+from compile import get_type_name
+from reflection import (
+    struct_field_count,
+    struct_field_names,
+    struct_field_types,
+    struct_field_index_by_name,
+    struct_field_type_by_name,
+)
+
+@fieldwise_init
+struct Point(Copyable):
+    var x: Float32
+    var y: Float32
+
+fn print_fields[T: AnyType]():
+    comptime names = struct_field_names[T]()
+    comptime types = struct_field_types[T]()
+    @parameter
+    for i in range(struct_field_count[T]()):
+        print(names[i], get_type_name[types[i]]())
+
+fn main():
+    print_fields[Point]()
+    comptime idx = struct_field_index_by_name[Point, "x"]()
+    comptime field_type = struct_field_type_by_name[Point, "y"]()
+    print(idx)
+    print(get_type_name[field_type.T]())
 ```
 
 ## 22. Coroutines
 
-## Mojo Coroutines & Async
+### Mojo Coroutines & Async
 
 ### Coroutine Struct (Built-in)
 ```mojo
@@ -2004,29 +2032,6 @@ async fn caller():
     var coro = compute()
     var result = await coro^  # Move with ^
 ```
-
-# Casting
-rebind[dest_type: AnyType](value: src_type) -> dest_type
-
-# Fused Multiply Add
-x.fma(y, z)  # Computes x * y + z
-
-# Range check
-constrained[value >= min and value <= max, "value out of range"]()
-
-# Type check
-constrained[idx in (0, 1), "idx must be 0 or 1"]()
-constrained[is_same_type[T1, T2](), "types must match"]()
-
-# Custom condition
-constrained[size % 8 == 0, "size must be multiple of 8"]()
-
-# Conditional Select
-result = condition.select(true_value, false_value)
-
-e.g.
-var t = x.fma(x, y2).le(4)  # t is a boolean SIMD vector
-iters = t.select(iters + 1, iters)  # Increment only where condition is true
 
 
 ### Runtime AsyncRT
@@ -2072,37 +2077,7 @@ from module import Item
 from package.module import Item
 import module as alias
 ```
-
-## 24. Important Notes
-
-### String & Unicode
-- `len(str)` = bytes, `char_length()` = codepoints
-- Valid: 0-0xD7FF, 0xE000-0x10FFFF (excludes surrogates)
-- Whitespace: ASCII " \t\n\v\f\r\x1c\x1d\x1e"
-- String SSO: inline ≤23 bytes (64-bit), no heap
-
-### Collections
-- KeyElement = Copyable & Hashable & Equatable
-- Dict/Set capacity: power of 2, min 8
-- BitSet size: compile-time power of 2, ≥8
-- Value semantics: assignment deep copies List/String/Dict/Set
-
-### Compilation
-- Type check needs function twice (temporary)
-- Capturing needs annotation
-- PTX version must match driver
-
-### Memory & Access
-- Coalesced access for optimal performance
-- Async copy: 4, 8, 16 bytes
-- L2 prefetch: 64, 128, 256 bytes
-
-### Synchronization Costs
-- `barrier()`: ~100 cycles
-- Warp shuffle: no overhead
-- Cluster sync > Block sync
-
-## 25. Pixi Package Manager
+## 24. Pixi Package Manager
 
 ### Installation
 ```sh

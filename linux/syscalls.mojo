@@ -478,7 +478,7 @@ struct IoUringFeat:
     comptime CQE_SKIP = 1 << 11
     comptime LINKED_FILE = 1 << 12
 
-fn syscall[count: Int](nr: Int64, *args: Int64) -> Int:
+fn syscall[count: Int](nr: Int, *args: Int) -> Int:
     comptime regs = ("", ",{rdi}", ",{rdi},{rsi}", ",{rdi},{rsi},{rdx}",
                   ",{rdi},{rsi},{rdx},{rcx}", ",{rdi},{rsi},{rdx},{rcx},{r8}",
                   ",{rdi},{rsi},{rdx},{rcx},{r8},{r9}")
@@ -486,19 +486,19 @@ fn syscall[count: Int](nr: Int64, *args: Int64) -> Int:
     comptime constraints = "={rax},{rax}" + regs[count] + ",~{rcx},~{r10},~{r11},~{memory}"
     @parameter
     if count == 0:
-        return Int(inlined_assembly[asm, Int64, Int64, constraints=constraints](nr))
+        return Int(inlined_assembly[asm, Int, Int, constraints=constraints](nr))
     elif count == 1:
-        return Int(inlined_assembly[asm, Int64, Int64, Int64, constraints=constraints](nr, args[0]))
+        return Int(inlined_assembly[asm, Int, Int, Int, constraints=constraints](nr, args[0]))
     elif count == 2:
-        return Int(inlined_assembly[asm, Int64, Int64, Int64, Int64, constraints=constraints](nr, args[0], args[1]))
+        return Int(inlined_assembly[asm, Int, Int, Int, Int, constraints=constraints](nr, args[0], args[1]))
     elif count == 3:
-        return Int(inlined_assembly[asm, Int64, Int64, Int64, Int64, Int64, constraints=constraints](nr, args[0], args[1], args[2]))
+        return Int(inlined_assembly[asm, Int, Int, Int, Int, Int, constraints=constraints](nr, args[0], args[1], args[2]))
     elif count == 4:
-        return Int(inlined_assembly[asm, Int64, Int64, Int64, Int64, Int64, Int64, constraints=constraints](nr, args[0], args[1], args[2], args[3]))
+        return Int(inlined_assembly[asm, Int, Int, Int, Int, Int, Int, constraints=constraints](nr, args[0], args[1], args[2], args[3]))
     elif count == 5:
-        return Int(inlined_assembly[asm, Int64, Int64, Int64, Int64, Int64, Int64, Int64, constraints=constraints](nr, args[0], args[1], args[2], args[3], args[4]))
+        return Int(inlined_assembly[asm, Int, Int, Int, Int, Int, Int, Int, constraints=constraints](nr, args[0], args[1], args[2], args[3], args[4]))
     elif count == 6:
-        return Int(inlined_assembly[asm, Int64, Int64, Int64, Int64, Int64, Int64, Int64, Int64, constraints=constraints](nr, args[0], args[1], args[2], args[3], args[4], args[5]))
+        return Int(inlined_assembly[asm, Int, Int, Int, Int, Int, Int, Int, Int, constraints=constraints](nr, args[0], args[1], args[2], args[3], args[4], args[5]))
     else:
         constrained[False, "syscall supports 0-6 arguments"]()
         return 0
@@ -522,12 +522,11 @@ fn sys_mmap[
     Returns:
         Mapped address, or negative errno on failure.
     """
-    return syscall[6](Syscall.mmap, Int64(addr), Int64(length),
-        Int64(prot), Int64(flags), Int64(fd), Int64(offset))
+    return syscall[6](Syscall.mmap, addr, length, prot, flags, fd, offset)
 
 fn sys_munmap(addr: Int, length: Int) -> Int:
     """Unmap memory region. Returns 0 on success, negative errno on failure."""
-    return syscall[2](Syscall.munmap, Int64(addr), Int64(length))
+    return syscall[2](Syscall.munmap, addr, length)
 
 fn sys_mbind[
     policy: Int = Mempolicy.BIND,
@@ -550,8 +549,7 @@ fn sys_mbind[
     """
     var mask_storage = InlineArray[UInt64, 1](nodemask)
     var mask_ptr = UnsafePointer(to=mask_storage)
-    var result = syscall[6](Syscall.mbind, Int64(addr), Int64(length),
-        Int64(policy), Int64(Int(mask_ptr)), Int64(maxnode), Int64(flags))
+    var result = syscall[6](Syscall.mbind, addr, length, policy, Int(mask_ptr), maxnode, flags)
     _ = mask_ptr[]
     return result
 
@@ -564,7 +562,7 @@ fn sys_madvise[advice: Int](addr: Int, length: Int) -> Int:
     Returns:
         0 on success, negative errno on failure.
     """
-    return syscall[3](Syscall.madvise, Int64(addr), Int64(length), Int64(advice))
+    return syscall[3](Syscall.madvise, addr, length, advice)
 
 fn sys_move_pages_query(addr: Int) -> Int:
     """Query which NUMA node a page resides on.
@@ -576,12 +574,11 @@ fn sys_move_pages_query(addr: Int) -> Int:
         Node ID (>= 0), or negative errno on failure.
         Note: Returns -ENOENT if page not yet faulted.
     """
-    var pages = InlineArray[Int64, 1](Int64(addr))
+    var pages = InlineArray[Int, 1](addr)
     var status = InlineArray[Int32, 1](Int32(-1))
     var pages_ptr = UnsafePointer(to=pages)
     var status_ptr = UnsafePointer(to=status)
-    var result = syscall[6](Syscall.move_pages, 0, 1,
-        Int64(Int(pages_ptr)), 0, Int64(Int(status_ptr)), 0)
+    var result = syscall[6](Syscall.move_pages, 0, 1, Int(pages_ptr), 0, Int(status_ptr), 0)
     _ = pages_ptr[]
     _ = status_ptr[]
     if result < 0:
@@ -590,27 +587,27 @@ fn sys_move_pages_query(addr: Int) -> Int:
 
 fn sys_mprotect(addr: Int, length: Int, prot: Int) -> Int:
     """Change protection on a region of memory."""
-    return syscall[3](Syscall.mprotect, Int64(addr), Int64(length), Int64(prot))
+    return syscall[3](Syscall.mprotect, addr, length, prot)
 
 # Lower 32 bits
-comptime FUTEX_BITSET_MATCH_ANY: Int64 = 0xFFFFFFFF
+comptime FUTEX_BITSET_MATCH_ANY: Int = 0xFFFFFFFF
 
 fn sys_futex_wait(addr: Int, expected: Int, flags: Int = Futex2.SIZE_U32 | Futex2.PRIVATE) -> Int:
     """Wait on a futex. Returns 0 on wake, negative errno on failure."""
-    return syscall[6](Syscall.futex_wait, Int64(addr), Int64(expected), FUTEX_BITSET_MATCH_ANY, Int64(flags), 0, 0)
+    return syscall[6](Syscall.futex_wait, addr, expected, FUTEX_BITSET_MATCH_ANY, flags, 0, 0)
 
 fn sys_futex_waitv(waiters: UnsafePointer[FutexWaitv], nr_futexes: Int, flags: Int = 0, timeout: Int = 0, clockid: Int = 0) -> Int:
     """Wait on multiple futexes. Returns index of woken futex, or negative errno.
     timeout=0 means NULL (wait indefinitely). clockid: 0=CLOCK_REALTIME, 1=CLOCK_MONOTONIC."""
-    return syscall[5](Syscall.futex_waitv, Int64(Int(waiters)), Int64(nr_futexes), Int64(flags), Int64(timeout), Int64(clockid))
+    return syscall[5](Syscall.futex_waitv, Int(waiters), nr_futexes, flags, timeout, clockid)
 
 fn sys_futex_wake(addr: Int, nr_wake: Int = 1, flags: Int = Futex2.SIZE_U32 | Futex2.PRIVATE) -> Int:
     """Wake waiters on a futex. Returns number of waiters woken, or negative errno."""
-    return syscall[4](Syscall.futex_wake, Int64(addr), FUTEX_BITSET_MATCH_ANY, Int64(nr_wake), Int64(flags))
+    return syscall[4](Syscall.futex_wake, addr, FUTEX_BITSET_MATCH_ANY, nr_wake, flags)
 
 fn sys_exit(code: Int = 0):
     """Exit current thread."""
-    _ = syscall[1](Syscall.exit, Int64(code))
+    _ = syscall[1](Syscall.exit, code)
 
 fn sys_gettid() -> Int:
     """Get thread ID."""
@@ -618,20 +615,20 @@ fn sys_gettid() -> Int:
 
 fn sys_rseq(rseq_ptr: Int, len: Int, flags: Int, sig: Int) -> Int:
     """Register rseq for current thread."""
-    return syscall[4](Syscall.rseq, Int64(rseq_ptr), Int64(len), Int64(flags), Int64(sig))
+    return syscall[4](Syscall.rseq, rseq_ptr, len, flags, sig)
 
 fn sys_sched_setaffinity(tid: Int, mask_size: Int, mask_ptr: Int) -> Int:
     """Set CPU affinity for thread. tid=0 -> current thread."""
-    return syscall[3](Syscall.sched_setaffinity, Int64(tid), Int64(mask_size), Int64(mask_ptr))
+    return syscall[3](Syscall.sched_setaffinity, tid, mask_size, mask_ptr)
 
 fn sys_openat(dirfd: Int, mut pathname: String, flags: Int, mode: Int = 0) -> Int:
     """Open file relative to directory fd. Use AT_FDCWD (-100) for cwd."""
     var cstr = pathname.as_c_string_slice()
-    return syscall[4](Syscall.openat, Int64(dirfd), Int64(Int(cstr.unsafe_ptr())), Int64(flags), Int64(mode))
+    return syscall[4](Syscall.openat, dirfd, Int(cstr.unsafe_ptr()), flags, mode)
 
 fn sys_close(fd: Int) -> Int:
     """Close file descriptor."""
-    return syscall[1](Syscall.close, Int64(fd))
+    return syscall[1](Syscall.close, fd)
 
 # =============================================================================
 # io_uring syscalls
@@ -641,7 +638,7 @@ fn sys_io_uring_setup(entries: UInt32, params: UnsafePointer[IoUringParams]) -> 
     """Create an io_uring instance.
     Returns ring file descriptor on success, negative errno on failure.
     """
-    return syscall[2](Syscall.io_uring_setup, Int64(entries), Int64(Int(params)))
+    return syscall[2](Syscall.io_uring_setup, Int(entries), Int(params))
 
 fn sys_io_uring_enter(
     fd: Int,
@@ -654,10 +651,10 @@ fn sys_io_uring_enter(
     """
     return syscall[4](
         Syscall.io_uring_enter,
-        Int64(fd),
-        Int64(to_submit),
-        Int64(min_complete),
-        Int64(flags),
+        fd,
+        Int(to_submit),
+        Int(min_complete),
+        Int(flags),
     )
 
 fn sys_io_uring_enter_sig(
@@ -671,12 +668,12 @@ fn sys_io_uring_enter_sig(
     """Submit SQEs and/or wait for completions with signal mask."""
     return syscall[6](
         Syscall.io_uring_enter,
-        Int64(fd),
-        Int64(to_submit),
-        Int64(min_complete),
-        Int64(flags),
-        Int64(sig),
-        Int64(sigsz),
+        fd,
+        Int(to_submit),
+        Int(min_complete),
+        Int(flags),
+        sig,
+        sigsz,
     )
 
 fn sys_io_uring_register(
@@ -690,8 +687,8 @@ fn sys_io_uring_register(
     """
     return syscall[4](
         Syscall.io_uring_register,
-        Int64(fd),
-        Int64(opcode),
-        Int64(arg),
-        Int64(nr_args),
+        fd,
+        Int(opcode),
+        arg,
+        Int(nr_args),
     )

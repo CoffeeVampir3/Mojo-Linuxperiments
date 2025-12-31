@@ -9,25 +9,25 @@ from numa import NumaInfo, CpuMask
 comptime AtomicInt32 = Atomic[DType.int32]
 # Uniform worker call ABI:
 #   workers always invoke as (arg0..arg5) where each arg is a 64-bit integer-class
-#   value (pointers or Int64s).
+#   value (pointers or Ints).
 # User kernels may take any *prefix* of these arguments (0..6 total); extra
 # trailing args are passed by the caller but ignored by the callee on x86-64 SysV.
 #
 # Per-worker metadata (like worker_id) is published via %fs-relative storage in
 # the worker slot. Call `current_worker_id()` from inside a kernel if needed.
-comptime KernelFn = fn(Int64, Int64, Int64, Int64, Int64, Int64)
+comptime KernelFn = fn(Int, Int, Int, Int, Int, Int)
 
 @fieldwise_init
 @register_passable("trivial")
 struct ArgPack:
-    var arg0: Int64
-    var arg1: Int64
-    var arg2: Int64
-    var arg3: Int64
-    var arg4: Int64
-    var arg5: Int64
-    var pad0: Int64
-    var pad1: Int64
+    var arg0: Int
+    var arg1: Int
+    var arg2: Int
+    var arg3: Int
+    var arg4: Int
+    var arg5: Int
+    var pad0: Int
+    var pad1: Int
 
     fn __init__(out self):
         self.arg0 = 0
@@ -43,7 +43,7 @@ fn ptr[T: AnyType](addr: Int) -> UnsafePointer[T, MutAnyOrigin]:
     return UnsafePointer[T, MutAnyOrigin](unsafe_from_address=addr)
 
 fn get_fs_base() -> Int:
-    return Int(inlined_assembly["mov %fs:0, $0", Int64, constraints="=r"]())
+    return Int(inlined_assembly["mov %fs:0, $0", Int, constraints="=r"]())
 
 fn pause():
     inlined_assembly["pause", NoneType, constraints="~{memory}"]()
@@ -60,7 +60,7 @@ struct SlotLayout:
     comptime CHILD_TID = Self.TCB + Self.TCB_SIZE
     comptime WORKER_ID = Self.CHILD_TID + 8
     comptime WORKER_MAGIC = Self.WORKER_ID + 8
-    comptime WORKER_MAGIC_VALUE = Int64(0x4255525354574B52)  # "BURSTWKR"
+    comptime WORKER_MAGIC_VALUE = Int(0x4255525354574B52)  # "BURSTWKR"
     comptime WORKER_ID_FROM_FS = Self.WORKER_ID - Self.TCB
     comptime WORKER_MAGIC_FROM_FS = Self.WORKER_MAGIC - Self.TCB
     comptime HEADER = ((Self.WORKER_MAGIC + 8 + 4095) // 4096) * 4096
@@ -77,18 +77,18 @@ fn slot_size[stack_size: Int]() -> Int:
     return ((raw + SlotLayout.GUARD - 1) // SlotLayout.GUARD) * SlotLayout.GUARD
 
 @always_inline
-fn current_worker_id() -> Int64:
+fn current_worker_id() -> Int:
     """Return worker id when running in a BurstPool worker, else -1."""
     var magic = inlined_assembly[
         "mov %fs:" + String(SlotLayout.WORKER_MAGIC_FROM_FS) + ", $0",
-        Int64,
+        Int,
         constraints="=r",
     ]()
     if magic != SlotLayout.WORKER_MAGIC_VALUE:
         return -1
     return inlined_assembly[
         "mov %fs:" + String(SlotLayout.WORKER_ID_FROM_FS) + ", $0",
-        Int64,
+        Int,
         constraints="=r",
     ]()
 
@@ -97,7 +97,7 @@ struct SharedPoolState:
     # Cache line 1: Work dispatch (main writes, workers read)
     var work_available: AtomicInt32  # Workers decrement to claim work
     var shutdown: AtomicInt32        # Shutdown signal
-    var func_ptr: Int64              # Kernel entry bits
+    var func_ptr: Int               # Kernel entry bits
 
     # Pad the rest of the CL
     comptime DispatchPadBytes = 64 - (
@@ -121,7 +121,7 @@ struct SharedPoolState:
         self.work_done = AtomicInt32(0)
         self.pad1 = InlineArray[UInt8, Self.DonePadBytes](uninitialized=True)
 
-struct WorkerSlot(Movable):
+struct WorkerSlot(Movable, ImplicitlyDestructible):
     var base: UnsafePointer[UInt8, MutAnyOrigin]
     var child_tid: UnsafePointer[Int32, MutAnyOrigin]
     var stack_top: UnsafePointer[UInt8, MutAnyOrigin]
@@ -141,20 +141,21 @@ struct WorkerSlot(Movable):
         return self.child_tid[] != 0
 
 struct WorkerStackHead[mask_size: Int]:
-    var entry: Int64
-    var slot_base: Int64              # Base address, state/child_tid derived from this
-    var worker_id: Int64             # Logical worker index within the pool
-    var parent_fs: Int64              # Parent's FS base for TLS copy
+    var entry: Int
+    var slot_base: Int              # Base address, state/child_tid derived from this
+    var worker_id: Int             # Logical worker index within the pool
+    var parent_fs: Int              # Parent's FS base for TLS copy
     var shared: UnsafePointer[SharedPoolState, MutAnyOrigin]  # Pool's shared state (not in slot)
     var args_base: UnsafePointer[ArgPack, MutAnyOrigin]      # Base of per-dispatch args arena
-    var futex_flags: Int64
+    var futex_flags: Int
+    var pinned: Bool
     var cpu_mask: CpuMask[Self.mask_size]  # Embedded mask, copied to child's stack
 
-    fn __init__(out self, entry: Int64, slot_base: Int64, parent_fs: Int64,
-                worker_id: Int64,
+    fn __init__(out self, entry: Int, slot_base: Int, parent_fs: Int,
+                worker_id: Int,
                 shared: UnsafePointer[SharedPoolState, MutAnyOrigin],
                 args_base: UnsafePointer[ArgPack, MutAnyOrigin],
-                futex_flags: Int64, var cpu_mask: CpuMask[Self.mask_size]):
+                futex_flags: Int, pinned: Bool, var cpu_mask: CpuMask[Self.mask_size]):
         self.entry = entry
         self.slot_base = slot_base
         self.worker_id = worker_id
@@ -162,6 +163,7 @@ struct WorkerStackHead[mask_size: Int]:
         self.shared = shared
         self.args_base = args_base
         self.futex_flags = futex_flags
+        self.pinned = pinned
         self.cpu_mask = cpu_mask^
 
 struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 128](Movable):
@@ -287,7 +289,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
     fn dispatch[F: AnyTrivialRegType](mut self, kernel: F, packs: UnsafePointer[ArgPack, MutAnyOrigin], num_jobs: Int = -1):
         """Launch `num_jobs` packs to workers and return immediately.
 
-        Each pack is 8×Int64 (64B). arg0..arg5 are user arguments; pad0/pad1 are reserved.
+        Each pack is 8×Int (64B). arg0..arg5 are user arguments; pad0/pad1 are reserved.
         Workers steal jobs via work_available and invoke the kernel using the uniform ABI
         `(arg0..arg5)`. The user kernel may accept any prefix of these arguments.
         Use `current_worker_id()` inside a kernel if you need the worker id.
@@ -314,7 +316,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
             dst[] = src[]
 
         var kernel_copy = kernel
-        var kernel_ptr = UnsafePointer(to=kernel_copy).bitcast[Int64]()[]
+        var kernel_ptr = UnsafePointer(to=kernel_copy).bitcast[Int]()[]
         self.shared[].func_ptr = kernel_ptr
 
         var workPtr = UnsafePointer(to=self.shared[].work_available.value)
@@ -342,13 +344,14 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
             var head = ptr[WorkerStackHead[Self.mask_size]](stack_head_addr)
             var worker_main_copy = worker_main[Self.mask_size]
             head[] = WorkerStackHead[Self.mask_size](
-                entry=UnsafePointer(to=worker_main_copy).bitcast[Int64]()[],
-                slot_base=Int64(Int(self.slots[i][].base)),
-                worker_id=Int64(i),
-                parent_fs=Int64(parent_fs),
+                entry=UnsafePointer(to=worker_main_copy).bitcast[Int]()[],
+                slot_base=Int(self.slots[i][].base),
+                worker_id=i,
+                parent_fs=parent_fs,
                 shared=self.shared,
                 args_base=self.args_base,
-                futex_flags=Int64(self.futex_flags),
+                futex_flags=self.futex_flags,
+                pinned=self.pinned,
                 cpu_mask=worker_mask^,
             )
 
@@ -359,10 +362,10 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
                 tcb_addr,
                 Int(self.slots[i][].child_tid)
             )
+
             var result = clone3_with_entry(UnsafePointer(to=clone_args), size_of[linux.Clone3Args]())
             if result < 0:
                 return
-
         self.workers_alive = True
 
 fn clone3_with_entry(clone_args_ptr: UnsafePointer[linux.Clone3Args, MutAnyOrigin], clone_args_size: Int) -> Int:
@@ -370,14 +373,14 @@ fn clone3_with_entry(clone_args_ptr: UnsafePointer[linux.Clone3Args, MutAnyOrigi
     # Take a typed pointer so the compiler tracks the argument's lifetime.
     return Int(inlined_assembly[
         "mov $$435, %rax\nsyscall\ntest %rax, %rax\njnz 1f\nmov %rsp, %rdi\nret\n1:",
-        Int64, Int64, Int64,
+        Int, Int, Int,
         constraints="={rax},{rdi},{rsi},~{rcx},~{r11},~{memory}",
     ](Int(clone_args_ptr), clone_args_size))
 
 fn worker_main[mask_size: Int](stack_head_ptr: Int):
     var head_ptr = ptr[WorkerStackHead[mask_size]](stack_head_ptr)
-    var futex_flags = Int(head_ptr[].futex_flags)
-    var slot_base = Int(head_ptr[].slot_base)
+    var futex_flags = head_ptr[].futex_flags
+    var slot_base = head_ptr[].slot_base
     var worker_id = head_ptr[].worker_id
     var shared = head_ptr[].shared
     var args_base = head_ptr[].args_base
@@ -390,17 +393,17 @@ fn worker_main[mask_size: Int](stack_head_ptr: Int):
     comptime TLS_TCB_SIZE = SlotLayout.TLS_SIZE + SlotLayout.TCB_SIZE
     memcpy(
         dest=ptr[Int8](slot_base),
-        src=ptr[Int8](Int(head_ptr[].parent_fs) - SlotLayout.TLS_SIZE),
+        src=ptr[Int8](head_ptr[].parent_fs - SlotLayout.TLS_SIZE),
         count=TLS_TCB_SIZE,
     )
-    ptr[Int64](tcb_addr + SlotLayout.TCB_SELF_OFFSET)[] = Int64(tcb_addr)
+    ptr[Int](tcb_addr + SlotLayout.TCB_SELF_OFFSET)[] = tcb_addr
 
     # Publish worker_id into %fs-relative storage for kernel access.
-    ptr[Int64](slot_base + SlotLayout.WORKER_ID)[] = worker_id
-    ptr[Int64](slot_base + SlotLayout.WORKER_MAGIC)[] = SlotLayout.WORKER_MAGIC_VALUE
+    ptr[Int](slot_base + SlotLayout.WORKER_ID)[] = worker_id
+    ptr[Int](slot_base + SlotLayout.WORKER_MAGIC)[] = SlotLayout.WORKER_MAGIC_VALUE
 
-    # Pin to CPU if mask has any bits set
-    if head_ptr[].cpu_mask.count() > 0:
+    # Pin to CPU if requested by the parent.
+    if head_ptr[].pinned:
         var ret = linux.sys_sched_setaffinity(0, mask_size, Int(head_ptr[].cpu_mask.ptr()))
         if ret != 0:
             print("sched_setaffinity failed:", ret)
@@ -421,8 +424,8 @@ fn worker_main[mask_size: Int](stack_head_ptr: Int):
             var old = shared[].work_available.fetch_sub[ordering=Consistency.ACQUIRE_RELEASE](1)
             if old > 0:
                 # Successfully claimed work - execute the corresponding pack.
-                var job_idx = Int64(old - 1)
-                var pack_ptr = args_base + Int(job_idx)
+                var job_idx = Int(old - 1)
+                var pack_ptr = args_base + job_idx
                 var func_addr = shared[].func_ptr
                 UnsafePointer(to=func_addr).bitcast[KernelFn]()[](
                     pack_ptr[].arg0,

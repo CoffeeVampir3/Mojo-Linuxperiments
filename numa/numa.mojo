@@ -3,14 +3,14 @@ from memory import UnsafePointer, MutUnsafePointer
 from pathlib import Path
 from .cpumask import CpuMask
 
-fn syscall_getcpu(cpu: MutUnsafePointer[UInt32, MutOrigin.external], node: MutUnsafePointer[UInt32, MutOrigin.external]) -> Int64:
+fn syscall_getcpu(cpu: MutUnsafePointer[UInt32, MutOrigin.external], node: MutUnsafePointer[UInt32, MutOrigin.external]) -> Int:
     return inlined_assembly[
         """
         mov $$309, %rax
         xor %rdx, %rdx
         syscall
         """,
-        Int64,
+        Int,
         MutUnsafePointer[UInt32, MutOrigin.external], MutUnsafePointer[UInt32, MutOrigin.external],
         constraints = "={rax},{rdi},{rsi},~{rdx},~{rcx},~{r11},~{memory}",
     ](cpu, node)

@@ -7,24 +7,24 @@ from sys.info import size_of
 struct ReadOp:
     """A single read operation: file region → buffer."""
     var file_idx: Int32
-    var offset: Int64
+    var offset: Int
     var length: Int32
-    var dest: Int64
-    var id: Int64  # Maps to io_uring SQE user_data
+    var dest: Int
+    var id: Int  # Maps to io_uring SQE user_data
 
     fn __init__(out self, file_idx: Int, offset: Int, length: Int, dest: Int, id: Int = 0):
         self.file_idx = Int32(file_idx)
-        self.offset = Int64(offset)
+        self.offset = offset
         self.length = Int32(length)
-        self.dest = Int64(dest)
-        self.id = Int64(id)
+        self.dest = dest
+        self.id = id
 
 @register_passable("trivial")
 struct Completion:
-    var id: Int64  # Copied back from io_uring CQE user_data
+    var id: Int  # Copied back from io_uring CQE user_data
     var result: Int32
 
-    fn __init__(out self, id: Int64 = 0, result: Int32 = 0):
+    fn __init__(out self, id: Int = 0, result: Int32 = 0):
         self.id = id
         self.result = result
 
@@ -332,7 +332,7 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         while head != tail:
             var idx = head & self.cq.mask
             var cqe = self.cq.entries[Int(idx)]
-            completions.append(Completion(Int64(cqe.user_data), cqe.res))
+            completions.append(Completion(Int(cqe.user_data), cqe.res))
             head += 1
             self.pending_count -= 1
 
@@ -352,7 +352,7 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         while head != tail:
             var idx = head & self.cq.mask
             var cqe = self.cq.entries[Int(idx)]
-            completions.append(Completion(Int64(cqe.user_data), cqe.res))
+            completions.append(Completion(Int(cqe.user_data), cqe.res))
             head += 1
             self.pending_count -= 1
 

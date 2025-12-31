@@ -100,7 +100,7 @@ fn parse_dtype(s: String) -> DType:
         return DType.uint64
     return DType.invalid
 
-struct TensorMeta(Movable, Copyable):
+struct TensorMeta(Copyable):
     var dtype: DType
     var shape: List[Int]
     var start: Int
@@ -207,7 +207,7 @@ fn escape_value(esc: Byte) -> Byte:
 
 @always_inline
 fn match_literal_at[lit: StringLiteral](
-    ptr: UnsafePointer[Byte, MutAnyOrigin],
+    ptr: UnsafePointer[Byte, ImmutAnyOrigin],
     pos: Int,
     length: Int,
 ) -> Bool:
@@ -220,31 +220,29 @@ fn match_literal_at[lit: StringLiteral](
             return False
     return True
 
-struct Parser[simd_width: Int = 16]:
-    var ptr: UnsafePointer[Byte, MutAnyOrigin]
-    var len: Int
+struct Parser[origin: Origin, simd_width: Int = 16]:
+    var data: Span[Byte, Self.origin]
     var pos: Int
 
-    fn __init__(out self, ptr: UnsafePointer[Byte, MutAnyOrigin], length: Int):
-        self.ptr = ptr
-        self.len = length
+    fn __init__(out self, data: Span[Byte, Self.origin]):
+        self.data = data
         self.pos = 0
 
     @always_inline
     fn remaining(self) -> Int:
-        return self.len - self.pos
+        return len(self.data) - self.pos
 
     @always_inline
     fn has_more(self) -> Bool:
-        return self.pos < self.len
+        return self.pos < len(self.data)
 
     @always_inline
     fn peek(self) -> Byte:
-        return self.ptr[self.pos]
+        return self.data[self.pos]
 
     @always_inline
     fn advance(mut self) -> Byte:
-        var b = self.ptr[self.pos]
+        var b = self.data[self.pos]
         self.pos += 1
         return b
 
@@ -260,8 +258,9 @@ struct Parser[simd_width: Int = 16]:
         pred_simd: fn[width: Int](SIMD[DType.uint8, width]) -> SIMD[DType.bool, width],
     ](mut self) -> Int:
         var start = self.pos
+        var ptr = self.data.unsafe_ptr()
         while self.remaining() >= Self.simd_width:
-            var block = (self.ptr + self.pos).load[width=Self.simd_width]()
+            var block = (ptr + self.pos).load[width=Self.simd_width]()
             var matches = pred_simd[Self.simd_width](block)
             if all(matches):
                 self.pos += Self.simd_width
@@ -298,7 +297,7 @@ struct Parser[simd_width: Int = 16]:
         return key.value()
 
     fn try_consume[lit: StringLiteral](mut self) -> Bool:
-        if not match_literal_at[lit](self.ptr, self.pos, self.len):
+        if not match_literal_at[lit](self.data.unsafe_ptr(), self.pos, len(self.data)):
             return False
         self.pos += len(lit)
         return True
@@ -347,9 +346,10 @@ struct Parser[simd_width: Int = 16]:
         if not self.consume(QUOTE):
             return None
         var out_bytes = List[Byte]()
+        var ptr = self.data.unsafe_ptr()
         while self.has_more():
             if self.remaining() >= Self.simd_width:
-                var block = (self.ptr + self.pos).load[width=Self.simd_width]()
+                var block = (ptr + self.pos).load[width=Self.simd_width]()
                 var hits = simd_any_of2[Self.simd_width](block, QUOTE, BACKSLASH)
                 if not any(hits):
                     append_block_prefix[Self.simd_width](out_bytes, block, Self.simd_width)
@@ -362,8 +362,8 @@ struct Parser[simd_width: Int = 16]:
             if b == QUOTE:
                 if len(out_bytes) == 0:
                     return String("")
-                var ptr = out_bytes.unsafe_ptr()
-                return String(bytes=Span[Byte](ptr=ptr, length=len(out_bytes)))
+                var out_ptr = out_bytes.unsafe_ptr()
+                return String(bytes=Span[Byte](ptr=out_ptr, length=len(out_bytes)))
             if b == BACKSLASH:
                 if not self.append_escape(out_bytes):
                     return None
@@ -400,7 +400,7 @@ struct Parser[simd_width: Int = 16]:
             return None
         var v = 0
         for i in range(count):
-            v = v * 10 + Int(self.ptr[start + i] - DIGIT_0)
+            v = v * 10 + Int(self.data[start + i] - DIGIT_0)
         return v
 
     fn skip_value(mut self) -> Bool:
@@ -611,31 +611,8 @@ fn parse_safetensors_header[simd_width: Int = 16](path: Path) -> Optional[Safete
     except e:
         print("load: failed to read file:", e)
         return None
-    var ptr = header_bytes.unsafe_ptr()
-    var parser = Parser[simd_width](ptr, header_size)
+    var parser = Parser(Span(header_bytes))
     var tensors = parser.parse()
-    _ = header_bytes  # Lifetime extension
     if tensors:
         return SafetensorsHeader(path, tensors.take(), HEADER_LEN_BYTES + header_size, Int(file_len))
     return None
-
-fn main():
-    var args = argv()
-    if len(args) < 2:
-        print("usage:", args[0], "<safetensors_file>")
-        return
-    var result = parse_safetensors_header(Path(args[1]))
-    if result:
-        var header = result.take()
-        print("File:", header.path)
-        print("File size:", header.file_len, "bytes")
-        print("Tensors:", len(header.tensors))
-        print("Data offset:", header.data_offset)
-        for item in header.tensors.items():
-            var name = item.key
-            var meta = item.value.copy()
-            var start = header.data_offset + meta.start
-            var end = header.data_offset + meta.end
-            print(" ", name, meta.dtype, meta.shape, "-", meta.byte_size(), "bytes @", start, "..", end)
-    else:
-        print("Parse failed")

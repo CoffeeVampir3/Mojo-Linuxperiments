@@ -123,13 +123,13 @@ fn mmap_numa[
     Returns:
         Pointer to mapped memory, or zero pointer on failure.
     """
-    alias base_flags = linux.MapFlag.PRIVATE | linux.MapFlag.ANONYMOUS | linux.MapFlag.NORESERVE
+    comptime base_flags = linux.MapFlag.PRIVATE | linux.MapFlag.ANONYMOUS | linux.MapFlag.NORESERVE
     @parameter
     if page_size == linux.PageSize.EXPLICIT_2MB:
-        alias flags = base_flags | linux.MapFlag.HUGETLB | linux.MapFlag.HUGE_2MB
+        comptime flags = base_flags | linux.MapFlag.HUGETLB | linux.MapFlag.HUGE_2MB
         return mmap_numa_impl[prot, flags](size, node)
     elif page_size == linux.PageSize.EXPLICIT_1GB:
-        alias flags = base_flags | linux.MapFlag.HUGETLB | linux.MapFlag.HUGE_1GB
+        comptime flags = base_flags | linux.MapFlag.HUGETLB | linux.MapFlag.HUGE_1GB
         return mmap_numa_impl[prot, flags](size, node)
     elif page_size == linux.PageSize.THP_2MB:
         return mmap_numa_impl[prot, base_flags, use_thp=True](size, node)
