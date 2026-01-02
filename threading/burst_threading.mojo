@@ -1,8 +1,7 @@
-from sys.intrinsics import inlined_assembly
 from sys.info import size_of
 from memory import UnsafePointer, memcpy
 from os.atomic import Atomic, Consistency
-import linux.syscalls as linux
+import linux.sys as linux
 from notstdcollections import HeapMoveArray
 from numa import NumaInfo, CpuMask
 
@@ -42,12 +41,6 @@ struct ArgPack:
 fn ptr[T: AnyType](addr: Int) -> UnsafePointer[T, MutAnyOrigin]:
     return UnsafePointer[T, MutAnyOrigin](unsafe_from_address=addr)
 
-fn get_fs_base() -> Int:
-    return Int(inlined_assembly["mov %fs:0, $0", Int, constraints="=r"]())
-
-fn pause():
-    inlined_assembly["pause", NoneType, constraints="~{memory}"]()
-
 # Memory layout per worker slot (slot_base points at the start of the TLS block;
 # FS base points at the TCB at slot_base + TCB):
 # [TLS 256B][TCB 64B][child_tid 4B][pad 4B][worker_id 8B][magic 8B][pad..HEADER][Guard 4KB][Stack stack_size][AltGuard 4KB][AltStack altstack_size][pad..slot_end]
@@ -81,76 +74,42 @@ fn slot_size[stack_size: Int]() -> Int:
 @always_inline
 fn current_worker_id() -> Int:
     """Return worker id when running in a BurstPool worker, else -1."""
-    var magic = inlined_assembly[
-        "mov %fs:" + String(SlotLayout.WORKER_MAGIC_FROM_FS) + ", $0",
-        Int,
-        constraints="=r",
-    ]()
+    var sys = linux.linux_sys()
+    var magic = sys.arch_tls_load_i64[offset=SlotLayout.WORKER_MAGIC_FROM_FS]()
     if magic != SlotLayout.WORKER_MAGIC_VALUE:
         return -1
-    return inlined_assembly[
-        "mov %fs:" + String(SlotLayout.WORKER_ID_FROM_FS) + ", $0",
-        Int,
-        constraints="=r",
-    ]()
-
-@register_passable("trivial")
-struct KernelSigInfo:
-    # Minimal siginfo_t prefix + si_addr for SIGSEGV (x86_64).
-    var si_signo: Int32
-    var si_errno: Int32
-    var si_code: Int32
-    var pad0: Int32
-    var si_addr: Int
+    return sys.arch_tls_load_i64[offset=SlotLayout.WORKER_ID_FROM_FS]()
 
 fn burst_sigsegv_handler(signo: Int32, info: Int, ucontext: Int):
-    comptime UCONTEXT_GREGS_OFFSET = 40
-    comptime REG_RSP = 15
-    comptime REG_RIP = 16
-    var gregs = ucontext + UCONTEXT_GREGS_OFFSET
-    var rsp = ptr[UInt64](gregs + REG_RSP * 8)[]
-    var rip = ptr[UInt64](gregs + REG_RIP * 8)[]
-
+    var sys = linux.linux_sys()
+    var ctx = sys.arch_decode_sigsegv(info, ucontext)
     var worker = current_worker_id()
-    var si_addr = UInt64(ptr[KernelSigInfo](info)[].si_addr)
-    var pid = linux.sys_getpid()
-    var tid = linux.sys_gettid()
+    var pid = sys.sys_getpid()
+    var tid = sys.sys_gettid()
 
     print(
         "burst: SIGSEGV worker=", worker,
         "pid=", pid,
         "tid=", tid,
-        "rip=", hex(rip),
-        "rsp=", hex(rsp),
-        "addr=", hex(si_addr),
+        "rip=", hex(ctx.ip),
+        "rsp=", hex(ctx.sp),
+        "addr=", hex(ctx.fault_addr),
     )
 
-    _ = linux.sys_tgkill(pid, tid, linux.Signal.SEGV)
-    linux.sys_exit_group(128 + Int(signo))
-
-fn sig_restorer():
-    inlined_assembly[
-        "mov $$15, %rax\nsyscall",
-        NoneType,
-        constraints="~{rax},~{rcx},~{r11},~{memory}",
-    ]()
+    _ = sys.sys_tgkill(pid, tid, linux.Signal.SEGV)
+    sys.sys_exit_group(128 + Int(signo))
 
 fn install_burst_sigsegv_handler():
+    var sys = linux.linux_sys()
     var handler_copy = burst_sigsegv_handler
     var handler_addr = UnsafePointer(to=handler_copy).bitcast[Int]()[]
-    var restorer_copy = sig_restorer
-    var restorer_addr = UnsafePointer(to=restorer_copy).bitcast[Int]()[]
 
-    var act = linux.KernelSigAction()
+    var act = linux.RtSigAction()
     act.handler = handler_addr
-    act.flags = UInt64(
-        linux.SigActionFlag.SIGINFO | linux.SigActionFlag.ONSTACK |
-        linux.SigActionFlag.RESTORER
-    )
-    act.restorer = restorer_addr
-    act.mask = linux.KernelSigSet()
+    act.flags = UInt64(linux.SigActionFlag.SIGINFO | linux.SigActionFlag.ONSTACK)
+    act.mask = linux.SigSet64()
 
-    _ = linux.sys_rt_sigaction(linux.Signal.SEGV, UnsafePointer(to=act))
+    _ = sys.sys_rt_sigaction(linux.Signal.SEGV, UnsafePointer(to=act))
 
 struct SharedPoolState:
     # Cache line padding to avoid false sharing between dispatch and completion fields.
@@ -259,9 +218,10 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
 
         install_burst_sigsegv_handler()
 
+        var sys = linux.linux_sys()
         var args_arena_size = capacity * size_of[ArgPack]()
         var arena_size = Self.slot_size * capacity + size_of[SharedPoolState]() + args_arena_size
-        self.arena_base = linux.sys_mmap[
+        self.arena_base = sys.sys_mmap[
             prot=linux.Prot.RW,
             flags=linux.MapFlag.PRIVATE | linux.MapFlag.ANONYMOUS | linux.MapFlag.NORESERVE | linux.MapFlag.POPULATE
         ](0, arena_size)
@@ -270,8 +230,8 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
 
         if numa_node is not None:
             var nodemask = UInt64(1) << numa_node.value()
-            if linux.sys_mbind[policy=linux.Mempolicy.BIND](self.arena_base, arena_size, nodemask) < 0:
-                _ = linux.sys_munmap(self.arena_base, arena_size)
+            if sys.sys_mbind[policy=linux.Mempolicy.BIND](self.arena_base, arena_size, nodemask) < 0:
+                _ = sys.sys_munmap(self.arena_base, arena_size)
                 self.arena_base = 0
                 return
 
@@ -284,16 +244,16 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
 
         for i in range(capacity):
             var slot_base = self.arena_base + i * Self.slot_size
-            if linux.sys_mprotect(slot_base + SlotLayout.HEADER, SlotLayout.GUARD, linux.Prot.NONE) != 0:
-                _ = linux.sys_munmap(self.arena_base, arena_size)
+            if sys.sys_mprotect(slot_base + SlotLayout.HEADER, SlotLayout.GUARD, linux.Prot.NONE) != 0:
+                _ = sys.sys_munmap(self.arena_base, arena_size)
                 self.arena_base = 0
                 return
-            if linux.sys_mprotect(
+            if sys.sys_mprotect(
                 slot_base + SlotLayout.HEADER + SlotLayout.GUARD + Self.stack_size,
                 SlotLayout.ALT_GUARD,
                 linux.Prot.NONE,
             ) != 0:
-                _ = linux.sys_munmap(self.arena_base, arena_size)
+                _ = sys.sys_munmap(self.arena_base, arena_size)
                 self.arena_base = 0
                 return
             var slot = WorkerSlot(slot_base)
@@ -318,12 +278,13 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         if self.arena_base == 0:
             return
 
+        var sys = linux.linux_sys()
         if self.workers_alive:
             # Signal shutdown and wake all workers
             AtomicInt32.store[ordering=Consistency.RELEASE](
                 UnsafePointer(to=self.shared[].shutdown.value), 1)
             var workPtr = UnsafePointer(to=self.shared[].work_available.value)
-            _ = linux.sys_futex_wake(Int(workPtr), self.capacity, self.futex_flags)
+            _ = sys.sys_futex_wake(Int(workPtr), self.capacity, self.futex_flags)
 
             # Wait for all workers to exit
             # CHILD_CLEARTID does legacy futex(FUTEX_WAKE) without PRIVATE flag,
@@ -331,12 +292,12 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
             comptime shared_futex_flags = linux.Futex2.SIZE_U32
             for i in range(self.capacity):
                 while self.slots[i][].is_alive():
-                    _ = linux.sys_futex_wait(
+                    _ = sys.sys_futex_wait(
                         Int(self.slots[i][].child_tid),
                         Int(self.slots[i][].child_tid[]),
                         shared_futex_flags)
 
-        _ = linux.sys_munmap(
+        _ = sys.sys_munmap(
             self.arena_base,
             Self.slot_size * self.capacity + size_of[SharedPoolState]() + self.capacity * size_of[ArgPack]()
         )
@@ -399,16 +360,19 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         AtomicInt32.store[ordering=Consistency.MONOTONIC](donePtr, Int32(jobs))
         AtomicInt32.store[ordering=Consistency.RELEASE](workPtr, Int32(jobs))
 
-        _ = linux.sys_futex_wake(Int(workPtr), jobs, self.futex_flags)
+        var sys = linux.linux_sys()
+        _ = sys.sys_futex_wake(Int(workPtr), jobs, self.futex_flags)
 
     fn join(mut self):
         """Wait for the most recent dispatch to complete."""
         var donePtr = UnsafePointer(to=self.shared[].work_done.value)
+        var sys = linux.linux_sys()
         while AtomicInt32.load[ordering=Consistency.ACQUIRE](donePtr) > 0:
-            pause()
+            sys.arch_cpu_relax()
 
     fn spawn_workers(mut self):
-        var parent_fs = get_fs_base()
+        var sys = linux.linux_sys()
+        var parent_fs = sys.arch_thread_pointer()
 
         for i in range(self.capacity):
             var worker_mask = self.cpu_mask.copy() if self.pinned else CpuMask[Self.mask_size]()
@@ -442,29 +406,21 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
                 Int(self.slots[i][].child_tid)
             )
 
-            var result = clone3_with_entry(UnsafePointer(to=clone_args), size_of[linux.Clone3Args]())
+            var result = sys.sys_clone3_with_entry(UnsafePointer(to=clone_args), size_of[linux.Clone3Args]())
             if result < 0:
                 return
         self.workers_alive = True
 
-fn clone3_with_entry(clone_args_ptr: UnsafePointer[linux.Clone3Args, MutAnyOrigin], clone_args_size: Int) -> Int:
-    # Child diverges via ret to entry point on stack head.
-    # Take a typed pointer so the compiler tracks the argument's lifetime.
-    return Int(inlined_assembly[
-        "mov $$435, %rax\nsyscall\ntest %rax, %rax\njnz 1f\nmov %rsp, %rdi\nret\n1:",
-        Int, Int, Int,
-        constraints="={rax},{rdi},{rsi},~{rcx},~{r11},~{memory}",
-    ](Int(clone_args_ptr), clone_args_size))
-
 fn worker_main[mask_size: Int](stack_head_ptr: Int):
     var head_ptr = ptr[WorkerStackHead[mask_size]](stack_head_ptr)
+    var sys = linux.linux_sys()
     var altstack_base_val = head_ptr[].altstack_base
     var altstack_size_val = head_ptr[].altstack_size
     var ss = linux.StackT()
     ss.ss_sp = altstack_base_val
     ss.ss_size = UInt64(altstack_size_val)
     ss.ss_flags = 0
-    _ = linux.sys_sigaltstack(UnsafePointer(to=ss))
+    _ = sys.sys_sigaltstack(UnsafePointer(to=ss))
     var futex_flags = head_ptr[].futex_flags
     var slot_base = head_ptr[].slot_base
     var worker_id = head_ptr[].worker_id
@@ -490,7 +446,7 @@ fn worker_main[mask_size: Int](stack_head_ptr: Int):
 
     # Pin to CPU if requested by the parent.
     if head_ptr[].pinned != 0:
-        var ret = linux.sys_sched_setaffinity(0, mask_size, Int(head_ptr[].cpu_mask.ptr()))
+        var ret = sys.sys_sched_setaffinity(0, mask_size, Int(head_ptr[].cpu_mask.ptr()))
         if ret != 0:
             print("sched_setaffinity failed:", ret)
 
@@ -550,12 +506,12 @@ fn worker_main[mask_size: Int](stack_head_ptr: Int):
             if shared[].shutdown.load[ordering=Consistency.MONOTONIC]() != 0:
                 break
             if spins < SPIN_LIMIT:
-                pause()
+                sys.arch_cpu_relax()
                 spins += 1
             else:
                 # Sleep on work_available address, expecting value == 0
-                _ = linux.sys_futex_wait(Int(workPtr), 0, futex_flags)
+                _ = sys.sys_futex_wait(Int(workPtr), 0, futex_flags)
                 spins = 0  # Reset spin count after wake
 
     # CHILD_CLEARTID handles clearing child_tid and futex wake automatically
-    linux.sys_exit()
+    sys.sys_exit()

@@ -1,6 +1,6 @@
 from sys.info import size_of
 from memory import UnsafePointer
-import linux.syscalls as linux
+import linux.sys as linux
 
 @fieldwise_init
 struct NumaArena[alignment: Int = 8, page_size: Int = linux.PageSize.THP_2MB](Movable):
@@ -31,7 +31,8 @@ struct NumaArena[alignment: Int = 8, page_size: Int = linux.PageSize.THP_2MB](Mo
 
     fn __del__(deinit self):
         if self.base:
-            _ = linux.sys_munmap(Int(self.base), self.size)
+            var sys = linux.linux_sys()
+            _ = sys.sys_munmap(Int(self.base), self.size)
 
     fn __bool__(self) -> Bool:
         """ True if arena memory was allocated. """
@@ -81,7 +82,8 @@ struct NumaArena[alignment: Int = 8, page_size: Int = linux.PageSize.THP_2MB](Mo
         """Debugging -> Verify first allocated page resides on expected NUMA node."""
         if not self.base or self.offset == 0:
             return True
-        var status = linux.sys_move_pages_query(Int(self.base))
+        var sys = linux.linux_sys()
+        var status = sys.sys_move_pages_query(Int(self.base))
         if status < 0:
             return False
         return status == self.node
@@ -93,16 +95,17 @@ struct NumaArena[alignment: Int = 8, page_size: Int = linux.PageSize.THP_2MB](Mo
 fn mmap_numa_impl[
     prot: Int, flags: Int, use_thp: Bool = False
 ](size: Int, node: Int) -> UnsafePointer[UInt8, MutAnyOrigin]:
-    var addr = linux.sys_mmap[prot=prot, flags=flags](0, size)
+    var sys = linux.linux_sys()
+    var addr = sys.sys_mmap[prot=prot, flags=flags](0, size)
     if addr < 0:
         return UnsafePointer[UInt8, MutAnyOrigin]()
     @parameter
     if use_thp:
-        _ = linux.sys_madvise[linux.Madvise.HUGEPAGE](addr, size)
+        _ = sys.sys_madvise[linux.Madvise.HUGEPAGE](addr, size)
     var nodemask = UInt64(1) << node
-    var bind_result = linux.sys_mbind[policy=linux.Mempolicy.BIND](addr, size, nodemask)
+    var bind_result = sys.sys_mbind[policy=linux.Mempolicy.BIND](addr, size, nodemask)
     if bind_result < 0:
-        _ = linux.sys_munmap(addr, size)
+        _ = sys.sys_munmap(addr, size)
         return UnsafePointer[UInt8, MutAnyOrigin]()
     return UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=addr)
 

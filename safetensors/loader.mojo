@@ -1,4 +1,4 @@
-import linux.syscalls as linux
+import linux.sys as linux
 from memory import UnsafePointer
 from pathlib import Path
 from sys.info import size_of
@@ -104,9 +104,10 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         self.file_fds = List[Int32]()
         self.single_mmap = False
 
+        var sys = linux.linux_sys()
         var params = linux.IoUringParams()
         var params_ptr = UnsafePointer(to=params)
-        var fd = linux.sys_io_uring_setup(self.max_entries, params_ptr)
+        var fd = sys.sys_io_uring_setup(self.max_entries, params_ptr)
         if fd < 0:
             return
 
@@ -117,6 +118,7 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
 
     fn map_rings(mut self, params: linux.IoUringParams):
         """Map submission and completion queue rings after io_uring_setup."""
+        var sys = linux.linux_sys()
         self.sq.ring_size = Int(params.sq_off.array) + Int(params.sq_entries) * size_of[UInt32]()
         self.cq.ring_size = Int(params.cq_off.cqes) + Int(params.cq_entries) * size_of[linux.IoUringCqe]()
 
@@ -127,13 +129,13 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
                 self.sq.ring_size = self.cq.ring_size
             self.cq.ring_size = self.sq.ring_size
 
-        var sq_addr = linux.sys_mmap[
+        var sq_addr = sys.sys_mmap[
             prot=linux.Prot.RW,
             flags=linux.MapFlag.SHARED | linux.MapFlag.POPULATE,
         ](0, self.sq.ring_size, self.ring_fd, linux.IORING_OFF_SQ_RING)
 
         if sq_addr < 0:
-            _ = linux.sys_close(self.ring_fd)
+            _ = sys.sys_close(self.ring_fd)
             self.ring_fd = -1
             return
 
@@ -143,30 +145,30 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         if self.single_mmap:
             self.cq.ring = self.sq.ring
         else:
-            var cq_addr = linux.sys_mmap[
+            var cq_addr = sys.sys_mmap[
                 prot=linux.Prot.RW,
                 flags=linux.MapFlag.SHARED | linux.MapFlag.POPULATE,
             ](0, self.cq.ring_size, self.ring_fd, linux.IORING_OFF_CQ_RING)
 
             if cq_addr < 0:
-                _ = linux.sys_munmap(Int(self.sq.ring), self.sq.ring_size)
-                _ = linux.sys_close(self.ring_fd)
+                _ = sys.sys_munmap(Int(self.sq.ring), self.sq.ring_size)
+                _ = sys.sys_close(self.ring_fd)
                 self.ring_fd = -1
                 return
 
             self.cq.ring = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=cq_addr)
 
         self.sq.entries_size = Int(params.sq_entries) * size_of[linux.IoUringSqe]()
-        var sqes_addr = linux.sys_mmap[
+        var sqes_addr = sys.sys_mmap[
             prot=linux.Prot.RW,
             flags=linux.MapFlag.SHARED | linux.MapFlag.POPULATE,
         ](0, self.sq.entries_size, self.ring_fd, linux.IORING_OFF_SQES)
 
         if sqes_addr < 0:
-            _ = linux.sys_munmap(Int(self.sq.ring), self.sq.ring_size)
+            _ = sys.sys_munmap(Int(self.sq.ring), self.sq.ring_size)
             if not self.single_mmap:
-                _ = linux.sys_munmap(Int(self.cq.ring), self.cq.ring_size)
-            _ = linux.sys_close(self.ring_fd)
+                _ = sys.sys_munmap(Int(self.cq.ring), self.cq.ring_size)
+            _ = sys.sys_close(self.ring_fd)
             self.ring_fd = -1
             return
 
@@ -183,23 +185,24 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         self.cq.entries = (self.cq.ring + Int(params.cq_off.cqes)).bitcast[linux.IoUringCqe]()
 
     fn __del__(deinit self):
+        var sys = linux.linux_sys()
         for i in range(len(self.file_fds)):
             if self.file_fds[i] >= 0:
-                _ = linux.sys_close(Int(self.file_fds[i]))
+                _ = sys.sys_close(Int(self.file_fds[i]))
 
         if self.ring_fd < 0:
             return
 
         if self.sq.entries:
-            _ = linux.sys_munmap(Int(self.sq.entries), self.sq.entries_size)
+            _ = sys.sys_munmap(Int(self.sq.entries), self.sq.entries_size)
 
         if self.cq.ring and not self.single_mmap:
-            _ = linux.sys_munmap(Int(self.cq.ring), self.cq.ring_size)
+            _ = sys.sys_munmap(Int(self.cq.ring), self.cq.ring_size)
 
         if self.sq.ring:
-            _ = linux.sys_munmap(Int(self.sq.ring), self.sq.ring_size)
+            _ = sys.sys_munmap(Int(self.sq.ring), self.sq.ring_size)
 
-        _ = linux.sys_close(self.ring_fd)
+        _ = sys.sys_close(self.ring_fd)
 
     fn __bool__(self) -> Bool:
         return self.ring_fd >= 0
@@ -215,23 +218,24 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         if count == 0:
             return 0
 
+        var sys = linux.linux_sys()
         self.file_fds = List[Int32](capacity=count)
         for i in range(count):
             var path_str = String(paths[i])
-            var fd = linux.sys_openat(
+            var fd = sys.sys_openat(
                 linux.AT_FDCWD,
                 path_str,
                 linux.OpenFlags.RDONLY | linux.OpenFlags.CLOEXEC,
             )
             if fd < 0:
                 for k in range(len(self.file_fds)):
-                    _ = linux.sys_close(Int(self.file_fds[k]))
+                    _ = sys.sys_close(Int(self.file_fds[k]))
                 self.file_fds = List[Int32]()
                 return fd
 
             self.file_fds.append(Int32(fd))
 
-        var result = linux.sys_io_uring_register(
+        var result = sys.sys_io_uring_register(
             self.ring_fd,
             linux.IoUringRegisterOp.REGISTER_FILES,
             Int(self.file_fds.unsafe_ptr()),
@@ -240,7 +244,7 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
 
         if result < 0:
             for i in range(len(self.file_fds)):
-                _ = linux.sys_close(Int(self.file_fds[i]))
+                _ = sys.sys_close(Int(self.file_fds[i]))
             self.file_fds = List[Int32]()
             return result
 
@@ -294,7 +298,8 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
 
         self.sq.tail[] = tail
 
-        var result = linux.sys_io_uring_enter(
+        var sys = linux.linux_sys()
+        var result = sys.sys_io_uring_enter(
             self.ring_fd,
             UInt32(submitted),
             0,
@@ -319,7 +324,8 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         var tail = self.cq.tail[]
 
         if head == tail and min_complete > 0:
-            var result = linux.sys_io_uring_enter(
+            var sys = linux.linux_sys()
+            var result = sys.sys_io_uring_enter(
                 self.ring_fd,
                 0,
                 UInt32(min_complete),
