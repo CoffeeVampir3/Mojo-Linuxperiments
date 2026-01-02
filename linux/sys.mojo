@@ -126,6 +126,10 @@ struct LinuxSysImpl(LinuxSys):
         require_supported_target()
         return X86_64LinuxSys().sys_gettid()
 
+    fn sys_getcpu(self) -> Tuple[Int, Int]:
+        require_supported_target()
+        return X86_64LinuxSys().sys_getcpu()
+
     fn sys_tgkill(self, pid: Int, tid: Int, sig: Int) -> Int:
         require_supported_target()
         return X86_64LinuxSys().sys_tgkill(pid, tid, sig)

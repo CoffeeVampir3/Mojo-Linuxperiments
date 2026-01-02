@@ -46,6 +46,7 @@ struct X86_64LinuxSys(LinuxSys):
     comptime NR_exit = 60
     comptime NR_getpid = 39
     comptime NR_gettid = 186
+    comptime NR_getcpu = 309
     comptime NR_sched_setaffinity = 203
     comptime NR_exit_group = 231
     comptime NR_tgkill = 234
@@ -238,6 +239,14 @@ struct X86_64LinuxSys(LinuxSys):
 
     fn sys_gettid(self) -> Int:
         return self.syscall[0](Self.NR_gettid)
+
+    fn sys_getcpu(self) -> Tuple[Int, Int]:
+        var cpu = UInt32(0)
+        var node = UInt32(0)
+        var cpu_addr = Int(UnsafePointer(to=cpu))
+        var node_addr = Int(UnsafePointer(to=node))
+        _ = self.syscall[3](Self.NR_getcpu, cpu_addr, node_addr, 0)
+        return Tuple[Int, Int](Int(cpu), Int(node))
 
     fn sys_tgkill(self, pid: Int, tid: Int, sig: Int) -> Int:
         return self.syscall[3](Self.NR_tgkill, pid, tid, sig)

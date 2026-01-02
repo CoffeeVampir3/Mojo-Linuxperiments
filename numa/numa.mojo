@@ -1,27 +1,10 @@
-from sys.intrinsics import inlined_assembly
-from memory import UnsafePointer, MutUnsafePointer
+import linux.sys as linux
 from pathlib import Path
 from .cpumask import CpuMask
 
-fn syscall_getcpu(cpu: MutUnsafePointer[UInt32, MutOrigin.external], node: MutUnsafePointer[UInt32, MutOrigin.external]) -> Int:
-    return inlined_assembly[
-        """
-        mov $$309, %rax
-        xor %rdx, %rdx
-        syscall
-        """,
-        Int,
-        MutUnsafePointer[UInt32, MutOrigin.external], MutUnsafePointer[UInt32, MutOrigin.external],
-        constraints = "={rax},{rdi},{rsi},~{rdx},~{rcx},~{r11},~{memory}",
-    ](cpu, node)
-
 fn get_current_cpu_and_node() -> Tuple[Int, Int]:
-    var cpu = UInt32(0)
-    var node = UInt32(0)
-    var cpu_ptr = MutUnsafePointer[UInt32, MutOrigin.external](unsafe_from_address=Int(UnsafePointer(to=cpu)))
-    var node_ptr = MutUnsafePointer[UInt32, MutOrigin.external](unsafe_from_address=Int(UnsafePointer(to=node)))
-    _ = syscall_getcpu(cpu_ptr, node_ptr)
-    return Tuple[Int, Int](Int(cpu), Int(node))
+    var sys = linux.linux_sys()
+    return sys.sys_getcpu()
 
 def read_sysfs(path: String) -> String:
     var p = Path(path)
