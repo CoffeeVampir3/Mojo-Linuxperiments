@@ -1,4 +1,5 @@
 from sys.intrinsics import inlined_assembly
+from sys.info import size_of
 from memory import UnsafePointer
 
 comptime KernelPtr = UInt64
@@ -7,20 +8,26 @@ comptime KernelFlags32 = UInt32
 
 @register_passable("trivial")
 struct Syscall:
+    comptime write = 1
     comptime mmap = 9
     comptime munmap = 11
     comptime mprotect = 10
+    comptime rt_sigaction = 13
     comptime mbind = 237
     comptime move_pages = 279
     comptime madvise = 28
     comptime clone3 = 435
     comptime exit = 60
+    comptime exit_group = 231
+    comptime getpid = 39
     comptime futex_waitv = 449
     comptime futex_wake = 454
     comptime futex_wait = 455
     comptime sched_setaffinity = 203
     comptime rseq = 334
     comptime gettid = 186
+    comptime tgkill = 234
+    comptime sigaltstack = 131
     comptime openat = 257
     comptime close = 3
     comptime io_uring_setup = 425
@@ -67,6 +74,58 @@ struct Futex2:
     comptime SIZE_U64 = 0x03
     comptime NUMA = 0x04
     comptime PRIVATE = 0x80
+
+@register_passable("trivial")
+struct Signal:
+    comptime ABRT = 6
+    comptime SEGV = 11
+
+@register_passable("trivial")
+struct SigActionFlag:
+    # From asm-generic/signal-defs.h (Linux uapi)
+    comptime SIGINFO = 0x00000004
+    comptime RESTORER = 0x04000000
+    comptime ONSTACK = 0x08000000
+    comptime RESTART = 0x10000000
+    comptime NODEFER = 0x40000000
+    comptime RESETHAND = 0x80000000
+
+@register_passable("trivial")
+struct KernelSigSet:
+    # Kernel rt_sigaction uses a 64-signal mask on x86_64 (8 bytes).
+    var bits0: UInt64
+
+    fn __init__(out self):
+        self.bits0 = 0
+
+@register_passable("trivial")
+struct KernelSigAction:
+    # Kernel layout on x86_64:
+    #   handler (or sigaction), flags, restorer, mask
+    var handler: Int
+    var flags: UInt64
+    var restorer: Int
+    var mask: KernelSigSet
+
+    fn __init__(out self):
+        self.handler = 0
+        self.flags = 0
+        self.restorer = 0
+        self.mask = KernelSigSet()
+
+@register_passable("trivial")
+struct StackT:
+    # stack_t: void *ss_sp; int ss_flags; size_t ss_size;
+    var ss_sp: Int
+    var ss_flags: Int32
+    var _pad: Int32
+    var ss_size: UInt64
+
+    fn __init__(out self):
+        self.ss_sp = 0
+        self.ss_flags = 0
+        self._pad = 0
+        self.ss_size = 0
 
 @register_passable("trivial")
 struct FutexNuma32:
@@ -589,6 +648,31 @@ fn sys_mprotect(addr: Int, length: Int, prot: Int) -> Int:
     """Change protection on a region of memory."""
     return syscall[3](Syscall.mprotect, addr, length, prot)
 
+fn sys_write(fd: Int, buf: Int, count: Int) -> Int:
+    """Write bytes to a file descriptor. Returns bytes written, or negative errno."""
+    return syscall[3](Syscall.write, fd, buf, count)
+
+fn sys_rt_sigaction(
+    signum: Int,
+    act: UnsafePointer[KernelSigAction, MutAnyOrigin],
+    old: UnsafePointer[KernelSigAction, MutAnyOrigin] = UnsafePointer[KernelSigAction, MutAnyOrigin](),
+) -> Int:
+    """Install a signal handler via rt_sigaction. Returns 0 on success, negative errno on failure."""
+    return syscall[4](
+        Syscall.rt_sigaction,
+        signum,
+        Int(act),
+        Int(old),
+        size_of[KernelSigSet](),
+    )
+
+fn sys_sigaltstack(
+    ss: UnsafePointer[StackT, MutAnyOrigin],
+    old: UnsafePointer[StackT, MutAnyOrigin] = UnsafePointer[StackT, MutAnyOrigin](),
+) -> Int:
+    """Set/get the calling thread's alternate signal stack."""
+    return syscall[2](Syscall.sigaltstack, Int(ss), Int(old))
+
 # Lower 32 bits
 comptime FUTEX_BITSET_MATCH_ANY: Int = 0xFFFFFFFF
 
@@ -609,9 +693,21 @@ fn sys_exit(code: Int = 0):
     """Exit current thread."""
     _ = syscall[1](Syscall.exit, code)
 
+fn sys_exit_group(code: Int = 0):
+    """Exit the entire process (all threads)."""
+    _ = syscall[1](Syscall.exit_group, code)
+
+fn sys_getpid() -> Int:
+    """Get process ID."""
+    return syscall[0](Syscall.getpid)
+
 fn sys_gettid() -> Int:
     """Get thread ID."""
     return syscall[0](Syscall.gettid)
+
+fn sys_tgkill(pid: Int, tid: Int, sig: Int) -> Int:
+    """Send a signal to a specific thread."""
+    return syscall[3](Syscall.tgkill, pid, tid, sig)
 
 fn sys_rseq(rseq_ptr: Int, len: Int, flags: Int, sig: Int) -> Int:
     """Register rseq for current thread."""
@@ -629,10 +725,6 @@ fn sys_openat(dirfd: Int, mut pathname: String, flags: Int, mode: Int = 0) -> In
 fn sys_close(fd: Int) -> Int:
     """Close file descriptor."""
     return syscall[1](Syscall.close, fd)
-
-# =============================================================================
-# io_uring syscalls
-# =============================================================================
 
 fn sys_io_uring_setup(entries: UInt32, params: UnsafePointer[IoUringParams]) -> Int:
     """Create an io_uring instance.

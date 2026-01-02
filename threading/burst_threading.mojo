@@ -50,7 +50,7 @@ fn pause():
 
 # Memory layout per worker slot (slot_base points at the start of the TLS block;
 # FS base points at the TCB at slot_base + TCB):
-# [TLS 256B][TCB 64B][child_tid 4B][pad 4B][worker_id 8B][magic 8B][pad..HEADER][Guard 4KB][Stack stack_size][pad..slot_end]
+# [TLS 256B][TCB 64B][child_tid 4B][pad 4B][worker_id 8B][magic 8B][pad..HEADER][Guard 4KB][Stack stack_size][AltGuard 4KB][AltStack altstack_size][pad..slot_end]
 @register_passable("trivial")
 struct SlotLayout:
     comptime TLS_SIZE = 256
@@ -65,6 +65,8 @@ struct SlotLayout:
     comptime WORKER_MAGIC_FROM_FS = Self.WORKER_MAGIC - Self.TCB
     comptime HEADER = ((Self.WORKER_MAGIC + 8 + 4095) // 4096) * 4096
     comptime GUARD = 4096
+    comptime ALTSTACK_SIZE = 64 * 1024 # Much bigger than MINSTK however it overflows frequently at that size.
+    comptime ALT_GUARD = Self.GUARD
     comptime DEFAULT_STACK = 64 * 1024
 
 fn slot_size[stack_size: Int]() -> Int:
@@ -73,7 +75,7 @@ fn slot_size[stack_size: Int]() -> Int:
         "stack_size must be a multiple of 4096 (>= 4096)",
     ]()
     # Must be page-aligned so each worker's guard page can be protected with mprotect.
-    var raw = SlotLayout.HEADER + SlotLayout.GUARD + stack_size
+    var raw = SlotLayout.HEADER + SlotLayout.GUARD + stack_size + SlotLayout.ALT_GUARD + SlotLayout.ALTSTACK_SIZE
     return ((raw + SlotLayout.GUARD - 1) // SlotLayout.GUARD) * SlotLayout.GUARD
 
 @always_inline
@@ -91,6 +93,64 @@ fn current_worker_id() -> Int:
         Int,
         constraints="=r",
     ]()
+
+@register_passable("trivial")
+struct KernelSigInfo:
+    # Minimal siginfo_t prefix + si_addr for SIGSEGV (x86_64).
+    var si_signo: Int32
+    var si_errno: Int32
+    var si_code: Int32
+    var pad0: Int32
+    var si_addr: Int
+
+fn burst_sigsegv_handler(signo: Int32, info: Int, ucontext: Int):
+    comptime UCONTEXT_GREGS_OFFSET = 40
+    comptime REG_RSP = 15
+    comptime REG_RIP = 16
+    var gregs = ucontext + UCONTEXT_GREGS_OFFSET
+    var rsp = ptr[UInt64](gregs + REG_RSP * 8)[]
+    var rip = ptr[UInt64](gregs + REG_RIP * 8)[]
+
+    var worker = current_worker_id()
+    var si_addr = UInt64(ptr[KernelSigInfo](info)[].si_addr)
+    var pid = linux.sys_getpid()
+    var tid = linux.sys_gettid()
+
+    print(
+        "burst: SIGSEGV worker=", worker,
+        "pid=", pid,
+        "tid=", tid,
+        "rip=", hex(rip),
+        "rsp=", hex(rsp),
+        "addr=", hex(si_addr),
+    )
+
+    _ = linux.sys_tgkill(pid, tid, linux.Signal.SEGV)
+    linux.sys_exit_group(128 + Int(signo))
+
+fn sig_restorer():
+    inlined_assembly[
+        "mov $$15, %rax\nsyscall",
+        NoneType,
+        constraints="~{rax},~{rcx},~{r11},~{memory}",
+    ]()
+
+fn install_burst_sigsegv_handler():
+    var handler_copy = burst_sigsegv_handler
+    var handler_addr = UnsafePointer(to=handler_copy).bitcast[Int]()[]
+    var restorer_copy = sig_restorer
+    var restorer_addr = UnsafePointer(to=restorer_copy).bitcast[Int]()[]
+
+    var act = linux.KernelSigAction()
+    act.handler = handler_addr
+    act.flags = UInt64(
+        linux.SigActionFlag.SIGINFO | linux.SigActionFlag.ONSTACK |
+        linux.SigActionFlag.RESTORER
+    )
+    act.restorer = restorer_addr
+    act.mask = linux.KernelSigSet()
+
+    _ = linux.sys_rt_sigaction(linux.Signal.SEGV, UnsafePointer(to=act))
 
 struct SharedPoolState:
     # Cache line padding to avoid false sharing between dispatch and completion fields.
@@ -142,20 +202,22 @@ struct WorkerSlot(Movable, ImplicitlyDestructible):
 
 struct WorkerStackHead[mask_size: Int]:
     var entry: Int
-    var slot_base: Int              # Base address, state/child_tid derived from this
-    var worker_id: Int             # Logical worker index within the pool
-    var parent_fs: Int              # Parent's FS base for TLS copy
-    var shared: UnsafePointer[SharedPoolState, MutAnyOrigin]  # Pool's shared state (not in slot)
-    var args_base: UnsafePointer[ArgPack, MutAnyOrigin]      # Base of per-dispatch args arena
+    var slot_base: Int
+    var worker_id: Int
+    var parent_fs: Int
+    var shared: UnsafePointer[SharedPoolState, MutAnyOrigin]
+    var args_base: UnsafePointer[ArgPack, MutAnyOrigin]
     var futex_flags: Int
-    var pinned: Bool
-    var cpu_mask: CpuMask[Self.mask_size]  # Embedded mask, copied to child's stack
+    var altstack_base: Int
+    var altstack_size: Int
+    var pinned: Int
+    var cpu_mask: CpuMask[Self.mask_size]
 
     fn __init__(out self, entry: Int, slot_base: Int, parent_fs: Int,
                 worker_id: Int,
                 shared: UnsafePointer[SharedPoolState, MutAnyOrigin],
                 args_base: UnsafePointer[ArgPack, MutAnyOrigin],
-                futex_flags: Int, pinned: Bool, var cpu_mask: CpuMask[Self.mask_size]):
+                futex_flags: Int, altstack_base: Int, altstack_size: Int, pinned: Int, var cpu_mask: CpuMask[Self.mask_size]):
         self.entry = entry
         self.slot_base = slot_base
         self.worker_id = worker_id
@@ -163,6 +225,8 @@ struct WorkerStackHead[mask_size: Int]:
         self.shared = shared
         self.args_base = args_base
         self.futex_flags = futex_flags
+        self.altstack_base = altstack_base
+        self.altstack_size = altstack_size
         self.pinned = pinned
         self.cpu_mask = cpu_mask^
 
@@ -193,6 +257,8 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         # Use plain PRIVATE futexes (not NUMA-bucketed) to allow CHILD_CLEARTID to work
         self.futex_flags = linux.Futex2.SIZE_U32 | linux.Futex2.PRIVATE
 
+        install_burst_sigsegv_handler()
+
         var args_arena_size = capacity * size_of[ArgPack]()
         var arena_size = Self.slot_size * capacity + size_of[SharedPoolState]() + args_arena_size
         self.arena_base = linux.sys_mmap[
@@ -222,11 +288,19 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
                 _ = linux.sys_munmap(self.arena_base, arena_size)
                 self.arena_base = 0
                 return
+            if linux.sys_mprotect(
+                slot_base + SlotLayout.HEADER + SlotLayout.GUARD + Self.stack_size,
+                SlotLayout.ALT_GUARD,
+                linux.Prot.NONE,
+            ) != 0:
+                _ = linux.sys_munmap(self.arena_base, arena_size)
+                self.arena_base = 0
+                return
             var slot = WorkerSlot(slot_base)
             slot.child_tid[] = 0
             self.slots.push(slot^)
 
-        self._spawn_workers()
+        self.spawn_workers()
 
     fn __moveinit__(out self, deinit other: Self):
         self.slots = other.slots^
@@ -333,7 +407,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         while AtomicInt32.load[ordering=Consistency.ACQUIRE](donePtr) > 0:
             pause()
 
-    fn _spawn_workers(mut self):
+    fn spawn_workers(mut self):
         var parent_fs = get_fs_base()
 
         for i in range(self.capacity):
@@ -343,18 +417,23 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
             var stack_head_addr = (stack_top_addr - size_of[WorkerStackHead[Self.mask_size]]()) & ~15
             var head = ptr[WorkerStackHead[Self.mask_size]](stack_head_addr)
             var worker_main_copy = worker_main[Self.mask_size]
-            head[] = WorkerStackHead[Self.mask_size](
-                entry=UnsafePointer(to=worker_main_copy).bitcast[Int]()[],
-                slot_base=Int(self.slots[i][].base),
-                worker_id=i,
-                parent_fs=parent_fs,
-                shared=self.shared,
-                args_base=self.args_base,
-                futex_flags=self.futex_flags,
-                pinned=self.pinned,
-                cpu_mask=worker_mask^,
+            var slot_base = Int(self.slots[i][].base)
+            var altstack_base = (
+                slot_base + SlotLayout.HEADER + SlotLayout.GUARD + Self.stack_size + SlotLayout.ALT_GUARD
             )
-
+            head[] = WorkerStackHead[Self.mask_size](
+                UnsafePointer(to=worker_main_copy).bitcast[Int]()[],
+                slot_base,
+                parent_fs,
+                i,
+                self.shared,
+                self.args_base,
+                self.futex_flags,
+                altstack_base,
+                SlotLayout.ALTSTACK_SIZE,
+                Int(self.pinned),
+                worker_mask^,
+            )
             var tcb_addr = Int(self.slots[i][].base) + SlotLayout.TCB
             var clone_args = linux.Clone3Args.thread(
                 Int(self.slots[i][].stack_top),
@@ -379,6 +458,13 @@ fn clone3_with_entry(clone_args_ptr: UnsafePointer[linux.Clone3Args, MutAnyOrigi
 
 fn worker_main[mask_size: Int](stack_head_ptr: Int):
     var head_ptr = ptr[WorkerStackHead[mask_size]](stack_head_ptr)
+    var altstack_base_val = head_ptr[].altstack_base
+    var altstack_size_val = head_ptr[].altstack_size
+    var ss = linux.StackT()
+    ss.ss_sp = altstack_base_val
+    ss.ss_size = UInt64(altstack_size_val)
+    ss.ss_flags = 0
+    _ = linux.sys_sigaltstack(UnsafePointer(to=ss))
     var futex_flags = head_ptr[].futex_flags
     var slot_base = head_ptr[].slot_base
     var worker_id = head_ptr[].worker_id
@@ -403,7 +489,7 @@ fn worker_main[mask_size: Int](stack_head_ptr: Int):
     ptr[Int](slot_base + SlotLayout.WORKER_MAGIC)[] = SlotLayout.WORKER_MAGIC_VALUE
 
     # Pin to CPU if requested by the parent.
-    if head_ptr[].pinned:
+    if head_ptr[].pinned != 0:
         var ret = linux.sys_sched_setaffinity(0, mask_size, Int(head_ptr[].cpu_mask.ptr()))
         if ret != 0:
             print("sched_setaffinity failed:", ret)
