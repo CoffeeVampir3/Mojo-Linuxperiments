@@ -429,7 +429,7 @@ fn worker_main[mask_size: Int](stack_head_ptr: Int):
 
     # Derive addresses from slot_base
     var tcb_addr = slot_base + SlotLayout.TCB
-    # TLS init must happen before any print/stdlib calls.
+    # TLS must be initialized before clone3 is called
     # Parent FS base points at its TCB and static TLS precedes it, so copy the
     # TLS+TCB block as one contiguous region.
     comptime TLS_TCB_SIZE = SlotLayout.TLS_SIZE + SlotLayout.TCB_SIZE
@@ -444,7 +444,7 @@ fn worker_main[mask_size: Int](stack_head_ptr: Int):
     ptr[Int](slot_base + SlotLayout.WORKER_ID)[] = worker_id
     ptr[Int](slot_base + SlotLayout.WORKER_MAGIC)[] = SlotLayout.WORKER_MAGIC_VALUE
 
-    # Pin to CPU if requested by the parent.
+    # Pin to CPU
     if head_ptr[].pinned != 0:
         var ret = sys.sys_sched_setaffinity(0, mask_size, Int(head_ptr[].cpu_mask.ptr()))
         if ret != 0:
@@ -454,7 +454,6 @@ fn worker_main[mask_size: Int](stack_head_ptr: Int):
     var workPtr = UnsafePointer(to=shared[].work_available.value)
 
     while True:
-        # Check for shutdown
         if shared[].shutdown.load[ordering=Consistency.ACQUIRE]() != 0:
             break
 
@@ -462,10 +461,8 @@ fn worker_main[mask_size: Int](stack_head_ptr: Int):
         var avail = shared[].work_available.load[ordering=Consistency.MONOTONIC]()
 
         if avail > 0:
-            # Try to claim one unit of work
             var old = shared[].work_available.fetch_sub[ordering=Consistency.ACQUIRE_RELEASE](1)
             if old > 0:
-                # Successfully claimed work - execute the corresponding pack.
                 var job_idx = Int(old - 1)
                 var pack_ptr = args_base + job_idx
                 var func_addr = shared[].func_ptr
