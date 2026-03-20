@@ -1,8 +1,8 @@
 from memory import UnsafePointer, alloc
-from iter import Iterator
+from iter import Iterator, StopIteration
 
 @fieldwise_init
-struct HeapMoveArray[T: Movable](Movable, Indexer):
+struct HeapMoveArray[T: Movable & ImplicitlyDestructible](Movable, Indexer):
     var ptr: UnsafePointer[Self.T, MutAnyOrigin]
     var capacity: Int
     var len: Int
@@ -39,7 +39,7 @@ struct HeapMoveArray[T: Movable](Movable, Indexer):
         return MoveOnlyArrayIter[Self.T](self.ptr, self.len)
 
 struct MoveOnlyArrayIter[T: Movable](Iterator):
-    alias Element = UnsafePointer[Self.T, MutAnyOrigin]
+    comptime Element = UnsafePointer[Self.T, MutAnyOrigin]
     var ptr: UnsafePointer[Self.T, MutAnyOrigin]
     var index: Int
     var len: Int
@@ -49,10 +49,9 @@ struct MoveOnlyArrayIter[T: Movable](Iterator):
         self.index = 0
         self.len = len
 
-    fn __next__(mut self) -> Self.Element:
+    fn __next__(mut self) raises StopIteration -> Self.Element:
+        if self.index >= self.len:
+            raise StopIteration()
         var p = self.ptr + self.index
         self.index += 1
         return p
-
-    fn __has_next__(self) -> Bool:
-        return self.index < self.len

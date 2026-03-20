@@ -19,7 +19,7 @@ struct CpuMask[size: Int = 128](Copyable, Movable):
         if byte_idx < Self.size:
             self.bytes[byte_idx] &= ~(1 << bit_idx)
 
-    fn test(self, cpu_id: Int) -> Bool:
+    fn test(ref self, cpu_id: Int) -> Bool:
         var byte_idx = cpu_id >> 3
         var bit_idx = cpu_id & 7
         if byte_idx >= Self.size:
@@ -34,7 +34,7 @@ struct CpuMask[size: Int = 128](Copyable, Movable):
         for i in range(Self.size):
             self.bytes[i] = 0xFF
 
-    fn count(self) -> Int:
+    fn count(ref self) -> Int:
         var total = 0
         for i in range(Self.size):
             var b = self.bytes[i]
@@ -43,10 +43,10 @@ struct CpuMask[size: Int = 128](Copyable, Movable):
                 b >>= 1
         return total
 
-    fn ptr(self) -> UnsafePointer[UInt8, MutOrigin.external]:
+    fn ptr(ref self) -> UnsafePointer[UInt8, MutOrigin.external]:
         return UnsafePointer[UInt8, MutOrigin.external](unsafe_from_address=Int(UnsafePointer(to=self.bytes)))
 
-    fn copy_to(self, dest: UnsafePointer[UInt8, MutOrigin.external]):
+    fn copy_to(ref self, dest: UnsafePointer[UInt8, MutOrigin.external]):
         memcpy(dest=dest, src=self.ptr(), count=Self.size)
 
     @staticmethod

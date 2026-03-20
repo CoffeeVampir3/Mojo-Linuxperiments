@@ -1,4 +1,3 @@
 #!/usr/bin/env fish
-
-pixi run mojo build -I . -debug-level=line-tables test_linux_threading.mojo
-./test_linux_threading
+env MOJO_ENABLE_RUNTIME=0 pixi run mojo -I . test_burst_stress.mojo
+env MOJO_ENABLE_RUNTIME=0 pixi run mojo -I . test_loader.mojo
