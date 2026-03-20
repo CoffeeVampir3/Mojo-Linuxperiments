@@ -1,7 +1,7 @@
 from memory import UnsafePointer, memcpy
 from collections import InlineArray
 
-struct CpuMask[size: Int = 128](Copyable, Movable):
+struct CpuMask[size: Int = 128](Copyable):
     var bytes: InlineArray[UInt8, Self.size]
 
     fn __init__(out self):
@@ -11,20 +11,20 @@ struct CpuMask[size: Int = 128](Copyable, Movable):
         var byte_idx = cpu_id >> 3
         var bit_idx = cpu_id & 7
         if byte_idx < Self.size:
-            self.bytes[byte_idx] |= (1 << bit_idx)
+            self.bytes[byte_idx] |= UInt8(1 << bit_idx)
 
     fn clear(mut self, cpu_id: Int):
         var byte_idx = cpu_id >> 3
         var bit_idx = cpu_id & 7
         if byte_idx < Self.size:
-            self.bytes[byte_idx] &= ~(1 << bit_idx)
+            self.bytes[byte_idx] &= ~UInt8(1 << bit_idx)
 
     fn test(ref self, cpu_id: Int) -> Bool:
         var byte_idx = cpu_id >> 3
         var bit_idx = cpu_id & 7
         if byte_idx >= Self.size:
             return False
-        return (self.bytes[byte_idx] & (1 << bit_idx)) != 0
+        return (self.bytes[byte_idx] & UInt8(1 << bit_idx)) != 0
 
     fn clear_all(mut self):
         for i in range(Self.size):
@@ -43,10 +43,10 @@ struct CpuMask[size: Int = 128](Copyable, Movable):
                 b >>= 1
         return total
 
-    fn ptr(ref self) -> UnsafePointer[UInt8, MutOrigin.external]:
-        return UnsafePointer[UInt8, MutOrigin.external](unsafe_from_address=Int(UnsafePointer(to=self.bytes)))
+    fn ptr(ref self) -> UnsafePointer[UInt8, MutAnyOrigin]:
+        return UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=self.bytes)))
 
-    fn copy_to(ref self, dest: UnsafePointer[UInt8, MutOrigin.external]):
+    fn copy_to(ref self, dest: UnsafePointer[UInt8, MutAnyOrigin]):
         memcpy(dest=dest, src=self.ptr(), count=Self.size)
 
     @staticmethod

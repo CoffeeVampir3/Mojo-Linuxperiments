@@ -1,4 +1,5 @@
 from sys.info import size_of
+from math import align_up
 from memory import UnsafePointer
 import linux.sys as linux
 
@@ -51,7 +52,7 @@ struct NumaArena[alignment: Int = 8, page_size: Int = linux.PageSize.THP_2MB](Mo
         var aligned_offset = align_up(self.offset, Self.alignment)
         if aligned_offset + bytes_needed > self.size:
             return UnsafePointer[T, MutAnyOrigin]()
-        var ptr = self.base.offset(aligned_offset).bitcast[T]()
+        var ptr = (self.base + aligned_offset).bitcast[T]()
         self.offset = aligned_offset + bytes_needed
         return ptr
 
@@ -102,7 +103,7 @@ fn mmap_numa_impl[
     @parameter
     if use_thp:
         _ = sys.sys_madvise[linux.Madvise.HUGEPAGE](addr, size)
-    var nodemask = UInt64(1) << node
+    var nodemask = UInt64(1) << UInt64(node)
     var bind_result = sys.sys_mbind[policy=linux.Mempolicy.BIND](addr, size, nodemask)
     if bind_result < 0:
         _ = sys.sys_munmap(addr, size)
@@ -138,6 +139,3 @@ fn mmap_numa[
         return mmap_numa_impl[prot, base_flags, use_thp=True](size, node)
     else:
         return mmap_numa_impl[prot, base_flags](size, node)
-
-fn align_up(value: Int, alignment: Int) -> Int:
-    return (value + alignment - 1) & ~(alignment - 1)

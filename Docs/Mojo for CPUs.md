@@ -63,11 +63,16 @@ fn incr(a: Int, out b: Int):
 
 This is why stdlib buffer functions declare `raises` - they may call Python-style code.
 
+**Note:** Mojo does not support overloading functions on parameters alone (e.g., `fn foo[a: Int8]()` vs `fn foo[a: Int32]()`). Overloading on function arguments is supported.
+
+**Error type:** `Error` does not conform to `Boolable` or `Defaultable`. Errors must be constructed with meaningful context. Use `Optional[Error]` for optionality.
+
 ### Function Type Conversions
 
 Implicit conversions allowed between function types:
 - Non-raising to raising function
 - Functions whose result types are implicitly convertible
+- Functions returning references to functions returning values (if type is implicitly copyable/convertible)
 
 ```mojo
 fn takes_raising_float(a: fn () raises -> Float32): ...
@@ -136,7 +141,7 @@ def use_pointer():
 | Origin Value | Description |
 |--------------|-------------|
 | `StaticConstantOrigin` | Immutable values lasting program duration (e.g., string literals) |
-| `origin_of(value)` | Derived origin from value(s) |
+| `origin_of(value)` | Derived origin from value(s), returns `Origin` type |
 | Inferred | Captured from function argument via parameter inference |
 | `MutOrigin.external` / `ImmutOrigin.external` | Untracked memory (e.g., dynamic allocation) |
 | `MutAnyOrigin` / `ImmutAnyOrigin` | Wildcard - might access any live value (disables ASAP destruction) |
@@ -282,7 +287,7 @@ Reference bindings: `ref value_ref = list[0]`
 ## `read` (Default)
 
 - Immutable reference, no copy
-- `@register_passable` types (Int, Float, SIMD) pass in registers, not by indirection
+- `RegisterPassable`/`TrivialRegisterPassable` types (Int, Float, SIMD) pass in registers, not by indirection
 - No default values allowed for any convention except read
 
 ## `mut`
@@ -291,7 +296,7 @@ Reference bindings: `ref value_ref = list[0]`
 - Caller must pass mutable variable
 - Cannot form mutable ref from immutable ref
 - **Exclusivity enforced**: No other references (mutable or immutable) to same value allowed
-- Exclusivity not enforced for register-passable trivial types (they copy)
+- Exclusivity not enforced for `TrivialRegisterPassable` types (they copy)
 - No default values allowed
 
 ## `var` with `^` Transfer Sigil
@@ -329,8 +334,8 @@ Ownership transfer ≠ guaranteed move operation. Three mechanisms:
 
 ```mojo
 # Strided: extract every Nth element (e.g., R from RGB with stride=3)
-vals = ptr.offset(i).strided_load[width=8](stride)
-ptr.offset(i).strided_store[width=8](vals, stride)
+vals = (ptr + i).strided_load[width=8](stride)
+(ptr + i).strided_store[width=8](vals, stride)
 
 # Gather/scatter: load/store from vector of offsets
 vals = ptr.gather[width=8](offsets)
@@ -346,7 +351,7 @@ ptr.scatter[width=8](vals, offsets)
 - Freeing same memory twice = UB
 - Double-check: who allocates, who frees
 
-**Linear types support**: `UnsafePointer`, `Pointer`, `Variant`, and `VariadicPack` can contain linear types (non-implicitly-destructible types).
+**Explicitly-destroyed types (linear types)**: `UnsafePointer`, `Pointer`, `OwnedPointer`, `Span`, `List`, `InlineArray`, `Optional`, `Variant`, `VariadicListMem`, and `VariadicPack` can contain explicitly-destroyed types. `Iterator.Element` does not require `ImplicitlyDestructible`.
 
 ```mojo
 fn __init__(out self, args)
@@ -357,8 +362,8 @@ fn __moveinit__(out self, deinit existing: Self)
 @fieldwise_init
 struct MyType(Copyable, ImplicitlyCopyable)
 
-@register_passable("trivial")
-struct TrivialType
+struct TrivialType(TrivialRegisterPassable):
+    var x: Int
 
 fn read_only(val: Int)
 fn mutable(mut val: Int)
@@ -440,6 +445,11 @@ fn speak[a: Int = 3, msg: String = "woof"]():
 speak()                                    # woof 3
 speak[5]()                                 # woof 5
 speak[msg="meow"]()                        # meow 3
+
+# Flexible default arguments - can infer parameters from defaults
+fn take_string_slice[o: ImmOrigin](str: StringSlice[o] = ""): ...
+fn use_it():
+    take_string_slice()                    # Defaults to "", infers "o"
 ```
 
 **Parameterized Structs:**
@@ -453,7 +463,7 @@ struct GenericArray[ElementType: Copyable]:
 
 var arr: GenericArray[Int] = [1, 2, 3]
 
-# Accessing struct parameters
+# Accessing struct parameters (use Self.param_name, not unqualified access)
 print(SIMD[DType.float32, 4].size)         # On type: 4
 var x = SIMD[DType.int32, 2](4, 8)
 print(x.dtype)                             # On instance: int32
@@ -466,7 +476,7 @@ struct Container[ElementType: Movable]:
         return String(self.element)        # Only works if ElementType is Writable
 ```
 
-**comptime Declarations:**
+**comptime Declarations** (use `comptime`, not `alias`):
 ```mojo
 # Named compile-time constants
 comptime rows = 512
@@ -507,7 +517,7 @@ struct Sentiment(Equatable):
 **Automatic Parameterization:**
 ```mojo
 # Unbound type = auto-parameterized function
-fn print_info(vec: SIMD):                  # SIMD[*_] - all params unbound
+fn print_info(vec: SIMD):                  # SIMD[...] - all params unbound
     print(vec.dtype, vec.size)
 
 # Equivalent to:
@@ -515,7 +525,7 @@ fn print_info[dt: DType, sz: Int, //](vec: SIMD[dt, sz]):
     print(vec.dtype, vec.size)
 
 # Partially-bound types
-fn eat(f: Fudge[5, *_]):                   # sugar=5, others unbound
+fn eat(f: Fudge[5, ...]):                   # sugar=5, others unbound
     pass
 
 fn devour(f: Fudge[_, 6, _]):              # cream=6, others unbound
@@ -536,8 +546,7 @@ comptime StringDict = Dict[String, _]      # Key bound, Value unbound
 var d: StringDict[Int] = {}
 
 # Unbound patterns
-MyType[*_]                                 # All positional params unbound
-MyType[**_]                                # All keyword params unbound
+MyType[...]                                # All remaining params unbound
 MyType[_, _, _]                            # Explicit individual unbinding
 
 # Partially bound in signatures
@@ -576,14 +585,14 @@ fn generic[nelts: Int](x: SIMD[DType.float32, nelts]):
 
 **where Clauses (Experimental):**
 ```mojo
-# DType constraints
-fn foo[dt: DType]() -> Int where dt is DType.int32:
+# DType constraints (equality, inequality, predicates)
+fn foo[dt: DType]() -> Int where dt == DType.int32:
     return 42
 
 # DType predicates: is_signed(), is_unsigned(), is_numeric(), is_integral(),
 #                   is_floating_point(), is_float8(), is_half_float()
 
-# SIMD constraints
+# SIMD constraints (construction, comparison, arithmetic, bitwise)
 fn bar[dt: DType, x: Int]() -> Int where SIMD[dt, 4](x) + 2 > SIMD[dt, 4](0):
     return 42
 ```
@@ -605,6 +614,11 @@ struct MyStruct(Copyable):
     fn __del__(deinit self)
     fn __getitem/setitem/len/str/repr__(self)
     fn write_to(self, mut writer: Writer)
+
+# Ellipsis expression (... is EllipsisType, usable in overloaded getitem etc.)
+struct MyArray:
+    fn __getitem__(self, idx: Int) -> Int: ...
+    fn __getitem__(self, idx: EllipsisType) -> Int: ...  # x[...]
 
 # Context managers (with statements)
 struct MyContextManager:
@@ -705,13 +719,11 @@ comptime MassProducible = Defaultable & Movable
 fn factory[T: MassProducible]() -> T:
     return T()
 
-# Register-passable traits
-@register_passable
-trait TrivialTrait:                        # Conformers must be @register_passable
+# Register-passable traits (use trait conformance, not decorators)
+trait TrivialTrait(RegisterPassable):      # Conformers must be RegisterPassable
     pass
 
-@register_passable("trivial")
-trait VeryTrivial:                         # Conformers must be @register_passable("trivial")
+trait VeryTrivial(TrivialRegisterPassable):  # Conformers must be TrivialRegisterPassable
     pass
 ```
 
@@ -722,18 +734,19 @@ trait VeryTrivial:                         # Conformers must be @register_passab
 | `Intable` | `__int__(self) -> Int` |
 | `IntableRaising` | `__int__(self) raises -> Int` |
 | `Stringable` | `__str__(self) -> String` |
-| `StringableRaising` | `__str__(self) raises -> String` |
 | `Representable` | `__repr__(self) -> String` |
-| `Writable` | `write_to(self, mut writer: Some[Writer])` |
+| `Writable` | `write_to(self, mut writer: Some[Writer])` + optional `write_repr_to()` for `repr()`/`{!r}`. Has reflection-based default impl. |
 | `Boolable` | `__bool__(self) -> Bool` |
-| `Hashable` | `__hash__(self) -> UInt` |
-| `Equatable` | `__eq__(self, other: Self) -> Bool` |
+| `Hashable` | `__hash__(self) -> UInt`. Has reflection-based default impl (hashes all fields). |
+| `Equatable` | `__eq__(self, other: Self) -> Bool`. Has reflection-based default impl (compares all fields). |
 | `Comparable` | `__lt__`, `__le__`, `__gt__`, `__ge__` |
 | `Movable` | `__moveinit__(out self, deinit existing: Self)` |
 | `Copyable` | `__copyinit__(out self, existing: Self)` (refines `Movable`) |
 | `Defaultable` | `__init__(out self)` |
-| `AnyType` | Base trait, no `__del__()` required (supports linear types) |
-| `ImplicitlyDestructible` | `__del__()` callable by compiler (use for generic destructible types) |
+| `AnyType` | Base trait, no `__del__()` required (supports explicitly-destroyed types) |
+| `ImplicitlyDestructible` | `__del__()` callable by compiler. `struct` auto-inherits this; `trait` must opt-in explicitly. |
+| `RegisterPassable` | Type is register-passable (passed in registers) |
+| `TrivialRegisterPassable` | Type is trivially register-passable (no copy/move/destroy) |
 | `KeyElement` | `Copyable & Hashable & Equatable` |
 
 ```mojo
@@ -752,13 +765,45 @@ struct Dog(Copyable, Stringable, Representable, Writable):
     fn __repr__(self) -> String:
         return String("Dog(name=", repr(self.name), ", age=", repr(self.age), ")")
 
-# Compile-time trait conformance check (experimental)
+# Traits with reflection-based default implementations
+# Simple structs just need fields that conform to the same trait:
+@fieldwise_init
+struct Point(Hashable, Writable, Equatable):
+    var x: Float64
+    var y: Float64
+    # No methods needed - Hashable, Writable, Equatable auto-derived from fields
+
+hash(Point(1.5, 2.7))                     # Works automatically
+print(Point(1.5, 2.7))                    # Point(x=1.5, y=2.7)
+Point(1, 2) == Point(1, 2)                # True
+
+# Compile-time trait conformance check and downcast
 fn maybe_print[T: AnyType](value: T):
     @parameter
     if conforms_to(T, Writable):
         print(trait_downcast[Writable](value))
     else:
         print("[UNPRINTABLE]")
+```
+
+**Trait inheritance for `ImplicitlyDestructible`:**
+- `struct` declarations automatically inherit from `ImplicitlyDestructible`
+- `trait` declarations do **not** auto-inherit — opt-in explicitly if needed:
+```mojo
+# Trait that requires implicit destructibility
+trait Foo(ImplicitlyDestructible):
+    ...
+
+# Trait that supports explicitly-destroyed (linear) types — no annotation needed
+trait Bar:
+    ...
+```
+
+**`pass` vs `...` in trait methods:**
+```mojo
+trait T:
+    fn foo(self): ...    # No default implementation (required)
+    fn bar(self): pass   # Default do-nothing implementation
 ```
 
 ## 2. Data Types
@@ -769,15 +814,23 @@ Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64, Int, UInt
 Float16, Float32, Float64
 DType.float4_e2m1fn
 
+# UInt is a type alias for Scalar[DType.uint] (machine word size unsigned SIMD)
 vec = SIMD[DType.f32, 4](1.0, 2.0, 3.0, 4.0)
 result = vec1 + vec2 | vec * scalar
 result = Float32(int_value) | simd1.cast[DType.i32]()
+
+# Int.__truediv__ performs truncating integer division (returns Int)
+# Use Float64(a) / Float64(b) for floating-point division
 
 0xFF, 0o77, 0b1010
 3.14, 1.2e9
 ```
 
 **No implicit conversion between `Int` and `UInt`** - explicit casts required.
+**No implicit conversion from `Int` to `SIMD`** (including `Int8`, `Float32`, etc.) - use explicit constructors:
+```mojo
+return Float32(arg)        # Explicit conversion required
+```
 
 ### Complex Numbers
 ```mojo
@@ -790,6 +843,7 @@ abs(c)
 ```
 
 ### Tuples
+Tuples conform to `Writable` and have `write_to`/`write_repr_to`. Element types do not need to be `Copyable`.
 ```mojo
 t = (1, "a", 3.14)
 (1, "a") == (1, "a")
@@ -804,7 +858,7 @@ t.reverse()
 s = "Hello" + " World"
 s *= 3
 if "sub" in s: pass
-char = s[0]
+char = s[0]                # Returns full Unicode codepoint; panics if index falls mid-codepoint
 substring = s[start:end:step]
 
 comptime CONST = "compile time"
@@ -812,17 +866,23 @@ comptime MULTI = """multiline"""
 
 # String Methods
 String() | String(capacity=1024) | String(unsafe_uninit_length=n)
-String(bytes=span) | String(unsafe_from_utf8_ptr=ptr)
+String(from_utf8=span)                     # Validates UTF-8, raises on error
+String(from_utf8_lossy=span)               # Replaces invalid UTF-8 with U+FFFD (�)
+String(unsafe_from_utf8=span)              # No validation (unsafe)
+String(unsafe_from_utf8_ptr=ptr)
 
-str.capacity() -> Int | byte_length()
+str.capacity() -> Int | byte_length() | count_codepoints()
 len(str.codepoints())
 str.unsafe_ptr() | unsafe_ptr_mut(capacity) | unsafe_cstr_ptr() | as_bytes()
-str.reserve(capacity: Int) | resize(length, fill_byte) | resize(unsafe_uninit_length=n)
+str.reserve(capacity: Int) | resize(unsafe_uninit_length=n)
+str.resize(length, fill_byte)              # Panics if truncating a codepoint or fill_byte >= 128
 
 str += other
 str.join(list) | split(sep) | strip() | lower() | upper()
 str.replace(old, new) | find(substr, start) | count(substr)
-str.startswith(prefix, start, end) | format(*args)
+str.startswith(prefix, start, end) | format(*args)  # format args must be Writable
+str.ascii_ljust(width, fill) | ascii_rjust(width, fill) | ascii_center(width, fill)
+str.codepoints() | codepoint_slices() | codepoints_reversed()
 
 # StringLiteral.format emits compile-time constraint error for invalid format strings
 "Hello, {!invalid}".format("world")  # Compile error: Conversion flag "invalid" not recognized
@@ -830,17 +890,17 @@ str.startswith(prefix, start, end) | format(*args)
 atol(str), atof(str), chr(codepoint), ord(str)
 
 # StringSlice
-slice = str.as_string_slice()
-slice.codepoints() | codepoint_slices()
-slice[idx] | slice[start:end]
+slice = StringSlice(str)                   # Propagates mutability from source String
+slice.codepoints() | codepoint_slices() | codepoints_reversed()
+slice[idx] | slice[start:end]              # Panics if index falls mid-codepoint; returns full codepoint
 
 slice = StringSlice("literal")
 slice = StringSlice(*, unsafe_from_utf8: Span[UInt8])
 slice = StringSlice(*, from_utf8: Span[UInt8])
 slice = StringSlice(*, ptr: UnsafePointer[UInt8], length: Int)
 
-slice[0:5]
-slice.byte_length() | char_length() | is_codepoint_boundary(index)
+slice[0:5]                                 # StringSlice[byte=] returns StringSlice (not String)
+slice.byte_length() | count_codepoints() | is_codepoint_boundary(index)
 slice.split(sep) | strip() | codepoints() | as_bytes()
 
 # CStringSlice - nul-terminated C-style strings
@@ -895,7 +955,7 @@ set1 - set2  # difference
 set1 ^ set2  # symmetric difference
 set1 < set2 | set1 <= set2  # subset
 
-# Deque
+# Deque (conforms to Writable, Stringable, Representable)
 deque = Deque[Int](capacity=64) | Deque[Int](maxlen=100)
 deque.append(val) | appendleft(val) | pop() | popleft() | insert(idx, val)
 deque[idx]
@@ -910,14 +970,14 @@ counter1 - counter2
 counter1 & counter2
 counter1 | counter2
 
-# LinkedList
+# LinkedList (conforms to Writable, Stringable, Representable)
 list = LinkedList[Int](1, 2, 3)
 list.append(val) | prepend(val) | pop() | pop(idx)
 list[idx]
 list.reverse() | insert(idx, val)
 
-# InlineArray
-arr = InlineArray[Int, 3](1, 2, 3)
+# InlineArray (not ImplicitlyCopyable - must explicitly copy or take references)
+var arr: InlineArray[Int, 3] = [1, 2, 3]  # Literal construction required
 arr = InlineArray[Int, 5](fill=42)
 arr = InlineArray[Int, 10](uninitialized=True)
 arr.unsafe_get(idx) | unsafe_ptr()
@@ -928,7 +988,7 @@ bs.set(idx: Int) | clear(idx: Int) | toggle(idx: Int) | test(idx: Int)
 len(bs)
 bs.union(other) | intersection(other) | difference(other)
 
-# Optional
+# Optional (element type does not need to be Copyable)
 opt = Optional(value) | Optional[Int](None)
 opt.value() | unsafe_value() | take() | unsafe_take() | or_else(default)
 if opt: pass
@@ -994,7 +1054,7 @@ Uninitialized → Null (addr 0) → Allocated → Initialized → Dangling
 from memory import UnsafePointer, alloc
 
 # Allocation
-ptr = alloc[Int](count)                    # Allocate space for count values
+ptr = alloc[Int](count)                    # Allocate space for count values (debug_assert: count >= 0)
 ptr = alloc[Float32](256, alignment=64)    # With alignment
 ptr = UnsafePointer[Int, MutOrigin.external]()  # Null pointer
 
@@ -1016,7 +1076,7 @@ ptr.init_pointee_move_from(src_ptr)        # Move from src to self, src uninitia
 swap_pointees(ptr1, ptr2)
 ptr.free()                                 # Deallocate (no destructors called!)
 
-# Linear pointees: use destroy_pointee_with(dtor_fn_ptr)
+# Explicitly-destroyed pointees: use destroy_pointee_with(dtor_fn_ptr)
 
 # Pointer arithmetic
 offset_ptr = ptr + 2
@@ -1049,7 +1109,10 @@ fn unsafe_ptr(ref self) -> UnsafePointer[T, origin_of(self)]:
 
 **Foreign Interop:**
 ```mojo
-# Python
+# FFI module is top-level: `from ffi import ...`
+from ffi import external_call
+
+# Python (ConvertibleFromPython requires keyword: Int(py=pyObj))
 ptr = arr.ctypes.data.unsafe_get_as_pointer[DType.int64]()
 
 # C/C++ FFI
@@ -1067,9 +1130,9 @@ swapped = byte_swap(value)                 # Little ↔ big endian
 
 ### Other Pointer Types
 ```mojo
-ptr = OwnedPointer(value)                  # Single-owner heap allocation
+ptr = OwnedPointer(value)                  # Single-owner heap allocation (conforms to Writable)
 value = ptr[]
-shared = ArcPointer(value)                 # Reference-counted shared ownership
+shared = ArcPointer(value)                 # Reference-counted shared ownership (conforms to Writable)
 copy = shared
 ```
 
@@ -1451,9 +1514,20 @@ val = permlane_shuffle[dtype, simd_width, stride](val)
 val = permlane_swap[dtype, stride](val1, val2)
 val = ds_read_tr16_b64[dtype](shared_ptr)
 warpgroup_reg_alloc[count]() | warpgroup_reg_dealloc[count]()
+
+# Inline assembly (LLVM-style syntax)
+from sys import inlined_assembly
+var result = inlined_assembly[
+    "cvt.f32.bf16 $0, $1;",
+    Float32,
+    constraints="=f,h",
+    has_side_effect=False,
+](my_bf16_as_int16)
 ```
 
 ## 7. Layout Programming
+
+`Layout` does not conform to `ImplicitlyCopyable`. Use `.copy()`, transfer operator `^`, or `comptime` expressions to avoid accidental materialization.
 
 ### Layout
 ```mojo
@@ -1784,6 +1858,11 @@ user = getpwnam("user")
 user = getpwuid(uid)
 ```
 
+### Process Management
+```mojo
+from os.process import spawn, wait  # Uses posix_spawn(), no system shell
+```
+
 ### OS Constants
 ```mojo
 os.sep = "/"
@@ -1791,6 +1870,8 @@ os.SEEK_SET = 0, os.SEEK_CUR = 1, os.SEEK_END = 2
 ```
 
 ## 10. I/O
+
+File I/O is implemented natively in Mojo using direct libc system calls (`open()`, `close()`, `read()`, `write()`, `lseek()`). Error handling includes errno-based messages.
 
 ```mojo
 fh = FileHandle(path, mode="r"|"w"|"rw"|"a")
@@ -1807,6 +1888,10 @@ ok = fd.isatty()
 fh = open[PathLike](path, mode)
 s = input(prompt="")
 print[*Ts](*values, sep=" ", end="\n", flush=False, file=FileDescriptor(1))
+
+# Writer and Writable are in the `format` module (not `io`)
+from format import Writer, Writable
+# Writer supports only UTF-8 data; write_string() is the primary method
 ```
 
 ## 11. Iterators
@@ -1821,7 +1906,12 @@ map[IterableType, ResultType, function](ref iterable)
 
 # Extras
 from iter import peekable
-from itertools import count, repeat, product
+from itertools import count, repeat, product, cycle, take_while, drop_while
+
+cycle(iterable)                            # Cycles through elements indefinitely
+take_while[predicate](iterable)            # Yields while predicate returns True
+drop_while[predicate](iterable)            # Drops while predicate returns True, yields rest
+peekable(iterator)                         # Peek at next element without advancing
 ```
 
 ```mojo
@@ -1829,7 +1919,7 @@ from iter import Iterator, StopIteration
 
 # Iterator protocol:
 # - implement __next__ that raises StopIteration
-# - __has_next__ was removed
+# - __next__ can return a value or a reference
 # - if you want `for x in MyIter()`, implement a consuming __iter__
 struct MyIter(Iterator):
     comptime Element = Int
@@ -1861,6 +1951,8 @@ logger.trace|debug|info|warning|error|critical[*Ts](
 ```
 
 ## 13. Math
+
+`abs()`, `divmod()`, `max()`, `min()`, `pow()`, `round()` are in the `math` module and available in the prelude. Math functions (`exp`, `sin`, `cos`, etc.) use `where dtype.is_floating_point()` clauses.
 
 ```mojo
 val = ceil[T](value) | floor[T](value) | trunc[T](value)
@@ -1914,6 +2006,7 @@ BenchConfig(
 
 ```mojo
 constrained[cond, msg]()
+comptime assert cond, "message"            # Compile-time assertion
 debug_assert(cond, msg)
 debug_assert[assert_mode="safe"](cond, msg)
 debug_assert[check_fn, cpu_only=True](msg)
@@ -1923,14 +2016,14 @@ debug_assert[_use_compiler_assume=True](cond, msg)
 ## 17. Optimization
 
 ```mojo
-@register_passable(trivial)
-struct Point:
+struct Point(TrivialRegisterPassable):
     var x: Float32
     var y: Float32
 
 alignment2 = simd_width * sizeof(dtype)
 buf.prefetch[PrefetchOptions(locality=3, cache=.data, rw=.read)](idx)
 keep(value)
+black_box(value)                           # Prevent compiler optimization, returns argument
 clobber_memory()
 ```
 
@@ -1975,6 +2068,10 @@ fn sum[*T: Intable](*args: *T) -> Int:
     @parameter
     for i in range(args.__len__()):
         total += Int(args[i])
+
+# Variadic utilities
+# zip_types(), zip_values(), slice_types() available on Variadic
+# *args syntax supports explicitly-destroyed types
 ```
 
 ## 21. Compilation
@@ -1985,6 +2082,9 @@ from compile import compile_info, get_linkage_name, get_type_name
 info = compile_info[func, emission_kind="asm"|"llvm"|"llvm-opt"|"object"]()
 get_linkage_name[func]()
 get_type_name[type]()
+
+# comptime assert (compile-time assertion)
+comptime assert condition, "message"
 ```
 
 ### Reflection
@@ -1992,11 +2092,19 @@ get_type_name[type]()
 ```mojo
 from compile import get_type_name
 from reflection import (
+    # Struct field introspection
     struct_field_count,
     struct_field_names,
     struct_field_types,
     struct_field_index_by_name,
     struct_field_type_by_name,
+    # Field byte offsets
+    offset_of,
+    # Type introspection
+    is_struct_type,
+    get_base_type_name,
+    # Source location
+    source_location, call_location, SourceLocation,
 )
 
 @fieldwise_init
@@ -2017,6 +2125,39 @@ fn main():
     comptime field_type = struct_field_type_by_name[Point, "y"]()
     print(idx)
     print(get_type_name[field_type.T]())
+
+# Field access by index (returns reference, works with non-copyable types)
+fn print_all_fields[T: AnyType](ref s: T):
+    comptime names = struct_field_names[T]()
+    @parameter
+    for i in range(struct_field_count[T]()):
+        print(names[i], "=", __struct_field_ref(i, s))
+
+# Field byte offsets
+comptime x_off = offset_of[Point, name="x"]()    # 0
+comptime y_off = offset_of[Point, name="y"]()    # Aligned offset
+comptime off_by_idx = offset_of[Point, index=0]() # By field index
+
+# Type introspection
+is_struct_type[Int]()                      # True for Mojo struct types
+get_base_type_name[List[Int]]()            # Returns "List"
+
+# Source location
+var loc = source_location()                # Returns SourceLocation(filename, line, col)
+print(loc)                                 # main.mojo:5:15
+
+@always_inline
+fn log_here():
+    var caller_loc = call_location()       # Location where caller was invoked
+    print("Called from:", caller_loc)
+
+# Trait conformance checking on dynamically obtained types
+@parameter
+for i in range(struct_field_count[MyStruct]()):
+    comptime field_type = struct_field_types[MyStruct]()[i]
+    @parameter
+    if conforms_to(field_type, Copyable):
+        print("Field", i, "is Copyable")
 ```
 
 ## 22. Coroutines

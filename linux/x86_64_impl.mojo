@@ -1,4 +1,4 @@
-from sys.intrinsics import inlined_assembly
+from sys import inlined_assembly
 from sys.info import size_of
 from memory import UnsafePointer
 
@@ -13,8 +13,7 @@ fn rt_sigreturn_restorer():
         constraints="~{rax},~{rcx},~{r11},~{memory}",
     ]()
 
-@register_passable("trivial")
-struct KernelRtSigActionX86_64:
+struct KernelRtSigActionX86_64(TrivialRegisterPassable):
     var handler: Int
     var flags: UInt64
     var restorer: Int
@@ -26,8 +25,7 @@ struct KernelRtSigActionX86_64:
         self.restorer = 0
         self.mask = SigSet64()
 
-@register_passable("trivial")
-struct KernelSigInfoX86_64:
+struct KernelSigInfoX86_64(TrivialRegisterPassable):
     # Minimal siginfo_t prefix + si_addr for SIGSEGV (x86_64).
     var si_signo: Int32
     var si_errno: Int32
@@ -134,7 +132,7 @@ struct X86_64LinuxSys(LinuxSys):
         policy: Int = Mempolicy.BIND,
         flags: Int = 0,
     ](self, addr: Int, length: Int, nodemask: UInt64, maxnode: Int = 64) -> Int:
-        var mask_storage = InlineArray[UInt64, 1](nodemask)
+        var mask_storage: InlineArray[UInt64, 1] = [nodemask]
         var mask_ptr = UnsafePointer(to=mask_storage)
         var result = self.syscall[6](Self.NR_mbind, addr, length, policy, Int(mask_ptr), maxnode, flags)
         _ = mask_ptr[]
@@ -144,8 +142,8 @@ struct X86_64LinuxSys(LinuxSys):
         return self.syscall[3](Self.NR_madvise, addr, length, advice)
 
     fn sys_move_pages_query(self, addr: Int) -> Int:
-        var pages = InlineArray[Int, 1](addr)
-        var status = InlineArray[Int32, 1](Int32(-1))
+        var pages: InlineArray[Int, 1] = [addr]
+        var status: InlineArray[Int32, 1] = [Int32(-1)]
         var pages_ptr = UnsafePointer(to=pages)
         var status_ptr = UnsafePointer(to=status)
         var result = self.syscall[6](Self.NR_move_pages, 0, 1, Int(pages_ptr), 0, Int(status_ptr), 0)
@@ -300,12 +298,14 @@ struct X86_64LinuxSys(LinuxSys):
         min_complete: UInt32,
         flags: UInt32,
     ) -> Int:
-        return self.syscall[4](
+        return self.syscall[6](
             Self.NR_io_uring_enter,
             fd,
             Int(to_submit),
             Int(min_complete),
             Int(flags),
+            0,
+            0,
         )
 
     fn sys_io_uring_enter_sig(

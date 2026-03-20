@@ -17,8 +17,7 @@ comptime AtomicInt32 = Atomic[DType.int32]
 comptime KernelFn = fn(Int, Int, Int, Int, Int, Int)
 
 @fieldwise_init
-@register_passable("trivial")
-struct ArgPack:
+struct ArgPack(TrivialRegisterPassable):
     var arg0: Int
     var arg1: Int
     var arg2: Int
@@ -44,8 +43,7 @@ fn ptr[T: AnyType](addr: Int) -> UnsafePointer[T, MutAnyOrigin]:
 # Memory layout per worker slot (slot_base points at the start of the TLS block;
 # FS base points at the TCB at slot_base + TCB):
 # [TLS 256B][TCB 64B][child_tid 4B][pad 4B][worker_id 8B][magic 8B][pad..HEADER][Guard 4KB][Stack stack_size][AltGuard 4KB][AltStack altstack_size][pad..slot_end]
-@register_passable("trivial")
-struct SlotLayout:
+struct SlotLayout(TrivialRegisterPassable):
     comptime TLS_SIZE = 256
     comptime TCB_SIZE = 64
     comptime TCB_SELF_OFFSET = 0x10
@@ -229,7 +227,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
             return
 
         if numa_node is not None:
-            var nodemask = UInt64(1) << numa_node.value()
+            var nodemask = UInt64(1) << UInt64(numa_node.value())
             if sys.sys_mbind[policy=linux.Mempolicy.BIND](self.arena_base, arena_size, nodemask) < 0:
                 _ = sys.sys_munmap(self.arena_base, arena_size)
                 self.arena_base = 0
@@ -321,7 +319,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
             cap -= 1
         return Self(cap, mask^, node)
 
-    fn dispatch[F: AnyTrivialRegType](mut self, kernel: F, packs: UnsafePointer[ArgPack, MutAnyOrigin], num_jobs: Int = -1):
+    fn dispatch[F: TrivialRegisterPassable](mut self, kernel: F, packs: UnsafePointer[ArgPack, MutAnyOrigin], num_jobs: Int = -1):
         """Launch `num_jobs` packs to workers and return immediately.
 
         Each pack is 8×Int (64B). arg0..arg5 are user arguments; pad0/pad1 are reserved.

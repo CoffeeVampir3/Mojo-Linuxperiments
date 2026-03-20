@@ -1,6 +1,6 @@
 from threading.burst_threading import BurstPool, ArgPack
 from notstdcollections import HeapMoveArray
-from memory import MutUnsafePointer
+from memory import UnsafePointer
 from collections import InlineArray
 from time import perf_counter_ns
 
@@ -27,7 +27,7 @@ fn calc_scratch_sum(iter: Int, job_idx: Int) -> Int:
     return (iter + job_idx) * 128 + 8128
 
 
-fn stress_kernel(out_ptr: MutUnsafePointer[Int, MutOrigin.external], iter: Int, job_idx: Int):
+fn stress_kernel(out_ptr: UnsafePointer[Int, MutAnyOrigin], iter: Int, job_idx: Int):
     # Heavy-ish stack usage to stress small worker stacks.
     var scratch = InlineArray[Int, 128](uninitialized=True)  # 1KB
     for i in range(128):

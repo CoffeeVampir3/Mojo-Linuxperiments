@@ -54,18 +54,33 @@ def parse_meminfo(path: String, field: String) -> Int:
             var key_pos = line.find(field)
             if key_pos == -1:
                 continue
+            var bytes = line.as_bytes()
             var value_start = key_pos + len(field)
-            while value_start < len(line) and (line[value_start] == ' ' or line[value_start] == ':'):
-                value_start += 1
+
+            while value_start < len(bytes):
+                var b = bytes[value_start]
+                if b == Byte(32) or b == Byte(58) or b == Byte(9):
+                    value_start += 1
+                else:
+                    break
+
+            var value = 0
+            var saw_digit = False
             var value_end = value_start
-            while value_end < len(line) and line[value_end] >= '0' and line[value_end] <= '9':
-                value_end += 1
-            if value_end > value_start:
-                return atol(String(line[value_start:value_end]))
+            while value_end < len(bytes):
+                var b = bytes[value_end]
+                if b >= Byte(48) and b <= Byte(57):
+                    value = value * 10 + Int(b - Byte(48))
+                    saw_digit = True
+                    value_end += 1
+                else:
+                    break
+            if saw_digit:
+                return value
     return 0
 
 @fieldwise_init
-struct NumaNode(Copyable, Movable):
+struct NumaNode(Copyable, Writable):
     var id: Int
     var cpu_ids: List[Int]
     var distances: List[Int]
