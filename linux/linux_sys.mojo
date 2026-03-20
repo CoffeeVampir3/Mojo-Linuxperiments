@@ -16,8 +16,7 @@ comptime KernelPtr = UInt64
 comptime KernelFlags = UInt64
 comptime KernelFlags32 = UInt32
 
-@register_passable("trivial")
-struct CloneFlags:
+struct CloneFlags(TrivialRegisterPassable):
     comptime VM = 0x00000100
     comptime FS = 0x00000200
     comptime FILES = 0x00000400
@@ -48,8 +47,7 @@ struct CloneFlags:
         Self.PARENT_SETTID | Self.CHILD_CLEARTID
     )
 
-@register_passable("trivial")
-struct Futex2:
+struct Futex2(TrivialRegisterPassable):
     comptime SIZE_U8 = 0x00
     comptime SIZE_U16 = 0x01
     comptime SIZE_U32 = 0x02
@@ -57,13 +55,11 @@ struct Futex2:
     comptime NUMA = 0x04
     comptime PRIVATE = 0x80
 
-@register_passable("trivial")
-struct Signal:
+struct Signal(TrivialRegisterPassable):
     comptime ABRT = 6
     comptime SEGV = 11
 
-@register_passable("trivial")
-struct SigActionFlag:
+struct SigActionFlag(TrivialRegisterPassable):
     # From asm-generic/signal-defs.h (Linux uapi)
     comptime SIGINFO = 0x00000004
     comptime ONSTACK = 0x08000000
@@ -71,16 +67,14 @@ struct SigActionFlag:
     comptime NODEFER = 0x40000000
     comptime RESETHAND = 0x80000000
 
-@register_passable("trivial")
-struct SigSet64:
+struct SigSet64(TrivialRegisterPassable):
     # Portable 64-signal mask used by rt_sigaction on 64-bit Linux.
     var bits0: UInt64
 
     fn __init__(out self):
         self.bits0 = 0
 
-@register_passable("trivial")
-struct RtSigAction:
+struct RtSigAction(TrivialRegisterPassable):
     # Portable rt_sigaction inputs/outputs.
     # Implementations may translate to the kernel's per-arch sigaction ABI.
     var handler: Int
@@ -92,8 +86,7 @@ struct RtSigAction:
         self.flags = 0
         self.mask = SigSet64()
 
-@register_passable("trivial")
-struct SigSegvContext:
+struct SigSegvContext(TrivialRegisterPassable):
     # Portable subset of SIGSEGV context information.
     # Implementations decode per-arch kernel signal frame layouts.
     var ip: UInt64
@@ -105,8 +98,7 @@ struct SigSegvContext:
         self.sp = 0
         self.fault_addr = 0
 
-@register_passable("trivial")
-struct StackT:
+struct StackT(TrivialRegisterPassable):
     # stack_t: void *ss_sp; int ss_flags; size_t ss_size;
     var ss_sp: Int
     var ss_flags: Int32
@@ -119,8 +111,7 @@ struct StackT:
         self.pad = 0
         self.ss_size = 0
 
-@register_passable("trivial")
-struct FutexNuma32:
+struct FutexNuma32(TrivialRegisterPassable):
     var value: Int32
     var node: Int32
 
@@ -129,15 +120,13 @@ struct FutexNuma32:
         self.node = node
 
 @fieldwise_init
-@register_passable("trivial")
-struct FutexWaitv:
+struct FutexWaitv(TrivialRegisterPassable):
     var val: UInt64
     var uaddr: KernelPtr
     var flags: KernelFlags32
     var reserved: UInt32
 
-@register_passable("trivial")
-struct Clone3Args:
+struct Clone3Args(TrivialRegisterPassable):
     var flags: KernelFlags
     var pidfd: KernelPtr
     var child_tid: KernelPtr
@@ -174,8 +163,7 @@ struct Clone3Args:
         args.parent_tid = UInt64(child_tid_addr)
         return args
 
-@register_passable("trivial")
-struct Rseq:
+struct Rseq(TrivialRegisterPassable):
     var cpu_id_start: UInt32
     var cpu_id: UInt32
     var rseq_cs: KernelPtr
@@ -195,8 +183,7 @@ struct Rseq:
 
 comptime RSEQ_SIG = 0x53053053
 
-@register_passable("trivial")
-struct Prot:
+struct Prot(TrivialRegisterPassable):
     comptime NONE = 0x0
     comptime READ = 0x1
     comptime WRITE = 0x2
@@ -204,8 +191,7 @@ struct Prot:
     comptime RW = Self.READ | Self.WRITE
     comptime RWX = Self.READ | Self.WRITE | Self.EXEC
 
-@register_passable("trivial")
-struct MapFlag:
+struct MapFlag(TrivialRegisterPassable):
     comptime SHARED = 0x01
     comptime PRIVATE = 0x02
     comptime FIXED = 0x10
@@ -216,16 +202,14 @@ struct MapFlag:
     comptime HUGE_2MB = 21 << 26
     comptime HUGE_1GB = 30 << 26
 
-@register_passable("trivial")
-struct Mempolicy:
+struct Mempolicy(TrivialRegisterPassable):
     comptime DEFAULT = 0
     comptime PREFERRED = 1
     comptime BIND = 2
     comptime INTERLEAVE = 3
     comptime LOCAL = 4
 
-@register_passable("trivial")
-struct Madvise:
+struct Madvise(TrivialRegisterPassable):
     comptime NORMAL = 0
     comptime RANDOM = 1
     comptime SEQUENTIAL = 2
@@ -234,8 +218,7 @@ struct Madvise:
     comptime HUGEPAGE = 14
     comptime NOHUGEPAGE = 15
 
-@register_passable("trivial")
-struct PageSize:
+struct PageSize(TrivialRegisterPassable):
     comptime STANDARD = 4096
     comptime THP_2MB = 2 * 1024 * 1024
     comptime EXPLICIT_2MB = -2
@@ -246,8 +229,7 @@ struct PageSize:
 # Reference: https://github.com/torvalds/linux/blob/master/include/uapi/linux/io_uring.h
 # =============================================================================
 
-@register_passable("trivial")
-struct IoUringSetup:
+struct IoUringSetup(TrivialRegisterPassable):
     comptime IOPOLL = 1 << 0
     comptime SQPOLL = 1 << 1
     comptime SQ_AFF = 1 << 2
@@ -266,16 +248,14 @@ struct IoUringSetup:
     comptime REGISTERED_FD_ONLY = 1 << 15
     comptime NO_SQARRAY = 1 << 16
 
-@register_passable("trivial")
-struct IoUringEnter:
+struct IoUringEnter(TrivialRegisterPassable):
     comptime GETEVENTS = 1 << 0
     comptime SQ_WAKEUP = 1 << 1
     comptime SQ_WAIT = 1 << 2
     comptime EXT_ARG = 1 << 3
     comptime REGISTERED_RING = 1 << 4
 
-@register_passable("trivial")
-struct IoUringSqeFlags:
+struct IoUringSqeFlags(TrivialRegisterPassable):
     comptime FIXED_FILE = 1 << 0
     comptime IO_DRAIN = 1 << 1
     comptime IO_LINK = 1 << 2
@@ -284,8 +264,7 @@ struct IoUringSqeFlags:
     comptime BUFFER_SELECT = 1 << 5
     comptime CQE_SKIP_SUCCESS = 1 << 6
 
-@register_passable("trivial")
-struct IoUringOp:
+struct IoUringOp(TrivialRegisterPassable):
     comptime NOP = 0
     comptime READV = 1
     comptime WRITEV = 2
@@ -320,8 +299,7 @@ struct IoUringOp:
     comptime PROVIDE_BUFFERS = 31
     comptime REMOVE_BUFFERS = 32
 
-@register_passable("trivial")
-struct IoUringRegisterOp:
+struct IoUringRegisterOp(TrivialRegisterPassable):
     comptime REGISTER_BUFFERS = 0
     comptime UNREGISTER_BUFFERS = 1
     comptime REGISTER_FILES = 2
@@ -334,15 +312,13 @@ struct IoUringRegisterOp:
     comptime REGISTER_PERSONALITY = 9
     comptime UNREGISTER_PERSONALITY = 10
 
-@register_passable("trivial")
-struct IoUringCqeFlags:
+struct IoUringCqeFlags(TrivialRegisterPassable):
     comptime BUFFER = 1 << 0
     comptime MORE = 1 << 1
     comptime SOCK_NONEMPTY = 1 << 2
     comptime NOTIF = 1 << 3
 
-@register_passable("trivial")
-struct SqRingOffsets:
+struct SqRingOffsets(TrivialRegisterPassable):
     var head: UInt32
     var tail: UInt32
     var ring_mask: UInt32
@@ -364,8 +340,7 @@ struct SqRingOffsets:
         self.resv1 = 0
         self.user_addr = 0
 
-@register_passable("trivial")
-struct CqRingOffsets:
+struct CqRingOffsets(TrivialRegisterPassable):
     var head: UInt32
     var tail: UInt32
     var ring_mask: UInt32
@@ -387,8 +362,7 @@ struct CqRingOffsets:
         self.resv1 = 0
         self.user_addr = 0
 
-@register_passable("trivial")
-struct IoUringParams:
+struct IoUringParams(TrivialRegisterPassable):
     var sq_entries: UInt32
     var cq_entries: UInt32
     var flags: UInt32
@@ -416,8 +390,7 @@ struct IoUringParams:
         self.sq_off = SqRingOffsets()
         self.cq_off = CqRingOffsets()
 
-@register_passable("trivial")
-struct IoUringSqe:
+struct IoUringSqe(TrivialRegisterPassable):
     var opcode: UInt8
     var flags: UInt8
     var ioprio: UInt16
@@ -474,8 +447,7 @@ struct IoUringSqe:
         sqe.user_data = user_data
         return sqe
 
-@register_passable("trivial")
-struct IoUringCqe:
+struct IoUringCqe(TrivialRegisterPassable):
     var user_data: UInt64
     var res: Int32
     var flags: UInt32
@@ -485,8 +457,7 @@ struct IoUringCqe:
         self.res = 0
         self.flags = 0
 
-@register_passable("trivial")
-struct IoVec:
+struct IoVec(TrivialRegisterPassable):
     var base: UInt64
     var len: UInt64
 
@@ -500,8 +471,7 @@ comptime IORING_OFF_SQES: Int = 0x10000000
 
 comptime AT_FDCWD: Int = -100
 
-@register_passable("trivial")
-struct OpenFlags:
+struct OpenFlags(TrivialRegisterPassable):
     comptime RDONLY = 0
     comptime WRONLY = 1
     comptime RDWR = 2
@@ -513,8 +483,7 @@ struct OpenFlags:
     comptime CLOEXEC = 0o2000000
     comptime DIRECT = 0o40000
 
-@register_passable("trivial")
-struct IoUringFeat:
+struct IoUringFeat(TrivialRegisterPassable):
     comptime SINGLE_MMAP = 1 << 0
     comptime NODROP = 1 << 1
     comptime SUBMIT_STABLE = 1 << 2

@@ -1,10 +1,10 @@
 import linux.sys as linux
+from collections import Dict
 from memory import UnsafePointer
 from pathlib import Path
 from sys.info import size_of
 
-@register_passable("trivial")
-struct ReadOp:
+struct ReadOp(TrivialRegisterPassable, Writable):
     """A single read operation: file region → buffer."""
     var file_idx: Int32
     var offset: Int
@@ -19,8 +19,7 @@ struct ReadOp:
         self.dest = dest
         self.id = id
 
-@register_passable("trivial")
-struct Completion:
+struct Completion(TrivialRegisterPassable, Writable):
     var id: Int  # Copied back from io_uring CQE user_data
     var result: Int32
 
@@ -29,8 +28,136 @@ struct Completion:
         self.result = result
 
 
-@register_passable("trivial")
-struct SubmissionQueue:
+struct IoLoadErrorTag(Copyable, TrivialRegisterPassable, Equatable, Writable):
+    var raw: UInt8
+
+    fn __init__(out self, raw: UInt8):
+        self.raw = raw
+
+
+struct IoLoadErrorKind(TrivialRegisterPassable):
+    comptime INVALID_RING_STATE = IoLoadErrorTag(1)
+    comptime INVALID_OP_SPEC = IoLoadErrorTag(2)
+    comptime DUPLICATE_OP_ID = IoLoadErrorTag(3)
+    comptime SUBMIT_FAILED = IoLoadErrorTag(4)
+    comptime SUBMIT_SHORT = IoLoadErrorTag(5)
+    comptime WAIT_FAILED = IoLoadErrorTag(6)
+    comptime UNKNOWN_COMPLETION_ID = IoLoadErrorTag(7)
+    comptime DUPLICATE_COMPLETION_ID = IoLoadErrorTag(8)
+    comptime CQE_NEGATIVE = IoLoadErrorTag(9)
+    comptime SHORT_READ = IoLoadErrorTag(10)
+    comptime INTERNAL_STATE = IoLoadErrorTag(11)
+
+
+fn io_load_error_name(tag: IoLoadErrorTag) -> String:
+    if tag == IoLoadErrorKind.INVALID_RING_STATE:
+        return "INVALID_RING_STATE"
+    if tag == IoLoadErrorKind.INVALID_OP_SPEC:
+        return "INVALID_OP_SPEC"
+    if tag == IoLoadErrorKind.DUPLICATE_OP_ID:
+        return "DUPLICATE_OP_ID"
+    if tag == IoLoadErrorKind.SUBMIT_FAILED:
+        return "SUBMIT_FAILED"
+    if tag == IoLoadErrorKind.SUBMIT_SHORT:
+        return "SUBMIT_SHORT"
+    if tag == IoLoadErrorKind.WAIT_FAILED:
+        return "WAIT_FAILED"
+    if tag == IoLoadErrorKind.UNKNOWN_COMPLETION_ID:
+        return "UNKNOWN_COMPLETION_ID"
+    if tag == IoLoadErrorKind.DUPLICATE_COMPLETION_ID:
+        return "DUPLICATE_COMPLETION_ID"
+    if tag == IoLoadErrorKind.CQE_NEGATIVE:
+        return "CQE_NEGATIVE"
+    if tag == IoLoadErrorKind.SHORT_READ:
+        return "SHORT_READ"
+    if tag == IoLoadErrorKind.INTERNAL_STATE:
+        return "INTERNAL_STATE"
+    return "UNKNOWN_IO_LOAD_ERROR"
+
+
+struct IoLoadError(Copyable, Writable):
+    var kind: IoLoadErrorTag
+    var op_id: Int
+    var expected: Int
+    var actual: Int
+    var errno: Int
+
+    fn __init__(
+        out self,
+        kind: IoLoadErrorTag,
+        op_id: Int = -1,
+        expected: Int = 0,
+        actual: Int = 0,
+        errno: Int = 0,
+    ):
+        self.kind = kind
+        self.op_id = op_id
+        self.expected = expected
+        self.actual = actual
+        self.errno = errno
+
+
+fn print_io_load_error(err: IoLoadError):
+    print(
+        "io_uring load error:",
+        io_load_error_name(err.kind),
+        "op_id",
+        err.op_id,
+        "expected",
+        err.expected,
+        "actual",
+        err.actual,
+        "errno",
+        err.errno,
+    )
+
+
+fn validate_completion_checked(
+    c: Completion,
+    expected_by_id: Dict[Int, Int],
+    mut seen_by_id: Dict[Int, Int],
+) -> Optional[IoLoadError]:
+    var expected_opt = expected_by_id.get(c.id)
+    var seen_opt = seen_by_id.get(c.id)
+    if not expected_opt or not seen_opt:
+        return IoLoadError(
+            kind=IoLoadErrorKind.UNKNOWN_COMPLETION_ID,
+            op_id=c.id,
+            actual=Int(c.result),
+        )
+
+    if seen_opt.value() != 0:
+        return IoLoadError(
+            kind=IoLoadErrorKind.DUPLICATE_COMPLETION_ID,
+            op_id=c.id,
+            actual=Int(c.result),
+        )
+
+    seen_by_id[c.id] = 1
+
+    if c.result < 0:
+        return IoLoadError(
+            kind=IoLoadErrorKind.CQE_NEGATIVE,
+            op_id=c.id,
+            expected=expected_opt.value(),
+            actual=Int(c.result),
+            errno=Int(c.result),
+        )
+
+    var expected = expected_opt.value()
+    var got = Int(c.result)
+    if got != expected:
+        return IoLoadError(
+            kind=IoLoadErrorKind.SHORT_READ,
+            op_id=c.id,
+            expected=expected,
+            actual=got,
+        )
+
+    return None
+
+
+struct SubmissionQueue(TrivialRegisterPassable):
     var ring: UnsafePointer[UInt8, MutAnyOrigin]
     var ring_size: Int
     var head: UnsafePointer[UInt32, MutAnyOrigin]
@@ -57,8 +184,7 @@ struct SubmissionQueue:
         return Int(max_entries - (self.tail[] - self.head[]))
 
 
-@register_passable("trivial")
-struct CompletionQueue:
+struct CompletionQueue(TrivialRegisterPassable):
     var ring: UnsafePointer[UInt8, MutAnyOrigin]
     var ring_size: Int
     var head: UnsafePointer[UInt32, MutAnyOrigin]
@@ -83,6 +209,8 @@ struct CompletionQueue:
 
 
 struct IoLoader[queue_depth: Int = 2048](Movable):
+    comptime MAX_WAIT_EMPTY_RETRIES = 8
+
     var ring_fd: Int
     var sq: SubmissionQueue
     var cq: CompletionQueue
@@ -90,6 +218,8 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
     var pending_count: Int
     var file_fds: List[Int32]
     var single_mmap: Bool
+    var last_wait_result: Int
+    var last_wait_errno: Int
 
     fn __init__(out self):
         constrained[
@@ -103,6 +233,8 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         self.pending_count = 0
         self.file_fds = List[Int32]()
         self.single_mmap = False
+        self.last_wait_result = 0
+        self.last_wait_errno = 0
 
         var sys = linux.linux_sys()
         var params = linux.IoUringParams()
@@ -115,6 +247,10 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         params = params_ptr[]
 
         self.map_rings(params)
+        if self.ring_fd >= 0 and self.sq:
+            var entries = Int(self.sq.mask) + 1
+            if entries > 0:
+                self.max_entries = UInt32(entries)
 
     fn map_rings(mut self, params: linux.IoUringParams):
         """Map submission and completion queue rings after io_uring_setup."""
@@ -261,12 +397,16 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         if count == 0:
             return 0
 
+        var ring_entries = Int(self.sq.mask) + 1
+        if ring_entries <= 0:
+            return -1
+
         var tail = self.sq.tail[]
         var head = self.sq.head[]
         var submitted = 0
 
         for i in range(count):
-            if tail - head >= self.max_entries:
+            if Int(tail - head) >= ring_entries:
                 break
 
             var idx = tail & self.sq.mask
@@ -309,8 +449,8 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         if result < 0:
             return result
 
-        self.pending_count += submitted
-        return submitted
+        self.pending_count += Int(result)
+        return Int(result)
 
     fn wait(mut self, min_complete: Int = 1) -> List[Completion]:
         """Block until at least min_complete operations finish. (No burn, kernel sleep)
@@ -325,15 +465,22 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
 
         if head == tail and min_complete > 0:
             var sys = linux.linux_sys()
-            var result = sys.sys_io_uring_enter(
-                self.ring_fd,
-                0,
-                UInt32(min_complete),
-                linux.IoUringEnter.GETEVENTS,
-            )
-            if result < 0:
-                return completions^
-            tail = self.cq.tail[]
+            self.last_wait_result = 0
+            self.last_wait_errno = 0
+            for _ in range(Self.MAX_WAIT_EMPTY_RETRIES):
+                var result = sys.sys_io_uring_enter(
+                    self.ring_fd,
+                    0,
+                    UInt32(min_complete),
+                    linux.IoUringEnter.GETEVENTS,
+                )
+                self.last_wait_result = result
+                if result < 0:
+                    self.last_wait_errno = result
+                    return completions^
+                tail = self.cq.tail[]
+                if head != tail:
+                    break
 
         while head != tail:
             var idx = head & self.cq.mask
@@ -368,60 +515,186 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
     fn pending(self) -> Int:
         return self.pending_count
 
+    fn submit_one_checked(mut self, op: ReadOp) -> Int:
+        if self.ring_fd < 0:
+            return -1
+
+        if Int(op.length) <= 0:
+            return -1
+
+        var ring_entries = Int(self.sq.mask) + 1
+        if ring_entries <= 0:
+            return -1
+
+        var tail = self.sq.tail[]
+        var head = self.sq.head[]
+        if Int(tail - head) >= ring_entries:
+            return 0
+
+        var idx = tail & self.sq.mask
+        var sqe = self.sq.entries + Int(idx)
+
+        sqe[].opcode = linux.IoUringOp.READ
+        sqe[].flags = linux.IoUringSqeFlags.FIXED_FILE
+        sqe[].fd = op.file_idx
+        sqe[].off = UInt64(op.offset)
+        sqe[].addr = UInt64(op.dest)
+        sqe[].len = UInt32(op.length)
+        sqe[].user_data = UInt64(op.id)
+        sqe[].ioprio = 0
+        sqe[].buf_index = 0
+        sqe[].personality = 0
+        sqe[].splice_fd_in = 0
+        sqe[].addr3 = 0
+        sqe[].pad = 0
+        sqe[].op_flags = 0
+        self.sq.array[Int(idx)] = idx
+
+        self.sq.tail[] = tail + 1
+
+        var sys = linux.linux_sys()
+        var result = sys.sys_io_uring_enter(
+            self.ring_fd,
+            1,
+            0,
+            0,
+        )
+        if result < 0:
+            self.sq.tail[] = tail
+            return result
+        if result != 1:
+            return -1
+
+        self.pending_count += 1
+        return 1
+
+    fn process_queue_checked[
+        on_complete: fn(Completion) capturing -> None,
+    ](mut self, ops: List[ReadOp], min_complete: Int = 1) -> Optional[IoLoadError]:
+        var total = len(ops)
+        if total == 0:
+            return None
+
+        if self.ring_fd < 0 or not self.sq or not self.cq:
+            return IoLoadError(
+                kind=IoLoadErrorKind.INVALID_RING_STATE,
+                actual=self.ring_fd,
+            )
+
+        var ring_entries = Int(self.sq.mask) + 1
+        if ring_entries <= 0:
+            return IoLoadError(
+                kind=IoLoadErrorKind.INVALID_RING_STATE,
+                actual=ring_entries,
+            )
+
+        var expected_by_id = Dict[Int, Int]()
+        var seen_by_id = Dict[Int, Int]()
+        for i in range(total):
+            var op = ops[i]
+            var expected = Int(op.length)
+            if expected <= 0:
+                return IoLoadError(
+                    kind=IoLoadErrorKind.INVALID_OP_SPEC,
+                    op_id=op.id,
+                    expected=1,
+                    actual=expected,
+                )
+            var prior = expected_by_id.get(op.id)
+            if prior:
+                return IoLoadError(
+                    kind=IoLoadErrorKind.DUPLICATE_OP_ID,
+                    op_id=op.id,
+                    expected=prior.value(),
+                    actual=expected,
+                )
+            expected_by_id[op.id] = expected
+            seen_by_id[op.id] = 0
+
+        var submitted = 0
+        var completed = 0
+        while submitted < total:
+            var submit_res = self.submit_one_checked(ops[submitted])
+            if submit_res < 0:
+                return IoLoadError(
+                    kind=IoLoadErrorKind.SUBMIT_FAILED,
+                    op_id=ops[submitted].id,
+                    errno=submit_res,
+                    actual=submit_res,
+                )
+
+            if submit_res == 0:
+                var completions = self.wait(min_complete=min_complete)
+                if len(completions) == 0:
+                    return IoLoadError(
+                        kind=IoLoadErrorKind.WAIT_FAILED,
+                        op_id=ops[submitted].id,
+                        expected=min_complete,
+                        actual=self.last_wait_result,
+                        errno=self.last_wait_errno,
+                    )
+                for c in completions:
+                    var err = validate_completion_checked(c, expected_by_id, seen_by_id)
+                    if err:
+                        return err
+                    on_complete(c)
+                    completed += 1
+                continue
+
+            submitted += 1
+
+            var completions = self.wait(min_complete=min_complete)
+            if len(completions) == 0:
+                return IoLoadError(
+                    kind=IoLoadErrorKind.WAIT_FAILED,
+                    op_id=ops[submitted - 1].id,
+                    expected=min_complete,
+                    actual=self.last_wait_result,
+                    errno=self.last_wait_errno,
+                )
+            for c in completions:
+                var err = validate_completion_checked(c, expected_by_id, seen_by_id)
+                if err:
+                    return err
+                on_complete(c)
+                completed += 1
+
+        while self.pending_count > 0:
+            var completions = self.wait(min_complete=min_complete)
+            if len(completions) == 0:
+                return IoLoadError(
+                    kind=IoLoadErrorKind.WAIT_FAILED,
+                    expected=min_complete,
+                    actual=self.last_wait_result,
+                    errno=self.last_wait_errno,
+                )
+            for c in completions:
+                var err = validate_completion_checked(c, expected_by_id, seen_by_id)
+                if err:
+                    return err
+                on_complete(c)
+                completed += 1
+
+        if completed != total:
+            return IoLoadError(
+                kind=IoLoadErrorKind.INTERNAL_STATE,
+                expected=total,
+                actual=completed,
+            )
+
+        return None
+
     fn process_queue[
         on_complete: fn(Completion) capturing -> None,
     ](mut self, ops: List[ReadOp], min_complete: Int = 1) -> Int:
-        """Submit ops and invoke `on_complete` as each finishes.
-
-        `submit()` may partially submit when the SQ is full; this helper handles
-        re-submitting the remainder and draining CQEs until all ops complete.
-        """
-        var total = len(ops)
-        if total == 0:
-            return 0
-
-        var next_to_submit = 0
         var completed = 0
 
-        while completed < total:
-            # Submit to fill SQ.
-            while next_to_submit < total:
-                var remaining = total - next_to_submit
-                var batch_size = remaining
-                var max_batch = Int(self.max_entries)
-                if batch_size > max_batch:
-                    batch_size = max_batch
+        @parameter
+        fn wrapped(c: Completion):
+            completed += 1
+            on_complete(c)
 
-                var batch = List[ReadOp](capacity=batch_size)
-                for i in range(batch_size):
-                    batch.append(ops[next_to_submit + i])
-
-                var submitted = self.submit(batch)
-                if submitted < 0:
-                    return submitted
-                if submitted == 0:
-                    break
-                next_to_submit += submitted
-
-            # Drain any completions
-            var ready = self.poll()
-            for c in ready:
-                completed += 1
-                on_complete(c)
-
-            if completed >= total:
-                break
-
-            if self.pending_count <= 0:
-                # No in-flight ops to wait on, but not done.
-                return -1
-
-            # Block until at least one completion is available, then drain
-            var completions = self.wait(min_complete=min_complete)
-            if len(completions) == 0:
-                return -1
-            for c in completions:
-                completed += 1
-                on_complete(c)
-
+        var err = self.process_queue_checked[wrapped](ops, min_complete=min_complete)
+        if err:
+            return -1
         return completed

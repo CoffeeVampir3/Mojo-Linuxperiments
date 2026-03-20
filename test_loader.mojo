@@ -1,11 +1,11 @@
 from safetensors.parser import parse_safetensors_header, TensorMeta
-from safetensors.loader import IoLoader, ReadOp, Completion
+from safetensors.loader import IoLoader, ReadOp, Completion, print_io_load_error
 from pathlib import Path
 from memory import UnsafePointer, alloc
 
 fn validate_f32_tensor(buf: UnsafePointer[UInt8, MutAnyOrigin], meta: TensorMeta, name: String) -> Bool:
     """Validate tensor values are sequential starting from base."""
-    var ptr = buf.offset(meta.start).bitcast[Float32]()
+    var ptr = (buf + meta.start).bitcast[Float32]()
 
     var total = 1
     for i in range(len(meta.shape)):
@@ -86,18 +86,8 @@ fn main():
     @parameter
     fn on_tensor_complete(c: Completion):
         var idx = Int(c.id)
-        if idx < 0 or idx >= len(names):
-            print("Completion with unknown id:", c.id, "res", c.result)
-            return
-
         var meta = metas[idx].copy()
         var name = names[idx].copy()
-
-        if c.result < 0:
-            print("IO FAIL:", name, "-", meta.dtype, meta.shape, "errno:", c.result)
-            if meta.dtype == DType.float32:
-                failed += 1
-            return
 
         print("IO DONE:", name, "-", meta.dtype, meta.shape, "-", c.result, "bytes")
         if meta.dtype == DType.float32:
@@ -108,8 +98,9 @@ fn main():
         else:
             print("  (unsupported dtype)")
 
-    var done = loader.process_queue[on_tensor_complete](ops)
-    if done < 0:
+    var err = loader.process_queue_checked[on_tensor_complete](ops)
+    if err:
+        print_io_load_error(err.value())
         print("Load failed")
         buf.free()
         return
