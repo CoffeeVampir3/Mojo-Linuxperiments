@@ -42,7 +42,26 @@ fn main():
     var tok = tok_opt.take()
 
     # --- Encode prompt ---
-    var prompt = "The capital of France is"
+    var prompt = """Constantinos Daskalakis (Greek: Κωνσταντίνος Δασκαλάκης; born 29 April 1981) is a Greek theoretical computer scientist.[2] He is a professor at MIT's Electrical Engineering and Computer Science department and a member of the MIT Computer Science and Artificial Intelligence Laboratory.[3][4][5] He was awarded the Rolf Nevanlinna Prize and the Grace Murray Hopper Award in 2018.
+Education and career
+
+Daskalakis was born in Athens on 29 April 1981.[6] His grandparents originated from Crete, where he summered as a child. His parents were high school teachers of mathematics and literature.[7][8] He has a younger brother, Nikolaos Daskalakis, who is a neuroscientist and Boston University professor.[9][10] When Daskalakis was in third grade, his father bought an Amstrad CPC, which Daskalakis stayed up all night with, attempting to learn how it worked.[11]
+
+He attended Varvakeio High School and received a Diploma in Electrical and Computer Engineering from the National Technical University of Athens in 2004, completing an undergraduate thesis supervised by Stathis Zachos. As an undergraduate, Daskalakis attained perfect scores in all but one of his classes, something which had not previously been achieved in the university's history.[11] He received a PhD in computer science from the University of California, Berkeley advised by Christos Papadimitriou.[12][1]
+
+From 2008 to 2009, Daskalakis was a postdoctoral researcher at Microsoft Research mentored by Jennifer Chayes. He joined MIT in 2009 and was given tenure in 2015.[13]
+
+He is a co-founder and chief scientist of Archimedes AI research center.[citation needed]
+Research
+
+Daskalakis works on the theory of computation and its interface with game theory, economics, probability theory, statistics and machine learning.[2] He is known for work on the computational complexity of Nash equilibria, the complexity of multi-item auctions, and the behavior of the expectation–maximization algorithm. He has worked on efficient methods for statistical hypothesis testing and learning in high dimensions, as well as concentration properties of high-dimensional distributions.
+Awards and honors
+
+Constantinos Daskalakis was awarded the 2008 ACM Doctoral Dissertation Award for "advancing our understanding of behavior in complex networks of interacting individuals."[14] He later co-authored the paper The Complexity of Computing a Nash Equilibrium[15] based on the same work with Christos Papadimitriou and Paul W. Goldberg, for which they were awarded the 2008 Kalai Game Theory and Computer Science Prize.[16]
+
+In 2018, Daskalakis was awarded the Nevanlinna Prize for "transforming our understanding of the computational complexity of fundamental problems in markets, auctions, equilibria and other economic structures."[17] In the same year, he also received the Simons Foundation Investigator award in theoretical computer science.[18]
+
+He was named to the 2022 class of ACM Fellows"""
     var token_ids = tok.encode(prompt)
     print("prompt:", repr(prompt))
     print("tokens:", len(token_ids), "ids:", end="")
