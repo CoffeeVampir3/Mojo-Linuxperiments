@@ -503,15 +503,15 @@ fn silu_mul[GT: Encoding & Shaped, UT: Encoding & Shaped, DstT: Encoding & Shape
 fn elem_add[AT: Encoding & Shaped, BT: Encoding & Shaped, DstT: Encoding & Shaped](
     a: DynView[AT], b: DynView[BT], dst: DynView[DstT],
 ):
-    """Elementwise: dst = a + b. Bf16 throughout."""
+    """Elementwise: dst = a + b. F32 compute, bf16 I/O."""
     constrained[AT.DTYPE == DType.bfloat16, "elem_add: a must be bf16"]()
     constrained[BT.DTYPE == DType.bfloat16, "elem_add: b must be bf16"]()
     constrained[DstT.DTYPE == DType.bfloat16, "elem_add: dst must be bf16"]()
     constrained[AT.COLS == BT.COLS, "elem_add: a/b cols mismatch"]()
     constrained[AT.COLS == DstT.COLS, "elem_add: a/dst cols mismatch"]()
     constrained[
-        AT.COLS % simd_width_of[DType.bfloat16]() == 0,
-        "elem_add: cols must be bf16-simd-aligned",
+        AT.COLS % simd_width_of[DType.float32]() == 0,
+        "elem_add: cols must be f32-simd-aligned",
     ]()
 
     var seq_len = a.seq_len
@@ -527,12 +527,12 @@ fn elem_add[AT: Encoding & Shaped, BT: Encoding & Shaped, DstT: Encoding & Shape
     var dp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
         unsafe_from_address=dst.ptr
     )
-    comptime width = simd_width_of[DType.bfloat16]()
+    comptime width = simd_width_of[DType.float32]()
 
     for i in range(0, seq_len * AT.COLS, width):
-        var av = (ap + i).load[width=width]()
-        var bv = (bp + i).load[width=width]()
-        (dp + i).store(av + bv)
+        var av = bf16_to_f32[width](ap, i)
+        var bv = bf16_to_f32[width](bp, i)
+        (dp + i).store((av + bv).cast[DType.bfloat16]())
 
 
 fn init_rope_tables[CosT: Encoding & Shaped, SinT: Encoding & Shaped](
