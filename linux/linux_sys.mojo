@@ -217,6 +217,8 @@ struct Madvise(TrivialRegisterPassable):
     comptime DONTNEED = 4
     comptime HUGEPAGE = 14
     comptime NOHUGEPAGE = 15
+    comptime POPULATE_READ = 22
+    comptime POPULATE_WRITE = 23
 
 struct PageSize(TrivialRegisterPassable):
     comptime STANDARD = 4096

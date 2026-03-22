@@ -8,11 +8,11 @@ from pathlib import Path
 from time import perf_counter_ns
 
 from tokenizer import load_tokenizer
-from experimental3.logits import LogitsView
-from experimental3.smollm2_tp1 import SmolLM2Model, load_smollm2, VOCAB
+from experimental4.smollm2 import LogitsView, SmolLM2Loaded, SmolLM2Config, MODEL_PATH, BF16
 
 
 comptime TOKENIZER_PATH = "checkpoints/SmolLM2/tokenizer.json"
+comptime VOCAB = SmolLM2Config.VOCAB_SIZE
 comptime MAX_NEW_TOKENS = 30
 
 
@@ -52,7 +52,7 @@ fn main():
 
     # --- Load model ---
     var t0 = perf_counter_ns()
-    var model_opt = load_smollm2()
+    var model_opt = SmolLM2Loaded[BF16, 1].load(Path(MODEL_PATH), 0)
     if not model_opt:
         return
     var model = model_opt.take()

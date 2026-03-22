@@ -71,6 +71,27 @@ struct NumaArena[alignment: Int = 8, page_size: Int = linux.PageSize.THP_2MB](Mo
         """Invalidate entire arena."""
         self.offset = 0
 
+    fn prefault(self, offset: Int = 0, length: Int = -1) -> Bool:
+        """Pre-fault pages via MADV_POPULATE_WRITE so first access doesn't page-fault.
+
+        Args:
+            offset: Byte offset into the arena to start prefaulting.
+            length: Bytes to prefault. -1 (default) means from offset to end of arena.
+
+        Returns:
+            True on success, False on failure.
+        """
+        if not self.base:
+            return False
+        var actual_len = length if length >= 0 else self.size - offset
+        if actual_len <= 0 or offset + actual_len > self.size:
+            return False
+        var sys = linux.linux_sys()
+        var result = sys.sys_madvise[linux.Madvise.POPULATE_WRITE](
+            Int(self.base) + offset, actual_len,
+        )
+        return result == 0
+
     fn remaining(self) -> Int:
         """Remaining (bytes)"""
         return self.size - self.offset
