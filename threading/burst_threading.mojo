@@ -1,6 +1,6 @@
-from sys.info import size_of
-from memory import UnsafePointer, memcpy
-from os.atomic import Atomic, Consistency
+from std.sys.info import size_of
+from std.memory import UnsafePointer, memcpy
+from std.os.atomic import Atomic, Consistency
 import linux.sys as linux
 from notstdcollections import HeapMoveArray
 from numa import NumaInfo, CpuMask
@@ -14,7 +14,7 @@ comptime AtomicInt32 = Atomic[DType.int32]
 #
 # Per-worker metadata (like worker_id) is published via %fs-relative storage in
 # the worker slot. Call `current_worker_id()` from inside a kernel if needed.
-comptime KernelFn = fn(Int, Int, Int, Int, Int, Int)
+comptime KernelFn = def(Int, Int, Int, Int, Int, Int)
 
 @fieldwise_init
 struct ArgPack(TrivialRegisterPassable):
@@ -27,7 +27,7 @@ struct ArgPack(TrivialRegisterPassable):
     var pad0: Int
     var pad1: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         self.arg0 = 0
         self.arg1 = 0
         self.arg2 = 0
@@ -37,7 +37,7 @@ struct ArgPack(TrivialRegisterPassable):
         self.pad0 = 0
         self.pad1 = 0
 
-fn ptr[T: AnyType](addr: Int) -> UnsafePointer[T, MutAnyOrigin]:
+def ptr[T: AnyType](addr: Int) -> UnsafePointer[T, MutAnyOrigin]:
     return UnsafePointer[T, MutAnyOrigin](unsafe_from_address=addr)
 
 # Memory layout per worker slot (slot_base points at the start of the TLS block;
@@ -60,17 +60,14 @@ struct SlotLayout(TrivialRegisterPassable):
     comptime ALT_GUARD = Self.GUARD
     comptime DEFAULT_STACK = 64 * 1024
 
-fn slot_size[stack_size: Int]() -> Int:
-    constrained[
-        stack_size >= SlotLayout.GUARD and stack_size % SlotLayout.GUARD == 0,
-        "stack_size must be a multiple of 4096 (>= 4096)",
-    ]()
+def slot_size[stack_size: Int]() -> Int:
+    comptime assert stack_size >= SlotLayout.GUARD and stack_size % SlotLayout.GUARD == 0, "stack_size must be a multiple of 4096 (>= 4096)"
     # Must be page-aligned so each worker's guard page can be protected with mprotect.
     var raw = SlotLayout.HEADER + SlotLayout.GUARD + stack_size + SlotLayout.ALT_GUARD + SlotLayout.ALTSTACK_SIZE
     return ((raw + SlotLayout.GUARD - 1) // SlotLayout.GUARD) * SlotLayout.GUARD
 
 @always_inline
-fn current_worker_id() -> Int:
+def current_worker_id() -> Int:
     """Return worker id when running in a BurstPool worker, else -1."""
     var sys = linux.linux_sys()
     var magic = sys.arch_tls_load_i64[offset=SlotLayout.WORKER_MAGIC_FROM_FS]()
@@ -78,7 +75,7 @@ fn current_worker_id() -> Int:
         return -1
     return sys.arch_tls_load_i64[offset=SlotLayout.WORKER_ID_FROM_FS]()
 
-fn burst_sigsegv_handler(signo: Int32, info: Int, ucontext: Int):
+def burst_sigsegv_handler(signo: Int32, info: Int, ucontext: Int):
     var sys = linux.linux_sys()
     var ctx = sys.arch_decode_sigsegv(info, ucontext)
     var worker = current_worker_id()
@@ -97,7 +94,7 @@ fn burst_sigsegv_handler(signo: Int32, info: Int, ucontext: Int):
     _ = sys.sys_tgkill(pid, tid, linux.Signal.SEGV)
     sys.sys_exit_group(128 + Int(signo))
 
-fn install_burst_sigsegv_handler():
+def install_burst_sigsegv_handler():
     var sys = linux.linux_sys()
     var handler_copy = burst_sigsegv_handler
     var handler_addr = UnsafePointer(to=handler_copy).bitcast[Int]()[]
@@ -130,7 +127,7 @@ struct SharedPoolState:
     comptime DonePadBytes = 64 - size_of[type_of(Self().work_done)]()
     var pad1: InlineArray[UInt8, Self.DonePadBytes]
 
-    fn __init__(out self):
+    def __init__(out self):
         self.work_available = AtomicInt32(0)
         self.shutdown = AtomicInt32(0)
         self.func_ptr = 0
@@ -143,18 +140,18 @@ struct WorkerSlot(Movable, ImplicitlyDestructible):
     var child_tid: UnsafePointer[Int32, MutAnyOrigin]
     var stack_top: UnsafePointer[UInt8, MutAnyOrigin]
 
-    fn __init__(out self, slot_base: Int):
+    def __init__(out self, slot_base: Int):
         self.base = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=slot_base)
         self.child_tid = UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=slot_base + SlotLayout.CHILD_TID)
         self.stack_top = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=slot_base + SlotLayout.HEADER + SlotLayout.GUARD)
 
-    fn __moveinit__(out self, deinit other: Self):
+    def __moveinit__(out self, deinit other: Self):
         self.base = other.base
         self.child_tid = other.child_tid
         self.stack_top = other.stack_top
 
     @always_inline
-    fn is_alive(self) -> Bool:
+    def is_alive(self) -> Bool:
         return self.child_tid[] != 0
 
 struct WorkerStackHead[mask_size: Int]:
@@ -170,7 +167,7 @@ struct WorkerStackHead[mask_size: Int]:
     var pinned: Int
     var cpu_mask: CpuMask[Self.mask_size]
 
-    fn __init__(out self, entry: Int, slot_base: Int, parent_fs: Int,
+    def __init__(out self, entry: Int, slot_base: Int, parent_fs: Int,
                 worker_id: Int,
                 shared: UnsafePointer[SharedPoolState, MutAnyOrigin],
                 args_base: UnsafePointer[ArgPack, MutAnyOrigin],
@@ -200,7 +197,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
     var pinned: Bool
     var workers_alive: Bool
 
-    fn __init__(out self, capacity: Int, var cpu_mask: CpuMask[Self.mask_size] = CpuMask[Self.mask_size](), numa_node: Optional[Int] = None):
+    def __init__(out self, capacity: Int, var cpu_mask: CpuMask[Self.mask_size] = CpuMask[Self.mask_size](), numa_node: Optional[Int] = None):
         self.capacity = capacity
         self.slots = HeapMoveArray[WorkerSlot](capacity)
         self.arena_base = 0
@@ -260,7 +257,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
 
         self.spawn_workers()
 
-    fn __moveinit__(out self, deinit other: Self):
+    def __moveinit__(out self, deinit other: Self):
         self.slots = other.slots^
         self.shared = other.shared
         self.args_base = other.args_base
@@ -272,7 +269,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         self.pinned = other.pinned
         self.workers_alive = other.workers_alive
 
-    fn __del__(deinit self):
+    def __del__(deinit self):
         if self.arena_base == 0:
             return
 
@@ -300,18 +297,18 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
             Self.slot_size * self.capacity + size_of[SharedPoolState]() + self.capacity * size_of[ArgPack]()
         )
 
-    fn __bool__(self) -> Bool:
+    def __bool__(self) -> Bool:
         return self.arena_base != 0 and self.workers_alive
 
-    fn __len__(self) -> Int:
+    def __len__(self) -> Int:
         return self.capacity
 
     @staticmethod
-    fn for_numa_node(numa: NumaInfo, node: Int) -> Self:
+    def for_numa_node(numa: NumaInfo, node: Int) -> Self:
         return Self(numa.cpus_on_node(node), numa.get_node_mask[Self.mask_size](node), node)
 
     @staticmethod
-    fn for_numa_node_excluding(numa: NumaInfo, node: Int, exclude_cpu: Int) -> Self:
+    def for_numa_node_excluding(numa: NumaInfo, node: Int, exclude_cpu: Int) -> Self:
         var mask = numa.get_node_mask[Self.mask_size](node)
         var cap = numa.cpus_on_node(node)
         if mask.test(exclude_cpu):
@@ -319,7 +316,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
             cap -= 1
         return Self(cap, mask^, node)
 
-    fn dispatch[F: TrivialRegisterPassable](mut self, kernel: F, packs: UnsafePointer[ArgPack, MutAnyOrigin], num_jobs: Int = -1):
+    def dispatch[F: TrivialRegisterPassable](mut self, kernel: F, packs: UnsafePointer[ArgPack, MutAnyOrigin], num_jobs: Int = -1):
         """Launch `num_jobs` packs to workers and return immediately.
 
         Each pack is 8×Int (64B). arg0..arg5 are user arguments; pad0/pad1 are reserved.
@@ -334,7 +331,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
             return
 
         comptime KernelType = type_of(kernel)
-        constrained[size_of[KernelType]() == 8, "kernel must be an 8-byte function pointer"]()
+        comptime assert size_of[KernelType]() == 8, "kernel must be an 8-byte function pointer"
 
         var donePtr = UnsafePointer(to=self.shared[].work_done.value)
         debug_assert(
@@ -361,14 +358,14 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         var sys = linux.linux_sys()
         _ = sys.sys_futex_wake(Int(workPtr), jobs, self.futex_flags)
 
-    fn join(mut self):
+    def join(mut self):
         """Wait for the most recent dispatch to complete."""
         var donePtr = UnsafePointer(to=self.shared[].work_done.value)
         var sys = linux.linux_sys()
         while AtomicInt32.load[ordering=Consistency.ACQUIRE](donePtr) > 0:
             sys.arch_cpu_relax()
 
-    fn spawn_workers(mut self):
+    def spawn_workers(mut self):
         var sys = linux.linux_sys()
         var parent_fs = sys.arch_thread_pointer()
 
@@ -409,7 +406,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
                 return
         self.workers_alive = True
 
-fn worker_main[mask_size: Int](stack_head_ptr: Int):
+def worker_main[mask_size: Int](stack_head_ptr: Int):
     var head_ptr = ptr[WorkerStackHead[mask_size]](stack_head_ptr)
     var sys = linux.linux_sys()
     var altstack_base_val = head_ptr[].altstack_base

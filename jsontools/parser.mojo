@@ -1,6 +1,6 @@
-from collections import Dict
-from memory import Span, UnsafePointer
-from bit import count_trailing_zeros
+from std.collections import Dict
+from std.memory import Span, UnsafePointer
+from std.bit import count_trailing_zeros
 
 # --- JSON byte constants ---
 
@@ -29,7 +29,7 @@ comptime CHAR_e = Byte(101)
 
 # --- Lookup tables ---
 
-fn make_escape_table() -> InlineArray[Byte, 256]:
+def make_escape_table() -> InlineArray[Byte, 256]:
     var table = InlineArray[Byte, 256](fill=0)
     table[Int(QUOTE)] = QUOTE
     table[Int(BACKSLASH)] = BACKSLASH
@@ -41,7 +41,7 @@ fn make_escape_table() -> InlineArray[Byte, 256]:
     table[Int(CHAR_t)] = Byte(9)
     return table^
 
-fn make_hex_table() -> InlineArray[Int8, 256]:
+def make_hex_table() -> InlineArray[Int8, 256]:
     var table = InlineArray[Int8, 256](fill=-1)
     for i in range(10):
         table[Int(DIGIT_0) + i] = Int8(i)
@@ -57,7 +57,7 @@ comptime CHAR_WHITESPACE: Byte = 1
 comptime CHAR_DIGIT: Byte = 2
 comptime CHAR_NUMBER_START: Byte = 4
 
-fn make_char_class_table() -> InlineArray[Byte, 256]:
+def make_char_class_table() -> InlineArray[Byte, 256]:
     var table = InlineArray[Byte, 256](fill=0)
     table[9] = CHAR_WHITESPACE
     table[10] = CHAR_WHITESPACE
@@ -80,29 +80,29 @@ struct ParseError(Copyable, Writable):
 # --- Scalar classification helpers ---
 
 @always_inline
-fn is_whitespace(b: Byte) -> Bool:
+def is_whitespace(b: Byte) -> Bool:
     return (materialize[CHAR_CLASS]()[Int(b)] & CHAR_WHITESPACE) != 0
 
 @always_inline
-fn is_digit(b: Byte) -> Bool:
+def is_digit(b: Byte) -> Bool:
     return (materialize[CHAR_CLASS]()[Int(b)] & CHAR_DIGIT) != 0
 
 @always_inline
-fn is_number_start(b: Byte) -> Bool:
+def is_number_start(b: Byte) -> Bool:
     return (materialize[CHAR_CLASS]()[Int(b)] & CHAR_NUMBER_START) != 0
 
 # --- SIMD classification helpers ---
 
 @always_inline
-fn simd_whitespace[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
+def simd_whitespace[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
     return (block - Byte(9)).le(Byte(4)) | block.eq(Byte(32))
 
 @always_inline
-fn simd_digits[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
+def simd_digits[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
     return (block - DIGIT_0).le(Byte(9))
 
 @always_inline
-fn simd_any_of2[w: Int](
+def simd_any_of2[w: Int](
     block: SIMD[DType.uint8, w],
     a: Byte,
     b: Byte,
@@ -110,33 +110,31 @@ fn simd_any_of2[w: Int](
     return block.eq(a) | block.eq(b)
 
 @always_inline
-fn first_true_index[w: Int](mask: SIMD[DType.bool, w]) -> Int:
+def first_true_index[w: Int](mask: SIMD[DType.bool, w]) -> Int:
     var packed: UInt64 = 0
-    @parameter
-    for i in range(w):
+    comptime for i in range(w):
         packed |= UInt64(mask[i]) << UInt64(i)
     if packed == 0:
         return w
     return Int(count_trailing_zeros(packed))
 
 @always_inline
-fn append_block_prefix[w: Int](
+def append_block_prefix[w: Int](
     mut out: List[Byte],
     block: SIMD[DType.uint8, w],
     count: Int,
 ):
-    @parameter
-    for i in range(w):
+    comptime for i in range(w):
         if i < count:
             out.append(block[i])
 
 # --- Scalar string helpers ---
 
 @always_inline
-fn hex_value(b: Byte) -> Int:
+def hex_value(b: Byte) -> Int:
     return Int(materialize[HEX_TABLE]()[Int(b)])
 
-fn append_utf8(mut out: List[Byte], codepoint: Int):
+def append_utf8(mut out: List[Byte], codepoint: Int):
     var cp = Codepoint(unsafe_unchecked_codepoint=UInt32(codepoint))
     var needed = cp.utf8_byte_length()
     var base = len(out)
@@ -145,11 +143,11 @@ fn append_utf8(mut out: List[Byte], codepoint: Int):
     _ = cp.unsafe_write_utf8[True](dst)
 
 @always_inline
-fn escape_value(esc: Byte) -> Byte:
+def escape_value(esc: Byte) -> Byte:
     return materialize[ESCAPE_TABLE]()[Int(esc)]
 
 @always_inline
-fn match_literal_at[lit: StringLiteral](
+def match_literal_at[lit: StringLiteral](
     ptr: UnsafePointer[Byte, ImmutAnyOrigin],
     pos: Int,
     length: Int,
@@ -157,8 +155,7 @@ fn match_literal_at[lit: StringLiteral](
     if pos + len(lit) > length:
         return False
     comptime bytes = StringSlice(lit).as_bytes()
-    @parameter
-    for i in range(len(lit)):
+    comptime for i in range(len(lit)):
         if ptr[pos + i] != bytes[i]:
             return False
     return True
@@ -169,38 +166,38 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
     var data: Span[Byte, Self.origin]
     var pos: Int
 
-    fn __init__(out self, data: Span[Byte, Self.origin]):
+    def __init__(out self, data: Span[Byte, Self.origin]):
         self.data = data
         self.pos = 0
 
     @always_inline
-    fn remaining(self) -> Int:
+    def remaining(self) -> Int:
         return len(self.data) - self.pos
 
     @always_inline
-    fn has_more(self) -> Bool:
+    def has_more(self) -> Bool:
         return self.pos < len(self.data)
 
     @always_inline
-    fn peek(self) -> Byte:
+    def peek(self) -> Byte:
         return self.data[self.pos]
 
     @always_inline
-    fn advance(mut self) -> Byte:
+    def advance(mut self) -> Byte:
         var b = self.data[self.pos]
         self.pos += 1
         return b
 
     @always_inline
-    fn consume(mut self, expected: Byte) -> Bool:
+    def consume(mut self, expected: Byte) -> Bool:
         if self.has_more() and self.peek() == expected:
             self.pos += 1
             return True
         return False
 
-    fn skip_while_simd[
-        pred_scalar: fn(Byte) -> Bool,
-        pred_simd: fn[width: Int](SIMD[DType.uint8, width]) -> SIMD[DType.bool, width],
+    def skip_while_simd[
+        pred_scalar: def(Byte) -> Bool,
+        pred_simd: def[width: Int](SIMD[DType.uint8, width]) -> SIMD[DType.bool, width],
     ](mut self) -> Int:
         var start = self.pos
         var ptr = self.data.unsafe_ptr()
@@ -210,8 +207,7 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
             if all(matches):
                 self.pos += Self.simd_width
                 continue
-            @parameter
-            for i in range(Self.simd_width):
+            comptime for i in range(Self.simd_width):
                 if not matches[i]:
                     self.pos += i
                     return self.pos - start
@@ -219,19 +215,19 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
             self.pos += 1
         return self.pos - start
 
-    fn skip_whitespace(mut self):
+    def skip_whitespace(mut self):
         _ = self.skip_while_simd[is_whitespace, simd_whitespace]()
 
-    fn skip_digits(mut self) -> Int:
+    def skip_digits(mut self) -> Int:
         return self.skip_while_simd[is_digit, simd_digits]()
 
-    fn try_consume[lit: StringLiteral](mut self) -> Bool:
+    def try_consume[lit: StringLiteral](mut self) -> Bool:
         if not match_literal_at[lit](self.data.unsafe_ptr(), self.pos, len(self.data)):
             return False
         self.pos += len(lit)
         return True
 
-    fn delimited_next(mut self, close: Byte) raises ParseError -> Bool:
+    def delimited_next(mut self, close: Byte) raises ParseError -> Bool:
         """Returns True if more items follow, False if delimiter closed."""
         self.skip_whitespace()
         if self.consume(close):
@@ -241,7 +237,7 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
         self.skip_whitespace()
         return True
 
-    fn object_key(mut self) raises ParseError -> String:
+    def object_key(mut self) raises ParseError -> String:
         var key = self.parse_string()
         self.skip_whitespace()
         if not self.consume(COLON):
@@ -249,7 +245,7 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
         self.skip_whitespace()
         return key
 
-    fn parse_hex4(mut self) raises ParseError -> Int:
+    def parse_hex4(mut self) raises ParseError -> Int:
         var v = 0
         for _ in range(4):
             if not self.has_more():
@@ -260,7 +256,7 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
             v = (v << 4) + digit
         return v
 
-    fn append_escape(mut self, mut out: List[Byte]) raises ParseError:
+    def append_escape(mut self, mut out: List[Byte]) raises ParseError:
         if not self.has_more():
             raise ParseError("unexpected end in escape sequence", self.pos)
         var esc = self.advance()
@@ -284,7 +280,7 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
             cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
         append_utf8(out, cp)
 
-    fn parse_string(mut self) raises ParseError -> String:
+    def parse_string(mut self) raises ParseError -> String:
         if not self.consume(QUOTE):
             raise ParseError("expected '\"'", self.pos)
         var out_bytes = List[Byte]()
@@ -305,14 +301,14 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
                 if len(out_bytes) == 0:
                     return String("")
                 var out_ptr = out_bytes.unsafe_ptr()
-                return String(unsafe_from_utf8=Span[Byte](ptr=out_ptr, length=len(out_bytes)))
+                return String(unsafe_from_utf8=Span[Byte, _](ptr=out_ptr, length=len(out_bytes)))
             if b == BACKSLASH:
                 self.append_escape(out_bytes)
             else:
                 out_bytes.append(b)
         raise ParseError("unterminated string", self.pos)
 
-    fn skip_number(mut self) raises ParseError:
+    def skip_number(mut self) raises ParseError:
         _ = self.consume(MINUS)
         if not self.has_more():
             raise ParseError("unexpected end in number", self.pos)
@@ -328,7 +324,7 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
             if self.skip_digits() == 0:
                 raise ParseError("expected digit in exponent", self.pos)
 
-    fn parse_uint(mut self) raises ParseError -> Int:
+    def parse_uint(mut self) raises ParseError -> Int:
         if not self.has_more() or not is_digit(self.peek()):
             raise ParseError("expected unsigned integer", self.pos)
         var start = self.pos
@@ -340,7 +336,7 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
             v = v * 10 + Int(self.data[start + i] - DIGIT_0)
         return v
 
-    fn skip_value(mut self) raises ParseError:
+    def skip_value(mut self) raises ParseError:
         self.skip_whitespace()
         if not self.has_more():
             raise ParseError("unexpected end of input", self.pos)
@@ -361,7 +357,7 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
             return
         raise ParseError("unexpected character", self.pos)
 
-    fn skip_array(mut self) raises ParseError:
+    def skip_array(mut self) raises ParseError:
         if not self.consume(LBRACKET):
             raise ParseError("expected '['", self.pos)
         self.skip_whitespace()
@@ -372,7 +368,7 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
             if not self.delimited_next(RBRACKET):
                 return
 
-    fn skip_object(mut self) raises ParseError:
+    def skip_object(mut self) raises ParseError:
         if not self.consume(LBRACE):
             raise ParseError("expected '{'", self.pos)
         self.skip_whitespace()
@@ -384,14 +380,14 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
             if not self.delimited_next(RBRACE):
                 return
 
-    fn parse_bool(mut self) raises ParseError -> Bool:
+    def parse_bool(mut self) raises ParseError -> Bool:
         if self.try_consume[lit="true"]():
             return True
         if self.try_consume[lit="false"]():
             return False
         raise ParseError("expected 'true' or 'false'", self.pos)
 
-    fn parse_string_array(mut self) raises ParseError -> List[String]:
+    def parse_string_array(mut self) raises ParseError -> List[String]:
         """Parse a JSON array of strings: ["a", "b", ...]"""
         if not self.consume(LBRACKET):
             raise ParseError("expected '['", self.pos)
@@ -405,7 +401,7 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
                 break
         return result^
 
-    fn parse_uint_array(mut self) raises ParseError -> List[Int]:
+    def parse_uint_array(mut self) raises ParseError -> List[Int]:
         """Parse a JSON array of unsigned integers: [1, 2, ...]"""
         if not self.consume(LBRACKET):
             raise ParseError("expected '['", self.pos)
@@ -419,7 +415,7 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
                 break
         return result^
 
-    fn parse_string_uint_dict(mut self) raises ParseError -> Dict[String, Int]:
+    def parse_string_uint_dict(mut self) raises ParseError -> Dict[String, Int]:
         """Parse a JSON object mapping strings to unsigned ints: {"a": 1, ...}"""
         if not self.consume(LBRACE):
             raise ParseError("expected '{'", self.pos)

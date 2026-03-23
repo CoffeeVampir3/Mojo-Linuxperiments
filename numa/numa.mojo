@@ -1,22 +1,22 @@
 import linux.sys as linux
-from pathlib import Path
+from std.pathlib import Path
 from .cpumask import CpuMask
 
-fn get_current_cpu_and_node() -> Tuple[Int, Int]:
+def get_current_cpu_and_node() -> Tuple[Int, Int]:
     var sys = linux.linux_sys()
     return sys.sys_getcpu()
 
-def read_sysfs(path: String) -> String:
+def read_sysfs(path: String) raises -> String:
     var p = Path(path)
     if not p.exists():
         return String("")
     var content = p.read_text()
     var newline_pos = content.find("\n")
     if newline_pos >= 0:
-        return String(content[:newline_pos])
+        return String(content[byte=:newline_pos])
     return content
 
-def parse_cpulist(cpulist: String) -> List[Int]:
+def parse_cpulist(cpulist: String) raises -> List[Int]:
     var cpus = List[Int]()
     if len(cpulist) == 0:
         return cpus^
@@ -25,15 +25,15 @@ def parse_cpulist(cpulist: String) -> List[Int]:
         var part = String(parts[i])
         var dash_pos = part.find("-")
         if dash_pos >= 0:
-            var start = atol(String(part[:dash_pos]))
-            var end = atol(String(part[dash_pos + 1:]))
+            var start = atol(String(part[byte=:dash_pos]))
+            var end = atol(String(part[byte=dash_pos + 1:]))
             for cpu in range(start, end + 1):
                 cpus.append(cpu)
         else:
             cpus.append(atol(part))
     return cpus^
 
-def parse_distances(s: String) -> List[Int]:
+def parse_distances(s: String) raises -> List[Int]:
     var distances = List[Int]()
     var parts = s.split(" ")
     for i in range(len(parts)):
@@ -42,7 +42,7 @@ def parse_distances(s: String) -> List[Int]:
             distances.append(atol(part))
     return distances^
 
-def parse_meminfo(path: String, field: String) -> Int:
+def parse_meminfo(path: String, field: String) raises -> Int:
     var p = Path(path)
     if not p.exists():
         return 0
@@ -87,7 +87,7 @@ struct NumaNode(Copyable, Writable):
     var mem_total_kb: Int
     var mem_free_kb: Int
 
-    fn __init__(out self, id: Int):
+    def __init__(out self, id: Int):
         self.id = id
         self.cpu_ids = List[Int]()
         self.distances = List[Int]()
@@ -102,10 +102,10 @@ struct NumaTopology(Movable):
     var node_ids: List[Int]
     var tp: Int
 
-    fn __len__(self) -> Int:
+    def __len__(self) -> Int:
         return self.tp
 
-    fn __getitem__(self, rank: Int) -> Int:
+    def __getitem__(self, rank: Int) -> Int:
         return self.node_ids[rank]
 
 
@@ -113,7 +113,7 @@ struct NumaInfo:
     var nodes: List[NumaNode]
     var num_nodes: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         self.num_nodes = 0
         self.nodes = List[NumaNode]()
         try:
@@ -134,13 +134,13 @@ struct NumaInfo:
         except:
             print("NumaInfo failed to read system numa information or it was not present on the system.")
 
-    fn get_node_cpus(self, node_id: Int) -> List[Int]:
+    def get_node_cpus(self, node_id: Int) -> List[Int]:
         """Get the list of CPU IDs belonging to the specified NUMA node."""
         if node_id < 0 or node_id >= self.num_nodes:
             return List[Int]()
         return self.nodes[node_id].cpu_ids.copy()
 
-    fn get_node_mask[mask_size: Int = 128](self, node_id: Int) -> CpuMask[mask_size]:
+    def get_node_mask[mask_size: Int = 128](self, node_id: Int) -> CpuMask[mask_size]:
         var mask = CpuMask[mask_size]()
         if node_id < 0 or node_id >= self.num_nodes:
             return mask^
@@ -149,7 +149,7 @@ struct NumaInfo:
             mask.set(cpus[i])
         return mask^
 
-    fn distance(self, from_node: Int, to_node: Int) -> Int:
+    def distance(self, from_node: Int, to_node: Int) -> Int:
         """Get the NUMA distance between two nodes."""
         if from_node < 0 or from_node >= self.num_nodes:
             return -1
@@ -157,26 +157,26 @@ struct NumaInfo:
             return -1
         return self.nodes[from_node].distances[to_node]
 
-    fn cpus_per_node(self) -> Int:
+    def cpus_per_node(self) -> Int:
         """Get the number of CPUs per node (assumes uniform topology)."""
         if self.num_nodes == 0:
             return 0
         return len(self.nodes[0].cpu_ids)
 
-    fn cpus_on_node(self, node: Int) -> Int:
+    def cpus_on_node(self, node: Int) -> Int:
         """Get the number of CPUs on a specific node."""
         if node < 0 or node >= self.num_nodes:
             return 0
         return len(self.nodes[node].cpu_ids)
 
-    fn total_cpus(self) -> Int:
+    def total_cpus(self) -> Int:
         """Get the total number of CPUs across all nodes."""
         var total = 0
         for i in range(self.num_nodes):
             total += len(self.nodes[i].cpu_ids)
         return total
 
-    fn plan_topology(self, tp: Int) -> NumaTopology:
+    def plan_topology(self, tp: Int) -> NumaTopology:
         """Select tp NUMA nodes with minimum communication cost, ordered as
         a nearest-neighbor ring for optimal allreduce adjacency.
 
@@ -194,7 +194,7 @@ struct NumaInfo:
         if self.num_nodes <= 1 or tp <= 1:
             var ids = List[Int]()
             var node_id = self.nodes[0].id if self.num_nodes > 0 else 0
-            for i in range(tp):
+            for _ in range(tp):
                 ids.append(node_id)
             return NumaTopology(ids^, tp)
 
@@ -268,7 +268,7 @@ struct NumaInfo:
 
         return NumaTopology(ordered^, tp)
 
-    fn print_debug(self):
+    def print_debug(self):
         print("NUMA Info:", self.num_nodes, "nodes,", self.cpus_per_node(), "cpus/node")
         print()
         for i in range(self.num_nodes):

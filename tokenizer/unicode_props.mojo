@@ -1,7 +1,7 @@
 # Auto-generated from Unicode data. Do not edit by hand.
 
 
-fn make_letter_ranges() -> InlineArray[UInt32, 1354]:
+def make_letter_ranges() -> InlineArray[UInt32, 1354]:
     var arr = InlineArray[UInt32, 1354](fill=UInt32(0))
     arr[0] = UInt32(0x0041)
     arr[1] = UInt32(0x005A)
@@ -1364,7 +1364,7 @@ comptime LETTER_PAIR_COUNT = 677
 comptime LETTER_MIN = UInt32(0x0041)
 comptime LETTER_MAX = UInt32(0x323AF)
 
-fn make_number_ranges() -> InlineArray[UInt32, 288]:
+def make_number_ranges() -> InlineArray[UInt32, 288]:
     var arr = InlineArray[UInt32, 288](fill=UInt32(0))
     arr[0] = UInt32(0x0030)
     arr[1] = UInt32(0x0039)
@@ -1661,7 +1661,7 @@ comptime NUMBER_PAIR_COUNT = 144
 comptime NUMBER_MIN = UInt32(0x0030)
 comptime NUMBER_MAX = UInt32(0x1FBF9)
 
-fn make_whitespace_ranges() -> InlineArray[UInt32, 20]:
+def make_whitespace_ranges() -> InlineArray[UInt32, 20]:
     var arr = InlineArray[UInt32, 20](fill=UInt32(0))
     arr[0] = UInt32(0x0009)
     arr[1] = UInt32(0x000D)

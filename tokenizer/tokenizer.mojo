@@ -1,5 +1,5 @@
-from collections import Dict
-from memory import Span
+from std.collections import Dict
+from std.memory import Span
 from .capabilities import ByteTransformCapability, PreTokenizerCapability
 from .auto import AutoPreTokenizer
 from .gpt2 import GPT2ByteTransform
@@ -12,29 +12,29 @@ from .shared_capabilities import (
 
 
 trait Tokenizer(Movable):
-    fn encode(mut self, text: String) -> List[Int]:
+    def encode(mut self, text: String) -> List[Int]:
         ...
 
-    fn decode(self, ids: List[Int]) -> String:
+    def decode(self, ids: List[Int]) -> String:
         ...
 
-    fn vocab_size(self) -> Int:
+    def vocab_size(self) -> Int:
         ...
 
-    fn token_to_id(self, token: String) -> Optional[Int]:
+    def token_to_id(self, token: String) -> Optional[Int]:
         ...
 
-    fn id_to_token(self, id: Int) -> Optional[String]:
+    def id_to_token(self, id: Int) -> Optional[String]:
         ...
 
 
 @always_inline
-fn pack_pair_ids(left: Int, right: Int) -> UInt64:
+def pack_pair_ids(left: Int, right: Int) -> UInt64:
     return (UInt64(UInt32(left)) << UInt64(32)) | UInt64(UInt32(right))
 
 
 @always_inline
-fn split_merge_pair(pair: String) -> Optional[Tuple[String, String]]:
+def split_merge_pair(pair: String) -> Optional[Tuple[String, String]]:
     var bytes = pair.as_bytes()
     for i in range(len(bytes)):
         if bytes[i] == Byte(32):
@@ -50,20 +50,20 @@ struct MergeCandidate(Copyable, ImplicitlyCopyable):
     var left: Int
     var right: Int
 
-    fn __init__(out self, rank: Int, left: Int, right: Int):
+    def __init__(out self, rank: Int, left: Int, right: Int):
         self.rank = rank
         self.left = left
         self.right = right
 
 
 @always_inline
-fn candidate_less(a: MergeCandidate, b: MergeCandidate) -> Bool:
+def candidate_less(a: MergeCandidate, b: MergeCandidate) -> Bool:
     if a.rank != b.rank:
         return a.rank < b.rank
     return a.left < b.left
 
 
-fn heap_push(mut heap: List[MergeCandidate], cand: MergeCandidate):
+def heap_push(mut heap: List[MergeCandidate], cand: MergeCandidate):
     heap.append(cand)
     var idx = len(heap) - 1
     while idx > 0:
@@ -76,7 +76,7 @@ fn heap_push(mut heap: List[MergeCandidate], cand: MergeCandidate):
         idx = parent
 
 
-fn heap_pop_min(mut heap: List[MergeCandidate]) -> MergeCandidate:
+def heap_pop_min(mut heap: List[MergeCandidate]) -> MergeCandidate:
     var top = heap[0]
     var n = len(heap)
     if n == 1:
@@ -104,7 +104,7 @@ fn heap_pop_min(mut heap: List[MergeCandidate]) -> MergeCandidate:
     return top
 
 
-fn bpe_merge_ids(
+def bpe_merge_ids(
     mut symbols: List[Int],
     pair_ranks: Dict[UInt64, Int],
     pair_out: Dict[UInt64, Int],
@@ -201,13 +201,13 @@ struct PieceCache(Movable):
     var lens: List[Int]
     var values: List[Int]
 
-    fn __init__(out self):
+    def __init__(out self):
         self.index = Dict[String, Int]()
         self.starts = List[Int]()
         self.lens = List[Int]()
         self.values = List[Int]()
 
-    fn get(self, piece: String, mut ids: List[Int]) -> Bool:
+    def get(self, piece: String, mut ids: List[Int]) -> Bool:
         var cached_slot = self.index.get(piece)
         if not cached_slot:
             return False
@@ -220,7 +220,7 @@ struct PieceCache(Movable):
             ids.append(self.values[start + i])
         return True
 
-    fn put(mut self, piece: String, symbol_ids: List[Int]):
+    def put(mut self, piece: String, symbol_ids: List[Int]):
         if len(symbol_ids) == 0 or len(symbol_ids) > PIECE_CACHE_MAX_IDS_PER_ENTRY:
             return
         if len(self.starts) >= PIECE_CACHE_MAX_ENTRIES:
@@ -233,7 +233,7 @@ struct PieceCache(Movable):
         self.lens.append(len(symbol_ids))
         self.index[piece] = slot
 
-    fn clear(mut self):
+    def clear(mut self):
         self.index = Dict[String, Int]()
         self.starts.resize(unsafe_uninit_length=0)
         self.lens.resize(unsafe_uninit_length=0)
@@ -268,7 +268,7 @@ struct BPETokenizer[
     var pretokenizer: Self.pretokenizer_type
     var byte_transform: Self.byte_transform_type
 
-    fn __init__(
+    def __init__(
         out self,
         var vocab: Dict[String, Int],
         var merges: List[String],
@@ -348,44 +348,44 @@ struct BPETokenizer[
         self.pretokenizer = pretokenizer^
         self.byte_transform = byte_transform^
 
-    fn vocab_size(self) -> Int:
+    def vocab_size(self) -> Int:
         return self._vocab_size
 
-    fn token_to_id(self, token: String) -> Optional[Int]:
+    def token_to_id(self, token: String) -> Optional[Int]:
         var found = self.vocab.get(token)
         if found:
             return found.value()
         return None
 
-    fn id_to_token(self, id: Int) -> Optional[String]:
+    def id_to_token(self, id: Int) -> Optional[String]:
         if id >= 0 and id < self._vocab_size:
             var tok = self.vocab_rev[id]
             if tok.byte_length() > 0:
                 return tok
         return None
 
-    fn is_special_token(self, token: String) -> Bool:
+    def is_special_token(self, token: String) -> Bool:
         return self.special_tokens.__contains__(token)
 
-    fn is_special_id(self, id: Int) -> Bool:
+    def is_special_id(self, id: Int) -> Bool:
         for i in range(len(self.special_ids)):
             if self.special_ids[i] == id:
                 return True
         return False
 
-    fn merge_rank(self, pair: String) -> Int:
+    def merge_rank(self, pair: String) -> Int:
         var found = self.merge_ranks.get(pair)
         if found:
             return found.value()
         return -1
 
-    fn num_merges(self) -> Int:
+    def num_merges(self) -> Int:
         return len(self.merges)
 
-    fn num_special_tokens(self) -> Int:
+    def num_special_tokens(self) -> Int:
         return len(self.special_tokens)
 
-    fn encode_piece(mut self, piece: String, mut ids: List[Int]):
+    def encode_piece(mut self, piece: String, mut ids: List[Int]):
         if piece.byte_length() == 0:
             return
 
@@ -408,7 +408,7 @@ struct BPETokenizer[
         for i in range(len(symbol_ids)):
             ids.append(symbol_ids[i])
 
-    fn encode_span(mut self, data: Span[Byte], start: Int, end: Int, mut ids: List[Int]):
+    def encode_span(mut self, data: Span[Byte, _], start: Int, end: Int, mut ids: List[Int]):
         if end <= start:
             return
         var chunk = span_to_string(data, start, end)
@@ -416,7 +416,7 @@ struct BPETokenizer[
         for i in range(len(pieces)):
             self.encode_piece(pieces[i], ids)
 
-    fn encode(mut self, text: String) -> List[Int]:
+    def encode(mut self, text: String) -> List[Int]:
         var ids = List[Int]()
 
         if self.add_bos_token and self.bos_token_id >= 0:
@@ -447,7 +447,7 @@ struct BPETokenizer[
 
         return ids^
 
-    fn decode(self, ids: List[Int]) -> String:
+    def decode(self, ids: List[Int]) -> String:
         var encoded_parts = List[Byte]()
         var decoded = String("")
         for i in range(len(ids)):
@@ -475,7 +475,7 @@ struct BPETokenizer[
             decoded = decoded + String(unsafe_from_utf8=Span(raw_bytes))
         return decoded^
 
-    fn print_summary(self):
+    def print_summary(self):
         print("=== BPETokenizer Summary ===")
         print("Vocab size:      ", self._vocab_size)
         print("Merge rules:     ", len(self.merges))

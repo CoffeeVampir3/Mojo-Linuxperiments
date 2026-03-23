@@ -1,7 +1,7 @@
 # Auto-generated Unicode ranges for tokenizer category checks.
 # Generated from Unicode general categories using Python unicodedata.
 
-fn make_mark_ranges() -> InlineArray[UInt32, 642]:
+def make_mark_ranges() -> InlineArray[UInt32, 642]:
     var arr = InlineArray[UInt32, 642](fill=UInt32(0))
     arr[0] = UInt32(0x0300)
     arr[1] = UInt32(0x036F)
@@ -652,7 +652,7 @@ comptime MARK_PAIR_COUNT = 321
 comptime MARK_MIN = UInt32(0x0300)
 comptime MARK_MAX = UInt32(0xE01EF)
 
-fn make_punct_symbol_ranges() -> InlineArray[UInt32, 698]:
+def make_punct_symbol_ranges() -> InlineArray[UInt32, 698]:
     var arr = InlineArray[UInt32, 698](fill=UInt32(0))
     arr[0] = UInt32(0x0021)
     arr[1] = UInt32(0x002F)

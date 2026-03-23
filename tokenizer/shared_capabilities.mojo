@@ -1,5 +1,5 @@
-from collections import Dict
-from memory import Span, UnsafePointer
+from std.collections import Dict
+from std.memory import Span, UnsafePointer
 
 from .unicode_props import (
     LETTER_PAIR_COUNT,
@@ -19,7 +19,7 @@ from .unicode_psm_props import (
 )
 
 
-fn make_byte_to_codepoint() -> InlineArray[Int, 256]:
+def make_byte_to_codepoint() -> InlineArray[Int, 256]:
     var table = InlineArray[Int, 256](fill=0)
     var n = 256
     for b in range(256):
@@ -31,7 +31,7 @@ fn make_byte_to_codepoint() -> InlineArray[Int, 256]:
     return table^
 
 
-fn make_codepoint_to_byte() -> InlineArray[Int, 324]:
+def make_codepoint_to_byte() -> InlineArray[Int, 324]:
     var table = InlineArray[Int, 324](fill=-1)
     var fwd = make_byte_to_codepoint()
     for b in range(256):
@@ -43,7 +43,7 @@ comptime BYTE_TO_CODEPOINT = make_byte_to_codepoint()
 comptime CODEPOINT_TO_BYTE = make_codepoint_to_byte()
 
 
-fn bytes_to_gpt2(data: Span[Byte]) -> String:
+def bytes_to_gpt2(data: Span[Byte, _]) -> String:
     var cp_table = materialize[BYTE_TO_CODEPOINT]()
     var out = List[Byte]()
     out.reserve(len(data) * 2)
@@ -56,7 +56,7 @@ fn bytes_to_gpt2(data: Span[Byte]) -> String:
     return String(unsafe_from_utf8=Span(out))
 
 
-fn gpt2_to_bytes(text: String) -> List[Byte]:
+def gpt2_to_bytes(text: String) -> List[Byte]:
     var cp_table = materialize[CODEPOINT_TO_BYTE]()
     var out = List[Byte]()
     out.reserve(text.byte_length())
@@ -70,22 +70,22 @@ fn gpt2_to_bytes(text: String) -> List[Byte]:
 
 
 @always_inline
-fn is_ascii_letter(b: Byte) -> Bool:
+def is_ascii_letter(b: Byte) -> Bool:
     return ((b | Byte(0x20)) - Byte(97)) < Byte(26)
 
 
 @always_inline
-fn is_ascii_digit(b: Byte) -> Bool:
+def is_ascii_digit(b: Byte) -> Bool:
     return (b - Byte(48)) < Byte(10)
 
 
 @always_inline
-fn is_ascii_regex_space(b: Byte) -> Bool:
+def is_ascii_regex_space(b: Byte) -> Bool:
     return (b >= Byte(9) and b <= Byte(13)) or b == Byte(32)
 
 
 @always_inline
-fn decode_utf8_codepoint(data: Span[Byte], pos: Int, n: Int) -> Tuple[UInt32, Int]:
+def decode_utf8_codepoint(data: Span[Byte, _], pos: Int, n: Int) -> Tuple[UInt32, Int]:
     var b0 = data[pos]
     if b0 < Byte(0x80):
         return (UInt32(b0), 1)
@@ -115,7 +115,7 @@ fn decode_utf8_codepoint(data: Span[Byte], pos: Int, n: Int) -> Tuple[UInt32, In
 
 
 @always_inline
-fn in_unicode_ranges(cp: UInt32, ranges: UnsafePointer[UInt32], pair_count: Int) -> Bool:
+def in_unicode_ranges(cp: UInt32, ranges: UnsafePointer[UInt32, _], pair_count: Int) -> Bool:
     var lo = 0
     var hi = pair_count
     while lo < hi:
@@ -132,7 +132,7 @@ fn in_unicode_ranges(cp: UInt32, ranges: UnsafePointer[UInt32], pair_count: Int)
 
 
 @always_inline
-fn is_unicode_letter_cp(cp: UInt32, letter_ranges: UnsafePointer[UInt32]) -> Bool:
+def is_unicode_letter_cp(cp: UInt32, letter_ranges: UnsafePointer[UInt32, _]) -> Bool:
     if cp < UInt32(0x80):
         return is_ascii_letter(Byte(cp))
     if cp < LETTER_MIN or cp > LETTER_MAX:
@@ -141,7 +141,7 @@ fn is_unicode_letter_cp(cp: UInt32, letter_ranges: UnsafePointer[UInt32]) -> Boo
 
 
 @always_inline
-fn is_unicode_number_cp(cp: UInt32, number_ranges: UnsafePointer[UInt32]) -> Bool:
+def is_unicode_number_cp(cp: UInt32, number_ranges: UnsafePointer[UInt32, _]) -> Bool:
     if cp < UInt32(0x80):
         return is_ascii_digit(Byte(cp))
     if cp < NUMBER_MIN or cp > NUMBER_MAX:
@@ -150,7 +150,7 @@ fn is_unicode_number_cp(cp: UInt32, number_ranges: UnsafePointer[UInt32]) -> Boo
 
 
 @always_inline
-fn is_unicode_whitespace_cp(cp: UInt32, whitespace_ranges: UnsafePointer[UInt32]) -> Bool:
+def is_unicode_whitespace_cp(cp: UInt32, whitespace_ranges: UnsafePointer[UInt32, _]) -> Bool:
     if cp < UInt32(0x80):
         return is_ascii_regex_space(Byte(cp))
     if cp < WHITESPACE_MIN or cp > WHITESPACE_MAX:
@@ -159,7 +159,7 @@ fn is_unicode_whitespace_cp(cp: UInt32, whitespace_ranges: UnsafePointer[UInt32]
 
 
 @always_inline
-fn is_ascii_punct_symbol(b: Byte) -> Bool:
+def is_ascii_punct_symbol(b: Byte) -> Bool:
     return (
         (b >= Byte(33) and b <= Byte(47))
         or (b >= Byte(58) and b <= Byte(64))
@@ -169,7 +169,7 @@ fn is_ascii_punct_symbol(b: Byte) -> Bool:
 
 
 @always_inline
-fn is_unicode_punct_symbol_cp(cp: UInt32, punct_symbol_ranges: UnsafePointer[UInt32]) -> Bool:
+def is_unicode_punct_symbol_cp(cp: UInt32, punct_symbol_ranges: UnsafePointer[UInt32, _]) -> Bool:
     if cp < UInt32(0x80):
         return is_ascii_punct_symbol(Byte(cp))
     if cp < PUNCT_SYMBOL_MIN or cp > PUNCT_SYMBOL_MAX:
@@ -178,30 +178,30 @@ fn is_unicode_punct_symbol_cp(cp: UInt32, punct_symbol_ranges: UnsafePointer[UIn
 
 
 @always_inline
-fn is_number_start_at(
-    data: Span[Byte],
+def is_number_start_at(
+    data: Span[Byte, _],
     pos: Int,
     n: Int,
-    number_ranges: UnsafePointer[UInt32],
+    number_ranges: UnsafePointer[UInt32, _],
 ) -> Bool:
     var parsed = decode_utf8_codepoint(data, pos, n)
     return is_unicode_number_cp(parsed[0], number_ranges)
 
 
 @always_inline
-fn is_whitespace_start_at(
-    data: Span[Byte],
+def is_whitespace_start_at(
+    data: Span[Byte, _],
     pos: Int,
     n: Int,
-    whitespace_ranges: UnsafePointer[UInt32],
+    whitespace_ranges: UnsafePointer[UInt32, _],
 ) -> Bool:
     var parsed = decode_utf8_codepoint(data, pos, n)
     return is_unicode_whitespace_cp(parsed[0], whitespace_ranges)
 
 
 @always_inline
-fn span_to_string(data: Span[Byte], start: Int, end: Int) -> String:
-    return String(unsafe_from_utf8=Span[Byte](ptr=data.unsafe_ptr() + start, length=end - start))
+def span_to_string(data: Span[Byte, _], start: Int, end: Int) -> String:
+    return String(unsafe_from_utf8=Span[Byte, _](ptr=data.unsafe_ptr() + start, length=end - start))
 
 
 # =============================================================================
@@ -212,26 +212,26 @@ comptime PRETOKENIZE_SIMD_WIDTH = 16
 
 
 @always_inline
-fn simd_ascii_letters[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
+def simd_ascii_letters[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
     return ((block | Byte(0x20)) - Byte(97)).le(Byte(25))
 
 
 @always_inline
-fn simd_ascii_digits[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
+def simd_ascii_digits[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
     return (block - Byte(48)).le(Byte(9))
 
 
 @always_inline
-fn simd_spaces[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
+def simd_spaces[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
     return (block - Byte(9)).le(Byte(4)) | block.eq(Byte(32))
 
 
 @always_inline
-fn skip_while_matching[
-    scalar_pred: fn(Byte) -> Bool,
-    simd_pred: fn[w: Int](SIMD[DType.uint8, w]) -> SIMD[DType.bool, w],
+def skip_while_matching[
+    scalar_pred: def(Byte) -> Bool,
+    simd_pred: def[w: Int](SIMD[DType.uint8, w]) -> SIMD[DType.bool, w],
     width: Int = PRETOKENIZE_SIMD_WIDTH,
-](data: Span[Byte], pos: Int, n: Int) -> Int:
+](data: Span[Byte, _], pos: Int, n: Int) -> Int:
     var i = pos
     var data_ptr = data.unsafe_ptr()
     while i + width <= n:
@@ -240,8 +240,7 @@ fn skip_while_matching[
         if all(mask):
             i += width
             continue
-        @parameter
-        for lane in range(width):
+        comptime for lane in range(width):
             if not mask[lane]:
                 return i + lane
     while i < n and scalar_pred(data[i]):
@@ -255,9 +254,9 @@ fn skip_while_matching[
 
 
 @always_inline
-fn consume_codepoint_run[
-    pred: fn(UInt32, UnsafePointer[UInt32]) -> Bool,
-](data: Span[Byte], start: Int, n: Int, ranges: UnsafePointer[UInt32]) -> Int:
+def consume_codepoint_run[
+    pred: def(UInt32, UnsafePointer[UInt32, _]) -> Bool,
+](data: Span[Byte, _], start: Int, n: Int, ranges: UnsafePointer[UInt32, _]) -> Int:
     var i = start
     while i < n:
         var parsed = decode_utf8_codepoint(data, i, n)
@@ -272,7 +271,7 @@ fn consume_codepoint_run[
 # =============================================================================
 
 
-fn sort_strings_by_byte_length_desc(mut values: List[String]):
+def sort_strings_by_byte_length_desc(mut values: List[String]):
     for i in range(1, len(values)):
         var cur = values[i]
         var cur_len = cur.byte_length()
@@ -284,7 +283,7 @@ fn sort_strings_by_byte_length_desc(mut values: List[String]):
 
 
 @always_inline
-fn span_matches_at(data: Span[Byte], pos: Int, pattern: Span[Byte]) -> Bool:
+def span_matches_at(data: Span[Byte, _], pos: Int, pattern: Span[Byte, _]) -> Bool:
     if pos + len(pattern) > len(data):
         return False
     for i in range(len(pattern)):
@@ -293,8 +292,8 @@ fn span_matches_at(data: Span[Byte], pos: Int, pattern: Span[Byte]) -> Bool:
     return True
 
 
-fn find_added_token_match(
-    text: Span[Byte],
+def find_added_token_match(
+    text: Span[Byte, _],
     pos: Int,
     added_token_order: List[String],
     added_tokens: Dict[String, Int],

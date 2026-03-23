@@ -1,6 +1,6 @@
-from sys import inlined_assembly
-from sys.info import size_of
-from memory import UnsafePointer
+from std.sys import inlined_assembly
+from std.sys.info import size_of
+from std.memory import UnsafePointer
 
 from .linux_sys import *
 
@@ -10,7 +10,7 @@ from .linux_sys import *
 
 comptime SA_RESTORER: UInt64 = 0x04000000
 
-fn rt_sigreturn_restorer():
+def rt_sigreturn_restorer():
     inlined_assembly[
         "mov $$15, %rax\nsyscall",
         NoneType,
@@ -23,7 +23,7 @@ struct KernelRtSigActionX86_64(TrivialRegisterPassable):
     var restorer: Int
     var mask: SigSet64
 
-    fn __init__(out self):
+    def __init__(out self):
         self.handler = 0
         self.flags = 0
         self.restorer = 0
@@ -72,19 +72,18 @@ struct X86_64LinuxSys(LinuxSys):
     comptime NR_futex_wake = 454
     comptime NR_futex_wait = 455
 
-    fn __init__(out self):
+    def __init__(out self):
         pass
 
     # --- Raw syscall mechanism (x86_64 register ABI) ---
 
-    fn syscall[count: Int](self, nr: Int, *args: Int) -> Int:
+    def syscall[count: Int](self, nr: Int, *args: Int) -> Int:
         comptime regs = ("", ",{rdi}", ",{rdi},{rsi}", ",{rdi},{rsi},{rdx}",
                       ",{rdi},{rsi},{rdx},{rcx}", ",{rdi},{rsi},{rdx},{rcx},{r8}",
                       ",{rdi},{rsi},{rdx},{rcx},{r8},{r9}")
         comptime asm = "mov %rcx, %r10\nsyscall" if count > 3 else "syscall"
         comptime constraints = "={rax},{rax}" + regs[count] + ",~{rcx},~{r10},~{r11},~{memory}"
-        @parameter
-        if count == 0:
+        comptime if count == 0:
             return Int(inlined_assembly[asm, Int, Int, constraints=constraints](nr))
         elif count == 1:
             return Int(inlined_assembly[asm, Int, Int, Int, constraints=constraints](nr, args[0]))
@@ -117,22 +116,21 @@ struct X86_64LinuxSys(LinuxSys):
                 )
             )
         else:
-            constrained[False, "syscall supports 0-6 arguments"]()
-            return 0
+            comptime assert False, "syscall supports 0-6 arguments"
 
     # --- Architecture-specific operations ---
 
-    fn arch_cpu_relax(self):
+    def arch_cpu_relax(self):
         inlined_assembly["pause", NoneType, constraints="~{memory}"]()
 
-    fn arch_thread_pointer(self) -> Int:
+    def arch_thread_pointer(self) -> Int:
         return Int(inlined_assembly["mov %fs:0, $0", Int, constraints="=r"]())
 
-    fn arch_tls_load_i64[offset: Int](self) -> Int:
+    def arch_tls_load_i64[offset: Int](self) -> Int:
         comptime asm = "mov %fs:" + String(offset) + ", $0"
         return Int(inlined_assembly[asm, Int, constraints="=r"]())
 
-    fn sys_rt_sigaction(
+    def sys_rt_sigaction(
         self,
         signum: Int,
         act: UnsafePointer[RtSigAction, MutAnyOrigin],
@@ -176,7 +174,7 @@ struct X86_64LinuxSys(LinuxSys):
             _ = kact_ptr[]
             return result
 
-    fn sys_clone3_with_entry(
+    def sys_clone3_with_entry(
         self,
         clone_args_ptr: UnsafePointer[Clone3Args, MutAnyOrigin],
         clone_args_size: Int,
@@ -200,7 +198,7 @@ struct X86_64LinuxSys(LinuxSys):
             ](Int(clone_args_ptr), clone_args_size)
         )
 
-    fn arch_decode_sigsegv(self, siginfo: Int, ucontext: Int) -> SigSegvContext:
+    def arch_decode_sigsegv(self, siginfo: Int, ucontext: Int) -> SigSegvContext:
         comptime UCONTEXT_GREGS_OFFSET = 40
         comptime REG_RSP = 15
         comptime REG_RIP = 16

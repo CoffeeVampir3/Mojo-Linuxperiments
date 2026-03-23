@@ -1,6 +1,6 @@
-from collections import Dict
-from memory import Span, UnsafePointer
-from pathlib import Path
+from std.collections import Dict
+from std.memory import Span, UnsafePointer
+from std.pathlib import Path
 
 from jsontools.parser import (
     Parser,
@@ -14,7 +14,7 @@ from jsontools.parser import (
 comptime HEADER_LEN_BYTES = 8
 comptime MAX_HEADER_SIZE = 100 * 1024 * 1024
 
-fn parse_dtype(s: String) -> DType:
+def parse_dtype(s: String) -> DType:
     if s == "BOOL":
         return DType.bool
     if s == "U8":
@@ -49,16 +49,16 @@ struct TensorMeta(Copyable, Writable):
     var start: Int
     var end: Int
 
-    fn __init__(out self, dtype: DType, var shape: List[Int], start: Int, end: Int):
+    def __init__(out self, dtype: DType, var shape: List[Int], start: Int, end: Int):
         self.dtype = dtype
         self.shape = shape^
         self.start = start
         self.end = end
 
-    fn byte_size(self) -> Int:
+    def byte_size(self) -> Int:
         return self.end - self.start
 
-    fn numel(self) -> Int:
+    def numel(self) -> Int:
         var n = 1
         for i in range(len(self.shape)):
             n *= self.shape[i]
@@ -71,7 +71,7 @@ struct SafetensorsHeader(Movable):
     var data_offset: Int
     var file_len: Int
 
-fn parse_offsets(mut parser: Parser) raises ParseError -> Tuple[Int, Int]:
+def parse_offsets(mut parser: Parser) raises ParseError -> Tuple[Int, Int]:
     if not parser.consume(LBRACKET):
         raise ParseError("expected '[' for offsets", parser.pos)
     parser.skip_whitespace()
@@ -84,7 +84,7 @@ fn parse_offsets(mut parser: Parser) raises ParseError -> Tuple[Int, Int]:
         raise ParseError("expected ']' after offsets", parser.pos)
     return (start_val, end_val)
 
-fn parse_shape(mut parser: Parser) raises ParseError -> List[Int]:
+def parse_shape(mut parser: Parser) raises ParseError -> List[Int]:
     if not parser.consume(LBRACKET):
         raise ParseError("expected '[' for shape", parser.pos)
     parser.skip_whitespace()
@@ -97,7 +97,7 @@ fn parse_shape(mut parser: Parser) raises ParseError -> List[Int]:
             break
     return shape^
 
-fn parse_tensor(mut parser: Parser) raises ParseError -> TensorMeta:
+def parse_tensor(mut parser: Parser) raises ParseError -> TensorMeta:
     if not parser.consume(LBRACE):
         raise ParseError("expected '{' for tensor", parser.pos)
     parser.skip_whitespace()
@@ -132,7 +132,7 @@ fn parse_tensor(mut parser: Parser) raises ParseError -> TensorMeta:
         raise ParseError("tensor missing required fields (dtype, shape, data_offsets)", parser.pos)
     return TensorMeta(dtype, shape^, start, end)
 
-fn parse_safetensors_dict(mut parser: Parser) raises ParseError -> Dict[String, TensorMeta]:
+def parse_safetensors_dict(mut parser: Parser) raises ParseError -> Dict[String, TensorMeta]:
     var tensors = Dict[String, TensorMeta]()
     parser.skip_whitespace()
     if not parser.consume(LBRACE):
@@ -156,13 +156,13 @@ fn parse_safetensors_dict(mut parser: Parser) raises ParseError -> Dict[String, 
         raise ParseError("trailing content after root object", parser.pos)
     return tensors^
 
-fn read_u64_le(ptr: UnsafePointer[Byte, MutAnyOrigin]) -> UInt64:
+def read_u64_le(ptr: UnsafePointer[Byte, MutAnyOrigin]) -> UInt64:
     var v = UInt64(0)
     for i in range(HEADER_LEN_BYTES):
         v |= UInt64(ptr[i]) << UInt64(i * 8)
     return v
 
-fn parse_safetensors_header[simd_width: Int = 16](path: Path) -> Optional[SafetensorsHeader]:
+def parse_safetensors_header[simd_width: Int = 16](path: Path) -> Optional[SafetensorsHeader]:
     var header_bytes: List[Byte]
     var header_size = 0
     var file_len: UInt64

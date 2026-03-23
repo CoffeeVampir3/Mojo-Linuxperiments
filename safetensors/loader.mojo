@@ -1,8 +1,8 @@
 import linux.sys as linux
-from collections import Dict
-from memory import UnsafePointer
-from pathlib import Path
-from sys.info import size_of
+from std.collections import Dict
+from std.memory import UnsafePointer
+from std.pathlib import Path
+from std.sys.info import size_of
 
 struct ReadOp(TrivialRegisterPassable, Writable):
     """A single read operation: file region → buffer."""
@@ -12,7 +12,7 @@ struct ReadOp(TrivialRegisterPassable, Writable):
     var dest: Int
     var id: Int  # Maps to io_uring SQE user_data
 
-    fn __init__(out self, file_idx: Int, offset: Int, length: Int, dest: Int, id: Int = 0):
+    def __init__(out self, file_idx: Int, offset: Int, length: Int, dest: Int, id: Int = 0):
         self.file_idx = Int32(file_idx)
         self.offset = offset
         self.length = Int32(length)
@@ -23,7 +23,7 @@ struct Completion(TrivialRegisterPassable, Writable):
     var id: Int  # Copied back from io_uring CQE user_data
     var result: Int32
 
-    fn __init__(out self, id: Int = 0, result: Int32 = 0):
+    def __init__(out self, id: Int = 0, result: Int32 = 0):
         self.id = id
         self.result = result
 
@@ -31,7 +31,7 @@ struct Completion(TrivialRegisterPassable, Writable):
 struct IoLoadErrorTag(Copyable, TrivialRegisterPassable, Equatable, Writable):
     var raw: UInt8
 
-    fn __init__(out self, raw: UInt8):
+    def __init__(out self, raw: UInt8):
         self.raw = raw
 
 
@@ -49,7 +49,7 @@ struct IoLoadErrorKind(TrivialRegisterPassable):
     comptime INTERNAL_STATE = IoLoadErrorTag(11)
 
 
-fn io_load_error_name(tag: IoLoadErrorTag) -> String:
+def io_load_error_name(tag: IoLoadErrorTag) -> String:
     if tag == IoLoadErrorKind.INVALID_RING_STATE:
         return "INVALID_RING_STATE"
     if tag == IoLoadErrorKind.INVALID_OP_SPEC:
@@ -82,7 +82,7 @@ struct IoLoadError(Copyable, Writable):
     var actual: Int
     var errno: Int
 
-    fn __init__(
+    def __init__(
         out self,
         kind: IoLoadErrorTag,
         op_id: Int = -1,
@@ -97,7 +97,7 @@ struct IoLoadError(Copyable, Writable):
         self.errno = errno
 
 
-fn print_io_load_error(err: IoLoadError):
+def print_io_load_error(err: IoLoadError):
     print(
         "io_uring load error:",
         io_load_error_name(err.kind),
@@ -112,7 +112,7 @@ fn print_io_load_error(err: IoLoadError):
     )
 
 
-fn validate_completion_checked(
+def validate_completion_checked(
     c: Completion,
     expected_by_id: Dict[Int, Int],
     mut seen_by_id: Dict[Int, Int],
@@ -167,7 +167,7 @@ struct SubmissionQueue(TrivialRegisterPassable):
     var entries: UnsafePointer[linux.IoUringSqe, MutAnyOrigin]
     var entries_size: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         self.ring = UnsafePointer[UInt8, MutAnyOrigin]()
         self.ring_size = 0
         self.head = UnsafePointer[UInt32, MutAnyOrigin]()
@@ -177,10 +177,10 @@ struct SubmissionQueue(TrivialRegisterPassable):
         self.entries = UnsafePointer[linux.IoUringSqe, MutAnyOrigin]()
         self.entries_size = 0
 
-    fn __bool__(self) -> Bool:
+    def __bool__(self) -> Bool:
         return self.ring.__bool__()
 
-    fn available(self, max_entries: UInt32) -> Int:
+    def available(self, max_entries: UInt32) -> Int:
         return Int(max_entries - (self.tail[] - self.head[]))
 
 
@@ -192,7 +192,7 @@ struct CompletionQueue(TrivialRegisterPassable):
     var mask: UInt32
     var entries: UnsafePointer[linux.IoUringCqe, MutAnyOrigin]
 
-    fn __init__(out self):
+    def __init__(out self):
         self.ring = UnsafePointer[UInt8, MutAnyOrigin]()
         self.ring_size = 0
         self.head = UnsafePointer[UInt32, MutAnyOrigin]()
@@ -200,10 +200,10 @@ struct CompletionQueue(TrivialRegisterPassable):
         self.mask = 0
         self.entries = UnsafePointer[linux.IoUringCqe, MutAnyOrigin]()
 
-    fn __bool__(self) -> Bool:
+    def __bool__(self) -> Bool:
         return self.ring.__bool__()
 
-    fn ready(self) -> Int:
+    def ready(self) -> Int:
         """Number of completions ready to be used."""
         return Int(self.tail[] - self.head[])
 
@@ -221,11 +221,8 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
     var last_wait_result: Int
     var last_wait_errno: Int
 
-    fn __init__(out self):
-        constrained[
-            (Self.queue_depth & (Self.queue_depth - 1)) == 0 and Self.queue_depth > 0,
-            "queue_depth must be a power of 2"
-        ]()
+    def __init__(out self):
+        comptime assert (Self.queue_depth & (Self.queue_depth - 1)) == 0 and Self.queue_depth > 0, "queue_depth must be a power of 2"
         self.ring_fd = -1
         self.sq = SubmissionQueue()
         self.cq = CompletionQueue()
@@ -252,7 +249,7 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
             if entries > 0:
                 self.max_entries = UInt32(entries)
 
-    fn map_rings(mut self, params: linux.IoUringParams):
+    def map_rings(mut self, params: linux.IoUringParams):
         """Map submission and completion queue rings after io_uring_setup."""
         var sys = linux.linux_sys()
         self.sq.ring_size = Int(params.sq_off.array) + Int(params.sq_entries) * size_of[UInt32]()
@@ -320,7 +317,7 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         self.cq.mask = (self.cq.ring + Int(params.cq_off.ring_mask)).bitcast[UInt32]()[]
         self.cq.entries = (self.cq.ring + Int(params.cq_off.cqes)).bitcast[linux.IoUringCqe]()
 
-    fn __del__(deinit self):
+    def __del__(deinit self):
         var sys = linux.linux_sys()
         for i in range(len(self.file_fds)):
             if self.file_fds[i] >= 0:
@@ -340,13 +337,11 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
 
         _ = sys.sys_close(self.ring_fd)
 
-    fn __bool__(self) -> Bool:
+    def __bool__(self) -> Bool:
         return self.ring_fd >= 0
 
-    fn register_files(mut self, paths: List[Path]) -> Int:
-        """
-        Returns number of files registered, or negative errno on failure.
-        """
+    def register_files(mut self, paths: List[Path]) -> Int:
+        """Returns number of files registered, or negative errno on failure."""
         if self.ring_fd < 0:
             return -1
 
@@ -386,7 +381,7 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
 
         return count
 
-    fn submit(mut self, ops: List[ReadOp]) -> Int:
+    def submit(mut self, ops: List[ReadOp]) -> Int:
         """Non-blocking.
         Returns number of ops submitted (may be < len(ops) if queue full).
         """
@@ -452,8 +447,8 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         self.pending_count += Int(result)
         return Int(result)
 
-    fn wait(mut self, min_complete: Int = 1) -> List[Completion]:
-        """Block until at least min_complete operations finish. (No burn, kernel sleep)
+    def wait(mut self, min_complete: Int = 1) -> List[Completion]:
+        """Block until at least min_complete operations finish.
         Returns all available completions.
         """
         var completions = List[Completion]()
@@ -492,7 +487,7 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         self.cq.head[] = head
         return completions^
 
-    fn poll(mut self) -> List[Completion]:
+    def poll(mut self) -> List[Completion]:
         """Immediately returns whatever completions are ready."""
         var completions = List[Completion]()
         if self.ring_fd < 0:
@@ -501,7 +496,6 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         var head = self.cq.head[]
         var tail = self.cq.tail[]
 
-        # Pointer traversal.
         while head != tail:
             var idx = head & self.cq.mask
             var cqe = self.cq.entries[Int(idx)]
@@ -512,10 +506,10 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         self.cq.head[] = head
         return completions^
 
-    fn pending(self) -> Int:
+    def pending(self) -> Int:
         return self.pending_count
 
-    fn submit_one_checked(mut self, op: ReadOp) -> Int:
+    def submit_one_checked(mut self, op: ReadOp) -> Int:
         if self.ring_fd < 0:
             return -1
 
@@ -568,8 +562,8 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         self.pending_count += 1
         return 1
 
-    fn process_queue_checked[
-        on_complete: fn(Completion) capturing -> None,
+    def process_queue_checked[
+        on_complete: def(Completion) capturing -> None,
     ](mut self, ops: List[ReadOp], min_complete: Int = 1) -> Optional[IoLoadError]:
         var total = len(ops)
         if total == 0:
@@ -636,7 +630,7 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
                 for c in completions:
                     var err = validate_completion_checked(c, expected_by_id, seen_by_id)
                     if err:
-                        return err
+                        return err^
                     on_complete(c)
                     completed += 1
                 continue
@@ -655,7 +649,7 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
             for c in completions:
                 var err = validate_completion_checked(c, expected_by_id, seen_by_id)
                 if err:
-                    return err
+                    return err^
                 on_complete(c)
                 completed += 1
 
@@ -671,7 +665,7 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
             for c in completions:
                 var err = validate_completion_checked(c, expected_by_id, seen_by_id)
                 if err:
-                    return err
+                    return err^
                 on_complete(c)
                 completed += 1
 
@@ -684,13 +678,13 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
 
         return None
 
-    fn process_queue[
-        on_complete: fn(Completion) capturing -> None,
+    def process_queue[
+        on_complete: def(Completion) capturing -> None,
     ](mut self, ops: List[ReadOp], min_complete: Int = 1) -> Int:
         var completed = 0
 
         @parameter
-        fn wrapped(c: Completion):
+        def wrapped(c: Completion):
             completed += 1
             on_complete(c)
 

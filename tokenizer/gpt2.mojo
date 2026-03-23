@@ -1,4 +1,4 @@
-from memory import Span
+from std.memory import Span
 from .capabilities import ByteTransformCapability, PreTokenizerCapability
 from .shared_capabilities import (
     is_ascii_letter,
@@ -25,24 +25,24 @@ from .unicode_props import (
 
 
 @always_inline
-fn is_letter_start_at(
-    data: Span[Byte],
+def is_letter_start_at(
+    data: Span[Byte, _],
     pos: Int,
     n: Int,
-    letter_ranges: UnsafePointer[UInt32],
+    letter_ranges: UnsafePointer[UInt32, _],
 ) -> Bool:
     var parsed = decode_utf8_codepoint(data, pos, n)
     return is_unicode_letter_cp(parsed[0], letter_ranges)
 
 
 @always_inline
-fn is_symbol_start_at(
-    data: Span[Byte],
+def is_symbol_start_at(
+    data: Span[Byte, _],
     pos: Int,
     n: Int,
-    letter_ranges: UnsafePointer[UInt32],
-    number_ranges: UnsafePointer[UInt32],
-    whitespace_ranges: UnsafePointer[UInt32],
+    letter_ranges: UnsafePointer[UInt32, _],
+    number_ranges: UnsafePointer[UInt32, _],
+    whitespace_ranges: UnsafePointer[UInt32, _],
 ) -> Bool:
     var b = data[pos]
     if b < Byte(0x80):
@@ -59,11 +59,11 @@ fn is_symbol_start_at(
 
 
 @always_inline
-fn consume_letter_run(
-    data: Span[Byte],
+def consume_letter_run(
+    data: Span[Byte, _],
     start: Int,
     n: Int,
-    letter_ranges: UnsafePointer[UInt32],
+    letter_ranges: UnsafePointer[UInt32, _],
 ) -> Int:
     var i = start
     while i < n:
@@ -80,11 +80,11 @@ fn consume_letter_run(
 
 
 @always_inline
-fn consume_number_run(
-    data: Span[Byte],
+def consume_number_run(
+    data: Span[Byte, _],
     start: Int,
     n: Int,
-    number_ranges: UnsafePointer[UInt32],
+    number_ranges: UnsafePointer[UInt32, _],
 ) -> Int:
     var i = start
     while i < n:
@@ -100,13 +100,13 @@ fn consume_number_run(
 
 
 @always_inline
-fn consume_symbol_run(
-    data: Span[Byte],
+def consume_symbol_run(
+    data: Span[Byte, _],
     start: Int,
     n: Int,
-    letter_ranges: UnsafePointer[UInt32],
-    number_ranges: UnsafePointer[UInt32],
-    whitespace_ranges: UnsafePointer[UInt32],
+    letter_ranges: UnsafePointer[UInt32, _],
+    number_ranges: UnsafePointer[UInt32, _],
+    whitespace_ranges: UnsafePointer[UInt32, _],
 ) -> Int:
     var i = start
     while i < n:
@@ -118,11 +118,11 @@ fn consume_symbol_run(
 
 
 @always_inline
-fn consume_whitespace_run(
-    data: Span[Byte],
+def consume_whitespace_run(
+    data: Span[Byte, _],
     start: Int,
     n: Int,
-    whitespace_ranges: UnsafePointer[UInt32],
+    whitespace_ranges: UnsafePointer[UInt32, _],
 ) -> Tuple[Int, Int, Int]:
     var i = start
     var last_cp_start = start
@@ -151,7 +151,7 @@ fn consume_whitespace_run(
     return (i, last_cp_start, cp_count)
 
 
-fn try_contraction(data: Span[Byte], pos: Int, n: Int) -> Int:
+def try_contraction(data: Span[Byte, _], pos: Int, n: Int) -> Int:
     if pos + 1 >= n:
         return 0
     var c = data[pos + 1]
@@ -165,13 +165,13 @@ fn try_contraction(data: Span[Byte], pos: Int, n: Int) -> Int:
     return 0
 
 
-fn pre_tokenize_bytelevel_span(
-    data: Span[Byte],
+def pre_tokenize_bytelevel_span(
+    data: Span[Byte, _],
     start: Int,
     end: Int,
-    letter_ranges: UnsafePointer[UInt32],
-    number_ranges: UnsafePointer[UInt32],
-    whitespace_ranges: UnsafePointer[UInt32],
+    letter_ranges: UnsafePointer[UInt32, _],
+    number_ranges: UnsafePointer[UInt32, _],
+    whitespace_ranges: UnsafePointer[UInt32, _],
     mut result: List[String],
 ):
     var i = start
@@ -255,7 +255,7 @@ fn pre_tokenize_bytelevel_span(
         i += parsed[1]
 
 
-fn pre_tokenize(text: String) -> List[String]:
+def pre_tokenize(text: String) -> List[String]:
     var result = List[String]()
     var data = text.as_bytes()
     var n = len(data)
@@ -302,13 +302,13 @@ fn pre_tokenize(text: String) -> List[String]:
     return result^
 
 struct GPT2ByteTransform(ByteTransformCapability):
-    fn __init__(out self):
+    def __init__(out self):
         pass
 
 
 struct GPT2PreTokenizer(PreTokenizerCapability):
-    fn __init__(out self):
+    def __init__(out self):
         pass
 
-    fn pre_tokenize(self, text: String) -> List[String]:
+    def pre_tokenize(self, text: String) -> List[String]:
         return pre_tokenize(text)

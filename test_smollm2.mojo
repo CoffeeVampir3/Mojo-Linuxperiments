@@ -2,10 +2,10 @@
 decode 30 tokens greedily. Reports load time, per-token forward time,
 and the final generated sequence."""
 
-from memory import UnsafePointer
-from sys.info import simd_width_of
-from pathlib import Path
-from time import perf_counter_ns
+from std.memory import UnsafePointer
+from std.sys.info import simd_width_of
+from std.pathlib import Path
+from std.time import perf_counter_ns
 
 from tokenizer import load_tokenizer
 from experimental4.smollm2 import LogitsView, SmolLM2Loaded, SmolLM2Config, MODEL_PATH, BF16
@@ -16,7 +16,7 @@ comptime VOCAB = SmolLM2Config.VOCAB_SIZE
 comptime MAX_NEW_TOKENS = 512
 
 
-fn greedy_argmax(view: LogitsView[VOCAB]) -> Tuple[Int, Float32]:
+def greedy_argmax(view: LogitsView[VOCAB]) -> Tuple[Int, Float32]:
     """Greedy decode: return (token_id, logit) with highest value in last row."""
     comptime width = simd_width_of[DType.float32]()
     var last = view.rows() - 1
@@ -33,7 +33,7 @@ fn greedy_argmax(view: LogitsView[VOCAB]) -> Tuple[Int, Float32]:
     return (best_idx, best_val)
 
 
-fn main():
+def main():
     # --- Load tokenizer ---
     var tok_opt = load_tokenizer(Path(TOKENIZER_PATH))
     if not tok_opt:

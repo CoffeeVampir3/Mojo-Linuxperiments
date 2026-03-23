@@ -1,4 +1,4 @@
-from time import perf_counter_ns
+from std.time import perf_counter_ns
 
 
 @fieldwise_init
@@ -16,14 +16,14 @@ struct Profiler:
     var t: UInt
     var current: String
 
-    fn __init__(out self, enabled: Bool):
+    def __init__(out self, enabled: Bool):
         self.sections = List[ProfileSection]()
         self.enabled = enabled
         self.t = 0
         self.current = String("")
 
     @always_inline
-    fn section(mut self, name: String):
+    def section(mut self, name: String):
         if not self.enabled:
             return
         var now = perf_counter_ns()
@@ -33,20 +33,20 @@ struct Profiler:
         self.current = name
 
     @always_inline
-    fn finish(mut self):
+    def finish(mut self):
         if not self.enabled or self.t == 0:
             return
         self._accumulate(perf_counter_ns() - self.t)
         self.t = 0
 
-    fn _accumulate(mut self, elapsed: UInt):
+    def _accumulate(mut self, elapsed: UInt):
         for i in range(len(self.sections)):
             if self.sections[i].name == self.current:
                 self.sections[i].ns += elapsed
                 return
         self.sections.append(ProfileSection(self.current, elapsed))
 
-    fn report(self):
+    def report(self):
         if not self.enabled or len(self.sections) == 0:
             return
         var total: UInt = 0

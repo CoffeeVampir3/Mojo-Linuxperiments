@@ -37,31 +37,31 @@ struct I8(Encoding):
 
 trait DimStrategy:
     @staticmethod
-    fn local(d: Int, tp: Int) -> Int: ...
+    def local(d: Int, tp: Int) -> Int: ...
 
 struct Divide(DimStrategy):
     @staticmethod
-    fn local(d: Int, tp: Int) -> Int:
+    def local(d: Int, tp: Int) -> Int:
         return d // tp
 
 struct Keep(DimStrategy):
     @staticmethod
-    fn local(d: Int, tp: Int) -> Int:
+    def local(d: Int, tp: Int) -> Int:
         return d
 
 
 trait ShardStrategy:
     @staticmethod
-    fn shard_rows(r: Int, tp: Int) -> Int: ...
+    def shard_rows(r: Int, tp: Int) -> Int: ...
     @staticmethod
-    fn shard_cols(c: Int, tp: Int) -> Int: ...
+    def shard_cols(c: Int, tp: Int) -> Int: ...
 
 struct Shard2D[Row: DimStrategy, Col: DimStrategy](ShardStrategy):
     @staticmethod
-    fn shard_rows(r: Int, tp: Int) -> Int:
+    def shard_rows(r: Int, tp: Int) -> Int:
         return Self.Row.local(r, tp)
     @staticmethod
-    fn shard_cols(c: Int, tp: Int) -> Int:
+    def shard_cols(c: Int, tp: Int) -> Int:
         return Self.Col.local(c, tp)
 
 comptime RowShard = Shard2D[Divide, Keep]
@@ -73,10 +73,10 @@ trait NodeLocal(ShardStrategy):
 
 struct PrincipleNodeLocal(NodeLocal):
     @staticmethod
-    fn shard_rows(r: Int, tp: Int) -> Int:
+    def shard_rows(r: Int, tp: Int) -> Int:
         return r
     @staticmethod
-    fn shard_cols(c: Int, tp: Int) -> Int:
+    def shard_cols(c: Int, tp: Int) -> Int:
         return c
 
 
@@ -103,10 +103,10 @@ struct PlacedSlot[
     comptime NAME: StaticString = Self.name
 
     @staticmethod
-    fn shard_rows(r: Int, n: Int) -> Int:
+    def shard_rows(r: Int, n: Int) -> Int:
         return Self.S.shard_rows(r, n)
     @staticmethod
-    fn shard_cols(c: Int, n: Int) -> Int:
+    def shard_cols(c: Int, n: Int) -> Int:
         return Self.S.shard_cols(c, n)
 
 
@@ -138,20 +138,20 @@ struct CacheView[T: Encoding & Shaped](Encoding, Shaped):
     comptime COLS = Self.T.COLS
     var ptr: Int
 
-fn bind[T: Encoding & Shaped & Placed & Named](base: Int) -> Bound[T]:
+def bind[T: Encoding & Shaped & Placed & Named](base: Int) -> Bound[T]:
     return Bound[T](base + T.OFFSET)
 
 
-fn byte_count[T: Encoding & Shaped]() -> Int:
+def byte_count[T: Encoding & Shaped]() -> Int:
     return T.ROWS * T.COLS * T.ELEMENT_BYTES
 
 comptime DEFAULT_ALIGNMENT = 64
 
-fn offset_after[T: Encoding & Shaped, base: Int, alignment: Int = DEFAULT_ALIGNMENT]() -> Int:
+def offset_after[T: Encoding & Shaped, base: Int, alignment: Int = DEFAULT_ALIGNMENT]() -> Int:
     comptime aligned = ((base + alignment - 1) // alignment) * alignment
     return aligned + byte_count[T]()
 
-fn next_offset[T: Encoding & Shaped & Placed, alignment: Int = DEFAULT_ALIGNMENT]() -> Int:
+def next_offset[T: Encoding & Shaped & Placed, alignment: Int = DEFAULT_ALIGNMENT]() -> Int:
     comptime aligned = ((T.OFFSET + alignment - 1) // alignment) * alignment
     return aligned + byte_count[T]()
 
@@ -167,7 +167,7 @@ struct WeightDesc(Copyable):
     var local_rows: Int
     var local_cols: Int
 
-fn weight_desc[T: Encoding & Shaped & Placed & Named](
+def weight_desc[T: Encoding & Shaped & Placed & Named](
     prefix: String = "", base: Int = 0,
 ) -> WeightDesc:
     return WeightDesc(
@@ -182,8 +182,8 @@ fn weight_desc[T: Encoding & Shaped & Placed & Named](
 # at which point PlacedSlot will conditionally conform to NodeLocal and S folds into T.
 trait WeightIterable:
     @staticmethod
-    fn for_each_weight[
-        func: fn[S: ShardStrategy, T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
+    def for_each_weight[
+        func: def[S: ShardStrategy, T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
     ](): ...
 
 

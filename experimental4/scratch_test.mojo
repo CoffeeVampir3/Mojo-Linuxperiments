@@ -1,9 +1,8 @@
+def call_it[f: def(Int) -> Int](x: Int) -> Int:
+    return f(x)
+
+def double(x: Int) -> Int:
+    return x * 2
+
 def main():
-    var s = String("hello world")
-    # Test slice syntax
-    var a = s[:5]
-    var b = s[6:]
-    print(a, b)
-    # Test atol
-    var n = atol("42")
-    print(n)
+    print(call_it[double](5))

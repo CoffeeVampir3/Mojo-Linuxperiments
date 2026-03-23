@@ -1,5 +1,5 @@
-from memory import UnsafePointer, alloc
-from iter import Iterator, StopIteration
+from std.memory import UnsafePointer, alloc
+from std.iter import Iterator, StopIteration
 
 @fieldwise_init
 struct HeapMoveArray[T: Movable & ImplicitlyDestructible](Movable, Indexer):
@@ -7,35 +7,35 @@ struct HeapMoveArray[T: Movable & ImplicitlyDestructible](Movable, Indexer):
     var capacity: Int
     var len: Int
 
-    fn __init__(out self, capacity: Int):
+    def __init__(out self, capacity: Int):
         self.ptr = alloc[Self.T](capacity)
         self.capacity = capacity
         self.len = 0
 
-    fn __del__(deinit self):
+    def __del__(deinit self):
         for i in range(self.len):
             (self.ptr + i).destroy_pointee()
         self.ptr.free()
 
-    fn push(mut self, var value: Self.T):
+    def push(mut self, var value: Self.T):
         debug_assert(self.len < self.capacity, "Attempted to index outside of MoveArray's bounds: push")
         (self.ptr + self.len).init_pointee_move(value^)
         self.len += 1
 
-    fn __getitem__(mut self, idx: Int) -> UnsafePointer[Self.T, MutAnyOrigin]:
+    def __getitem__(mut self, idx: Int) -> UnsafePointer[Self.T, MutAnyOrigin]:
         debug_assert(idx >= 0 and idx < self.len, "Attempted to index outside of MoveArray's bounds: __getitem__")
         return self.ptr + idx
 
-    fn __len__(self) -> Int:
+    def __len__(self) -> Int:
         return self.len
 
-    fn __index__(self) -> Int:
+    def __index__(self) -> Int:
         return self.capacity
 
-    fn __mlir_index__(self) -> __mlir_type.index:
+    def __mlir_index__(self) -> __mlir_type.index:
         return self.capacity.__mlir_index__()
 
-    fn __iter__(mut self) -> MoveOnlyArrayIter[Self.T]:
+    def __iter__(mut self) -> MoveOnlyArrayIter[Self.T]:
         return MoveOnlyArrayIter[Self.T](self.ptr, self.len)
 
 struct MoveOnlyArrayIter[T: Movable](Iterator):
@@ -44,12 +44,12 @@ struct MoveOnlyArrayIter[T: Movable](Iterator):
     var index: Int
     var len: Int
 
-    fn __init__(out self, ptr: UnsafePointer[Self.T, MutAnyOrigin], len: Int):
+    def __init__(out self, ptr: UnsafePointer[Self.T, MutAnyOrigin], len: Int):
         self.ptr = ptr
         self.index = 0
         self.len = len
 
-    fn __next__(mut self) raises StopIteration -> Self.Element:
+    def __next__(mut self) raises StopIteration -> Self.Element:
         if self.index >= self.len:
             raise StopIteration()
         var p = self.ptr + self.index

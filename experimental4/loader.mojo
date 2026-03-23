@@ -1,4 +1,4 @@
-from pathlib import Path
+from std.pathlib import Path
 
 from experimental4.model_spec import (
     Encoding, Shaped, Placed, Named, byte_count,
@@ -19,7 +19,7 @@ struct ReadFragment(Copyable):
     var length: Int
 
 
-fn validate_weight(
+def validate_weight(
     desc: WeightDesc, found_dtype: DType, found_shape: List[Int],
 ) -> Bool:
     if desc.dtype != found_dtype:
@@ -47,7 +47,7 @@ fn validate_weight(
     return True
 
 
-fn emit_reads(
+def emit_reads(
     desc: WeightDesc,
     file_data_start: Int,
     arena_base: Int,
@@ -84,7 +84,7 @@ struct LoadResult(Movable):
     var num_ops: Int
 
 
-fn load_safetensors[
+def load_safetensors[
     M: WeightIterable,
     io_depth: Int = DEFAULT_IO_DEPTH,
 ](
@@ -108,9 +108,8 @@ fn load_safetensors[
     var distributed_weights = List[WeightDesc]()
 
     @parameter
-    fn collect[S: ShardStrategy, T: Encoding & Shaped & Placed & Named](prefix: String, base: Int):
-        @parameter
-        if conforms_to(S, NodeLocal):
+    def collect[S: ShardStrategy, T: Encoding & Shaped & Placed & Named](prefix: String, base: Int):
+        comptime if conforms_to(S, NodeLocal):
             node_local_weights.append(weight_desc[T](prefix, base))
         else:
             distributed_weights.append(weight_desc[T](prefix, base))
@@ -170,7 +169,7 @@ fn load_safetensors[
     var bytes_loaded = 0
 
     @parameter
-    fn on_complete(c: Completion):
+    def on_complete(c: Completion):
         bytes_loaded += Int(c.result)
 
     var err = loader.process_queue_checked[on_complete](ops)

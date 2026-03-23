@@ -12,10 +12,10 @@ Tests:
 5. Verify NUMA placement via move_pages query
 """
 
-from memory import UnsafePointer, memcpy
+from std.memory import UnsafePointer, memcpy
 from numa import NumaArena, NumaInfo, NumaTopology
 from notstdcollections import HeapMoveArray
-from collections import InlineArray
+from std.collections import InlineArray
 
 from experimental4.model_spec import (
     Encoding, Shaped, BF16, Slot, Replicated, byte_count,
@@ -23,7 +23,7 @@ from experimental4.model_spec import (
 
 
 # Reuse ring_broadcast from the TP module.
-fn ring_broadcast[T: Encoding & Shaped, tp: Int](
+def ring_broadcast[T: Encoding & Shaped, tp: Int](
     src_ptr: Int, dst_ptrs: InlineArray[Int, tp], seq_len: Int,
 ):
     var total_bytes = seq_len * T.COLS * T.ELEMENT_BYTES
@@ -56,7 +56,7 @@ comptime SlotMedium = Slot[BF16, Replicated, MAX_SEQ, COLS_MEDIUM, TP]
 comptime SlotLarge = Slot[BF16, Replicated, MAX_SEQ, COLS_LARGE, TP]
 
 
-fn fill_pattern(ptr: Int, total_elements: Int, seed: UInt16):
+def fill_pattern(ptr: Int, total_elements: Int, seed: UInt16):
     """Fill a bf16 buffer with a deterministic pattern based on index + seed."""
     var p = UnsafePointer[UInt16, MutAnyOrigin](unsafe_from_address=ptr)
     for i in range(total_elements):
@@ -64,7 +64,7 @@ fn fill_pattern(ptr: Int, total_elements: Int, seed: UInt16):
         p[i] = UInt16((Int(seed) + i * 7 + 13) & 0xFFFF)
 
 
-fn verify_match(ptr_a: Int, ptr_b: Int, total_elements: Int) -> Tuple[Bool, Int]:
+def verify_match(ptr_a: Int, ptr_b: Int, total_elements: Int) -> Tuple[Bool, Int]:
     """Compare two bf16 buffers element-wise. Returns (ok, first_mismatch_idx)."""
     var a = UnsafePointer[UInt16, MutAnyOrigin](unsafe_from_address=ptr_a)
     var b = UnsafePointer[UInt16, MutAnyOrigin](unsafe_from_address=ptr_b)
@@ -74,7 +74,7 @@ fn verify_match(ptr_a: Int, ptr_b: Int, total_elements: Int) -> Tuple[Bool, Int]
     return (True, -1)
 
 
-fn verify_zero(ptr: Int, total_elements: Int) -> Bool:
+def verify_zero(ptr: Int, total_elements: Int) -> Bool:
     """Verify a buffer is all zeros."""
     var p = UnsafePointer[UInt16, MutAnyOrigin](unsafe_from_address=ptr)
     for i in range(total_elements):
@@ -83,13 +83,13 @@ fn verify_zero(ptr: Int, total_elements: Int) -> Bool:
     return True
 
 
-fn clear_buffer(ptr: Int, total_bytes: Int):
+def clear_buffer(ptr: Int, total_bytes: Int):
     var p = UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=ptr)
     for i in range(total_bytes):
         p[i] = 0
 
 
-fn run_broadcast_test[T: Encoding & Shaped](
+def run_broadcast_test[T: Encoding & Shaped](
     name: String,
     seq_len: Int,
     arenas: List[Int],  # arena base addresses
@@ -135,7 +135,7 @@ fn run_broadcast_test[T: Encoding & Shaped](
     return True
 
 
-fn main():
+def main():
     print("=== Ring Broadcast Tests ===")
     print()
 

@@ -1,6 +1,6 @@
-from pathlib import Path
+from std.pathlib import Path
 
-from memory import UnsafePointer
+from std.memory import UnsafePointer
 from numa import NumaArena, NumaInfo
 from threading import BurstPool
 
@@ -29,8 +29,8 @@ trait LogitAccess:
     dtype so consumers always work in f32."""
     comptime DTYPE: DType
     comptime VOCAB: Int
-    fn rows(self) -> Int: ...
-    fn load_f32[width: Int](self, row: Int, offset: Int) -> SIMD[DType.float32, width]: ...
+    def rows(self) -> Int: ...
+    def load_f32[width: Int](self, row: Int, offset: Int) -> SIMD[DType.float32, width]: ...
 
 
 @fieldwise_init
@@ -42,10 +42,10 @@ struct LogitsView[vocab: Int, dtype: DType = DType.bfloat16](LogitAccess):
     var ptr: Int
     var seq_len: Int
 
-    fn rows(self) -> Int:
+    def rows(self) -> Int:
         return self.seq_len
 
-    fn load_f32[width: Int](self, row: Int, offset: Int) -> SIMD[DType.float32, width]:
+    def load_f32[width: Int](self, row: Int, offset: Int) -> SIMD[DType.float32, width]:
         var p = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
             unsafe_from_address=self.ptr
         )
@@ -87,8 +87,8 @@ struct SmolLM2Layer[E: Encoding, tp: Int]:
     comptime V_CACHE = Slot[BF16, Replicated, Self.C.MAX_SEQ_LEN, Self.C.KV_HIDDEN, Self.tp]
 
     @staticmethod
-    fn for_each_weight[
-        func: fn[S: ShardStrategy, T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
+    def for_each_weight[
+        func: def[S: ShardStrategy, T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
     ](prefix: String, base: Int):
         func[RowShard, Self.Q_PROJ](prefix, base)
         func[RowShard, Self.K_PROJ](prefix, base)
@@ -101,11 +101,11 @@ struct SmolLM2Layer[E: Encoding, tp: Int]:
         func[Replicated, Self.POST_ATTN_NORM](prefix, base)
 
     @staticmethod
-    fn weight_bytes() -> Int:
+    def weight_bytes() -> Int:
         return Self.STRIDE
 
     @staticmethod
-    fn cache_bytes() -> Int:
+    def cache_bytes() -> Int:
         return byte_count[Self.K_CACHE]() + byte_count[Self.V_CACHE]()
 
 
@@ -146,11 +146,10 @@ struct SmolLM2[E: Encoding, tp: Int](WeightIterable):
     comptime EMBED = PlacedSlot[Self.E, PrincipleNodeLocal, Self.C.VOCAB_SIZE, Self.C.HIDDEN, Self.tp, next_offset[Self.FINAL_NORM](), "model.embed_tokens.weight"]
 
     @staticmethod
-    fn for_each_weight[
-        func: fn[S: ShardStrategy, T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
+    def for_each_weight[
+        func: def[S: ShardStrategy, T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
     ]():
-        @parameter
-        for i in range(Self.NUM_LAYERS):
+        comptime for i in range(Self.NUM_LAYERS):
             var prefix = "model.layers." + String(i) + "."
             var base = Self.LAYERS_OFF + i * Self.LAYER_STRIDE
             Self.LAYER.for_each_weight[func](prefix, base)
@@ -159,37 +158,37 @@ struct SmolLM2[E: Encoding, tp: Int](WeightIterable):
         func[PrincipleNodeLocal, Self.EMBED]("", 0)
 
     @staticmethod
-    fn distributed_weight_bytes() -> Int:
+    def distributed_weight_bytes() -> Int:
         return Self.DISTRIBUTED_BYTES
 
     @staticmethod
-    fn node_local_weight_bytes() -> Int:
+    def node_local_weight_bytes() -> Int:
         return byte_count[Self.FINAL_NORM]() + byte_count[Self.EMBED]()
 
     @staticmethod
-    fn total_state_bytes() -> Int:
+    def total_state_bytes() -> Int:
         return Self.STATE_BYTES
 
     @staticmethod
-    fn arena_bytes() -> Int:
+    def arena_bytes() -> Int:
         """Non-host arena: distributed weights + state."""
         return Self.DISTRIBUTED_BYTES + Self.STATE_BYTES
 
     @staticmethod
-    fn host_arena_bytes() -> Int:
+    def host_arena_bytes() -> Int:
         """Host arena: distributed weights + state + node-local weights."""
         return next_offset[Self.EMBED]()
 
     @staticmethod
-    fn kv_cache_bytes() -> Int:
+    def kv_cache_bytes() -> Int:
         return Self.C.NUM_LAYERS * Self.KV_STRIDE
 
     @staticmethod
-    fn activation_bytes() -> Int:
+    def activation_bytes() -> Int:
         return byte_count[Self.X_MAIN]() + byte_count[Self.X_RESIDUAL]() + Self.SCRATCH_COUNT * Self.SCRATCH_STRIDE
 
     @staticmethod
-    fn precomputed_bytes() -> Int:
+    def precomputed_bytes() -> Int:
         return byte_count[Self.ROPE_COS]() + byte_count[Self.ROPE_SIN]()
 
 
@@ -198,10 +197,10 @@ struct SmolLM2Loaded[E: Encoding, tp: Int](Movable):
     comptime M = SmolLM2[Self.E, Self.tp]
 
     var arena: NumaArena[alignment=DEFAULT_ALIGNMENT]
-    var pool: BurstPool
+    var pool: BurstPool[]
 
     @staticmethod
-    fn load(path: Path, node_id: Int) -> Optional[Self]:
+    def load(path: Path, node_id: Int) -> Optional[Self]:
         """Load SmolLM2 from a safetensors file. Handles all setup:
         arena allocation, weight loading, RoPE init, and thread pool creation."""
         var arena = NumaArena[alignment=DEFAULT_ALIGNMENT](node_id, Self.M.host_arena_bytes())
@@ -215,7 +214,7 @@ struct SmolLM2Loaded[E: Encoding, tp: Int](Movable):
             return None
         _ = arena.prefault(Self.M.DISTRIBUTED_BYTES, Self.M.STATE_BYTES)
         var numa = NumaInfo()
-        var pool = BurstPool.for_numa_node(numa, node_id)
+        var pool = BurstPool[].for_numa_node(numa, node_id)
         var model = Self(arena^, pool^)
         init_rope_tables(
             Bound[Self.M.ROPE_COS](model.rope_cos_ptr()),
@@ -224,46 +223,46 @@ struct SmolLM2Loaded[E: Encoding, tp: Int](Movable):
         )
         return model^
 
-    fn weight_base(self) -> Int:
+    def weight_base(self) -> Int:
         return Int(self.arena.base)
 
-    fn state_base(self) -> Int:
+    def state_base(self) -> Int:
         return Int(self.arena.base) + Self.M.DISTRIBUTED_BYTES
 
-    fn weight[T: Encoding & Shaped & Placed & Named](self) -> Bound[T]:
+    def weight[T: Encoding & Shaped & Placed & Named](self) -> Bound[T]:
         return bind[T](self.weight_base())
 
-    fn layer_weight[T: Encoding & Shaped & Placed & Named](self, layer: Int) -> Bound[T]:
+    def layer_weight[T: Encoding & Shaped & Placed & Named](self, layer: Int) -> Bound[T]:
         return bind[T](self.weight_base() + Self.M.LAYERS_OFF + layer * Self.M.LAYER_STRIDE)
 
-    fn k_cache_ptr(self, layer: Int) -> Int:
+    def k_cache_ptr(self, layer: Int) -> Int:
         return self.state_base() + Self.M.KV_OFF + layer * Self.M.KV_STRIDE
 
-    fn v_cache_ptr(self, layer: Int) -> Int:
+    def v_cache_ptr(self, layer: Int) -> Int:
         return self.k_cache_ptr(layer) + byte_count[Self.M.LAYER.K_CACHE]()
 
-    fn x_main_ptr(self) -> Int:
+    def x_main_ptr(self) -> Int:
         return self.state_base() + Self.M.X_MAIN_OFF
 
-    fn x_residual_ptr(self) -> Int:
+    def x_residual_ptr(self) -> Int:
         return self.state_base() + Self.M.X_RESIDUAL_OFF
 
-    fn scratch_ptr(self) -> Int:
+    def scratch_ptr(self) -> Int:
         """Address of scratch memory for writing token IDs before forward().
         Safe to use as tokens_ptr — consumed by embed_lookup before
         scratch is reused for intermediates."""
         return self.state_base() + Self.M.SCRATCH_OFF
 
-    fn scratch_slot(self, index: Int) -> Int:
+    def scratch_slot(self, index: Int) -> Int:
         return self.state_base() + Self.M.SCRATCH_OFF + index * Self.M.SCRATCH_STRIDE
 
-    fn rope_cos_ptr(self) -> Int:
+    def rope_cos_ptr(self) -> Int:
         return self.state_base() + Self.M.ROPE_COS_OFF
 
-    fn rope_sin_ptr(self) -> Int:
+    def rope_sin_ptr(self) -> Int:
         return self.state_base() + Self.M.ROPE_SIN_OFF
 
-    fn forward(
+    def forward(
         mut self, tokens_ptr: Int, seq_len: Int, pos: Int,
         profile: Bool = False,
     ) -> LogitsView[Self.M.C.VOCAB_SIZE]
@@ -353,7 +352,7 @@ struct SmolLM2Loaded[E: Encoding, tp: Int](Movable):
 comptime MODEL_PATH = "checkpoints/SmolLM2/model.safetensors"
 
 
-fn main():
+def main():
     var model_opt = SmolLM2Loaded[BF16, 1].load(Path(MODEL_PATH), 0)
     if not model_opt:
         return

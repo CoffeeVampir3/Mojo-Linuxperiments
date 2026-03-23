@@ -12,11 +12,11 @@ struct AutoPreTokenizer(PreTokenizerCapability):
     var flavor: Int
     var deepseek: DeepSeekV3PreTokenizer
 
-    fn __init__(out self, flavor: Int):
+    def __init__(out self, flavor: Int):
         self.flavor = flavor
         self.deepseek = DeepSeekV3PreTokenizer()
 
-    fn pre_tokenize(self, text: String) -> List[String]:
+    def pre_tokenize(self, text: String) -> List[String]:
         if self.flavor == TOKENIZER_FLAVOR_GPT2:
             return gpt2_pre_tokenize(text)
         if self.flavor == TOKENIZER_FLAVOR_DEEPSEEK_V3:

@@ -1,6 +1,6 @@
-from sys.info import size_of
-from math import align_up
-from memory import UnsafePointer
+from std.sys.info import size_of
+from std.math import align_up
+from std.memory import UnsafePointer
 import linux.sys as linux
 
 @fieldwise_init
@@ -18,7 +18,7 @@ struct NumaArena[alignment: Int = 8, page_size: Int = linux.PageSize.THP_2MB](Mo
     var offset: Int
     var node: Int
 
-    fn __init__(out self, node: Int, size: Int):
+    def __init__(out self, node: Int, size: Int):
         """Args:
             node: NUMA node ID to bind memory to.
             size: Total arena size in bytes.
@@ -30,17 +30,17 @@ struct NumaArena[alignment: Int = 8, page_size: Int = linux.PageSize.THP_2MB](Mo
         if not self.base:
             self.size = 0
 
-    fn __del__(deinit self):
+    def __del__(deinit self):
         if self.base:
             var sys = linux.linux_sys()
             _ = sys.sys_munmap(Int(self.base), self.size)
 
-    fn __bool__(self) -> Bool:
-        """ True if arena memory was allocated. """
+    def __bool__(self) -> Bool:
+        """True if arena memory was allocated."""
         return self.base.__bool__()
 
-    fn alloc[T: AnyType](mut self, count: Int = 1) -> UnsafePointer[T, MutAnyOrigin]:
-        """Bump allocates a T aligned to arena's constraints
+    def alloc[T: AnyType](mut self, count: Int = 1) -> UnsafePointer[T, MutAnyOrigin]:
+        """Bump allocates a T aligned to arena's constraints.
 
         Args:
             count: Number of T's to allocate.
@@ -56,22 +56,22 @@ struct NumaArena[alignment: Int = 8, page_size: Int = linux.PageSize.THP_2MB](Mo
         self.offset = aligned_offset + bytes_needed
         return ptr
 
-    fn mark(self) -> Int:
+    def mark(self) -> Int:
         """Current allocation offset in bytes."""
         return self.offset
 
-    fn reset_to(mut self, watermark: Int):
+    def reset_to(mut self, watermark: Int):
         """Args:
             watermark: Offset (bytes)
         """
         if watermark >= 0 and watermark <= self.offset:
             self.offset = watermark
 
-    fn reset(mut self):
+    def reset(mut self):
         """Invalidate entire arena."""
         self.offset = 0
 
-    fn prefault(self, offset: Int = 0, length: Int = -1) -> Bool:
+    def prefault(self, offset: Int = 0, length: Int = -1) -> Bool:
         """Pre-fault pages via MADV_POPULATE_WRITE so first access doesn't page-fault.
 
         Args:
@@ -92,16 +92,16 @@ struct NumaArena[alignment: Int = 8, page_size: Int = linux.PageSize.THP_2MB](Mo
         )
         return result == 0
 
-    fn remaining(self) -> Int:
-        """Remaining (bytes)"""
+    def remaining(self) -> Int:
+        """Remaining (bytes)."""
         return self.size - self.offset
 
-    fn used(self) -> Int:
-        """Allocated (bytes)"""
+    def used(self) -> Int:
+        """Allocated (bytes)."""
         return self.offset
 
-    fn verify_placement(self) -> Bool:
-        """Debugging -> Verify first allocated page resides on expected NUMA node."""
+    def verify_placement(self) -> Bool:
+        """Verify first allocated page resides on expected NUMA node."""
         if not self.base or self.offset == 0:
             return True
         var sys = linux.linux_sys()
@@ -114,15 +114,14 @@ struct NumaArena[alignment: Int = 8, page_size: Int = linux.PageSize.THP_2MB](Mo
 # Implementation Details \/
 # === ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ ===
 
-fn mmap_numa_impl[
+def mmap_numa_impl[
     prot: Int, flags: Int, use_thp: Bool = False
 ](size: Int, node: Int) -> UnsafePointer[UInt8, MutAnyOrigin]:
     var sys = linux.linux_sys()
     var addr = sys.sys_mmap[prot=prot, flags=flags](0, size)
     if addr < 0:
         return UnsafePointer[UInt8, MutAnyOrigin]()
-    @parameter
-    if use_thp:
+    comptime if use_thp:
         _ = sys.sys_madvise[linux.Madvise.HUGEPAGE](addr, size)
     var nodemask = UInt64(1) << UInt64(node)
     var bind_result = sys.sys_mbind[policy=linux.Mempolicy.BIND](addr, size, nodemask)
@@ -131,7 +130,7 @@ fn mmap_numa_impl[
         return UnsafePointer[UInt8, MutAnyOrigin]()
     return UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=addr)
 
-fn mmap_numa[
+def mmap_numa[
     prot: Int = linux.Prot.RW,
     page_size: Int = linux.PageSize.THP_2MB,
 ](size: Int, node: Int) -> UnsafePointer[UInt8, MutAnyOrigin]:
@@ -149,8 +148,7 @@ fn mmap_numa[
         Pointer to mapped memory, or zero pointer on failure.
     """
     comptime base_flags = linux.MapFlag.PRIVATE | linux.MapFlag.ANONYMOUS | linux.MapFlag.NORESERVE
-    @parameter
-    if page_size == linux.PageSize.EXPLICIT_2MB:
+    comptime if page_size == linux.PageSize.EXPLICIT_2MB:
         comptime flags = base_flags | linux.MapFlag.HUGETLB | linux.MapFlag.HUGE_2MB
         return mmap_numa_impl[prot, flags](size, node)
     elif page_size == linux.PageSize.EXPLICIT_1GB:

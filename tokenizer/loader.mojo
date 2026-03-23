@@ -1,6 +1,6 @@
-from pathlib import Path
-from memory import Span
-from collections import Dict
+from std.pathlib import Path
+from std.memory import Span
+from std.collections import Dict
 
 from jsontools.parser import (
     Parser,
@@ -29,7 +29,7 @@ struct ModelOptions(Movable):
     var byte_fallback: Bool
     var unk_token: String
 
-    fn __init__(out self):
+    def __init__(out self):
         self.ignore_merges = False
         self.fuse_unk = False
         self.byte_fallback = False
@@ -42,7 +42,7 @@ struct TokenizerConfigOptions(Movable):
     var bos_token: String
     var eos_token: String
 
-    fn __init__(out self):
+    def __init__(out self):
         self.add_bos_token = False
         self.add_eos_token = False
         self.bos_token = String("")
@@ -57,7 +57,7 @@ struct PreTokenizerStageSignature(Copyable, ImplicitlyCopyable):
     var add_prefix_space: Bool
     var individual_digits: Bool
 
-    fn __init__(out self):
+    def __init__(out self):
         self.stage_type = String("")
         self.behavior = String("")
         self.regex_pattern = String("")
@@ -66,13 +66,13 @@ struct PreTokenizerStageSignature(Copyable, ImplicitlyCopyable):
         self.individual_digits = False
 
 
-fn parse_optional_bool(mut parser: Parser, default_value: Bool) raises ParseError -> Bool:
+def parse_optional_bool(mut parser: Parser, default_value: Bool) raises ParseError -> Bool:
     if parser.try_consume[lit="null"]():
         return default_value
     return parser.parse_bool()
 
 
-fn parse_regex_pattern(mut parser: Parser) raises ParseError -> String:
+def parse_regex_pattern(mut parser: Parser) raises ParseError -> String:
     parser.skip_whitespace()
     if parser.try_consume[lit="null"]():
         return String("")
@@ -98,7 +98,7 @@ fn parse_regex_pattern(mut parser: Parser) raises ParseError -> String:
     return regex^
 
 
-fn parse_pretokenizer_stage_signature(
+def parse_pretokenizer_stage_signature(
     mut parser: Parser, mut stage: PreTokenizerStageSignature
 ) raises ParseError:
     if not parser.consume(LBRACE):
@@ -128,7 +128,7 @@ fn parse_pretokenizer_stage_signature(
             break
 
 
-fn parse_pretokenizer_signatures(
+def parse_pretokenizer_signatures(
     mut parser: Parser, mut stages: List[PreTokenizerStageSignature]
 ) raises ParseError:
     if not parser.consume(LBRACE):
@@ -160,7 +160,7 @@ fn parse_pretokenizer_signatures(
             break
 
 
-fn is_gpt2_pretokenizer_signature(stages: List[PreTokenizerStageSignature]) -> Bool:
+def is_gpt2_pretokenizer_signature(stages: List[PreTokenizerStageSignature]) -> Bool:
     if len(stages) != 2:
         return False
 
@@ -177,7 +177,7 @@ fn is_gpt2_pretokenizer_signature(stages: List[PreTokenizerStageSignature]) -> B
     return True
 
 
-fn is_deepseek_v3_stage2_pattern(regex: String) -> Bool:
+def is_deepseek_v3_stage2_pattern(regex: String) -> Bool:
     if not ("[A-Za-z]+" in regex):
         return False
     if not ("\\p{M}" in regex):
@@ -189,7 +189,7 @@ fn is_deepseek_v3_stage2_pattern(regex: String) -> Bool:
     return True
 
 
-fn is_deepseek_v3_pretokenizer_signature(stages: List[PreTokenizerStageSignature]) -> Bool:
+def is_deepseek_v3_pretokenizer_signature(stages: List[PreTokenizerStageSignature]) -> Bool:
     if len(stages) != 4:
         return False
 
@@ -227,7 +227,7 @@ fn is_deepseek_v3_pretokenizer_signature(stages: List[PreTokenizerStageSignature
     return True
 
 
-fn detect_tokenizer_flavor(path: Path) -> Int:
+def detect_tokenizer_flavor(path: Path) -> Int:
     var file_bytes: List[Byte]
     try:
         file_bytes = path.read_bytes()
@@ -263,7 +263,7 @@ fn detect_tokenizer_flavor(path: Path) -> Int:
     return TOKENIZER_FLAVOR_UNSUPPORTED
 
 
-fn parse_added_token_content(mut parser: Parser) raises ParseError -> String:
+def parse_added_token_content(mut parser: Parser) raises ParseError -> String:
     if not parser.consume(LBRACE):
         raise ParseError("expected '{' for AddedToken object", parser.pos)
     parser.skip_whitespace()
@@ -282,7 +282,7 @@ fn parse_added_token_content(mut parser: Parser) raises ParseError -> String:
     return content^
 
 
-fn parse_token_string_value(mut parser: Parser) raises ParseError -> String:
+def parse_token_string_value(mut parser: Parser) raises ParseError -> String:
     parser.skip_whitespace()
     if parser.try_consume[lit="null"]():
         return String("")
@@ -297,7 +297,7 @@ fn parse_token_string_value(mut parser: Parser) raises ParseError -> String:
     return String("")
 
 
-fn parse_tokenizer_config(path: Path) -> TokenizerConfigOptions:
+def parse_tokenizer_config(path: Path) -> TokenizerConfigOptions:
     var opts = TokenizerConfigOptions()
     var file_bytes: List[Byte]
     try:
@@ -333,7 +333,7 @@ fn parse_tokenizer_config(path: Path) -> TokenizerConfigOptions:
 
     return opts^
 
-fn parse_added_token(mut parser: Parser) raises ParseError -> Tuple[Int, String, Bool]:
+def parse_added_token(mut parser: Parser) raises ParseError -> Tuple[Int, String, Bool]:
     """Parse one added_token object, returning (id, content, special)."""
     if not parser.consume(LBRACE):
         raise ParseError("expected '{' for added_token", parser.pos)
@@ -355,7 +355,7 @@ fn parse_added_token(mut parser: Parser) raises ParseError -> Tuple[Int, String,
             break
     return (id, content^, special)
 
-fn parse_added_tokens_array(
+def parse_added_tokens_array(
     mut parser: Parser,
     mut added_tokens: Dict[String, Int],
     mut added_token_order: List[String],
@@ -381,7 +381,7 @@ fn parse_added_tokens_array(
         if not parser.delimited_next(RBRACKET):
             break
 
-fn parse_model_section(
+def parse_model_section(
     mut parser: Parser,
     mut vocab: Dict[String, Int],
     mut merges: List[String],
@@ -415,7 +415,7 @@ fn parse_model_section(
         if not parser.delimited_next(RBRACE):
             break
 
-fn load_tokenizer_with_capabilities[
+def load_tokenizer_with_capabilities[
     pretokenizer_type: PreTokenizerCapability,
     byte_transform_type: ByteTransformCapability,
 ](
@@ -514,7 +514,7 @@ fn load_tokenizer_with_capabilities[
     )
 
 
-fn load_tokenizer(path: Path) -> Optional[BPETokenizer]:
+def load_tokenizer(path: Path) -> Optional[BPETokenizer[]]:
     """Load a BPETokenizer by auto-detecting supported pre-tokenizer semantics."""
     var flavor = detect_tokenizer_flavor(path)
     if flavor == TOKENIZER_FLAVOR_GPT2 or flavor == TOKENIZER_FLAVOR_DEEPSEEK_V3:
@@ -529,14 +529,14 @@ fn load_tokenizer(path: Path) -> Optional[BPETokenizer]:
     return None
 
 
-fn load_gpt2_tokenizer(path: Path) -> Optional[
+def load_gpt2_tokenizer(path: Path) -> Optional[
     BPETokenizer[GPT2PreTokenizer, GPT2ByteTransform]
 ]:
     """Load a BPETokenizer using GPT-2 pre-tokenizer semantics."""
     return load_tokenizer_with_capabilities(path, GPT2PreTokenizer(), GPT2ByteTransform())
 
 
-fn load_deepseek_v3_tokenizer(path: Path) -> Optional[
+def load_deepseek_v3_tokenizer(path: Path) -> Optional[
     BPETokenizer[DeepSeekV3PreTokenizer, DeepSeekV3ByteTransform]
 ]:
     """Load a BPETokenizer using DeepSeek V3 pre-tokenizer semantics."""
