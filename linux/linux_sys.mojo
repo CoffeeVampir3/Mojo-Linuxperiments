@@ -1,12 +1,17 @@
 from memory import UnsafePointer
 
 # =============================================================================
-# Linux syscall interface specification.
+# Linux syscall interface.
 #
 # This module defines:
 # - Linux kernel UAPI structs/constants used by syscalls in this project.
-# - A `LinuxSys` interface that architecture-specific implementations must
-#   implement end-to-end (no shared default method bodies).
+# - An `ArchLinux` trait: the arch-varying primitives (syscall numbers,
+#   raw syscall mechanism, and operations with per-arch functional design).
+# - A `LinuxSys` trait: shared syscall wrappers as default implementations
+#   built on ArchLinux primitives.
+#
+# Architecture implementations (e.g. X86_64LinuxSys) conform to LinuxSys,
+# provide the ArchLinux requirements, and inherit all shared defaults.
 #
 # The UAPI types here intentionally model the kernel syscall ABI (not libc).
 # For 64-bit Linux targets (x86-64 and arm64), these layouts are compatible.
@@ -60,7 +65,6 @@ struct Signal(TrivialRegisterPassable):
     comptime SEGV = 11
 
 struct SigActionFlag(TrivialRegisterPassable):
-    # From asm-generic/signal-defs.h (Linux uapi)
     comptime SIGINFO = 0x00000004
     comptime ONSTACK = 0x08000000
     comptime RESTART = 0x10000000
@@ -68,15 +72,12 @@ struct SigActionFlag(TrivialRegisterPassable):
     comptime RESETHAND = 0x80000000
 
 struct SigSet64(TrivialRegisterPassable):
-    # Portable 64-signal mask used by rt_sigaction on 64-bit Linux.
     var bits0: UInt64
 
     fn __init__(out self):
         self.bits0 = 0
 
 struct RtSigAction(TrivialRegisterPassable):
-    # Portable rt_sigaction inputs/outputs.
-    # Implementations may translate to the kernel's per-arch sigaction ABI.
     var handler: Int
     var flags: UInt64
     var mask: SigSet64
@@ -87,8 +88,6 @@ struct RtSigAction(TrivialRegisterPassable):
         self.mask = SigSet64()
 
 struct SigSegvContext(TrivialRegisterPassable):
-    # Portable subset of SIGSEGV context information.
-    # Implementations decode per-arch kernel signal frame layouts.
     var ip: UInt64
     var sp: UInt64
     var fault_addr: UInt64
@@ -99,7 +98,6 @@ struct SigSegvContext(TrivialRegisterPassable):
         self.fault_addr = 0
 
 struct StackT(TrivialRegisterPassable):
-    # stack_t: void *ss_sp; int ss_flags; size_t ss_size;
     var ss_sp: Int
     var ss_flags: Int32
     var pad: Int32
@@ -228,7 +226,6 @@ struct PageSize(TrivialRegisterPassable):
 
 # =============================================================================
 # io_uring types and constants
-# Reference: https://github.com/torvalds/linux/blob/master/include/uapi/linux/io_uring.h
 # =============================================================================
 
 struct IoUringSetup(TrivialRegisterPassable):
@@ -397,14 +394,14 @@ struct IoUringSqe(TrivialRegisterPassable):
     var flags: UInt8
     var ioprio: UInt16
     var fd: Int32
-    var off: UInt64       # File offset (union with addr2)
-    var addr: UInt64      # Buffer address (union with splice_off_in)
-    var len: UInt32       # Buffer size or iovec count
-    var op_flags: UInt32  # Operation-specific flags (rw_flags, fsync_flags, etc.)
-    var user_data: UInt64 # Passed back in CQE
-    var buf_index: UInt16 # Index into registered buffers (union with buf_group)
+    var off: UInt64
+    var addr: UInt64
+    var len: UInt32
+    var op_flags: UInt32
+    var user_data: UInt64
+    var buf_index: UInt16
     var personality: UInt16
-    var splice_fd_in: Int32  # Union with file_index
+    var splice_fd_in: Int32
     var addr3: UInt64
     var pad: UInt64
 
@@ -500,117 +497,50 @@ struct IoUringFeat(TrivialRegisterPassable):
     comptime CQE_SKIP = 1 << 11
     comptime LINKED_FILE = 1 << 12
 
-# Lower 32 bits
 comptime FUTEX_BITSET_MATCH_ANY: Int = 0xFFFFFFFF
 
-trait LinuxSys:
+# =============================================================================
+# ArchLinux — architecture-varying primitives.
+#
+# Each target provides: syscall numbers, the raw syscall mechanism, and
+# operations whose functional design differs per architecture.
+# =============================================================================
+
+trait ArchLinux:
+    # Syscall numbers (comptime, per-arch).
+    comptime NR_write: Int
+    comptime NR_mmap: Int
+    comptime NR_mprotect: Int
+    comptime NR_munmap: Int
+    comptime NR_rt_sigaction: Int
+    comptime NR_sigaltstack: Int
+    comptime NR_exit: Int
+    comptime NR_getpid: Int
+    comptime NR_gettid: Int
+    comptime NR_getcpu: Int
+    comptime NR_sched_setaffinity: Int
+    comptime NR_exit_group: Int
+    comptime NR_tgkill: Int
+    comptime NR_mbind: Int
+    comptime NR_openat: Int
+    comptime NR_close: Int
+    comptime NR_move_pages: Int
+    comptime NR_rseq: Int
+    comptime NR_madvise: Int
+    comptime NR_io_uring_setup: Int
+    comptime NR_io_uring_enter: Int
+    comptime NR_io_uring_register: Int
+    comptime NR_clone3: Int
+    comptime NR_futex_waitv: Int
+    comptime NR_futex_wake: Int
+    comptime NR_futex_wait: Int
+
+    # Raw syscall mechanism (arch-specific register ABI).
     fn syscall[count: Int](self, nr: Int, *args: Int) -> Int: ...
 
-    fn sys_mmap[
-        prot: Int = Prot.RW,
-        flags: Int = MapFlag.PRIVATE | MapFlag.ANONYMOUS,
-    ](self, addr: Int, length: Int, fd: Int = -1, offset: Int = 0) -> Int: ...
-
-    fn sys_munmap(self, addr: Int, length: Int) -> Int: ...
-
-    fn sys_mbind[
-        policy: Int = Mempolicy.BIND,
-        flags: Int = 0,
-    ](self, addr: Int, length: Int, nodemask: UInt64, maxnode: Int = 64) -> Int: ...
-
-    fn sys_madvise[advice: Int](self, addr: Int, length: Int) -> Int: ...
-
-    fn sys_move_pages_query(self, addr: Int) -> Int: ...
-
-    fn sys_mprotect(self, addr: Int, length: Int, prot: Int) -> Int: ...
-
-    fn sys_write(self, fd: Int, buf: Int, count: Int) -> Int: ...
-
-    fn sys_rt_sigaction(
-        self,
-        signum: Int,
-        act: UnsafePointer[RtSigAction, MutAnyOrigin],
-        old: UnsafePointer[RtSigAction, MutAnyOrigin] = UnsafePointer[RtSigAction, MutAnyOrigin](),
-    ) -> Int: ...
-
-    fn sys_sigaltstack(
-        self,
-        ss: UnsafePointer[StackT, MutAnyOrigin],
-        old: UnsafePointer[StackT, MutAnyOrigin] = UnsafePointer[StackT, MutAnyOrigin](),
-    ) -> Int: ...
-
-    fn sys_futex_wait(self, addr: Int, expected: Int, flags: Int = Futex2.SIZE_U32 | Futex2.PRIVATE) -> Int: ...
-
-    fn sys_futex_waitv(
-        self,
-        waiters: UnsafePointer[FutexWaitv],
-        nr_futexes: Int,
-        flags: Int = 0,
-        timeout: Int = 0,
-        clockid: Int = 0,
-    ) -> Int: ...
-
-    fn sys_futex_wake(self, addr: Int, nr_wake: Int = 1, flags: Int = Futex2.SIZE_U32 | Futex2.PRIVATE) -> Int: ...
-
-    fn sys_exit(self, code: Int = 0): ...
-
-    fn sys_exit_group(self, code: Int = 0): ...
-
-    fn sys_getpid(self) -> Int: ...
-
-    fn sys_gettid(self) -> Int: ...
-
-    fn sys_getcpu(self) -> Tuple[Int, Int]: ...
-
-    fn sys_tgkill(self, pid: Int, tid: Int, sig: Int) -> Int: ...
-
-    fn sys_rseq(self, rseq_ptr: Int, len: Int, flags: Int, sig: Int) -> Int: ...
-
-    fn sys_sched_setaffinity(self, tid: Int, mask_size: Int, mask_ptr: Int) -> Int: ...
-
-    fn sys_openat(self, dirfd: Int, mut pathname: String, flags: Int, mode: Int = 0) -> Int: ...
-
-    fn sys_close(self, fd: Int) -> Int: ...
-
-    fn sys_io_uring_setup(self, entries: UInt32, params: UnsafePointer[IoUringParams]) -> Int: ...
-
-    fn sys_io_uring_enter(
-        self,
-        fd: Int,
-        to_submit: UInt32,
-        min_complete: UInt32,
-        flags: UInt32,
-    ) -> Int: ...
-
-    fn sys_io_uring_enter_sig(
-        self,
-        fd: Int,
-        to_submit: UInt32,
-        min_complete: UInt32,
-        flags: UInt32,
-        sig: Int,
-        sigsz: Int,
-    ) -> Int: ...
-
-    fn sys_io_uring_register(
-        self,
-        fd: Int,
-        opcode: UInt32,
-        arg: Int,
-        nr_args: UInt32,
-    ) -> Int: ...
-
-    # -------------------------------------------------------------------------
-    # Architecture / threading capabilities.
-    # These are intentionally defined in the system interface so threading code
-    # can be written without embedding arch-specific inline assembly at call
-    # sites.
-    # -------------------------------------------------------------------------
-
+    # Architecture-specific operations — functional design differs per target.
     fn arch_cpu_relax(self): ...
-
     fn arch_thread_pointer(self) -> Int: ...
-
     fn arch_tls_load_i64[offset: Int](self) -> Int: ...
 
     fn sys_clone3_with_entry(
@@ -619,4 +549,161 @@ trait LinuxSys:
         clone_args_size: Int,
     ) -> Int: ...
 
+    fn sys_rt_sigaction(
+        self,
+        signum: Int,
+        act: UnsafePointer[RtSigAction, MutAnyOrigin],
+        old: UnsafePointer[RtSigAction, MutAnyOrigin] = UnsafePointer[RtSigAction, MutAnyOrigin](),
+    ) -> Int: ...
+
     fn arch_decode_sigsegv(self, siginfo: Int, ucontext: Int) -> SigSegvContext: ...
+
+
+# =============================================================================
+# LinuxSys — full syscall interface.
+#
+# Shared wrappers are default implementations built on ArchLinux primitives.
+# Arch-specific methods are inherited from ArchLinux (conformers provide them).
+# =============================================================================
+
+trait LinuxSys(ArchLinux):
+
+    # --- Memory management ---
+
+    fn sys_mmap[
+        prot: Int = Prot.RW,
+        flags: Int = MapFlag.PRIVATE | MapFlag.ANONYMOUS,
+    ](self, addr: Int, length: Int, fd: Int = -1, offset: Int = 0) -> Int:
+        return self.syscall[6](Self.NR_mmap, addr, length, prot, flags, fd, offset)
+
+    fn sys_munmap(self, addr: Int, length: Int) -> Int:
+        return self.syscall[2](Self.NR_munmap, addr, length)
+
+    fn sys_mbind[
+        policy: Int = Mempolicy.BIND,
+        flags: Int = 0,
+    ](self, addr: Int, length: Int, nodemask: UInt64, maxnode: Int = 64) -> Int:
+        var mask_storage: InlineArray[UInt64, 1] = [nodemask]
+        var mask_ptr = UnsafePointer(to=mask_storage)
+        var result = self.syscall[6](Self.NR_mbind, addr, length, policy, Int(mask_ptr), maxnode, flags)
+        _ = mask_ptr[]
+        return result
+
+    fn sys_madvise[advice: Int](self, addr: Int, length: Int) -> Int:
+        return self.syscall[3](Self.NR_madvise, addr, length, advice)
+
+    fn sys_move_pages_query(self, addr: Int) -> Int:
+        var pages: InlineArray[Int, 1] = [addr]
+        var status: InlineArray[Int32, 1] = [Int32(-1)]
+        var pages_ptr = UnsafePointer(to=pages)
+        var status_ptr = UnsafePointer(to=status)
+        var result = self.syscall[6](Self.NR_move_pages, 0, 1, Int(pages_ptr), 0, Int(status_ptr), 0)
+        _ = pages_ptr[]
+        _ = status_ptr[]
+        if result < 0:
+            return result
+        return Int(status[0])
+
+    fn sys_mprotect(self, addr: Int, length: Int, prot: Int) -> Int:
+        return self.syscall[3](Self.NR_mprotect, addr, length, prot)
+
+    # --- I/O ---
+
+    fn sys_write(self, fd: Int, buf: Int, count: Int) -> Int:
+        return self.syscall[3](Self.NR_write, fd, buf, count)
+
+    fn sys_openat(self, dirfd: Int, mut pathname: String, flags: Int, mode: Int = 0) -> Int:
+        var cstr = pathname.as_c_string_slice()
+        return self.syscall[4](Self.NR_openat, dirfd, Int(cstr.unsafe_ptr()), flags, mode)
+
+    fn sys_close(self, fd: Int) -> Int:
+        return self.syscall[1](Self.NR_close, fd)
+
+    # --- Signal handling ---
+
+    fn sys_sigaltstack(
+        self,
+        ss: UnsafePointer[StackT, MutAnyOrigin],
+        old: UnsafePointer[StackT, MutAnyOrigin] = UnsafePointer[StackT, MutAnyOrigin](),
+    ) -> Int:
+        return self.syscall[2](Self.NR_sigaltstack, Int(ss), Int(old))
+
+    # --- Futex ---
+
+    fn sys_futex_wait(self, addr: Int, expected: Int, flags: Int = Futex2.SIZE_U32 | Futex2.PRIVATE) -> Int:
+        return self.syscall[6](Self.NR_futex_wait, addr, expected, FUTEX_BITSET_MATCH_ANY, flags, 0, 0)
+
+    fn sys_futex_waitv(
+        self,
+        waiters: UnsafePointer[FutexWaitv, _],
+        nr_futexes: Int,
+        flags: Int = 0,
+        timeout: Int = 0,
+        clockid: Int = 0,
+    ) -> Int:
+        return self.syscall[5](Self.NR_futex_waitv, Int(waiters), nr_futexes, flags, timeout, clockid)
+
+    fn sys_futex_wake(self, addr: Int, nr_wake: Int = 1, flags: Int = Futex2.SIZE_U32 | Futex2.PRIVATE) -> Int:
+        return self.syscall[4](Self.NR_futex_wake, addr, FUTEX_BITSET_MATCH_ANY, nr_wake, flags)
+
+    # --- Process / thread ---
+
+    fn sys_exit(self, code: Int = 0):
+        _ = self.syscall[1](Self.NR_exit, code)
+
+    fn sys_exit_group(self, code: Int = 0):
+        _ = self.syscall[1](Self.NR_exit_group, code)
+
+    fn sys_getpid(self) -> Int:
+        return self.syscall[0](Self.NR_getpid)
+
+    fn sys_gettid(self) -> Int:
+        return self.syscall[0](Self.NR_gettid)
+
+    fn sys_getcpu(self) -> Tuple[Int, Int]:
+        var cpu = UInt32(0)
+        var node = UInt32(0)
+        var cpu_addr = Int(UnsafePointer(to=cpu))
+        var node_addr = Int(UnsafePointer(to=node))
+        _ = self.syscall[3](Self.NR_getcpu, cpu_addr, node_addr, 0)
+        return Tuple[Int, Int](Int(cpu), Int(node))
+
+    fn sys_tgkill(self, pid: Int, tid: Int, sig: Int) -> Int:
+        return self.syscall[3](Self.NR_tgkill, pid, tid, sig)
+
+    fn sys_rseq(self, rseq_ptr: Int, len: Int, flags: Int, sig: Int) -> Int:
+        return self.syscall[4](Self.NR_rseq, rseq_ptr, len, flags, sig)
+
+    fn sys_sched_setaffinity(self, tid: Int, mask_size: Int, mask_ptr: Int) -> Int:
+        return self.syscall[3](Self.NR_sched_setaffinity, tid, mask_size, mask_ptr)
+
+    # --- io_uring ---
+
+    fn sys_io_uring_setup(self, entries: UInt32, params: UnsafePointer[IoUringParams]) -> Int:
+        return self.syscall[2](Self.NR_io_uring_setup, Int(entries), Int(params))
+
+    fn sys_io_uring_enter(
+        self,
+        fd: Int,
+        to_submit: UInt32,
+        min_complete: UInt32,
+        flags: UInt32,
+        sig: Int = 0,
+        sigsz: Int = 0,
+    ) -> Int:
+        return self.syscall[6](
+            Self.NR_io_uring_enter,
+            fd, Int(to_submit), Int(min_complete), Int(flags), sig, sigsz,
+        )
+
+    fn sys_io_uring_register(
+        self,
+        fd: Int,
+        opcode: UInt32,
+        arg: Int,
+        nr_args: UInt32,
+    ) -> Int:
+        return self.syscall[4](
+            Self.NR_io_uring_register,
+            fd, Int(opcode), arg, Int(nr_args),
+        )

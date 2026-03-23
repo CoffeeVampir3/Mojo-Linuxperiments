@@ -94,6 +94,21 @@ struct NumaNode(Copyable, Writable):
         self.mem_total_kb = 0
         self.mem_free_kb = 0
 
+@fieldwise_init
+struct NumaTopology(Movable):
+    """Ring-ordered NUMA node placement for tensor parallelism.
+    Nodes are selected for minimum communication cost and ordered
+    by nearest-neighbor adjacency for ring allreduce."""
+    var node_ids: List[Int]
+    var tp: Int
+
+    fn __len__(self) -> Int:
+        return self.tp
+
+    fn __getitem__(self, rank: Int) -> Int:
+        return self.node_ids[rank]
+
+
 struct NumaInfo:
     var nodes: List[NumaNode]
     var num_nodes: Int
@@ -160,6 +175,98 @@ struct NumaInfo:
         for i in range(self.num_nodes):
             total += len(self.nodes[i].cpu_ids)
         return total
+
+    fn plan_topology(self, tp: Int) -> NumaTopology:
+        """Select tp NUMA nodes with minimum communication cost, ordered as
+        a nearest-neighbor ring for optimal allreduce adjacency.
+
+        Two phases:
+        1. Greedy selection: seed with the most central node (minimum total
+           distance to all others), then greedily add the node closest to
+           the selected set. O(tp^2 * num_nodes).
+        2. Ring ordering: nearest-neighbor TSP starting from the seed,
+           producing the ring traversal order. O(tp^2).
+
+        Returns a NumaTopology with node IDs in ring order — rank 0 is the
+        seed (most central of the selected set), and each subsequent rank
+        is adjacent in the communication ring.
+        """
+        if self.num_nodes <= 1 or tp <= 1:
+            var ids = List[Int]()
+            var node_id = self.nodes[0].id if self.num_nodes > 0 else 0
+            for i in range(tp):
+                ids.append(node_id)
+            return NumaTopology(ids^, tp)
+
+        # --- Phase 1: Greedy selection from topological center ---
+
+        # Find the most central node (minimum total distance to all others).
+        var best_centrality = Int.MAX
+        var seed = 0
+        for i in range(self.num_nodes):
+            var total = 0
+            for j in range(self.num_nodes):
+                total += self.distance(i, j)
+            if total < best_centrality:
+                best_centrality = total
+                seed = i
+
+        var selected = List[Bool](length=self.num_nodes, fill=False)
+        var chosen = List[Int]()
+        selected[seed] = True
+        chosen.append(seed)
+
+        # Greedily add the node with minimum distance to any already-selected node.
+        while len(chosen) < tp and len(chosen) < self.num_nodes:
+            var best_node = -1
+            var best_dist = Int.MAX
+            for candidate in range(self.num_nodes):
+                if selected[candidate]:
+                    continue
+                var min_dist = Int.MAX
+                for s in range(len(chosen)):
+                    var d = self.distance(candidate, chosen[s])
+                    if d < min_dist:
+                        min_dist = d
+                if min_dist < best_dist:
+                    best_dist = min_dist
+                    best_node = candidate
+            if best_node < 0:
+                break
+            selected[best_node] = True
+            chosen.append(best_node)
+
+        # --- Phase 2: Nearest-neighbor ring ordering ---
+
+        var ordered = List[Int]()
+        var visited = List[Bool](length=len(chosen), fill=False)
+
+        # Start from the seed (index 0 in chosen).
+        visited[0] = True
+        ordered.append(self.nodes[chosen[0]].id)
+
+        for step in range(1, len(chosen)):
+            var last = chosen[0]
+            # Find which chosen[] index corresponds to the last ordered node.
+            for k in range(len(chosen)):
+                if self.nodes[chosen[k]].id == ordered[step - 1]:
+                    last = chosen[k]
+                    break
+
+            var best_next = -1
+            var best_d = Int.MAX
+            for k in range(len(chosen)):
+                if visited[k]:
+                    continue
+                var d = self.distance(last, chosen[k])
+                if d < best_d:
+                    best_d = d
+                    best_next = k
+            if best_next >= 0:
+                visited[best_next] = True
+                ordered.append(self.nodes[chosen[best_next]].id)
+
+        return NumaTopology(ordered^, tp)
 
     fn print_debug(self):
         print("NUMA Info:", self.num_nodes, "nodes,", self.cpus_per_node(), "cpus/node")

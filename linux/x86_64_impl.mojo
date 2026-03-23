@@ -4,6 +4,10 @@ from memory import UnsafePointer
 
 from .linux_sys import *
 
+# =============================================================================
+# x86_64-specific types
+# =============================================================================
+
 comptime SA_RESTORER: UInt64 = 0x04000000
 
 fn rt_sigreturn_restorer():
@@ -26,15 +30,21 @@ struct KernelRtSigActionX86_64(TrivialRegisterPassable):
         self.mask = SigSet64()
 
 struct KernelSigInfoX86_64(TrivialRegisterPassable):
-    # Minimal siginfo_t prefix + si_addr for SIGSEGV (x86_64).
     var si_signo: Int32
     var si_errno: Int32
     var si_code: Int32
     var pad0: Int32
     var si_addr: Int
 
+# =============================================================================
+# X86_64LinuxSys — conforms to LinuxSys.
+#
+# Provides: syscall numbers, raw syscall mechanism, and arch-specific ops.
+# Inherits: all shared syscall wrappers from LinuxSys defaults.
+# =============================================================================
 
 struct X86_64LinuxSys(LinuxSys):
+    # Syscall numbers.
     comptime NR_write = 1
     comptime NR_mmap = 9
     comptime NR_mprotect = 10
@@ -64,6 +74,8 @@ struct X86_64LinuxSys(LinuxSys):
 
     fn __init__(out self):
         pass
+
+    # --- Raw syscall mechanism (x86_64 register ABI) ---
 
     fn syscall[count: Int](self, nr: Int, *args: Int) -> Int:
         comptime regs = ("", ",{rdi}", ",{rdi},{rsi}", ",{rdi},{rsi},{rdx}",
@@ -108,56 +120,17 @@ struct X86_64LinuxSys(LinuxSys):
             constrained[False, "syscall supports 0-6 arguments"]()
             return 0
 
+    # --- Architecture-specific operations ---
+
     fn arch_cpu_relax(self):
         inlined_assembly["pause", NoneType, constraints="~{memory}"]()
 
     fn arch_thread_pointer(self) -> Int:
-        # The thread pointer is stored at %fs:0 on x86-64 (tcb self-pointer).
         return Int(inlined_assembly["mov %fs:0, $0", Int, constraints="=r"]())
 
     fn arch_tls_load_i64[offset: Int](self) -> Int:
         comptime asm = "mov %fs:" + String(offset) + ", $0"
         return Int(inlined_assembly[asm, Int, constraints="=r"]())
-
-    fn sys_mmap[
-        prot: Int = Prot.RW,
-        flags: Int = MapFlag.PRIVATE | MapFlag.ANONYMOUS,
-    ](self, addr: Int, length: Int, fd: Int = -1, offset: Int = 0) -> Int:
-        return self.syscall[6](Self.NR_mmap, addr, length, prot, flags, fd, offset)
-
-    fn sys_munmap(self, addr: Int, length: Int) -> Int:
-        return self.syscall[2](Self.NR_munmap, addr, length)
-
-    fn sys_mbind[
-        policy: Int = Mempolicy.BIND,
-        flags: Int = 0,
-    ](self, addr: Int, length: Int, nodemask: UInt64, maxnode: Int = 64) -> Int:
-        var mask_storage: InlineArray[UInt64, 1] = [nodemask]
-        var mask_ptr = UnsafePointer(to=mask_storage)
-        var result = self.syscall[6](Self.NR_mbind, addr, length, policy, Int(mask_ptr), maxnode, flags)
-        _ = mask_ptr[]
-        return result
-
-    fn sys_madvise[advice: Int](self, addr: Int, length: Int) -> Int:
-        return self.syscall[3](Self.NR_madvise, addr, length, advice)
-
-    fn sys_move_pages_query(self, addr: Int) -> Int:
-        var pages: InlineArray[Int, 1] = [addr]
-        var status: InlineArray[Int32, 1] = [Int32(-1)]
-        var pages_ptr = UnsafePointer(to=pages)
-        var status_ptr = UnsafePointer(to=status)
-        var result = self.syscall[6](Self.NR_move_pages, 0, 1, Int(pages_ptr), 0, Int(status_ptr), 0)
-        _ = pages_ptr[]
-        _ = status_ptr[]
-        if result < 0:
-            return result
-        return Int(status[0])
-
-    fn sys_mprotect(self, addr: Int, length: Int, prot: Int) -> Int:
-        return self.syscall[3](Self.NR_mprotect, addr, length, prot)
-
-    fn sys_write(self, fd: Int, buf: Int, count: Int) -> Int:
-        return self.syscall[3](Self.NR_write, fd, buf, count)
 
     fn sys_rt_sigaction(
         self,
@@ -203,69 +176,11 @@ struct X86_64LinuxSys(LinuxSys):
             _ = kact_ptr[]
             return result
 
-    fn sys_sigaltstack(
-        self,
-        ss: UnsafePointer[StackT, MutAnyOrigin],
-        old: UnsafePointer[StackT, MutAnyOrigin] = UnsafePointer[StackT, MutAnyOrigin](),
-    ) -> Int:
-        return self.syscall[2](Self.NR_sigaltstack, Int(ss), Int(old))
-
-    fn sys_futex_wait(self, addr: Int, expected: Int, flags: Int = Futex2.SIZE_U32 | Futex2.PRIVATE) -> Int:
-        return self.syscall[6](Self.NR_futex_wait, addr, expected, FUTEX_BITSET_MATCH_ANY, flags, 0, 0)
-
-    fn sys_futex_waitv(
-        self,
-        waiters: UnsafePointer[FutexWaitv],
-        nr_futexes: Int,
-        flags: Int = 0,
-        timeout: Int = 0,
-        clockid: Int = 0,
-    ) -> Int:
-        return self.syscall[5](Self.NR_futex_waitv, Int(waiters), nr_futexes, flags, timeout, clockid)
-
-    fn sys_futex_wake(self, addr: Int, nr_wake: Int = 1, flags: Int = Futex2.SIZE_U32 | Futex2.PRIVATE) -> Int:
-        return self.syscall[4](Self.NR_futex_wake, addr, FUTEX_BITSET_MATCH_ANY, nr_wake, flags)
-
-    fn sys_exit(self, code: Int = 0):
-        _ = self.syscall[1](Self.NR_exit, code)
-
-    fn sys_exit_group(self, code: Int = 0):
-        _ = self.syscall[1](Self.NR_exit_group, code)
-
-    fn sys_getpid(self) -> Int:
-        return self.syscall[0](Self.NR_getpid)
-
-    fn sys_gettid(self) -> Int:
-        return self.syscall[0](Self.NR_gettid)
-
-    fn sys_getcpu(self) -> Tuple[Int, Int]:
-        var cpu = UInt32(0)
-        var node = UInt32(0)
-        var cpu_addr = Int(UnsafePointer(to=cpu))
-        var node_addr = Int(UnsafePointer(to=node))
-        _ = self.syscall[3](Self.NR_getcpu, cpu_addr, node_addr, 0)
-        return Tuple[Int, Int](Int(cpu), Int(node))
-
-    fn sys_tgkill(self, pid: Int, tid: Int, sig: Int) -> Int:
-        return self.syscall[3](Self.NR_tgkill, pid, tid, sig)
-
-    fn sys_rseq(self, rseq_ptr: Int, len: Int, flags: Int, sig: Int) -> Int:
-        return self.syscall[4](Self.NR_rseq, rseq_ptr, len, flags, sig)
-
-    fn sys_sched_setaffinity(self, tid: Int, mask_size: Int, mask_ptr: Int) -> Int:
-        return self.syscall[3](Self.NR_sched_setaffinity, tid, mask_size, mask_ptr)
-
-    fn sys_openat(self, dirfd: Int, mut pathname: String, flags: Int, mode: Int = 0) -> Int:
-        var cstr = pathname.as_c_string_slice()
-        return self.syscall[4](Self.NR_openat, dirfd, Int(cstr.unsafe_ptr()), flags, mode)
-
     fn sys_clone3_with_entry(
         self,
         clone_args_ptr: UnsafePointer[Clone3Args, MutAnyOrigin],
         clone_args_size: Int,
     ) -> Int:
-        # Child diverges via `ret` to the entry pointer placed at the top of the
-        # new stack. The entry is called with arg0 = stack head pointer.
         comptime asm = (
             "mov $$" + String(Self.NR_clone3) + ", %rax\n"
             "syscall\n"
@@ -285,66 +200,7 @@ struct X86_64LinuxSys(LinuxSys):
             ](Int(clone_args_ptr), clone_args_size)
         )
 
-    fn sys_close(self, fd: Int) -> Int:
-        return self.syscall[1](Self.NR_close, fd)
-
-    fn sys_io_uring_setup(self, entries: UInt32, params: UnsafePointer[IoUringParams]) -> Int:
-        return self.syscall[2](Self.NR_io_uring_setup, Int(entries), Int(params))
-
-    fn sys_io_uring_enter(
-        self,
-        fd: Int,
-        to_submit: UInt32,
-        min_complete: UInt32,
-        flags: UInt32,
-    ) -> Int:
-        return self.syscall[6](
-            Self.NR_io_uring_enter,
-            fd,
-            Int(to_submit),
-            Int(min_complete),
-            Int(flags),
-            0,
-            0,
-        )
-
-    fn sys_io_uring_enter_sig(
-        self,
-        fd: Int,
-        to_submit: UInt32,
-        min_complete: UInt32,
-        flags: UInt32,
-        sig: Int,
-        sigsz: Int,
-    ) -> Int:
-        return self.syscall[6](
-            Self.NR_io_uring_enter,
-            fd,
-            Int(to_submit),
-            Int(min_complete),
-            Int(flags),
-            sig,
-            sigsz,
-        )
-
-    fn sys_io_uring_register(
-        self,
-        fd: Int,
-        opcode: UInt32,
-        arg: Int,
-        nr_args: UInt32,
-    ) -> Int:
-        return self.syscall[4](
-            Self.NR_io_uring_register,
-            fd,
-            Int(opcode),
-            arg,
-            Int(nr_args),
-        )
-
     fn arch_decode_sigsegv(self, siginfo: Int, ucontext: Int) -> SigSegvContext:
-        # x86-64 ucontext_t layout (glibc/kernel ABI):
-        # gregs array is at offset 40 bytes and uses fixed indices.
         comptime UCONTEXT_GREGS_OFFSET = 40
         comptime REG_RSP = 15
         comptime REG_RIP = 16

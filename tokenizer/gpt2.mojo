@@ -1,8 +1,6 @@
 from memory import Span
 from .capabilities import ByteTransformCapability, PreTokenizerCapability
 from .shared_capabilities import (
-    bytes_to_gpt2,
-    gpt2_to_bytes,
     is_ascii_letter,
     is_ascii_digit,
     is_ascii_regex_space,
@@ -13,29 +11,17 @@ from .shared_capabilities import (
     is_number_start_at,
     is_whitespace_start_at,
     span_to_string,
+    skip_while_matching,
+    simd_ascii_letters,
+    simd_ascii_digits,
+    simd_spaces,
+    consume_codepoint_run,
 )
 from .unicode_props import (
     LETTER_RANGES,
     NUMBER_RANGES,
     WHITESPACE_RANGES,
 )
-
-comptime PRETOKENIZE_SIMD_WIDTH = 16
-
-
-@always_inline
-fn simd_ascii_letters[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
-    return ((block | Byte(0x20)) - Byte(97)).le(Byte(25))
-
-
-@always_inline
-fn simd_ascii_digits[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
-    return (block - Byte(48)).le(Byte(9))
-
-
-@always_inline
-fn simd_spaces[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
-    return (block - Byte(9)).le(Byte(4)) | block.eq(Byte(32))
 
 
 @always_inline
@@ -72,100 +58,6 @@ fn is_symbol_start_at(
     return True
 
 
-fn sort_strings_by_byte_length_desc(mut values: List[String]):
-    for i in range(1, len(values)):
-        var cur = values[i]
-        var cur_len = cur.byte_length()
-        var j = i
-        while j > 0 and values[j - 1].byte_length() < cur_len:
-            values[j] = values[j - 1]
-            j -= 1
-        values[j] = cur
-
-
-@always_inline
-fn span_matches_at(data: Span[Byte], pos: Int, pattern: Span[Byte]) -> Bool:
-    if pos + len(pattern) > len(data):
-        return False
-    for i in range(len(pattern)):
-        if data[pos + i] != pattern[i]:
-            return False
-    return True
-
-
-fn find_added_token_match(
-    text: Span[Byte],
-    pos: Int,
-    added_token_order: List[String],
-    added_tokens: Dict[String, Int],
-) -> Tuple[Int, Int]:
-    for i in range(len(added_token_order)):
-        var tok = added_token_order[i]
-        var tok_bytes = tok.as_bytes()
-        if span_matches_at(text, pos, tok_bytes):
-            var found = added_tokens.get(tok)
-            if found:
-                return (found.value(), len(tok_bytes))
-    return (-1, 0)
-
-
-@always_inline
-fn skip_ascii_letters_simd(data: Span[Byte], pos: Int, n: Int) -> Int:
-    var i = pos
-    var ptr = data.unsafe_ptr()
-    while i + PRETOKENIZE_SIMD_WIDTH <= n:
-        var block = (ptr + i).load[width=PRETOKENIZE_SIMD_WIDTH]()
-        var mask = simd_ascii_letters[PRETOKENIZE_SIMD_WIDTH](block)
-        if all(mask):
-            i += PRETOKENIZE_SIMD_WIDTH
-            continue
-        @parameter
-        for lane in range(PRETOKENIZE_SIMD_WIDTH):
-            if not mask[lane]:
-                return i + lane
-    while i < n and is_ascii_letter(data[i]):
-        i += 1
-    return i
-
-
-@always_inline
-fn skip_ascii_digits_simd(data: Span[Byte], pos: Int, n: Int) -> Int:
-    var i = pos
-    var ptr = data.unsafe_ptr()
-    while i + PRETOKENIZE_SIMD_WIDTH <= n:
-        var block = (ptr + i).load[width=PRETOKENIZE_SIMD_WIDTH]()
-        var mask = simd_ascii_digits[PRETOKENIZE_SIMD_WIDTH](block)
-        if all(mask):
-            i += PRETOKENIZE_SIMD_WIDTH
-            continue
-        @parameter
-        for lane in range(PRETOKENIZE_SIMD_WIDTH):
-            if not mask[lane]:
-                return i + lane
-    while i < n and is_ascii_digit(data[i]):
-        i += 1
-    return i
-
-
-@always_inline
-fn skip_spaces_simd(data: Span[Byte], pos: Int, n: Int) -> Int:
-    var i = pos
-    var ptr = data.unsafe_ptr()
-    while i + PRETOKENIZE_SIMD_WIDTH <= n:
-        var block = (ptr + i).load[width=PRETOKENIZE_SIMD_WIDTH]()
-        var mask = simd_spaces[PRETOKENIZE_SIMD_WIDTH](block)
-        if all(mask):
-            i += PRETOKENIZE_SIMD_WIDTH
-            continue
-        @parameter
-        for lane in range(PRETOKENIZE_SIMD_WIDTH):
-            if not mask[lane]:
-                return i + lane
-    while i < n and is_ascii_regex_space(data[i]):
-        i += 1
-    return i
-
-
 @always_inline
 fn consume_letter_run(
     data: Span[Byte],
@@ -177,7 +69,7 @@ fn consume_letter_run(
     while i < n:
         var b = data[i]
         if is_ascii_letter(b):
-            i = skip_ascii_letters_simd(data, i, n)
+            i = skip_while_matching[is_ascii_letter, simd_ascii_letters](data, i, n)
             continue
         var parsed = decode_utf8_codepoint(data, i, n)
         if is_unicode_letter_cp(parsed[0], letter_ranges):
@@ -197,7 +89,7 @@ fn consume_number_run(
     var i = start
     while i < n:
         if is_ascii_digit(data[i]):
-            i = skip_ascii_digits_simd(data, i, n)
+            i = skip_while_matching[is_ascii_digit, simd_ascii_digits](data, i, n)
             continue
         var parsed = decode_utf8_codepoint(data, i, n)
         if is_unicode_number_cp(parsed[0], number_ranges):
@@ -241,7 +133,7 @@ fn consume_whitespace_run(
         if b < Byte(0x80):
             if not is_ascii_regex_space(b):
                 break
-            var ascii_end = skip_spaces_simd(data, i, n)
+            var ascii_end = skip_while_matching[is_ascii_regex_space, simd_spaces](data, i, n)
             if ascii_end <= i:
                 break
             cp_count += ascii_end - i
@@ -370,8 +262,6 @@ fn pre_tokenize(text: String) -> List[String]:
     if n == 0:
         return result^
 
-    # Match HF pre-tokenizer semantics exactly:
-    # Sequence([Digits(individual_digits=true), ByteLevel(use_regex=true, add_prefix_space=false)])
     var letter_ranges = materialize[LETTER_RANGES]()
     var number_ranges = materialize[NUMBER_RANGES]()
     var whitespace_ranges = materialize[WHITESPACE_RANGES]()
@@ -389,22 +279,12 @@ fn pre_tokenize(text: String) -> List[String]:
             var cp_len = parsed[1]
             if chunk_start < i:
                 pre_tokenize_bytelevel_span(
-                    data,
-                    chunk_start,
-                    i,
-                    letter_ptr,
-                    number_ptr,
-                    whitespace_ptr,
-                    result,
+                    data, chunk_start, i,
+                    letter_ptr, number_ptr, whitespace_ptr, result,
                 )
             pre_tokenize_bytelevel_span(
-                data,
-                i,
-                i + cp_len,
-                letter_ptr,
-                number_ptr,
-                whitespace_ptr,
-                result,
+                data, i, i + cp_len,
+                letter_ptr, number_ptr, whitespace_ptr, result,
             )
             i += cp_len
             chunk_start = i
@@ -415,13 +295,8 @@ fn pre_tokenize(text: String) -> List[String]:
 
     if chunk_start < n:
         pre_tokenize_bytelevel_span(
-            data,
-            chunk_start,
-            n,
-            letter_ptr,
-            number_ptr,
-            whitespace_ptr,
-            result,
+            data, chunk_start, n,
+            letter_ptr, number_ptr, whitespace_ptr, result,
         )
 
     return result^
@@ -429,12 +304,6 @@ fn pre_tokenize(text: String) -> List[String]:
 struct GPT2ByteTransform(ByteTransformCapability):
     fn __init__(out self):
         pass
-
-    fn encode_bytes(self, data: Span[Byte]) -> String:
-        return bytes_to_gpt2(data)
-
-    fn decode_bytes(self, text: String) -> List[Byte]:
-        return gpt2_to_bytes(text)
 
 
 struct GPT2PreTokenizer(PreTokenizerCapability):

@@ -279,23 +279,23 @@ struct SmolLM2Loaded[E: Encoding, tp: Int](Movable):
         var rope_sin = Bound[M.ROPE_SIN](self.rope_sin_ptr())
 
         prof.section("embed")
-        embed_lookup(self.weight[M.EMBED](), tokens_ptr, x, self.pool)
+        embed_lookup(self.weight[M.EMBED](), tokens_ptr, x, self.pool).join()
 
         for layer_idx in range(C.NUM_LAYERS):
             var k_cache = CacheView[L.K_CACHE](self.k_cache_ptr(layer_idx))
             var v_cache = CacheView[L.V_CACHE](self.v_cache_ptr(layer_idx))
 
             prof.section("rmsnorm")
-            rmsnorm(x, self.layer_weight[L.INPUT_NORM](layer_idx), x_res, self.pool)
+            rmsnorm(x, self.layer_weight[L.INPUT_NORM](layer_idx), x_res, self.pool).join()
 
             var q = DynView[M.X_MAIN](self.scratch_slot(0), seq_len)
             var k = DynView[L.K_CACHE](self.scratch_slot(1), seq_len)
             var v = DynView[L.V_CACHE](self.scratch_slot(2), seq_len)
 
             prof.section("gemm_qkv")
-            gemm(x_res, self.layer_weight[L.Q_PROJ](layer_idx), q, self.pool)
-            gemm(x_res, self.layer_weight[L.K_PROJ](layer_idx), k, self.pool)
-            gemm(x_res, self.layer_weight[L.V_PROJ](layer_idx), v, self.pool)
+            gemm(x_res, self.layer_weight[L.Q_PROJ](layer_idx), q, self.pool).join()
+            gemm(x_res, self.layer_weight[L.K_PROJ](layer_idx), k, self.pool).join()
+            gemm(x_res, self.layer_weight[L.V_PROJ](layer_idx), v, self.pool).join()
 
             prof.section("rope")
             rope[C.HEAD_DIM, C.NUM_HEADS](q, rope_cos, rope_sin, pos)
@@ -309,10 +309,10 @@ struct SmolLM2Loaded[E: Encoding, tp: Int](Movable):
 
             prof.section("attention")
             attention[C.NUM_HEADS, C.NUM_KV_HEADS, C.HEAD_DIM](
-                q, k_cache, v_cache, attn_out, pos, self.pool)
+                q, k_cache, v_cache, attn_out, pos, self.pool).join()
 
             prof.section("gemm_o")
-            gemm(attn_out, self.layer_weight[L.O_PROJ](layer_idx), x_res, self.pool)
+            gemm(attn_out, self.layer_weight[L.O_PROJ](layer_idx), x_res, self.pool).join()
 
             prof.section("elem_add")
             elem_add(x, x_res, x)
@@ -321,28 +321,28 @@ struct SmolLM2Loaded[E: Encoding, tp: Int](Movable):
             var up = DynView[M.SCRATCH](self.scratch_slot(1), seq_len)
 
             prof.section("rmsnorm")
-            rmsnorm(x, self.layer_weight[L.POST_ATTN_NORM](layer_idx), x_res, self.pool)
+            rmsnorm(x, self.layer_weight[L.POST_ATTN_NORM](layer_idx), x_res, self.pool).join()
 
             prof.section("gemm_gate_up")
-            gemm(x_res, self.layer_weight[L.GATE_PROJ](layer_idx), gate, self.pool)
-            gemm(x_res, self.layer_weight[L.UP_PROJ](layer_idx), up, self.pool)
+            gemm(x_res, self.layer_weight[L.GATE_PROJ](layer_idx), gate, self.pool).join()
+            gemm(x_res, self.layer_weight[L.UP_PROJ](layer_idx), up, self.pool).join()
 
             prof.section("silu_mul")
             silu_mul(gate, up, gate)
 
             prof.section("gemm_down")
-            gemm(gate, self.layer_weight[L.DOWN_PROJ](layer_idx), x_res, self.pool)
+            gemm(gate, self.layer_weight[L.DOWN_PROJ](layer_idx), x_res, self.pool).join()
 
             prof.section("elem_add")
             elem_add(x, x_res, x)
 
         prof.section("final_norm")
-        rmsnorm(x, self.weight[M.FINAL_NORM](), x, self.pool)
+        rmsnorm(x, self.weight[M.FINAL_NORM](), x, self.pool).join()
 
         var logits = DynView[M.LOGITS](self.scratch_slot(0), seq_len)
 
         prof.section("lm_head")
-        gemm(x, self.weight[M.EMBED](), logits, self.pool)
+        gemm(x, self.weight[M.EMBED](), logits, self.pool).join()
 
         prof.finish()
         prof.report()

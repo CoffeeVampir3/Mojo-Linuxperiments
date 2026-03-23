@@ -2620,6 +2620,175 @@ def main():
         test_equality(original_instance, target_instance) \
         else "Values not equal") # Values not equal
 
+Advanced default method patterns
+
+The "Default method implementations" section above shows simple defaults like printing a string or negating an equality check. In practice, trait defaults are far more powerful — a default method body is ordinary Mojo code and can do anything a regular method can. This section documents patterns that go beyond simple one-liners.
+Default methods calling abstract methods
+
+A default method can call other methods required by the same trait, even if those methods are abstract (not yet implemented). The compiler guarantees that any conforming struct will have provided an implementation, so the call is always valid at monomorphization time.
+
+```mojo
+trait Codec:
+    fn raw_encode(self, data: Span[Byte]) -> List[Byte]: ...
+    fn raw_decode(self, data: Span[Byte]) -> List[Byte]: ...
+
+    fn encode_string(self, text: String) -> String:
+        var encoded = self.raw_encode(text.as_bytes())
+        return String(unsafe_from_utf8=Span(encoded))
+
+    fn decode_string(self, text: String) -> String:
+        var decoded = self.raw_decode(text.as_bytes())
+        return String(unsafe_from_utf8=Span(decoded))
+```
+
+Here `encode_string` and `decode_string` are defaults that call the abstract `raw_encode` and `raw_decode`. A conformer only needs to implement the two raw methods and gets the string-level API for free:
+
+```mojo
+struct Base64Codec(Codec):
+    fn raw_encode(self, data: Span[Byte]) -> List[Byte]:
+        # ... base64 encoding logic
+    fn raw_decode(self, data: Span[Byte]) -> List[Byte]:
+        # ... base64 decoding logic
+    # encode_string and decode_string inherited
+```
+
+Default methods with comptime members
+
+Defaults can reference comptime members declared in the same trait using `Self.MEMBER`. Combined with calling abstract methods, this lets you write shared logic that varies based on both comptime data and runtime behavior provided by the conformer:
+
+```mojo
+trait ArchPrimitives:
+    comptime NR_write: Int
+    comptime NR_exit: Int
+    fn syscall[count: Int](self, nr: Int, *args: Int) -> Int: ...
+
+trait Syscalls(ArchPrimitives):
+    fn sys_write(self, fd: Int, buf: Int, count: Int) -> Int:
+        return self.syscall[3](Self.NR_write, fd, buf, count)
+
+    fn sys_exit(self, code: Int = 0):
+        _ = self.syscall[1](Self.NR_exit, code)
+```
+
+Each conformer provides its own `NR_write`, `NR_exit`, and `syscall` implementation. The shared wrappers `sys_write` and `sys_exit` compose these primitives into a portable interface without any manual forwarding.
+
+The subtrait template method pattern
+
+The previous example demonstrates a powerful structural pattern: split a trait hierarchy into an abstract "primitives" trait and a "shared behavior" subtrait whose defaults build on those primitives.
+
+```
+ArchPrimitives (abstract: what varies per implementation)
+    └── Syscalls(ArchPrimitives) (defaults: shared logic built on the primitives)
+```
+
+This is the trait-level equivalent of the template method pattern. The parent trait defines the varying steps. The subtrait provides the algorithm as defaults. Conformers implement the parent and inherit the subtrait's shared behavior automatically.
+
+This pattern is most useful when:
+
+- Multiple implementations share significant common logic (the defaults).
+- The implementations differ in a small number of core operations (the abstract methods).
+- The shared logic calls the varying operations — it's not just data access, but behavioral composition.
+
+For example, an x86_64 implementation and an aarch64 implementation might have different syscall register ABIs and different signal handling, but share identical logic for memory mapping, futex operations, and file I/O:
+
+```mojo
+struct X86_64(Syscalls):
+    comptime NR_write = 1
+    comptime NR_exit = 60
+    fn syscall[count: Int](self, nr: Int, *args: Int) -> Int:
+        # x86_64 register ABI via inline assembly
+        ...
+
+struct AArch64(Syscalls):
+    comptime NR_write = 64
+    comptime NR_exit = 93
+    fn syscall[count: Int](self, nr: Int, *args: Int) -> Int:
+        # aarch64 register ABI via inline assembly
+        ...
+```
+
+Both implementations provide ~3 things (syscall numbers + the raw mechanism) and inherit ~20 shared wrappers from the `Syscalls` defaults. Without this pattern, each implementation would need to manually duplicate all the shared wrappers, or a forwarding wrapper would need to delegate every method individually.
+
+Default methods calling free functions
+
+Default method bodies can call any function in scope, not just methods on `self` or `Self.MEMBER` accesses. This includes free functions from other modules:
+
+```mojo
+# In transform_utils.mojo
+fn bytes_to_text(data: Span[Byte]) -> String:
+    # ... conversion logic
+
+fn text_to_bytes(text: String) -> List[Byte]:
+    # ... conversion logic
+
+# In capabilities.mojo
+from .transform_utils import bytes_to_text, text_to_bytes
+
+trait ByteTransform(Movable, ImplicitlyDestructible):
+    fn encode(self, data: Span[Byte]) -> String:
+        return bytes_to_text(data)
+
+    fn decode(self, text: String) -> List[Byte]:
+        return text_to_bytes(text)
+```
+
+Any struct conforming to `ByteTransform` inherits both methods without writing any code. A conformer can still override a default if it needs different behavior:
+
+```mojo
+struct StandardTransform(ByteTransform):
+    fn __init__(out self): pass
+    # encode and decode inherited from defaults
+
+struct CustomTransform(ByteTransform):
+    fn __init__(out self): pass
+
+    fn encode(self, data: Span[Byte]) -> String:
+        # Custom encoding that overrides the default
+        ...
+    # decode still inherited from default
+```
+
+Complex default method bodies
+
+Default methods are not limited to one-liners. They can contain local variables, control flow, pointer operations, and any other valid Mojo code:
+
+```mojo
+trait QueryableMemory:
+    fn syscall[count: Int](self, nr: Int, *args: Int) -> Int: ...
+    comptime NR_move_pages: Int
+
+    fn query_page_node(self, addr: Int) -> Int:
+        var pages: InlineArray[Int, 1] = [addr]
+        var status: InlineArray[Int32, 1] = [Int32(-1)]
+        var pages_ptr = UnsafePointer(to=pages)
+        var status_ptr = UnsafePointer(to=status)
+        var result = self.syscall[6](
+            Self.NR_move_pages, 0, 1,
+            Int(pages_ptr), 0, Int(status_ptr), 0,
+        )
+        _ = pages_ptr[]
+        _ = status_ptr[]
+        if result < 0:
+            return result
+        return Int(status[0])
+```
+
+This default method declares local `InlineArray` values, creates `UnsafePointer` references, calls an abstract method with compile-time parameters, and includes conditional control flow. Any struct that conforms to `QueryableMemory` inherits this complete implementation.
+
+When to use trait defaults vs. other patterns
+
+Trait defaults are the right choice when:
+
+- Multiple conformers would have identical implementations for a method.
+- The shared logic depends on abstract methods or comptime members that vary per conformer.
+- You want to eliminate a forwarding wrapper that manually delegates every method.
+
+Trait defaults are not useful when:
+
+- There's only one conformer — a direct implementation is simpler.
+- The method logic doesn't depend on anything that varies — make it a free function instead.
+- The "shared" behavior actually differs subtly between conformers — forced sharing creates bugs.
+
 Learn more
 
     Visit the reflection package documentation to explore additional Mojo reflection capabilities.

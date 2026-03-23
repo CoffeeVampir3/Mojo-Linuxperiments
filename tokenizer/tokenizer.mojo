@@ -3,6 +3,12 @@ from memory import Span
 from .capabilities import ByteTransformCapability, PreTokenizerCapability
 from .auto import AutoPreTokenizer
 from .gpt2 import GPT2ByteTransform
+from .shared_capabilities import (
+    span_to_string,
+    sort_strings_by_byte_length_desc,
+    span_matches_at,
+    find_added_token_match,
+)
 
 
 trait Tokenizer(Movable):
@@ -20,52 +26,6 @@ trait Tokenizer(Movable):
 
     fn id_to_token(self, id: Int) -> Optional[String]:
         ...
-
-
-comptime PIECE_CACHE_MAX_ENTRIES = 65536
-comptime PIECE_CACHE_MAX_IDS_PER_ENTRY = 128
-
-
-@always_inline
-fn span_to_string(data: Span[Byte], start: Int, end: Int) -> String:
-    return String(unsafe_from_utf8=Span[Byte](ptr=data.unsafe_ptr() + start, length=end - start))
-
-
-fn sort_strings_by_byte_length_desc(mut values: List[String]):
-    for i in range(1, len(values)):
-        var cur = values[i]
-        var cur_len = cur.byte_length()
-        var j = i
-        while j > 0 and values[j - 1].byte_length() < cur_len:
-            values[j] = values[j - 1]
-            j -= 1
-        values[j] = cur
-
-
-@always_inline
-fn span_matches_at(data: Span[Byte], pos: Int, pattern: Span[Byte]) -> Bool:
-    if pos + len(pattern) > len(data):
-        return False
-    for i in range(len(pattern)):
-        if data[pos + i] != pattern[i]:
-            return False
-    return True
-
-
-fn find_added_token_match(
-    text: Span[Byte],
-    pos: Int,
-    added_token_order: List[String],
-    added_tokens: Dict[String, Int],
-) -> Tuple[Int, Int]:
-    for i in range(len(added_token_order)):
-        var tok = added_token_order[i]
-        var tok_bytes = tok.as_bytes()
-        if span_matches_at(text, pos, tok_bytes):
-            var found = added_tokens.get(tok)
-            if found:
-                return (found.value(), len(tok_bytes))
-    return (-1, 0)
 
 
 @always_inline
@@ -231,6 +191,55 @@ fn bpe_merge_ids(
     return out_ids^
 
 
+comptime PIECE_CACHE_MAX_ENTRIES = 65536
+comptime PIECE_CACHE_MAX_IDS_PER_ENTRY = 128
+
+
+struct PieceCache(Movable):
+    var index: Dict[String, Int]
+    var starts: List[Int]
+    var lens: List[Int]
+    var values: List[Int]
+
+    fn __init__(out self):
+        self.index = Dict[String, Int]()
+        self.starts = List[Int]()
+        self.lens = List[Int]()
+        self.values = List[Int]()
+
+    fn get(self, piece: String, mut ids: List[Int]) -> Bool:
+        var cached_slot = self.index.get(piece)
+        if not cached_slot:
+            return False
+        var slot = cached_slot.value()
+        if slot < 0 or slot >= len(self.starts):
+            return False
+        var start = self.starts[slot]
+        var count = self.lens[slot]
+        for i in range(count):
+            ids.append(self.values[start + i])
+        return True
+
+    fn put(mut self, piece: String, symbol_ids: List[Int]):
+        if len(symbol_ids) == 0 or len(symbol_ids) > PIECE_CACHE_MAX_IDS_PER_ENTRY:
+            return
+        if len(self.starts) >= PIECE_CACHE_MAX_ENTRIES:
+            self.clear()
+        var entry_start = len(self.values)
+        for i in range(len(symbol_ids)):
+            self.values.append(symbol_ids[i])
+        var slot = len(self.starts)
+        self.starts.append(entry_start)
+        self.lens.append(len(symbol_ids))
+        self.index[piece] = slot
+
+    fn clear(mut self):
+        self.index = Dict[String, Int]()
+        self.starts.resize(unsafe_uninit_length=0)
+        self.lens.resize(unsafe_uninit_length=0)
+        self.values.resize(unsafe_uninit_length=0)
+
+
 struct BPETokenizer[
     pretokenizer_type: PreTokenizerCapability = AutoPreTokenizer,
     byte_transform_type: ByteTransformCapability = GPT2ByteTransform,
@@ -255,10 +264,7 @@ struct BPETokenizer[
     var bos_token_id: Int
     var eos_token_id: Int
     var _vocab_size: Int
-    var piece_cache_index: Dict[String, Int]
-    var piece_cache_starts: List[Int]
-    var piece_cache_lens: List[Int]
-    var piece_cache_values: List[Int]
+    var piece_cache: PieceCache
     var pretokenizer: Self.pretokenizer_type
     var byte_transform: Self.byte_transform_type
 
@@ -338,10 +344,7 @@ struct BPETokenizer[
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self._vocab_size = vocab_size
-        self.piece_cache_index = Dict[String, Int]()
-        self.piece_cache_starts = List[Int]()
-        self.piece_cache_lens = List[Int]()
-        self.piece_cache_values = List[Int]()
+        self.piece_cache = PieceCache()
         self.pretokenizer = pretokenizer^
         self.byte_transform = byte_transform^
 
@@ -382,25 +385,12 @@ struct BPETokenizer[
     fn num_special_tokens(self) -> Int:
         return len(self.special_tokens)
 
-    fn clear_piece_cache(mut self):
-        self.piece_cache_index = Dict[String, Int]()
-        self.piece_cache_starts.resize(unsafe_uninit_length=0)
-        self.piece_cache_lens.resize(unsafe_uninit_length=0)
-        self.piece_cache_values.resize(unsafe_uninit_length=0)
-
     fn encode_piece(mut self, piece: String, mut ids: List[Int]):
         if piece.byte_length() == 0:
             return
 
-        var cached_slot = self.piece_cache_index.get(piece)
-        if cached_slot:
-            var slot = cached_slot.value()
-            if slot >= 0 and slot < len(self.piece_cache_starts):
-                var start = self.piece_cache_starts[slot]
-                var count = self.piece_cache_lens[slot]
-                for i in range(count):
-                    ids.append(self.piece_cache_values[start + i])
-                return
+        if self.piece_cache.get(piece, ids):
+            return
 
         var transformed = self.byte_transform.encode_bytes(piece.as_bytes())
         var symbol_ids = List[Int]()
@@ -413,16 +403,7 @@ struct BPETokenizer[
         if not self.ignore_merges:
             symbol_ids = bpe_merge_ids(symbol_ids, self.merge_pair_ranks, self.merge_pair_out)
 
-        if len(symbol_ids) > 0 and len(symbol_ids) <= PIECE_CACHE_MAX_IDS_PER_ENTRY:
-            if len(self.piece_cache_starts) >= PIECE_CACHE_MAX_ENTRIES:
-                self.clear_piece_cache()
-            var entry_start = len(self.piece_cache_values)
-            for i in range(len(symbol_ids)):
-                self.piece_cache_values.append(symbol_ids[i])
-            var slot = len(self.piece_cache_starts)
-            self.piece_cache_starts.append(entry_start)
-            self.piece_cache_lens.append(len(symbol_ids))
-            self.piece_cache_index[piece.copy()] = slot
+        self.piece_cache.put(piece.copy(), symbol_ids)
 
         for i in range(len(symbol_ids)):
             ids.append(symbol_ids[i])

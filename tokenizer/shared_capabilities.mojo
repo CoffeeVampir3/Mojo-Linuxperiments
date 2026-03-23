@@ -1,4 +1,5 @@
-from memory import Span
+from collections import Dict
+from memory import Span, UnsafePointer
 
 from .unicode_props import (
     LETTER_PAIR_COUNT,
@@ -10,6 +11,11 @@ from .unicode_props import (
     WHITESPACE_PAIR_COUNT,
     WHITESPACE_MIN,
     WHITESPACE_MAX,
+)
+from .unicode_psm_props import (
+    PUNCT_SYMBOL_PAIR_COUNT,
+    PUNCT_SYMBOL_MIN,
+    PUNCT_SYMBOL_MAX,
 )
 
 
@@ -153,6 +159,25 @@ fn is_unicode_whitespace_cp(cp: UInt32, whitespace_ranges: UnsafePointer[UInt32]
 
 
 @always_inline
+fn is_ascii_punct_symbol(b: Byte) -> Bool:
+    return (
+        (b >= Byte(33) and b <= Byte(47))
+        or (b >= Byte(58) and b <= Byte(64))
+        or (b >= Byte(91) and b <= Byte(96))
+        or (b >= Byte(123) and b <= Byte(126))
+    )
+
+
+@always_inline
+fn is_unicode_punct_symbol_cp(cp: UInt32, punct_symbol_ranges: UnsafePointer[UInt32]) -> Bool:
+    if cp < UInt32(0x80):
+        return is_ascii_punct_symbol(Byte(cp))
+    if cp < PUNCT_SYMBOL_MIN or cp > PUNCT_SYMBOL_MAX:
+        return False
+    return in_unicode_ranges(cp, punct_symbol_ranges, PUNCT_SYMBOL_PAIR_COUNT)
+
+
+@always_inline
 fn is_number_start_at(
     data: Span[Byte],
     pos: Int,
@@ -177,3 +202,108 @@ fn is_whitespace_start_at(
 @always_inline
 fn span_to_string(data: Span[Byte], start: Int, end: Int) -> String:
     return String(unsafe_from_utf8=Span[Byte](ptr=data.unsafe_ptr() + start, length=end - start))
+
+
+# =============================================================================
+# Generic SIMD-accelerated skip
+# =============================================================================
+
+comptime PRETOKENIZE_SIMD_WIDTH = 16
+
+
+@always_inline
+fn simd_ascii_letters[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
+    return ((block | Byte(0x20)) - Byte(97)).le(Byte(25))
+
+
+@always_inline
+fn simd_ascii_digits[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
+    return (block - Byte(48)).le(Byte(9))
+
+
+@always_inline
+fn simd_spaces[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
+    return (block - Byte(9)).le(Byte(4)) | block.eq(Byte(32))
+
+
+@always_inline
+fn skip_while_matching[
+    scalar_pred: fn(Byte) -> Bool,
+    simd_pred: fn[w: Int](SIMD[DType.uint8, w]) -> SIMD[DType.bool, w],
+    width: Int = PRETOKENIZE_SIMD_WIDTH,
+](data: Span[Byte], pos: Int, n: Int) -> Int:
+    var i = pos
+    var data_ptr = data.unsafe_ptr()
+    while i + width <= n:
+        var block = (data_ptr + i).load[width=width]()
+        var mask = simd_pred[width](block)
+        if all(mask):
+            i += width
+            continue
+        @parameter
+        for lane in range(width):
+            if not mask[lane]:
+                return i + lane
+    while i < n and scalar_pred(data[i]):
+        i += 1
+    return i
+
+
+# =============================================================================
+# Generic codepoint-predicate consume
+# =============================================================================
+
+
+@always_inline
+fn consume_codepoint_run[
+    pred: fn(UInt32, UnsafePointer[UInt32]) -> Bool,
+](data: Span[Byte], start: Int, n: Int, ranges: UnsafePointer[UInt32]) -> Int:
+    var i = start
+    while i < n:
+        var parsed = decode_utf8_codepoint(data, i, n)
+        if not pred(parsed[0], ranges):
+            break
+        i += parsed[1]
+    return i
+
+
+# =============================================================================
+# Shared tokenizer utilities (used by tokenizer.mojo and pre-tokenizers)
+# =============================================================================
+
+
+fn sort_strings_by_byte_length_desc(mut values: List[String]):
+    for i in range(1, len(values)):
+        var cur = values[i]
+        var cur_len = cur.byte_length()
+        var j = i
+        while j > 0 and values[j - 1].byte_length() < cur_len:
+            values[j] = values[j - 1]
+            j -= 1
+        values[j] = cur
+
+
+@always_inline
+fn span_matches_at(data: Span[Byte], pos: Int, pattern: Span[Byte]) -> Bool:
+    if pos + len(pattern) > len(data):
+        return False
+    for i in range(len(pattern)):
+        if data[pos + i] != pattern[i]:
+            return False
+    return True
+
+
+fn find_added_token_match(
+    text: Span[Byte],
+    pos: Int,
+    added_token_order: List[String],
+    added_tokens: Dict[String, Int],
+) -> Tuple[Int, Int]:
+    for i in range(len(added_token_order)):
+        var tok = added_token_order[i]
+        var tok_bytes = tok.as_bytes()
+        if span_matches_at(text, pos, tok_bytes):
+            var found = added_tokens.get(tok)
+            if found:
+                return (found.value(), len(tok_bytes))
+    return (-1, 0)
