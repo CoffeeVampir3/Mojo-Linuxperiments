@@ -52,8 +52,8 @@ struct CpuMask[size: Int = 128](Copyable):
     @staticmethod
     def from_cpu_list(cpu_ids: List[Int]) -> Self:
         var mask = Self()
-        for i in range(len(cpu_ids)):
-            mask.set(cpu_ids[i])
+        for cpu in cpu_ids:
+            mask.set(cpu)
         return mask^
 
     @staticmethod

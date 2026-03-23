@@ -60,8 +60,8 @@ struct TensorMeta(Copyable, Writable):
 
     def numel(self) -> Int:
         var n = 1
-        for i in range(len(self.shape)):
-            n *= self.shape[i]
+        for dim in self.shape:
+            n *= dim
         return n
 
 @fieldwise_init

@@ -17,53 +17,49 @@ comptime N = 1024
 
 ### Functions
 ```mojo
-# def is raising by default
-def might_fail(x: Int):
+# def is non-raising by default — must declare `raises` to throw
+def safe_fn(x: Int) -> Int:
+    return x + 1
+
+def might_fail(x: Int) raises:
     if x == 0:
         raise "invalid input"
 
-# fn must opt-in with `raises`
-fn safe_use() raises -> None:
+def caller() raises:
     try:
         might_fail(0)
     except e:
         print("Error:", e)
 
 # Typed errors - specify error type after raises
-fn foo() raises CustomError -> Int:
+def foo() raises CustomError -> Int:
     raise CustomError("failed")
 
-fn caller():
+def typed_caller():
     try:
         print(foo())
     except err:  # err is typed as CustomError
         print(err)
 
 # Never type - for functions that never return normally
-fn abort_now() -> Never:
+def abort_now() -> Never:
     abort()
 
-# Never as an error type means the function can't raise.
-fn doesnt_raise() raises Never -> Int:
-    return 123
-
 # Named results (out) vs -> return
-fn incr(a: Int) -> Int:
+def incr(a: Int) -> Int:
     return a + 1
 
-fn incr(a: Int, out b: Int):
+def incr(a: Int, out b: Int):
     b = a + 1  # equivalent
 ```
 
-### Error Handling: def vs fn
+### Error Handling
 
-- `def` functions raise by default (Python compatibility)
-- `fn` functions must declare `raises` explicitly
-- Calling a `def` from `fn` requires `raises` or `try/except`
+- `def` functions are **non-raising by default**
+- Declare `raises` explicitly for functions that can throw
+- Calling code that raises requires `raises` on the caller, or `try/except`
 
-This is why stdlib buffer functions declare `raises` - they may call Python-style code.
-
-**Note:** Mojo does not support overloading functions on parameters alone (e.g., `fn foo[a: Int8]()` vs `fn foo[a: Int32]()`). Overloading on function arguments is supported.
+**Note:** Mojo does not support overloading functions on parameters alone (e.g., `def foo[a: Int8]()` vs `def foo[a: Int32]()`). Overloading on function arguments is supported.
 
 **Error type:** `Error` does not conform to `Boolable` or `Defaultable`. Errors must be constructed with meaningful context. Use `Optional[Error]` for optionality.
 
@@ -75,9 +71,9 @@ Implicit conversions allowed between function types:
 - Functions returning references to functions returning values (if type is implicitly copyable/convertible)
 
 ```mojo
-fn takes_raising_float(a: fn () raises -> Float32): ...
-fn returns_int() -> Int: ...
-fn example():
+def takes_raising_float(a: def () raises -> Float32): ...
+def returns_int() -> Int: ...
+def example():
     takes_raising_float(returns_int)  # Valid: Int -> Float32, non-raising -> raising
 ```
 
@@ -126,7 +122,7 @@ comptime o: MutOrigin = MutOrigin.external
 comptime immut: ImmutOrigin = ImmutOrigin(o)            # Safe: drop mutability
 comptime mut: MutOrigin = MutOrigin(unsafe_cast=immut)  # Unsafe: add mutability
 
-from memory import Pointer
+from std.memory import Pointer
 def use_pointer():
     a = 10
     ptr = Pointer(to=a)  # origin inferred from a
@@ -152,15 +148,15 @@ origin_of(x.y)
 origin_of(foo())      # analyzed statically, foo() not called
 origin_of(a, b)       # union of origins
 
-from memory import OwnedPointer, Pointer
+from std.memory import OwnedPointer, Pointer
 
 struct BoxedString:
     var o_ptr: OwnedPointer[String]
 
-    fn __init__(out self, value: String):
+    def __init__(out self, value: String):
         self.o_ptr = OwnedPointer(value)
 
-    fn as_ptr(mut self) -> Pointer[String, origin_of(self.o_ptr)]:
+    def as_ptr(mut self) -> Pointer[String, origin_of(self.o_ptr)]:
         return Pointer(to=self.o_ptr[])
 ```
 
@@ -191,8 +187,8 @@ def add_ref(ref a: Int, b: Int) -> Int:
 - `_` (unbound/infer)
 
 ```mojo
-from collections import List
-from memory import Span
+from std.collections import List
+from std.memory import Span
 
 def to_byte_span[
     origin: Origin,
@@ -245,7 +241,7 @@ ref name_ref = list[2]   # reference to list[2]
 
 **Parametric mutability**: Return value mutability follows `self` mutability:
 ```mojo
-fn pass_immutable_list(list: NameList) raises:
+def pass_immutable_list(list: NameList) raises:
     print(list[2])
     # list[2] += "?"  # Error: immutable
 ```
@@ -354,10 +350,10 @@ ptr.scatter[width=8](vals, offsets)
 **Explicitly-destroyed types (linear types)**: `UnsafePointer`, `Pointer`, `OwnedPointer`, `Span`, `List`, `InlineArray`, `Optional`, `Variant`, `VariadicListMem`, and `VariadicPack` can contain explicitly-destroyed types. `Iterator.Element` does not require `ImplicitlyDestructible`.
 
 ```mojo
-fn __init__(out self, args)
-fn __del__(deinit self)
-fn __copyinit__(out self, existing: Self)
-fn __moveinit__(out self, deinit existing: Self)
+def __init__(out self, args)
+def __del__(deinit self)
+def __copyinit__(out self, existing: Self)
+def __moveinit__(out self, deinit existing: Self)
 
 @fieldwise_init
 struct MyType(Copyable, ImplicitlyCopyable)
@@ -365,12 +361,12 @@ struct MyType(Copyable, ImplicitlyCopyable)
 struct TrivialType(TrivialRegisterPassable):
     var x: Int
 
-fn read_only(val: Int)
-fn mutable(mut val: Int)
-fn take_ownership(var val: Int)
+def read_only(val: Int)
+def mutable(mut val: Int)
+def take_ownership(var val: Int)
 transfer(val^)
 
-fn with_origin[origin: Origin](ref [origin] data: Type) -> ref [origin] Type
+def with_origin[origin: Origin](ref [origin] data: Type) -> ref [origin] Type
 origin_of(value) | origin_of(a, b)
 
 ref item_ref = list[0]
@@ -379,12 +375,12 @@ item_ref += 1
 
 ### Operators
 ```mojo
-fn __pos/neg/invert__(self) -> Self
-fn __add/radd/iadd__(self|mut self, rhs: Self) -> Self|void
-fn __eq/ne/lt/le/gt/ge__(self, other: Self) -> Bool
+def __pos/neg/invert__(self) -> Self
+def __add/radd/iadd__(self|mut self, rhs: Self) -> Self|void
+def __eq/ne/lt/le/gt/ge__(self, other: Self) -> Bool
 result = simd1.eq/ne/lt/le/gt/ge(simd2)
-fn __getitem__(self, idx: Int) -> T
-fn __setitem__(mut self, idx: Int, val: T)
+def __getitem__(self, idx: Int) -> T
+def __setitem__(mut self, idx: Int, val: T)
 
 quotient, remainder = divmod(simd_a, simd_b)
 ```
@@ -395,34 +391,34 @@ Parameters are compile-time values that become runtime constants. In Mojo, "para
 
 ```mojo
 # Parameterized functions
-fn repeat[count: Int](msg: String):
-    @parameter                             # Compile-time loop unrolling
+def repeat[count: Int](msg: String):
+    comptime                                   # Compile-time loop unrolling
     for i in range(count):
         print(msg)
 
 repeat[3]("Hello")                         # Compiler creates concrete version
 
 # Parameter list anatomy
-fn example[
+def example[
     dtype: DType,                          # Infer-only (before //)
     width: Int,
     //,
     values: SIMD[dtype, width],            # Positional-only (before /)
     /,
-    compare: fn(Scalar[dtype], Scalar[dtype]) -> Int,  # Positional-or-keyword
+    compare: def (Scalar[dtype], Scalar[dtype]) -> Int,  # Positional-or-keyword
     *,
     reverse: Bool = False,                 # Keyword-only (after *)
 ]():
     pass
 
 # Parameter inference
-fn rsqrt[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
+def rsqrt[dt: DType](x: Scalar[dt]) -> Scalar[dt]:
     return 1 / sqrt(x)
 
 rsqrt(Float16(42))                         # dt inferred from argument type
 
 # Infer-only parameters (before //)
-fn dependent[dtype: DType, //, value: Scalar[dtype]]():
+def dependent[dtype: DType, //, value: Scalar[dtype]]():
     print(value)
 
 dependent[Float64(2.2)]()                  # dtype inferred, value specified
@@ -431,7 +427,7 @@ dependent[Float64(2.2)]()                  # dtype inferred, value specified
 struct MyTensor[*dimensions: Int]:
     pass
 
-fn sum_params[*values: Int]() -> Int:
+def sum_params[*values: Int]() -> Int:
     comptime list = VariadicList(values)
     var sum = 0
     for v in list:
@@ -439,7 +435,7 @@ fn sum_params[*values: Int]() -> Int:
     return sum
 
 # Optional and keyword parameters
-fn speak[a: Int = 3, msg: String = "woof"]():
+def speak[a: Int = 3, msg: String = "woof"]():
     print(msg, a)
 
 speak()                                    # woof 3
@@ -447,8 +443,8 @@ speak[5]()                                 # woof 5
 speak[msg="meow"]()                        # meow 3
 
 # Flexible default arguments - can infer parameters from defaults
-fn take_string_slice[o: ImmOrigin](str: StringSlice[o] = ""): ...
-fn use_it():
+def take_string_slice[o: ImmOrigin](str: StringSlice[o] = ""): ...
+def use_it():
     take_string_slice()                    # Defaults to "", infers "o"
 ```
 
@@ -458,7 +454,7 @@ struct GenericArray[ElementType: Copyable]:
     var data: UnsafePointer[Self.ElementType]
     var size: Int
 
-    fn __getitem__(self, i: Int) -> ref [self] Self.ElementType:
+    def __getitem__(self, i: Int) -> ref [self] Self.ElementType:
         return self.data[i]
 
 var arr: GenericArray[Int] = [1, 2, 3]
@@ -468,12 +464,38 @@ print(SIMD[DType.float32, 4].size)         # On type: 4
 var x = SIMD[DType.int32, 2](4, 8)
 print(x.dtype)                             # On instance: int32
 
-# Conditional conformance
-struct Container[ElementType: Movable]:
-    var element: Self.ElementType
+# Conditional conformance — struct conforms to a trait only when its
+# type parameters satisfy a condition. Evaluated per-instantiation.
 
-    fn __str__[T: Writable & Movable, //](self: Container[T]) -> String:
-        return String(self.element)        # Only works if ElementType is Writable
+# Pattern 1: derived conformance — "container does X if element does X"
+@fieldwise_init
+struct Wrapper[T: Copyable & ImplicitlyDestructible](
+    Writable where conforms_to(T, Writable),
+):
+    var value: Self.T
+
+print(Wrapper[Int](42))          # OK — Int is Writable
+# print(Wrapper[NotWritable](...)) # Compile error — not Writable
+
+# Pattern 2: strategy delegation — "struct has property X if its
+# strategy parameter has X". Eliminates plumbing type parameters.
+trait ShardStrategy:
+    @staticmethod
+    def shard(d: Int, tp: Int) -> Int: ...
+
+trait NodeLocal(ShardStrategy): ...
+
+struct Slot[S: ShardStrategy, name: StringLiteral](
+    ShardStrategy,
+    NodeLocal where conforms_to(S, NodeLocal),
+):
+    comptime NAME: StaticString = Self.name
+    @staticmethod
+    def shard(d: Int, tp: Int) -> Int: return Self.S.shard(d, tp)
+
+# Query conformance at compile time — no separate S parameter needed
+comptime if conforms_to(Slot[SomeStrategy, "w"], NodeLocal):
+    ...  # taken only when SomeStrategy is NodeLocal
 ```
 
 **comptime Declarations** (use `comptime`, not `alias`):
@@ -483,7 +505,7 @@ comptime rows = 512
 comptime block_size = _calculate_block_size()
 
 # Force a subexpression to be evaluated at compile time
-fn takes_layout[a: Layout]():
+def takes_layout[a: Layout]():
     print(comptime(a.size()))
 
 # Type aliases
@@ -517,22 +539,22 @@ struct Sentiment(Equatable):
 **Automatic Parameterization:**
 ```mojo
 # Unbound type = auto-parameterized function
-fn print_info(vec: SIMD):                  # SIMD[...] - all params unbound
+def print_info(vec: SIMD):                  # SIMD[...] - all params unbound
     print(vec.dtype, vec.size)
 
 # Equivalent to:
-fn print_info[dt: DType, sz: Int, //](vec: SIMD[dt, sz]):
+def print_info[dt: DType, sz: Int, //](vec: SIMD[dt, sz]):
     print(vec.dtype, vec.size)
 
 # Partially-bound types
-fn eat(f: Fudge[5, ...]):                   # sugar=5, others unbound
+def eat(f: Fudge[5, ...]):                   # sugar=5, others unbound
     pass
 
-fn devour(f: Fudge[_, 6, _]):              # cream=6, others unbound
+def devour(f: Fudge[_, 6, _]):              # cream=6, others unbound
     pass
 
 # Using type_of for matching
-fn interleave(v1: SIMD, v2: type_of(v1)) -> SIMD[v1.dtype, v1.size * 2]:
+def interleave(v1: SIMD, v2: type_of(v1)) -> SIMD[v1.dtype, v1.size * 2]:
     pass
 ```
 
@@ -550,15 +572,15 @@ MyType[...]                                # All remaining params unbound
 MyType[_, _, _]                            # Explicit individual unbinding
 
 # Partially bound in signatures
-fn foo(m: MyType["Hello", _, _, True]):    # Some bound, some unbound
+def foo(m: MyType["Hello", _, _, True]):    # Some bound, some unbound
     pass
 ```
 
 **Compile-Time Control Flow:**
 ```mojo
-# @parameter if - compile-time branching
-fn reduce_add(x: SIMD) -> Int:
-    @parameter
+# comptime if - compile-time branching
+def reduce_add(x: SIMD) -> Int:
+    comptime
     if x.size == 1:
         return Int(x[0])
     elif x.size == 2:
@@ -566,19 +588,19 @@ fn reduce_add(x: SIMD) -> Int:
     comptime half = x.size // 2
     return reduce_add(slice(x, 0) + slice(x, half))
 
-# @parameter for - compile-time loop unrolling
-@parameter
+# comptime for - compile-time loop unrolling
+comptime
 for i in range(4):                         # Must have compile-time bounds
     process[i]()
 ```
 
 **rebind() for Type Coercion:**
 ```mojo
-fn take_simd8(x: SIMD[DType.float32, 8]):
+def take_simd8(x: SIMD[DType.float32, 8]):
     pass
 
-fn generic[nelts: Int](x: SIMD[DType.float32, nelts]):
-    @parameter
+def generic[nelts: Int](x: SIMD[DType.float32, nelts]):
+    comptime
     if nelts == 8:
         take_simd8(rebind[SIMD[DType.float32, 8]](x))  # Assert types match
 ```
@@ -586,14 +608,14 @@ fn generic[nelts: Int](x: SIMD[DType.float32, nelts]):
 **where Clauses (Experimental):**
 ```mojo
 # DType constraints (equality, inequality, predicates)
-fn foo[dt: DType]() -> Int where dt == DType.int32:
+def foo[dt: DType]() -> Int where dt == DType.int32:
     return 42
 
 # DType predicates: is_signed(), is_unsigned(), is_numeric(), is_integral(),
 #                   is_floating_point(), is_float8(), is_half_float()
 
 # SIMD constraints (construction, comparison, arithmetic, bitwise)
-fn bar[dt: DType, x: Int]() -> Int where SIMD[dt, 4](x) + 2 > SIMD[dt, 4](0):
+def bar[dt: DType, x: Int]() -> Int where SIMD[dt, 4](x) + 2 > SIMD[dt, 4](0):
     return 42
 ```
 
@@ -604,33 +626,33 @@ struct MyStruct(Copyable):
     var field1: Int
     var field2: String
 
-    fn method(self) -> Result
-    fn mutating(mut self)
+    def method(self) -> Result
+    def mutating(mut self)
 
     @staticmethod
-    fn static_method(args)
+    def static_method(args)
 
-    fn __init__(out self, args)
-    fn __del__(deinit self)
-    fn __getitem/setitem/len/str/repr__(self)
-    fn write_to(self, mut writer: Writer)
+    def __init__(out self, args)
+    def __del__(deinit self)
+    def __getitem/setitem/len/str/repr__(self)
+    def write_to(self, mut writer: Writer)
 
 # Ellipsis expression (... is EllipsisType, usable in overloaded getitem etc.)
 struct MyArray:
-    fn __getitem__(self, idx: Int) -> Int: ...
-    fn __getitem__(self, idx: EllipsisType) -> Int: ...  # x[...]
+    def __getitem__(self, idx: Int) -> Int: ...
+    def __getitem__(self, idx: EllipsisType) -> Int: ...  # x[...]
 
 # Context managers (with statements)
 struct MyContextManager:
-    fn __enter__(self): ...
-    fn __exit__(self): ...                           # Normal exit
-    fn __exit__[E: AnyType](self, err: E) -> Bool: ...  # Error exit (typed)
+    def __enter__(self): ...
+    def __exit__(self): ...                           # Normal exit
+    def __exit__[E: AnyType](self, err: E) -> Bool: ...  # Error exit (typed)
 
 # Consuming context managers (linear types)
 struct ConsumingCtxMgr:
-    fn __enter__(self): ...
-    fn __exit__(var self): ...                       # Consumes self on exit
-    fn __exit__(deinit self): ...                    # Also valid
+    def __enter__(self): ...
+    def __exit__(var self): ...                       # Consumes self on exit
+    def __exit__(deinit self): ...                    # Also valid
 ```
 
 ### Traits
@@ -640,23 +662,23 @@ Traits define a contract: a set of requirements a type must implement. Similar t
 ```mojo
 # Defining traits
 trait Quackable:
-    fn quack(self): ...                    # Required (no default implementation)
+    def quack(self): ...                    # Required (no default implementation)
 
 trait DefaultQuackable:
-    fn quack(self): pass                   # Default do-nothing implementation
+    def quack(self): pass                   # Default do-nothing implementation
 
 trait WithBody:
-    fn greet(self):                        # Default implementation with body
+    def greet(self):                        # Default implementation with body
         print("Hello")
 
 trait HasStatic:
     @staticmethod
-    fn do_stuff(): ...                     # Static methods supported
+    def do_stuff(): ...                     # Static methods supported
 
 # Conforming to traits
 @fieldwise_init
 struct Duck(Copyable, Quackable):
-    fn quack(self):
+    def quack(self):
         print("Quack")
 
 @fieldwise_init
@@ -664,34 +686,34 @@ struct DefaultDuck(Copyable, DefaultQuackable):
     pass                                   # Inherits default quack()
 
 # Using traits as type bounds
-fn make_quack[T: Quackable](duck: T):
+def make_quack[T: Quackable](duck: T):
     duck.quack()
 
-fn make_quack(duck: Some[Quackable]):      # Shorthand form
+def make_quack(duck: Some[Quackable]):      # Shorthand form
     duck.quack()
 
-fn take_two[T: Quackable](a: T, b: T):     # Same type constraint
+def take_two[T: Quackable](a: T, b: T):     # Same type constraint
     pass
 
 # Trait composition with &
 comptime QuackFly = Quackable & Flyable
 
-fn needs_both[T: Quackable & Flyable](x: T): pass
-fn needs_both(x: Some[Quackable & Flyable]): pass
+def needs_both[T: Quackable & Flyable](x: T): pass
+def needs_both(x: Some[Quackable & Flyable]): pass
 
 struct FlyingDuck(Quackable, Flyable):     # Conforms to QuackFly
-    fn quack(self): pass
-    fn fly(self): pass
+    def quack(self): pass
+    def fly(self): pass
 
 # Trait inheritance
 trait Animal:
-    fn make_sound(self): ...
+    def make_sound(self): ...
 
 trait Bird(Animal):                        # Bird requires Animal methods too
-    fn fly(self): ...
+    def fly(self): ...
 
 trait Named:
-    fn get_name(self) -> String: ...
+    def get_name(self) -> String: ...
 
 trait NamedAnimal(Animal, Named):          # Multiple inheritance
     pass
@@ -700,23 +722,23 @@ trait NamedAnimal(Animal, Named):          # Multiple inheritance
 trait Stacklike:
     comptime EltType: Copyable             # Required type member
 
-    fn push(mut self, var item: Self.EltType): ...
-    fn pop(mut self) -> Self.EltType: ...
+    def push(mut self, var item: Self.EltType): ...
+    def pop(mut self) -> Self.EltType: ...
 
 struct MyStack[type: Copyable](Stacklike):
     comptime EltType = Self.type           # Concrete type assignment
     var list: List[Self.EltType]
 
-    fn push(mut self, var item: Self.EltType):
+    def push(mut self, var item: Self.EltType):
         self.list.append(item^)
 
-    fn pop(mut self) -> Self.EltType:
+    def pop(mut self) -> Self.EltType:
         return self.list.pop()
 
 # Lifecycle traits
 comptime MassProducible = Defaultable & Movable
 
-fn factory[T: MassProducible]() -> T:
+def factory[T: MassProducible]() -> T:
     return T()
 
 # Register-passable traits (use trait conformance, not decorators)
@@ -733,8 +755,8 @@ trait VeryTrivial(TrivialRegisterPassable):  # Conformers must be TrivialRegiste
 | `Sized` | `__len__(self) -> Int` |
 | `Intable` | `__int__(self) -> Int` |
 | `IntableRaising` | `__int__(self) raises -> Int` |
-| `Stringable` | `__str__(self) -> String` |
-| `Representable` | `__repr__(self) -> String` |
+| `Stringable` | Deprecated in favor of `Writable`. `__str__(self) -> String` |
+| `Representable` | Deprecated in favor of `Writable`. `__repr__(self) -> String` |
 | `Writable` | `write_to(self, mut writer: Some[Writer])` + optional `write_repr_to()` for `repr()`/`{!r}`. Has reflection-based default impl. |
 | `Boolable` | `__bool__(self) -> Bool` |
 | `Hashable` | `__hash__(self) -> UInt`. Has reflection-based default impl (hashes all fields). |
@@ -750,20 +772,14 @@ trait VeryTrivial(TrivialRegisterPassable):  # Conformers must be TrivialRegiste
 | `KeyElement` | `Copyable & Hashable & Equatable` |
 
 ```mojo
-# Writable + Stringable + Representable pattern
+# Writable pattern (Stringable and Representable are deprecated; prefer Writable)
 @fieldwise_init
-struct Dog(Copyable, Stringable, Representable, Writable):
+struct Dog(Copyable, Writable):
     var name: String
     var age: Int
 
-    fn write_to(self, mut writer: Some[Writer]):
+    def write_to(self, mut writer: Some[Writer]):
         writer.write("Dog(", self.name, ", ", self.age, ")")
-
-    fn __str__(self) -> String:
-        return String.write(self)
-
-    fn __repr__(self) -> String:
-        return String("Dog(name=", repr(self.name), ", age=", repr(self.age), ")")
 
 # Traits with reflection-based default implementations
 # Simple structs just need fields that conform to the same trait:
@@ -778,8 +794,8 @@ print(Point(1.5, 2.7))                    # Point(x=1.5, y=2.7)
 Point(1, 2) == Point(1, 2)                # True
 
 # Compile-time trait conformance check and downcast
-fn maybe_print[T: AnyType](value: T):
-    @parameter
+def maybe_print[T: AnyType](value: T):
+    comptime
     if conforms_to(T, Writable):
         print(trait_downcast[Writable](value))
     else:
@@ -802,8 +818,8 @@ trait Bar:
 **`pass` vs `...` in trait methods:**
 ```mojo
 trait T:
-    fn foo(self): ...    # No default implementation (required)
-    fn bar(self): pass   # Default do-nothing implementation
+    def foo(self): ...    # No default implementation (required)
+    def bar(self): pass   # Default do-nothing implementation
 ```
 
 ## 2. Data Types
@@ -867,7 +883,7 @@ comptime MULTI = """multiline"""
 # String Methods
 String() | String(capacity=1024) | String(unsafe_uninit_length=n)
 String(from_utf8=span)                     # Validates UTF-8, raises on error
-String(from_utf8_lossy=span)               # Replaces invalid UTF-8 with U+FFFD (�)
+String(from_utf8_lossy=span)               # Replaces invalid UTF-8 with U+FFFD (&#65533;)
 String(unsafe_from_utf8=span)              # No validation (unsafe)
 String(unsafe_from_utf8_ptr=ptr)
 
@@ -918,10 +934,10 @@ cp1 < cp2 | cp1 == cp2 | cp1 <= cp2
 
 ### Collections
 ```mojo
-from collections import Set, Deque, Counter, LinkedList, BitSet
+from std.collections import Set, Deque, Counter, LinkedList, BitSet
 from collections.interval import Interval
 
-# List (conforms to Equatable, Writable, Stringable, Representable)
+# List (conforms to Equatable, Writable)
 var list: List[Int] = [1, 2, 3]
 list = List[Int]() | List[Int](capacity=1024) | List[Int](length: Int=10, fill=0)
 list.append(4) | insert(idx, val) | pop() | pop(idx)
@@ -936,7 +952,7 @@ span.unsafe_get(idx) | unsafe_swap_elements(i, j)
 subspan = span.unsafe_subspan(offset, length)
 for item in span: pass
 
-# Dict (raises DictKeyError on missing key; conforms to Writable, Stringable, Representable)
+# Dict (raises DictKeyError on missing key; conforms to Writable)
 dict = Dict[String, Int]() | Dict[String, Int](power_of_two_initial_capacity=1024)
 dict = {"key": value}
 dict[key] = value
@@ -955,7 +971,7 @@ set1 - set2  # difference
 set1 ^ set2  # symmetric difference
 set1 < set2 | set1 <= set2  # subset
 
-# Deque (conforms to Writable, Stringable, Representable)
+# Deque (conforms to Writable)
 deque = Deque[Int](capacity=64) | Deque[Int](maxlen=100)
 deque.append(val) | appendleft(val) | pop() | popleft() | insert(idx, val)
 deque[idx]
@@ -970,7 +986,7 @@ counter1 - counter2
 counter1 & counter2
 counter1 | counter2
 
-# LinkedList (conforms to Writable, Stringable, Representable)
+# LinkedList (conforms to Writable)
 list = LinkedList[Int](1, 2, 3)
 list.append(val) | prepend(val) | pop() | pop(idx)
 list[idx]
@@ -1036,7 +1052,7 @@ else:
 ```mojo
 all(iterable) | any(iterable)
 all(simd_vector) | any(simd_vector)
-all(map(fn, iterable)) | any(map(fn, iterable))
+all(map(def, iterable)) | any(map(def, iterable))
 ```
 
 ## 4. Pointers & Memory
@@ -1051,7 +1067,7 @@ Uninitialized → Null (addr 0) → Allocated → Initialized → Dangling
 ```
 
 ```mojo
-from memory import UnsafePointer, alloc
+from std.memory import UnsafePointer, alloc
 
 # Allocation
 ptr = alloc[Int](count)                    # Allocate space for count values (debug_assert: count >= 0)
@@ -1103,7 +1119,7 @@ unsafe_cast = ptr.unsafe_mut_cast[True]() | unsafe_origin_cast[new_origin]()
 # alloc() returns MutOrigin.external (untracked by lifetime checker)
 # UnsafePointer(to=value) infers origin from value
 
-fn unsafe_ptr(ref self) -> UnsafePointer[T, origin_of(self)]:
+def unsafe_ptr(ref self) -> UnsafePointer[T, origin_of(self)]:
     return self.data.unsafe_origin_cast[origin_of(self)]()
 ```
 
@@ -1138,7 +1154,7 @@ copy = shared
 
 ### Stack Allocation
 ```mojo
-from memory import stack_allocation
+from std.memory import stack_allocation
 
 var buf = stack_allocation[256, DType.int8]()
 var aligned = stack_allocation[64, DType.float32, alignment=64]()
@@ -1182,7 +1198,7 @@ var typed = stack_allocation[count, MyType]()
 
 ```mojo
 from layout import Layout, LayoutTensor
-from collections import InlineArray
+from std.collections import InlineArray
 
 # 2D row-major tensor
 comptime M = 4
@@ -1226,7 +1242,7 @@ var storage = InlineArray[Float32, 16](fill=3.0)
 var tensor = LayoutTensor[DType.float32, lt](storage)
 
 @parameter
-fn input_fn[dtype_: DType, width: Int](idx: Int) -> SIMD[dtype_, width]:
+def input_fn[dtype_: DType, width: Int](idx: Int) -> SIMD[dtype_, width]:
     return tensor.load[width=width](0, idx).cast[dtype_]()
 
 var result = sum[DType.float32, input_fn](16)  # Returns 48.0
@@ -1235,7 +1251,7 @@ var result = sum[DType.float32, input_fn](16)  # Returns 48.0
 var total = Float32(0)
 
 @parameter
-fn accumulate[width: Int](idx: Int):
+def accumulate[width: Int](idx: Int):
     total += tensor.load[width=width](0, idx).reduce_add()
 
 vectorize[accumulate, 4](16)
@@ -1273,19 +1289,19 @@ var fragment = tensor.distribute[thread_layout](thread_id)
 
 ```mojo
 # Accept any origin - caller's origin propagated
-fn process[
+def process[
     layout: Layout,
     origin: Origin
 ](tensor: LayoutTensor[DType.float32, layout, origin]):
     var val = tensor[0, 0][0]
 
 # Generic function for stdlib
-fn tensor_sum[
+def tensor_sum[
     layout: Layout,
     origin: Origin
 ](tensor: LayoutTensor[DType.float32, layout, origin]) -> Float32:
     @parameter
-    fn input_fn[dtype_: DType, width: Int](idx: Int) -> SIMD[dtype_, width]:
+    def input_fn[dtype_: DType, width: Int](idx: Int) -> SIMD[dtype_, width]:
         return tensor.load[width=width](0, idx).cast[dtype_]()
 
     return sum[DType.float32, input_fn](tensor.shape[1]())
@@ -1323,7 +1339,7 @@ vectorize[func, simd_width, unroll_factor=2, size=1024]()
 vectorize[func, simd_width](size)
 
 @parameter
-fn closure[width: Int](i: Int):
+def closure[width: Int](i: Int):
     ptr.store[width=width](i, value)
 
 bit_reverse(val)
@@ -1516,7 +1532,7 @@ val = ds_read_tr16_b64[dtype](shared_ptr)
 warpgroup_reg_alloc[count]() | warpgroup_reg_dealloc[count]()
 
 # Inline assembly (LLVM-style syntax)
-from sys import inlined_assembly
+from std.sys import inlined_assembly
 var result = inlined_assembly[
     "cvt.f32.bf16 $0, $1;",
     Float32,
@@ -1813,7 +1829,7 @@ S_ISDIR(info.st_mode)  # Directory
 
 ### Path Object
 ```mojo
-from pathlib import Path, cwd
+from std.pathlib import Path, cwd
 
 p = Path() | Path("/abs") | Path("rel")
 sub = p / "dir" / "file"
@@ -1925,13 +1941,13 @@ struct MyIter(Iterator):
     comptime Element = Int
     var i: Int
 
-    fn __init__(out self):
+    def __init__(out self):
         self.i = 0
 
-    fn __iter__(var self) -> Self:
+    def __iter__(var self) -> Self:
         return self^
 
-    fn __next__(mut self) raises StopIteration -> Int:
+    def __next__(mut self) raises StopIteration -> Int:
         if self.i >= 3:
             raise StopIteration()
         self.i += 1
@@ -2005,7 +2021,6 @@ BenchConfig(
 ## 16. Assertions & Debug
 
 ```mojo
-constrained[cond, msg]()
 comptime assert cond, "message"            # Compile-time assertion
 debug_assert(cond, msg)
 debug_assert[assert_mode="safe"](cond, msg)
@@ -2060,12 +2075,12 @@ b16encode(str), b16decode(str)
 ## 20. Variadics
 
 ```mojo
-fn sum(*args: Int) -> Int:
+def sum(*args: Int) -> Int:
     for i in range(len(args)):
         total += args[i]
 
-fn sum[*T: Intable](*args: *T) -> Int:
-    @parameter
+def sum[*T: Intable](*args: *T) -> Int:
+    comptime
     for i in range(args.__len__()):
         total += Int(args[i])
 
@@ -2112,14 +2127,14 @@ struct Point(Copyable):
     var x: Float32
     var y: Float32
 
-fn print_fields[T: AnyType]():
+def print_fields[T: AnyType]():
     comptime names = struct_field_names[T]()
     comptime types = struct_field_types[T]()
-    @parameter
+    comptime
     for i in range(struct_field_count[T]()):
         print(names[i], get_type_name[types[i]]())
 
-fn main():
+def main():
     print_fields[Point]()
     comptime idx = struct_field_index_by_name[Point, "x"]()
     comptime field_type = struct_field_type_by_name[Point, "y"]()
@@ -2127,9 +2142,9 @@ fn main():
     print(get_type_name[field_type.T]())
 
 # Field access by index (returns reference, works with non-copyable types)
-fn print_all_fields[T: AnyType](ref s: T):
+def print_all_fields[T: AnyType](ref s: T):
     comptime names = struct_field_names[T]()
-    @parameter
+    comptime
     for i in range(struct_field_count[T]()):
         print(names[i], "=", __struct_field_ref(i, s))
 
@@ -2147,15 +2162,15 @@ var loc = source_location()                # Returns SourceLocation(filename, li
 print(loc)                                 # main.mojo:5:15
 
 @always_inline
-fn log_here():
+def log_here():
     var caller_loc = call_location()       # Location where caller was invoked
     print("Called from:", caller_loc)
 
 # Trait conformance checking on dynamically obtained types
-@parameter
+comptime
 for i in range(struct_field_count[MyStruct]()):
     comptime field_type = struct_field_types[MyStruct]()[i]
-    @parameter
+    comptime
     if conforms_to(field_type, Copyable):
         print("Field", i, "is Copyable")
 ```
@@ -2167,9 +2182,9 @@ for i in range(struct_field_count[MyStruct]()):
 ### Coroutine Struct (Built-in)
 ```mojo
 # Coroutine[type, origins] - NOT copyable, use ^ to move
-async fn compute() -> Int: return 42
+async def compute() -> Int: return 42
 
-async fn caller():
+async def caller():
     var coro = compute()
     var result = await coro^  # Move with ^
 ```
@@ -2201,13 +2216,13 @@ __await__(var self, out result: type)
 force_destroy(var self)
 
 # RaisingCoroutine[type, lifetimes] - For raises functions
-async fn work() raises -> Int: ...
+async def work() raises -> Int: ...
 ```
 
 ### Entry Point
 ```mojo
-fn main():
-    async_main()()  # Call async fn + execute coroutine
+def main():
+    async_main()()  # Call async def + execute coroutine
 ```
 
 ## 23. Module System

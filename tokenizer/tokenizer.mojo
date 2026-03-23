@@ -1,248 +1,421 @@
+"""Core tokenizer module: traits, Unicode classification, shared utilities, and BPETokenizer."""
+
 from std.collections import Dict
-from std.memory import Span
-from .capabilities import ByteTransformCapability, PreTokenizerCapability
-from .auto import AutoPreTokenizer
-from .gpt2 import GPT2ByteTransform
-from .shared_capabilities import (
-    span_to_string,
-    sort_strings_by_byte_length_desc,
-    span_matches_at,
-    find_added_token_match,
+from std.memory import Span, UnsafePointer
+
+from .unicode_props import (
+    LETTER_RANGES,
+    LETTER_PAIR_COUNT,
+    LETTER_MIN,
+    LETTER_MAX,
+    NUMBER_RANGES,
+    NUMBER_PAIR_COUNT,
+    NUMBER_MIN,
+    NUMBER_MAX,
+    WHITESPACE_RANGES,
+    WHITESPACE_PAIR_COUNT,
+    WHITESPACE_MIN,
+    WHITESPACE_MAX,
+)
+from .unicode_psm_props import (
+    MARK_RANGES,
+    MARK_PAIR_COUNT,
+    MARK_MIN,
+    MARK_MAX,
+    PUNCT_SYMBOL_RANGES,
+    PUNCT_SYMBOL_PAIR_COUNT,
+    PUNCT_SYMBOL_MIN,
+    PUNCT_SYMBOL_MAX,
+)
+from .bpe import (
+    pack_pair_ids, split_merge_pair, bpe_merge_ids,
+    PieceCache,
 )
 
 
+# =============================================================================
+# Capability traits
+# =============================================================================
+
+
+def bytes_to_gpt2(data: Span[Byte, _]) -> String:
+    var cp_table = materialize[BYTE_TO_CODEPOINT]()
+    var out = List[Byte]()
+    out.reserve(len(data) * 2)
+    for i in range(len(data)):
+        var cp = Codepoint(unsafe_unchecked_codepoint=UInt32(cp_table[Int(data[i])]))
+        var needed = cp.utf8_byte_length()
+        var base = len(out)
+        out.resize(unsafe_uninit_length=base + needed)
+        _ = cp.unsafe_write_utf8[True](out.unsafe_ptr() + base)
+    return String(unsafe_from_utf8=Span(out))
+
+
+def gpt2_to_bytes(text: String) -> List[Byte]:
+    var cp_table = materialize[CODEPOINT_TO_BYTE]()
+    var out = List[Byte]()
+    out.reserve(text.byte_length())
+    for cp in text.codepoints():
+        var val = Int(cp.to_u32())
+        if val < 324:
+            var byte_val = cp_table[val]
+            if byte_val >= 0:
+                out.append(Byte(byte_val))
+    return out^
+
+
+trait ByteTransformCapability(Movable, ImplicitlyDestructible):
+    def encode_bytes(self, data: Span[Byte, _]) -> String:
+        return bytes_to_gpt2(data)
+
+    def decode_bytes(self, text: String) -> List[Byte]:
+        return gpt2_to_bytes(text)
+
+
+trait PreTokenizerCapability(Movable, ImplicitlyDestructible):
+    def pre_tokenize(self, text: String) -> List[String]:
+        ...
+
+
 trait Tokenizer(Movable):
-    def encode(mut self, text: String) -> List[Int]:
-        ...
-
-    def decode(self, ids: List[Int]) -> String:
-        ...
-
-    def vocab_size(self) -> Int:
-        ...
-
-    def token_to_id(self, token: String) -> Optional[Int]:
-        ...
-
-    def id_to_token(self, id: Int) -> Optional[String]:
-        ...
+    def encode(mut self, text: String) -> List[Int]: ...
+    def decode(self, ids: List[Int]) -> String: ...
+    def vocab_size(self) -> Int: ...
+    def token_to_id(self, token: String) -> Optional[Int]: ...
+    def id_to_token(self, id: Int) -> Optional[String]: ...
 
 
-@always_inline
-def pack_pair_ids(left: Int, right: Int) -> UInt64:
-    return (UInt64(UInt32(left)) << UInt64(32)) | UInt64(UInt32(right))
+# =============================================================================
+# GPT2 byte encoding tables
+# =============================================================================
 
 
-@always_inline
-def split_merge_pair(pair: String) -> Optional[Tuple[String, String]]:
-    var bytes = pair.as_bytes()
-    for i in range(len(bytes)):
-        if bytes[i] == Byte(32):
-            return (
-                span_to_string(bytes, 0, i),
-                span_to_string(bytes, i + 1, len(bytes)),
-            )
-    return None
+def make_byte_to_codepoint() -> InlineArray[Int, 256]:
+    var table = InlineArray[Int, 256](fill=0)
+    var n = 256
+    for b in range(256):
+        if (b >= 33 and b <= 126) or (b >= 161 and b <= 172) or (b >= 174 and b <= 255):
+            table[b] = b
+        else:
+            table[b] = n
+            n += 1
+    return table^
 
 
-struct MergeCandidate(Copyable, ImplicitlyCopyable):
-    var rank: Int
-    var left: Int
-    var right: Int
-
-    def __init__(out self, rank: Int, left: Int, right: Int):
-        self.rank = rank
-        self.left = left
-        self.right = right
+def make_codepoint_to_byte() -> InlineArray[Int, 324]:
+    var table = InlineArray[Int, 324](fill=-1)
+    var fwd = make_byte_to_codepoint()
+    for b in range(256):
+        table[fwd[b]] = b
+    return table^
 
 
-@always_inline
-def candidate_less(a: MergeCandidate, b: MergeCandidate) -> Bool:
-    if a.rank != b.rank:
-        return a.rank < b.rank
-    return a.left < b.left
+comptime BYTE_TO_CODEPOINT = make_byte_to_codepoint()
+comptime CODEPOINT_TO_BYTE = make_codepoint_to_byte()
 
 
-def heap_push(mut heap: List[MergeCandidate], cand: MergeCandidate):
-    heap.append(cand)
-    var idx = len(heap) - 1
-    while idx > 0:
-        var parent = (idx - 1) // 2
-        if not candidate_less(heap[idx], heap[parent]):
-            break
-        var tmp = heap[parent]
-        heap[parent] = heap[idx]
-        heap[idx] = tmp
-        idx = parent
+# =============================================================================
+# UnicodeContext — bundled range table pointers
+# =============================================================================
 
 
-def heap_pop_min(mut heap: List[MergeCandidate]) -> MergeCandidate:
-    var top = heap[0]
-    var n = len(heap)
-    if n == 1:
-        heap.resize(unsafe_uninit_length=0)
-        return top
-    heap[0] = heap[n - 1]
-    heap.resize(unsafe_uninit_length=n - 1)
-
-    var idx = 0
-    var heap_n = len(heap)
-    while True:
-        var left = idx * 2 + 1
-        if left >= heap_n:
-            break
-        var right = left + 1
-        var best = left
-        if right < heap_n and candidate_less(heap[right], heap[left]):
-            best = right
-        if not candidate_less(heap[best], heap[idx]):
-            break
-        var tmp = heap[idx]
-        heap[idx] = heap[best]
-        heap[best] = tmp
-        idx = best
-    return top
-
-
-def bpe_merge_ids(
-    mut symbols: List[Int],
-    pair_ranks: Dict[UInt64, Int],
-    pair_out: Dict[UInt64, Int],
-) -> List[Int]:
-    var n = len(symbols)
-    if n <= 1:
-        var out_short = List[Int]()
-        for i in range(n):
-            out_short.append(symbols[i])
-        return out_short^
-
-    var prev = List[Int](length=n, fill=-1)
-    var next = List[Int](length=n, fill=-1)
-    var alive = List[Bool](length=n, fill=True)
-    for i in range(n):
-        if i > 0:
-            prev[i] = i - 1
-        if i + 1 < n:
-            next[i] = i + 1
-
-    var heap = List[MergeCandidate]()
-    heap.reserve(n)
-    for i in range(n - 1):
-        var key = pack_pair_ids(symbols[i], symbols[i + 1])
-        var rank = pair_ranks.get(key)
-        if rank:
-            heap_push(heap, MergeCandidate(rank.value(), i, i + 1))
-
-    while len(heap) > 0:
-        var cand = heap_pop_min(heap)
-        var l = cand.left
-        var r = cand.right
-        if l < 0 or r < 0:
-            continue
-        if not alive[l] or not alive[r]:
-            continue
-        if next[l] != r:
-            continue
-
-        var key = pack_pair_ids(symbols[l], symbols[r])
-        var rank = pair_ranks.get(key)
-        if not rank or rank.value() != cand.rank:
-            continue
-        var out = pair_out.get(key)
-        if not out:
-            continue
-
-        symbols[l] = out.value()
-        alive[r] = False
-        var rr = next[r]
-        next[l] = rr
-        if rr >= 0:
-            prev[rr] = l
-        next[r] = -1
-        prev[r] = -1
-
-        var pl = prev[l]
-        if pl >= 0 and alive[pl]:
-            var k0 = pack_pair_ids(symbols[pl], symbols[l])
-            var r0 = pair_ranks.get(k0)
-            if r0:
-                heap_push(heap, MergeCandidate(r0.value(), pl, l))
-
-        if rr >= 0 and alive[rr]:
-            var k1 = pack_pair_ids(symbols[l], symbols[rr])
-            var r1 = pair_ranks.get(k1)
-            if r1:
-                heap_push(heap, MergeCandidate(r1.value(), l, rr))
-
-    var head = -1
-    for i in range(n):
-        if alive[i] and prev[i] < 0:
-            head = i
-            break
-
-    var out_ids = List[Int]()
-    if head < 0:
-        return out_ids^
-    var cur = head
-    while cur >= 0:
-        if alive[cur]:
-            out_ids.append(symbols[cur])
-        cur = next[cur]
-    return out_ids^
-
-
-comptime PIECE_CACHE_MAX_ENTRIES = 65536
-comptime PIECE_CACHE_MAX_IDS_PER_ENTRY = 128
-
-
-struct PieceCache(Movable):
-    var index: Dict[String, Int]
-    var starts: List[Int]
-    var lens: List[Int]
-    var values: List[Int]
+struct UnicodeContext(TrivialRegisterPassable):
+    """Bundled Unicode range table pointers. Materializes comptime tables
+    once and provides all classification pointers in a single value."""
+    var letters: UnsafePointer[UInt32, MutAnyOrigin]
+    var numbers: UnsafePointer[UInt32, MutAnyOrigin]
+    var whitespace: UnsafePointer[UInt32, MutAnyOrigin]
+    var marks: UnsafePointer[UInt32, MutAnyOrigin]
+    var punct_symbols: UnsafePointer[UInt32, MutAnyOrigin]
 
     def __init__(out self):
-        self.index = Dict[String, Int]()
-        self.starts = List[Int]()
-        self.lens = List[Int]()
-        self.values = List[Int]()
+        self.letters = UnsafePointer[UInt32, MutAnyOrigin](
+            unsafe_from_address=Int(materialize[LETTER_RANGES]().unsafe_ptr()))
+        self.numbers = UnsafePointer[UInt32, MutAnyOrigin](
+            unsafe_from_address=Int(materialize[NUMBER_RANGES]().unsafe_ptr()))
+        self.whitespace = UnsafePointer[UInt32, MutAnyOrigin](
+            unsafe_from_address=Int(materialize[WHITESPACE_RANGES]().unsafe_ptr()))
+        self.marks = UnsafePointer[UInt32, MutAnyOrigin](
+            unsafe_from_address=Int(materialize[MARK_RANGES]().unsafe_ptr()))
+        self.punct_symbols = UnsafePointer[UInt32, MutAnyOrigin](
+            unsafe_from_address=Int(materialize[PUNCT_SYMBOL_RANGES]().unsafe_ptr()))
 
-    def get(self, piece: String, mut ids: List[Int]) -> Bool:
-        var cached_slot = self.index.get(piece)
-        if not cached_slot:
+
+# =============================================================================
+# Unicode classification
+# =============================================================================
+
+
+@always_inline
+def is_ascii_letter(b: Byte) -> Bool:
+    return ((b | Byte(0x20)) - Byte(97)) < Byte(26)
+
+
+@always_inline
+def is_ascii_digit(b: Byte) -> Bool:
+    return (b - Byte(48)) < Byte(10)
+
+
+@always_inline
+def is_ascii_regex_space(b: Byte) -> Bool:
+    return (b >= Byte(9) and b <= Byte(13)) or b == Byte(32)
+
+
+@always_inline
+def decode_utf8_codepoint(data: Span[Byte, _], pos: Int, n: Int) -> Tuple[UInt32, Int]:
+    var b0 = data[pos]
+    if b0 < Byte(0x80):
+        return (UInt32(b0), 1)
+    if b0 < Byte(0xE0):
+        if pos + 1 < n:
+            var cp = (UInt32(b0 & Byte(0x1F)) << UInt32(6)) | UInt32(data[pos + 1] & Byte(0x3F))
+            return (cp, 2)
+        return (UInt32(b0), 1)
+    if b0 < Byte(0xF0):
+        if pos + 2 < n:
+            var cp = (
+                (UInt32(b0 & Byte(0x0F)) << UInt32(12))
+                | (UInt32(data[pos + 1] & Byte(0x3F)) << UInt32(6))
+                | UInt32(data[pos + 2] & Byte(0x3F))
+            )
+            return (cp, 3)
+        return (UInt32(b0), 1)
+    if pos + 3 < n:
+        var cp = (
+            (UInt32(b0 & Byte(0x07)) << UInt32(18))
+            | (UInt32(data[pos + 1] & Byte(0x3F)) << UInt32(12))
+            | (UInt32(data[pos + 2] & Byte(0x3F)) << UInt32(6))
+            | UInt32(data[pos + 3] & Byte(0x3F))
+        )
+        return (cp, 4)
+    return (UInt32(b0), 1)
+
+
+@always_inline
+def in_unicode_ranges(cp: UInt32, ranges: UnsafePointer[UInt32, _], pair_count: Int) -> Bool:
+    var lo = 0
+    var hi = pair_count
+    while lo < hi:
+        var mid = (lo + hi) // 2
+        var start = ranges[mid * 2]
+        var end = ranges[mid * 2 + 1]
+        if cp < start:
+            hi = mid
+        elif cp > end:
+            lo = mid + 1
+        else:
+            return True
+    return False
+
+
+@always_inline
+def is_unicode_letter_cp(cp: UInt32, ctx: UnicodeContext) -> Bool:
+    if cp < UInt32(0x80):
+        return is_ascii_letter(Byte(cp))
+    if cp < LETTER_MIN or cp > LETTER_MAX:
+        return False
+    return in_unicode_ranges(cp, ctx.letters, LETTER_PAIR_COUNT)
+
+
+@always_inline
+def is_unicode_number_cp(cp: UInt32, ctx: UnicodeContext) -> Bool:
+    if cp < UInt32(0x80):
+        return is_ascii_digit(Byte(cp))
+    if cp < NUMBER_MIN or cp > NUMBER_MAX:
+        return False
+    return in_unicode_ranges(cp, ctx.numbers, NUMBER_PAIR_COUNT)
+
+
+@always_inline
+def is_unicode_whitespace_cp(cp: UInt32, ctx: UnicodeContext) -> Bool:
+    if cp < UInt32(0x80):
+        return is_ascii_regex_space(Byte(cp))
+    if cp < WHITESPACE_MIN or cp > WHITESPACE_MAX:
+        return False
+    return in_unicode_ranges(cp, ctx.whitespace, WHITESPACE_PAIR_COUNT)
+
+
+@always_inline
+def is_ascii_punct_symbol(b: Byte) -> Bool:
+    return (
+        (b >= Byte(33) and b <= Byte(47))
+        or (b >= Byte(58) and b <= Byte(64))
+        or (b >= Byte(91) and b <= Byte(96))
+        or (b >= Byte(123) and b <= Byte(126))
+    )
+
+
+@always_inline
+def is_unicode_punct_symbol_cp(cp: UInt32, ctx: UnicodeContext) -> Bool:
+    if cp < UInt32(0x80):
+        return is_ascii_punct_symbol(Byte(cp))
+    if cp < PUNCT_SYMBOL_MIN or cp > PUNCT_SYMBOL_MAX:
+        return False
+    return in_unicode_ranges(cp, ctx.punct_symbols, PUNCT_SYMBOL_PAIR_COUNT)
+
+
+@always_inline
+def is_unicode_mark_cp(cp: UInt32, ctx: UnicodeContext) -> Bool:
+    if cp < MARK_MIN or cp > MARK_MAX:
+        return False
+    return in_unicode_ranges(cp, ctx.marks, MARK_PAIR_COUNT)
+
+
+@always_inline
+def is_number_start_at(data: Span[Byte, _], pos: Int, n: Int, ctx: UnicodeContext) -> Bool:
+    var parsed = decode_utf8_codepoint(data, pos, n)
+    return is_unicode_number_cp(parsed[0], ctx)
+
+
+@always_inline
+def is_whitespace_start_at(data: Span[Byte, _], pos: Int, n: Int, ctx: UnicodeContext) -> Bool:
+    var parsed = decode_utf8_codepoint(data, pos, n)
+    return is_unicode_whitespace_cp(parsed[0], ctx)
+
+
+# =============================================================================
+# Shared utilities
+# =============================================================================
+
+
+@always_inline
+def span_to_string(data: Span[Byte, _], start: Int, end: Int) -> String:
+    return String(unsafe_from_utf8=Span[Byte, _](ptr=data.unsafe_ptr() + start, length=end - start))
+
+
+comptime PRETOKENIZE_SIMD_WIDTH = 16
+
+
+@always_inline
+def simd_ascii_letters[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
+    return ((block | Byte(0x20)) - Byte(97)).le(Byte(25))
+
+
+@always_inline
+def simd_ascii_digits[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
+    return (block - Byte(48)).le(Byte(9))
+
+
+@always_inline
+def simd_spaces[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
+    return (block - Byte(9)).le(Byte(4)) | block.eq(Byte(32))
+
+
+@always_inline
+def skip_while_matching[
+    scalar_pred: def(Byte) -> Bool,
+    simd_pred: def[w: Int](SIMD[DType.uint8, w]) -> SIMD[DType.bool, w],
+    width: Int = PRETOKENIZE_SIMD_WIDTH,
+](data: Span[Byte, _], pos: Int, n: Int) -> Int:
+    var i = pos
+    var data_ptr = data.unsafe_ptr()
+    while i + width <= n:
+        var block = (data_ptr + i).load[width=width]()
+        var mask = simd_pred[width](block)
+        if all(mask):
+            i += width
+            continue
+        comptime for lane in range(width):
+            if not mask[lane]:
+                return i + lane
+    while i < n and scalar_pred(data[i]):
+        i += 1
+    return i
+
+
+@always_inline
+def consume_codepoint_run[
+    pred: def(UInt32, UnicodeContext) -> Bool,
+](data: Span[Byte, _], start: Int, n: Int, ctx: UnicodeContext) -> Int:
+    var i = start
+    while i < n:
+        var parsed = decode_utf8_codepoint(data, i, n)
+        if not pred(parsed[0], ctx):
+            break
+        i += parsed[1]
+    return i
+
+
+def sort_strings_by_byte_length_desc(mut values: List[String]):
+    for i in range(1, len(values)):
+        var cur = values[i]
+        var cur_len = cur.byte_length()
+        var j = i
+        while j > 0 and values[j - 1].byte_length() < cur_len:
+            values[j] = values[j - 1]
+            j -= 1
+        values[j] = cur
+
+
+@always_inline
+def span_matches_at(data: Span[Byte, _], pos: Int, pattern: Span[Byte, _]) -> Bool:
+    if pos + len(pattern) > len(data):
+        return False
+    for i in range(len(pattern)):
+        if data[pos + i] != pattern[i]:
             return False
-        var slot = cached_slot.value()
-        if slot < 0 or slot >= len(self.starts):
-            return False
-        var start = self.starts[slot]
-        var count = self.lens[slot]
-        for i in range(count):
-            ids.append(self.values[start + i])
-        return True
+    return True
 
-    def put(mut self, piece: String, symbol_ids: List[Int]):
-        if len(symbol_ids) == 0 or len(symbol_ids) > PIECE_CACHE_MAX_IDS_PER_ENTRY:
-            return
-        if len(self.starts) >= PIECE_CACHE_MAX_ENTRIES:
-            self.clear()
-        var entry_start = len(self.values)
-        for i in range(len(symbol_ids)):
-            self.values.append(symbol_ids[i])
-        var slot = len(self.starts)
-        self.starts.append(entry_start)
-        self.lens.append(len(symbol_ids))
-        self.index[piece] = slot
 
-    def clear(mut self):
-        self.index = Dict[String, Int]()
-        self.starts.resize(unsafe_uninit_length=0)
-        self.lens.resize(unsafe_uninit_length=0)
-        self.values.resize(unsafe_uninit_length=0)
+def find_added_token_match(
+    text: Span[Byte, _],
+    pos: Int,
+    added_token_order: List[String],
+    added_tokens: Dict[String, Int],
+) -> Tuple[Int, Int]:
+    for tok in added_token_order:
+        var tok_bytes = tok.as_bytes()
+        if span_matches_at(text, pos, tok_bytes):
+            var found = added_tokens.get(tok)
+            if found:
+                return (found.value(), len(tok_bytes))
+    return (-1, 0)
+
+
+def split_numbers(
+    piece: String, max_group: Int, ctx: UnicodeContext, mut out: List[String],
+):
+    """Split digit/number runs. max_group=1 for individual digits (GPT2),
+    max_group=3 for DeepSeek-style 1-3 grouping."""
+    var data = piece.as_bytes()
+    var n = len(data)
+    if n == 0:
+        return
+
+    var i = 0
+    var chunk_start = 0
+    while i < n:
+        if is_number_start_at(data, i, n, ctx):
+            if chunk_start < i:
+                out.append(span_to_string(data, chunk_start, i))
+
+            var j = i
+            var count = 0
+            while j < n and count < max_group and is_number_start_at(data, j, n, ctx):
+                var parsed = decode_utf8_codepoint(data, j, n)
+                j += parsed[1]
+                count += 1
+
+            out.append(span_to_string(data, i, j))
+            i = j
+            chunk_start = i
+            continue
+
+        var parsed = decode_utf8_codepoint(data, i, n)
+        i += parsed[1]
+
+    if chunk_start < n:
+        out.append(span_to_string(data, chunk_start, n))
+
+
+# =============================================================================
+# BPETokenizer
+# =============================================================================
 
 
 struct BPETokenizer[
-    pretokenizer_type: PreTokenizerCapability = AutoPreTokenizer,
-    byte_transform_type: ByteTransformCapability = GPT2ByteTransform,
+    pretokenizer_type: PreTokenizerCapability,
+    byte_transform_type: ByteTransformCapability,
 ](Tokenizer):
     var vocab: Dict[String, Int]
     var vocab_rev: List[String]
@@ -368,8 +541,8 @@ struct BPETokenizer[
         return self.special_tokens.__contains__(token)
 
     def is_special_id(self, id: Int) -> Bool:
-        for i in range(len(self.special_ids)):
-            if self.special_ids[i] == id:
+        for sid in self.special_ids:
+            if sid == id:
                 return True
         return False
 
@@ -405,16 +578,16 @@ struct BPETokenizer[
 
         self.piece_cache.put(piece.copy(), symbol_ids)
 
-        for i in range(len(symbol_ids)):
-            ids.append(symbol_ids[i])
+        for id in symbol_ids:
+            ids.append(id)
 
     def encode_span(mut self, data: Span[Byte, _], start: Int, end: Int, mut ids: List[Int]):
         if end <= start:
             return
         var chunk = span_to_string(data, start, end)
         var pieces = self.pretokenizer.pre_tokenize(chunk)
-        for i in range(len(pieces)):
-            self.encode_piece(pieces[i], ids)
+        for piece in pieces:
+            self.encode_piece(String(piece), ids)
 
     def encode(mut self, text: String) -> List[Int]:
         var ids = List[Int]()
@@ -450,8 +623,7 @@ struct BPETokenizer[
     def decode(self, ids: List[Int]) -> String:
         var encoded_parts = List[Byte]()
         var decoded = String("")
-        for i in range(len(ids)):
-            var id = ids[i]
+        for id in ids:
             if id < 0 or id >= self._vocab_size:
                 continue
 
@@ -474,63 +646,3 @@ struct BPETokenizer[
             var raw_bytes = self.byte_transform.decode_bytes(String(unsafe_from_utf8=Span(encoded_parts)))
             decoded = decoded + String(unsafe_from_utf8=Span(raw_bytes))
         return decoded^
-
-    def print_summary(self):
-        print("=== BPETokenizer Summary ===")
-        print("Vocab size:      ", self._vocab_size)
-        print("Merge rules:     ", len(self.merges))
-        print("Special tokens:  ", len(self.special_tokens))
-        print("Added tokens:    ", len(self.added_tokens))
-        print("Ignore merges:   ", self.ignore_merges)
-        print("Fuse unk:        ", self.fuse_unk)
-        print("Byte fallback:   ", self.byte_fallback)
-        print("Add BOS token:   ", self.add_bos_token, " (id=", self.bos_token_id, ")")
-        print("Add EOS token:   ", self.add_eos_token, " (id=", self.eos_token_id, ")")
-        print()
-
-        print("Special Tokens:")
-        for item in self.special_tokens.items():
-            print("  id:", item.value, " token:", repr(item.key))
-        print()
-
-        print("First 5 Merge Rules:")
-        var show = 5
-        if len(self.merges) < show:
-            show = len(self.merges)
-        for i in range(show):
-            print("  [", i, "]", repr(self.merges[i]))
-        print()
-
-        if len(self.merges) > 10:
-            print("Last 5 Merge Rules:")
-            for i in range(len(self.merges) - 5, len(self.merges)):
-                print("  [", i, "]", repr(self.merges[i]))
-            print()
-
-        print("First 10 Vocab Entries (by ID):")
-        var show_vocab = 10
-        if self._vocab_size < show_vocab:
-            show_vocab = self._vocab_size
-        for i in range(show_vocab):
-            print("  id:", i, " token:", repr(self.vocab_rev[i]))
-        print()
-
-        print("Sample Vocab Lookups:")
-        var samples = List[String]()
-        samples.append("hello")
-        samples.append("Hello")
-        samples.append("the")
-        samples.append("Ġthe")
-        samples.append("def")
-        samples.append("Ġdef")
-        samples.append(".")
-        samples.append("Ċ")
-        samples.append("0")
-        samples.append("Ġ")
-        for i in range(len(samples)):
-            var found = self.vocab.get(samples[i])
-            if found:
-                print("  ", repr(samples[i]), "->", found.value())
-            else:
-                print("  ", repr(samples[i]), "-> NOT FOUND")
-        print()

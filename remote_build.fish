@@ -10,6 +10,7 @@ rsync -av \
     --exclude='__pycache__' \
     --exclude='validation/.venv' \
     --exclude='test_smollm2_bin' \
+    --exclude='test_smollm2_tp3_bin' \
     --exclude='test_tp3_bin' \
     --exclude='test_tp_bin' \
     --exclude='test_rings_bin' \
@@ -20,4 +21,4 @@ rsync -av \
 
 echo "✓ Synced to $REMOTE_HOST:$REMOTE_PATH"
 
-ssh $REMOTE_USER@$REMOTE_HOST "cd $REMOTE_PATH && pixi run mojo build test_rings.mojo -o test_rings_bin && echo '✓ Build OK' && ./test_rings_bin"
+ssh $REMOTE_USER@$REMOTE_HOST "cd $REMOTE_PATH && pixi run mojo build test_smollm2_tp3.mojo -o test_smollm2_tp3_bin && echo '✓ Build OK' && ./test_smollm2_tp3_bin"

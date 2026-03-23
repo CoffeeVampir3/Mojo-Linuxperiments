@@ -92,7 +92,10 @@ struct PlacedSlot[
     E: Encoding, S: ShardStrategy,
     rows: Int, cols: Int, tp: Int, offset: Int,
     name: StringLiteral,
-](Encoding, Shaped, Placed, Named, ShardStrategy):
+](
+    Encoding, Shaped, Placed, Named, ShardStrategy,
+    NodeLocal where conforms_to(S, NodeLocal),
+):
     comptime DTYPE = Self.E.DTYPE
     comptime ELEMENT_BYTES = Self.E.ELEMENT_BYTES
     comptime ROWS = Self.S.shard_rows(Self.rows, Self.tp)
@@ -110,9 +113,6 @@ struct PlacedSlot[
         return Self.S.shard_cols(c, n)
 
 
-# TODO: Bound currently only carries T (Encoding & Shaped). Once conditional struct
-# conformance is supported, PlacedSlot will conditionally conform to NodeLocal,
-# and S can fold back into T — eliminating the separate S parameter in callbacks.
 @fieldwise_init
 struct Bound[T: Encoding & Shaped](Encoding, Shaped):
     comptime DTYPE = Self.T.DTYPE
@@ -178,12 +178,10 @@ def weight_desc[T: Encoding & Shaped & Placed & Named](
     )
 
 
-# TODO: S is passed separately until conditional struct conformance is supported,
-# at which point PlacedSlot will conditionally conform to NodeLocal and S folds into T.
 trait WeightIterable:
     @staticmethod
     def for_each_weight[
-        func: def[S: ShardStrategy, T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
+        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
     ](): ...
 
 

@@ -207,10 +207,8 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
             if all(matches):
                 self.pos += Self.simd_width
                 continue
-            comptime for i in range(Self.simd_width):
-                if not matches[i]:
-                    self.pos += i
-                    return self.pos - start
+            self.pos += first_true_index[Self.simd_width](~matches)
+            return self.pos - start
         while self.has_more() and pred_scalar(self.peek()):
             self.pos += 1
         return self.pos - start

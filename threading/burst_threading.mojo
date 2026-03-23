@@ -106,34 +106,33 @@ def install_burst_sigsegv_handler():
 
     _ = sys.sys_rt_sigaction(linux.Signal.SEGV, UnsafePointer(to=act))
 
-struct SharedPoolState:
-    # Cache line padding to avoid false sharing between dispatch and completion fields.
-    # Cache line 1: Work dispatch (main writes, workers read)
-    var work_available: AtomicInt32  # Workers decrement to claim work
-    var shutdown: AtomicInt32        # Shutdown signal
-    var func_ptr: Int               # Kernel entry bits
-
-    # Pad the rest of the CL
-    comptime DispatchPadBytes = 64 - (
-        size_of[type_of(Self().work_available)]()
-        + size_of[type_of(Self().shutdown)]()
-        + size_of[type_of(Self().func_ptr)]()
-    )
-    var pad0: InlineArray[UInt8, Self.DispatchPadBytes]
-
-    # Cache line 2: Completion tracking (workers write, main reads)
-    var work_done: AtomicInt32       # Jobs remaining; workers decrement when done
-
-    comptime DonePadBytes = 64 - size_of[type_of(Self().work_done)]()
-    var pad1: InlineArray[UInt8, Self.DonePadBytes]
+@align(64)
+struct DispatchLine:
+    var work_available: AtomicInt32
+    var shutdown: AtomicInt32
+    var func_ptr: Int
 
     def __init__(out self):
         self.work_available = AtomicInt32(0)
         self.shutdown = AtomicInt32(0)
         self.func_ptr = 0
-        self.pad0 = InlineArray[UInt8, Self.DispatchPadBytes](uninitialized=True)
+
+@align(64)
+struct CompletionLine:
+    var work_done: AtomicInt32
+
+    def __init__(out self):
         self.work_done = AtomicInt32(0)
-        self.pad1 = InlineArray[UInt8, Self.DonePadBytes](uninitialized=True)
+
+struct SharedPoolState:
+    # Cache line separation to avoid false sharing between dispatch and completion.
+    # @align(64) on each sub-struct ensures cache line boundary alignment.
+    var dispatch: DispatchLine
+    var completion: CompletionLine
+
+    def __init__(out self):
+        self.dispatch = DispatchLine()
+        self.completion = CompletionLine()
 
 struct WorkerSlot(Movable, ImplicitlyDestructible):
     var base: UnsafePointer[UInt8, MutAnyOrigin]
@@ -144,11 +143,6 @@ struct WorkerSlot(Movable, ImplicitlyDestructible):
         self.base = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=slot_base)
         self.child_tid = UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=slot_base + SlotLayout.CHILD_TID)
         self.stack_top = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=slot_base + SlotLayout.HEADER + SlotLayout.GUARD)
-
-    def __moveinit__(out self, deinit other: Self):
-        self.base = other.base
-        self.child_tid = other.child_tid
-        self.stack_top = other.stack_top
 
     @always_inline
     def is_alive(self) -> Bool:
@@ -257,18 +251,6 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
 
         self.spawn_workers()
 
-    def __moveinit__(out self, deinit other: Self):
-        self.slots = other.slots^
-        self.shared = other.shared
-        self.args_base = other.args_base
-        self.arena_base = other.arena_base
-        self.capacity = other.capacity
-        self.cpu_mask = other.cpu_mask.copy()
-        self.numa_node = other.numa_node
-        self.futex_flags = other.futex_flags
-        self.pinned = other.pinned
-        self.workers_alive = other.workers_alive
-
     def __del__(deinit self):
         if self.arena_base == 0:
             return
@@ -277,8 +259,8 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         if self.workers_alive:
             # Signal shutdown and wake all workers
             AtomicInt32.store[ordering=Consistency.RELEASE](
-                UnsafePointer(to=self.shared[].shutdown.value), 1)
-            var workPtr = UnsafePointer(to=self.shared[].work_available.value)
+                UnsafePointer(to=self.shared[].dispatch.shutdown.value), 1)
+            var workPtr = UnsafePointer(to=self.shared[].dispatch.work_available.value)
             _ = sys.sys_futex_wake(Int(workPtr), self.capacity, self.futex_flags)
 
             # Wait for all workers to exit
@@ -286,10 +268,10 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
             # so we must wait with shared (non-private) futex to match the hash bucket
             comptime shared_futex_flags = linux.Futex2.SIZE_U32
             for i in range(self.capacity):
-                while self.slots[i][].is_alive():
+                while self.slots[i].is_alive():
                     _ = sys.sys_futex_wait(
-                        Int(self.slots[i][].child_tid),
-                        Int(self.slots[i][].child_tid[]),
+                        Int(self.slots[i].child_tid),
+                        Int(self.slots[i].child_tid[]),
                         shared_futex_flags)
 
         _ = sys.sys_munmap(
@@ -333,7 +315,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         comptime KernelType = type_of(kernel)
         comptime assert size_of[KernelType]() == 8, "kernel must be an 8-byte function pointer"
 
-        var donePtr = UnsafePointer(to=self.shared[].work_done.value)
+        var donePtr = UnsafePointer(to=self.shared[].completion.work_done.value)
         debug_assert(
             AtomicInt32.load[ordering=Consistency.ACQUIRE](donePtr) == 0,
             "previous dispatch still in flight; call join() first",
@@ -347,9 +329,9 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
 
         var kernel_copy = kernel
         var kernel_ptr = UnsafePointer(to=kernel_copy).bitcast[Int]()[]
-        self.shared[].func_ptr = kernel_ptr
+        self.shared[].dispatch.func_ptr = kernel_ptr
 
-        var workPtr = UnsafePointer(to=self.shared[].work_available.value)
+        var workPtr = UnsafePointer(to=self.shared[].dispatch.work_available.value)
 
         # Publish jobs remaining and work available with release semantics.
         AtomicInt32.store[ordering=Consistency.MONOTONIC](donePtr, Int32(jobs))
@@ -360,7 +342,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
 
     def join(mut self):
         """Wait for the most recent dispatch to complete."""
-        var donePtr = UnsafePointer(to=self.shared[].work_done.value)
+        var donePtr = UnsafePointer(to=self.shared[].completion.work_done.value)
         var sys = linux.linux_sys()
         while AtomicInt32.load[ordering=Consistency.ACQUIRE](donePtr) > 0:
             sys.arch_cpu_relax()
@@ -372,11 +354,11 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         for i in range(self.capacity):
             var worker_mask = self.cpu_mask.copy() if self.pinned else CpuMask[Self.mask_size]()
 
-            var stack_top_addr = Int(self.slots[i][].stack_top) + Self.stack_size
+            var stack_top_addr = Int(self.slots[i].stack_top) + Self.stack_size
             var stack_head_addr = (stack_top_addr - size_of[WorkerStackHead[Self.mask_size]]()) & ~15
             var head = ptr[WorkerStackHead[Self.mask_size]](stack_head_addr)
             var worker_main_copy = worker_main[Self.mask_size]
-            var slot_base = Int(self.slots[i][].base)
+            var slot_base = Int(self.slots[i].base)
             var altstack_base = (
                 slot_base + SlotLayout.HEADER + SlotLayout.GUARD + Self.stack_size + SlotLayout.ALT_GUARD
             )
@@ -393,12 +375,12 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
                 Int(self.pinned),
                 worker_mask^,
             )
-            var tcb_addr = Int(self.slots[i][].base) + SlotLayout.TCB
+            var tcb_addr = Int(self.slots[i].base) + SlotLayout.TCB
             var clone_args = linux.Clone3Args.thread(
-                Int(self.slots[i][].stack_top),
-                stack_head_addr - Int(self.slots[i][].stack_top),
+                Int(self.slots[i].stack_top),
+                stack_head_addr - Int(self.slots[i].stack_top),
                 tcb_addr,
-                Int(self.slots[i][].child_tid)
+                Int(self.slots[i].child_tid)
             )
 
             var result = sys.sys_clone3_with_entry(UnsafePointer(to=clone_args), size_of[linux.Clone3Args]())
@@ -446,21 +428,21 @@ def worker_main[mask_size: Int](stack_head_ptr: Int):
             print("sched_setaffinity failed:", ret)
 
     comptime SPIN_LIMIT = 1000  # Spin iterations before sleeping
-    var workPtr = UnsafePointer(to=shared[].work_available.value)
+    var workPtr = UnsafePointer(to=shared[].dispatch.work_available.value)
 
     while True:
-        if shared[].shutdown.load[ordering=Consistency.ACQUIRE]() != 0:
+        if shared[].dispatch.shutdown.load[ordering=Consistency.ACQUIRE]() != 0:
             break
 
         # Try to claim work by atomically decrementing work_available
-        var avail = shared[].work_available.load[ordering=Consistency.MONOTONIC]()
+        var avail = shared[].dispatch.work_available.load[ordering=Consistency.MONOTONIC]()
 
         if avail > 0:
-            var old = shared[].work_available.fetch_sub[ordering=Consistency.ACQUIRE_RELEASE](1)
+            var old = shared[].dispatch.work_available.fetch_sub[ordering=Consistency.ACQUIRE_RELEASE](1)
             if old > 0:
                 var job_idx = Int(old - 1)
                 var pack_ptr = args_base + job_idx
-                var func_addr = shared[].func_ptr
+                var func_addr = shared[].dispatch.func_ptr
                 UnsafePointer(to=func_addr).bitcast[KernelFn]()[](
                     pack_ptr[].arg0,
                     pack_ptr[].arg1,
@@ -471,14 +453,14 @@ def worker_main[mask_size: Int](stack_head_ptr: Int):
                 )
 
                 # Signal completion by decrementing jobs remaining.
-                _ = shared[].work_done.fetch_sub[ordering=Consistency.ACQUIRE_RELEASE](1)
+                _ = shared[].completion.work_done.fetch_sub[ordering=Consistency.ACQUIRE_RELEASE](1)
                 continue
             else:
                 # If we fetch <= 0 there's no more work, compare to lowest racing loser
                 # and have the lowest racing loser set to 0 only if it's still that value,
                 # to not screw up new dispatches.
                 var expected = old - 1
-                _ = shared[].work_available.compare_exchange(expected, 0)
+                _ = shared[].dispatch.work_available.compare_exchange(expected, 0)
 
         # A note, because it wasn't obvious to me. If you do not futex wait the scheduler
         # on linux can absolutely deadlock spinning threads by not scheduling
@@ -494,8 +476,8 @@ def worker_main[mask_size: Int](stack_head_ptr: Int):
 
         # No work available - spin briefly then sleep
         var spins = 0
-        while shared[].work_available.load[ordering=Consistency.MONOTONIC]() <= 0:
-            if shared[].shutdown.load[ordering=Consistency.MONOTONIC]() != 0:
+        while shared[].dispatch.work_available.load[ordering=Consistency.MONOTONIC]() <= 0:
+            if shared[].dispatch.shutdown.load[ordering=Consistency.MONOTONIC]() != 0:
                 break
             if spins < SPIN_LIMIT:
                 sys.arch_cpu_relax()

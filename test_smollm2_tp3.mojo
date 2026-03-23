@@ -1,8 +1,10 @@
-"""Autoregressive generation test: tokenize a prompt, prefill, then
-decode tokens greedily. Reports load time, per-token forward time,
-and the final generated sequence.
+"""Autoregressive generation test with TP=3 tensor parallelism.
 
-Uses the parametric SmolLM2TP with TP=1."""
+Tokenizes a prompt, prefill, then decode tokens greedily across
+3 NUMA-aware ranks with automatic topology discovery.
+
+Uses SmolLM2TP[BF16, 3] — parametric Megatron-style TP with
+ring allreduce and parallel kernel dispatch."""
 
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
@@ -73,14 +75,14 @@ He was named to the 2022 class of ACM Fellows"""
         print("", token_ids[i], end="")
     print()
 
-    # --- Load model (parametric TP=1) ---
+    # --- Load model (TP=3, automatic NUMA topology) ---
     var t0 = perf_counter_ns()
-    var model_opt = SmolLM2TP[BF16, 1].load(Path(MODEL_PATH))
+    var model_opt = SmolLM2TP[BF16, 3].load(Path(MODEL_PATH))
     if not model_opt:
         return
     var model = model_opt.take()
     var load_ms = (perf_counter_ns() - t0) / 1_000_000
-    print("model loaded in", load_ms, "ms")
+    print("model loaded in", load_ms, "ms (TP=3)")
     print()
 
     # --- Write tokens into rank 0's scratch area ---
@@ -144,5 +146,8 @@ He was named to the 2022 class of ACM Fellows"""
 
     var full_text = tok.decode(all_ids)
     print()
-    print("=== generated", MAX_NEW_TOKENS, "tokens ===")
+    print("=== generated", MAX_NEW_TOKENS, "tokens (TP=3) ===")
     print(full_text)
+
+    # Keep model alive until the very end.
+    _ = model

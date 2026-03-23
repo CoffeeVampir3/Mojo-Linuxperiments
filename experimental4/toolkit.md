@@ -419,7 +419,7 @@ The Q4 constraint breaks the standard dimensional contract. `activation.cols != 
 
 Traits in Mojo can carry:
 - **Comptime members**: `comptime DTYPE: DType` — compile-time constants
-- **Static methods**: `@staticmethod fn f() -> T` — compile-time callable functions
+- **Static methods**: `@staticmethod def f() -> T` — compile-time callable functions
 - **Default implementations**: methods with bodies that conformers inherit
 - **Required conformance**: subtrait relationships via `trait A(B):`
 
@@ -427,7 +427,7 @@ A type conforms to a trait by providing all required comptime members and method
 
 ### 6.2 Trait Composition
 
-`fn f[T: A & B]()` requires T to satisfy both A and B. Inside the function, all members of both A and B are visible. This is the primary mechanism for combining concerns.
+`def f[T: A & B]()` requires T to satisfy both A and B. Inside the function, all members of both A and B are visible. This is the primary mechanism for combining concerns.
 
 Trait composition is a product/intersection: `A & B` gives access to the union of A's and B's members. This is the meet in the trait lattice — the most specific bound that includes both.
 
@@ -459,11 +459,11 @@ Type families are used with `[params]` in type position (no parens). Value famil
 
 ### 6.5 Hard Limits
 
-**No trait specialization.** If `fn f[E: Encoding]()` and `fn f[E: Encoding & HasScale]()` both exist, and a type satisfies both, calling `f` is an ambiguous call error. Mojo does not resolve overloads by trait specificity. You must use different function names.
+**No trait specialization.** If `def f[E: Encoding]()` and `def f[E: Encoding & HasScale]()` both exist, and a type satisfies both, calling `f` is an ambiguous call error. Mojo does not resolve overloads by trait specificity. You must use different function names.
 
 **No coproducts.** There is no `T: A | B` (either-or) bound. If you need to handle "weight or scale" generically, you need a common supertrait or a tagged comptime member, not a union type.
 
-**No dependent traits.** You cannot require `constrained[T.COLS % T.BLOCK_SIZE == 0]` as part of a trait definition. Divisibility constraints must be checked at the use site with `constrained[]`.
+**No dependent traits.** You cannot require `comptime assert T.COLS % T.BLOCK_SIZE == 0` as part of a trait definition. Divisibility constraints must be checked at the use site with `comptime assert`.
 
 **No negative bounds.** There is no `T: Encoding & !HasScale` to match types that lack a trait. If you need different behavior for types with and without a trait, use different function names.
 
@@ -482,7 +482,7 @@ trait Encoding:
     comptime DTYPE: DType
     comptime ELEMENT_BYTES: Int
     @staticmethod
-    fn byte_count(rows: Int, cols: Int) -> Int:
+    def byte_count(rows: Int, cols: Int) -> Int:
         return rows * cols * Self.ELEMENT_BYTES
 
 struct BF16(Encoding):
@@ -494,8 +494,8 @@ struct BF16(Encoding):
 **Trait-bounded free functions for conditional behavior.** Instead of overloading by specificity, use distinct function names with different trait bounds:
 
 ```mojo
-fn format_dense[E: Encoding]() -> String: ...
-fn format_quant[E: Encoding & HasScale]() -> String: ...
+def format_dense[E: Encoding]() -> String: ...
+def format_quant[E: Encoding & HasScale]() -> String: ...
 ```
 
 A type that lacks `HasScale` simply cannot call `format_quant` — compile error.

@@ -1,49 +1,25 @@
-from std.memory import Span, UnsafePointer
-
-from .capabilities import ByteTransformCapability, PreTokenizerCapability
-from .shared_capabilities import (
+from std.memory import Span
+from .tokenizer import (
+    ByteTransformCapability, PreTokenizerCapability,
+    UnicodeContext,
     is_ascii_letter,
-    is_ascii_digit,
-    is_ascii_regex_space,
     is_ascii_punct_symbol,
+    is_ascii_regex_space,
     decode_utf8_codepoint,
-    in_unicode_ranges,
     is_unicode_letter_cp,
-    is_unicode_number_cp,
     is_unicode_whitespace_cp,
     is_unicode_punct_symbol_cp,
-    is_number_start_at,
+    is_unicode_mark_cp,
     is_whitespace_start_at,
     span_to_string,
     consume_codepoint_run,
-)
-from .unicode_props import (
-    LETTER_RANGES,
-    NUMBER_RANGES,
-    WHITESPACE_RANGES,
-)
-from .unicode_psm_props import (
-    MARK_RANGES,
-    MARK_PAIR_COUNT,
-    MARK_MIN,
-    MARK_MAX,
-    PUNCT_SYMBOL_RANGES,
-    PUNCT_SYMBOL_PAIR_COUNT,
-    PUNCT_SYMBOL_MIN,
-    PUNCT_SYMBOL_MAX,
+    split_numbers,
 )
 
 
 @always_inline
 def is_newline_byte(b: Byte) -> Bool:
     return b == Byte(10) or b == Byte(13)
-
-
-@always_inline
-def is_unicode_mark_cp(cp: UInt32, mark_ranges: UnsafePointer[UInt32, _]) -> Bool:
-    if cp < MARK_MIN or cp > MARK_MAX:
-        return False
-    return in_unicode_ranges(cp, mark_ranges, MARK_PAIR_COUNT)
 
 
 @always_inline
@@ -56,97 +32,43 @@ def is_cjk_japanese_cp(cp: UInt32) -> Bool:
 
 
 @always_inline
-def is_letter_mark_cp(
-    cp: UInt32,
-    letter_ranges: UnsafePointer[UInt32, _],
-    mark_ranges: UnsafePointer[UInt32, _],
-) -> Bool:
-    return is_unicode_letter_cp(cp, letter_ranges) or is_unicode_mark_cp(cp, mark_ranges)
+def is_letter_mark_cp(cp: UInt32, ctx: UnicodeContext) -> Bool:
+    return is_unicode_letter_cp(cp, ctx) or is_unicode_mark_cp(cp, ctx)
 
 
 @always_inline
 def is_letter_mark_start_at(
-    data: Span[Byte, _],
-    pos: Int,
-    n: Int,
-    letter_ranges: UnsafePointer[UInt32, _],
-    mark_ranges: UnsafePointer[UInt32, _],
+    data: Span[Byte, _], pos: Int, n: Int, ctx: UnicodeContext,
 ) -> Bool:
     var parsed = decode_utf8_codepoint(data, pos, n)
-    return is_letter_mark_cp(parsed[0], letter_ranges, mark_ranges)
+    return is_letter_mark_cp(parsed[0], ctx)
 
 
 @always_inline
 def is_punct_symbol_start_at(
-    data: Span[Byte, _],
-    pos: Int,
-    n: Int,
-    punct_symbol_ranges: UnsafePointer[UInt32, _],
+    data: Span[Byte, _], pos: Int, n: Int, ctx: UnicodeContext,
 ) -> Bool:
     var parsed = decode_utf8_codepoint(data, pos, n)
-    return is_unicode_punct_symbol_cp(parsed[0], punct_symbol_ranges)
+    return is_unicode_punct_symbol_cp(parsed[0], ctx)
 
 
 @always_inline
 def consume_letter_mark_run(
-    data: Span[Byte, _],
-    start: Int,
-    n: Int,
-    letter_ranges: UnsafePointer[UInt32, _],
-    mark_ranges: UnsafePointer[UInt32, _],
+    data: Span[Byte, _], start: Int, n: Int, ctx: UnicodeContext,
 ) -> Int:
     var i = start
     while i < n:
         var parsed = decode_utf8_codepoint(data, i, n)
-        if not is_letter_mark_cp(parsed[0], letter_ranges, mark_ranges):
+        if not is_letter_mark_cp(parsed[0], ctx):
             break
         i += parsed[1]
     return i
 
 
 def consume_punct_symbol_run(
-    data: Span[Byte, _],
-    start: Int,
-    n: Int,
-    punct_symbol_ranges: UnsafePointer[UInt32, _],
+    data: Span[Byte, _], start: Int, n: Int, ctx: UnicodeContext,
 ) -> Int:
-    return consume_codepoint_run[is_unicode_punct_symbol_cp](data, start, n, punct_symbol_ranges)
-
-
-def split_numbers_piece(
-    piece: String,
-    number_ranges: UnsafePointer[UInt32, _],
-    mut out: List[String],
-):
-    var data = piece.as_bytes()
-    var n = len(data)
-    if n == 0:
-        return
-
-    var i = 0
-    var chunk_start = 0
-    while i < n:
-        if is_number_start_at(data, i, n, number_ranges):
-            if chunk_start < i:
-                out.append(span_to_string(data, chunk_start, i))
-
-            var j = i
-            var count = 0
-            while j < n and count < 3 and is_number_start_at(data, j, n, number_ranges):
-                var parsed = decode_utf8_codepoint(data, j, n)
-                j += parsed[1]
-                count += 1
-
-            out.append(span_to_string(data, i, j))
-            i = j
-            chunk_start = i
-            continue
-
-        var parsed = decode_utf8_codepoint(data, i, n)
-        i += parsed[1]
-
-    if chunk_start < n:
-        out.append(span_to_string(data, chunk_start, n))
+    return consume_codepoint_run[is_unicode_punct_symbol_cp](data, start, n, ctx)
 
 
 def split_cjk_piece(piece: String, mut out: List[String]):
@@ -182,28 +104,18 @@ def split_cjk_piece(piece: String, mut out: List[String]):
 
 
 @always_inline
-def is_branch_b_prefix_cp(
-    cp: UInt32,
-    letter_ranges: UnsafePointer[UInt32, _],
-    punct_symbol_ranges: UnsafePointer[UInt32, _],
-) -> Bool:
+def is_branch_b_prefix_cp(cp: UInt32, ctx: UnicodeContext) -> Bool:
     if cp == UInt32(10) or cp == UInt32(13):
         return False
-    if is_unicode_letter_cp(cp, letter_ranges):
+    if is_unicode_letter_cp(cp, ctx):
         return False
-    if is_unicode_punct_symbol_cp(cp, punct_symbol_ranges):
+    if is_unicode_punct_symbol_cp(cp, ctx):
         return False
     return True
 
 
 def try_match_main_pattern(
-    data: Span[Byte, _],
-    pos: Int,
-    end: Int,
-    letter_ranges: UnsafePointer[UInt32, _],
-    mark_ranges: UnsafePointer[UInt32, _],
-    punct_symbol_ranges: UnsafePointer[UInt32, _],
-    whitespace_ranges: UnsafePointer[UInt32, _],
+    data: Span[Byte, _], pos: Int, end: Int, ctx: UnicodeContext,
 ) -> Int:
     var b = data[pos]
 
@@ -219,36 +131,33 @@ def try_match_main_pattern(
     var cp = parsed[0]
     var cp_len = parsed[1]
 
-    if is_branch_b_prefix_cp(cp, letter_ranges, punct_symbol_ranges):
+    if is_branch_b_prefix_cp(cp, ctx):
         var j = pos + cp_len
-        if (
-            j < end
-            and is_letter_mark_start_at(data, j, end, letter_ranges, mark_ranges)
-        ):
-            return consume_letter_mark_run(data, j, end, letter_ranges, mark_ranges)
+        if j < end and is_letter_mark_start_at(data, j, end, ctx):
+            return consume_letter_mark_run(data, j, end, ctx)
 
-    if is_letter_mark_cp(cp, letter_ranges, mark_ranges):
-        return consume_letter_mark_run(data, pos, end, letter_ranges, mark_ranges)
+    if is_letter_mark_cp(cp, ctx):
+        return consume_letter_mark_run(data, pos, end, ctx)
 
     #  ?[\p{P}\p{S}]+[\r\n]*
     var sym_start = pos
     if b == Byte(32):
-        if pos + 1 < end and is_punct_symbol_start_at(data, pos + 1, end, punct_symbol_ranges):
+        if pos + 1 < end and is_punct_symbol_start_at(data, pos + 1, end, ctx):
             sym_start = pos + 1
         else:
             sym_start = -1
     else:
-        if not is_punct_symbol_start_at(data, pos, end, punct_symbol_ranges):
+        if not is_punct_symbol_start_at(data, pos, end, ctx):
             sym_start = -1
 
     if sym_start >= 0:
-        var j = consume_punct_symbol_run(data, sym_start, end, punct_symbol_ranges)
+        var j = consume_punct_symbol_run(data, sym_start, end, ctx)
         while j < end and is_newline_byte(data[j]):
             j += 1
         return j
 
     # \s*[\r\n]+ | \s+(?!\S) | \s+
-    if is_whitespace_start_at(data, pos, end, whitespace_ranges):
+    if is_whitespace_start_at(data, pos, end, ctx):
         var ws_end = pos
         var last_newline_end = -1
         while ws_end < end:
@@ -262,7 +171,7 @@ def try_match_main_pattern(
                 continue
 
             var ws_parsed = decode_utf8_codepoint(data, ws_end, end)
-            if not is_unicode_whitespace_cp(ws_parsed[0], whitespace_ranges):
+            if not is_unicode_whitespace_cp(ws_parsed[0], ctx):
                 break
             ws_end += ws_parsed[1]
 
@@ -276,12 +185,7 @@ def try_match_main_pattern(
 
 
 def split_main_piece(
-    piece: String,
-    letter_ranges: UnsafePointer[UInt32, _],
-    mark_ranges: UnsafePointer[UInt32, _],
-    punct_symbol_ranges: UnsafePointer[UInt32, _],
-    whitespace_ranges: UnsafePointer[UInt32, _],
-    mut out: List[String],
+    piece: String, ctx: UnicodeContext, mut out: List[String],
 ):
     var data = piece.as_bytes()
     var n = len(data)
@@ -291,10 +195,7 @@ def split_main_piece(
     var i = 0
     var chunk_start = 0
     while i < n:
-        var match_end = try_match_main_pattern(
-            data, i, n,
-            letter_ranges, mark_ranges, punct_symbol_ranges, whitespace_ranges,
-        )
+        var match_end = try_match_main_pattern(data, i, n, ctx)
         if match_end > i:
             if chunk_start < i:
                 out.append(span_to_string(data, chunk_start, i))
@@ -324,30 +225,19 @@ struct DeepSeekV3PreTokenizer(PreTokenizerCapability):
         if text.byte_length() == 0:
             return result^
 
-        var number_ranges = materialize[NUMBER_RANGES]()
-        var letter_ranges = materialize[LETTER_RANGES]()
-        var whitespace_ranges = materialize[WHITESPACE_RANGES]()
-        var mark_ranges = materialize[MARK_RANGES]()
-        var punct_symbol_ranges = materialize[PUNCT_SYMBOL_RANGES]()
+        var ctx = UnicodeContext()
 
-        var number_ptr = number_ranges.unsafe_ptr()
-        var letter_ptr = letter_ranges.unsafe_ptr()
-        var whitespace_ptr = whitespace_ranges.unsafe_ptr()
-        var mark_ptr = mark_ranges.unsafe_ptr()
-        var punct_symbol_ptr = punct_symbol_ranges.unsafe_ptr()
-
+        # Stage 1: Split numbers in groups of 1-3
         var stage1 = List[String]()
-        split_numbers_piece(text, number_ptr, stage1)
+        split_numbers(text, 3, ctx, stage1)
 
+        # Stage 2: Isolate CJK/Japanese runs
         var stage2 = List[String]()
-        for i in range(len(stage1)):
-            split_cjk_piece(stage1[i], stage2)
+        for piece in stage1:
+            split_cjk_piece(String(piece), stage2)
 
-        for i in range(len(stage2)):
-            split_main_piece(
-                stage2[i],
-                letter_ptr, mark_ptr, punct_symbol_ptr, whitespace_ptr,
-                result,
-            )
+        # Stage 3: Main pattern split
+        for piece in stage2:
+            split_main_piece(String(piece), ctx, result)
 
         return result^

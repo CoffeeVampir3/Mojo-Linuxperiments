@@ -230,7 +230,7 @@ def my_sort[
     values: SIMD[dtype, width],
     /,
     # positional-or-keyword parameter
-    compare: fn(Scalar[dtype], Scalar[dtype]) raises -> Int,
+    compare: def(Scalar[dtype], Scalar[dtype]) raises -> Int,
     *,
     # keyword-only parameter
     reverse: Bool = False,
@@ -1191,6 +1191,8 @@ def __ne__(self, other: Self) -> Bool:
 
 Trait compositions
 
+Mojo uses `def` for all function declarations, function type positions, and comptime aliases. There is no separate `fn` keyword — `def` is used everywhere.
+
 You can compose traits using the & sigil. This lets you define new traits that are simple combinations of other traits. You can use a trait composition anywhere that you'd use a single trait:
 
 trait Flyable:
@@ -1868,6 +1870,90 @@ else:
 This condition on your method isn't conditional trait conformance. It's conditional method access. In this example, the method and the conformance use the same condition, so they stay aligned.
 
 That said, where clauses on methods and functions are useful even when you're not working with trait conformance. For example, you might gate a method so it only works with non-empty lists, real numbers, or with values that fall within the index bounds of a collection.
+Example: strategy delegation
+
+The previous examples propagate conformance from a data parameter — "this container can do X if its elements can." There is a second, equally important pattern: propagating conformance from a strategy or policy parameter.
+
+Consider a struct parameterized on a behavior strategy. Some strategies have a special property (expressed as a sub-trait), and you want the struct to inherit that property only when its strategy has it. This lets generic code query the struct's conformance directly, rather than threading the strategy type through every callback and function signature.
+
+trait ShardStrategy:
+    @staticmethod
+    def shard_rows(r: Int, tp: Int) -> Int: ...
+    @staticmethod
+    def shard_cols(c: Int, tp: Int) -> Int: ...
+
+trait NodeLocal(ShardStrategy):
+    ...
+
+struct RowShard(ShardStrategy):
+    @staticmethod
+    def shard_rows(r: Int, tp: Int) -> Int: return r // tp
+    @staticmethod
+    def shard_cols(c: Int, tp: Int) -> Int: return c
+
+struct PrincipleNodeLocal(NodeLocal):
+    @staticmethod
+    def shard_rows(r: Int, tp: Int) -> Int: return r
+    @staticmethod
+    def shard_cols(c: Int, tp: Int) -> Int: return c
+
+struct PlacedSlot[S: ShardStrategy, name: StringLiteral](
+    ShardStrategy,
+    NodeLocal where conforms_to(S, NodeLocal),
+):
+    comptime NAME: StaticString = Self.name
+
+    @staticmethod
+    def shard_rows(r: Int, tp: Int) -> Int: return Self.S.shard_rows(r, tp)
+    @staticmethod
+    def shard_cols(c: Int, tp: Int) -> Int: return Self.S.shard_cols(c, tp)
+
+PlacedSlot always conforms to ShardStrategy, but it only conforms to NodeLocal when its strategy parameter S does. The compiler evaluates this per-instantiation:
+
+comptime DISTRIBUTED = PlacedSlot[RowShard, "q_proj"]
+comptime LOCAL = PlacedSlot[PrincipleNodeLocal, "norm"]
+
+comptime if conforms_to(DISTRIBUTED, NodeLocal):
+    ...  # not taken — RowShard is not NodeLocal
+
+comptime if conforms_to(LOCAL, NodeLocal):
+    ...  # taken — PrincipleNodeLocal is NodeLocal
+
+The key benefit is eliminating plumbing parameters. Without conditional conformance, generic iteration over both distributed and node-local slots requires passing the strategy type as a separate parameter through every callback:
+
+# Before: two type parameters, S threaded everywhere
+trait WeightIterable:
+    @staticmethod
+    def for_each_weight[
+        func: def[S: ShardStrategy, T: Named](String) capturing -> None,
+    ](): ...
+
+# Call sites must redundantly pass the strategy
+func[RowShard, Self.Q_PROJ]("q_proj")
+func[PrincipleNodeLocal, Self.EMBED]("embed")
+
+With conditional conformance, the NodeLocal-ness is baked into the PlacedSlot type itself. Callbacks need only one type parameter and query it directly:
+
+# After: single type parameter, no plumbing
+trait WeightIterable:
+    @staticmethod
+    def for_each_weight[
+        func: def[T: Named](String) capturing -> None,
+    ](): ...
+
+# Call sites are simpler
+func[Self.Q_PROJ]("q_proj")
+func[Self.EMBED]("embed")
+
+# Consumer branches on T directly
+@parameter
+def collect[T: Named](name: String):
+    comptime if conforms_to(T, NodeLocal):
+        node_local_weights.append(name)
+    else:
+        distributed_weights.append(name)
+
+This pattern applies whenever a struct delegates behavior to a strategy parameter and consumers need to branch on the strategy's properties: placement policies, memory allocation strategies, serialization backends, scheduling disciplines, and similar.
 Conditional trait composition
 
 Mojo supports flexible condition composition, as shown in these examples:
@@ -2629,14 +2715,14 @@ A default method can call other methods required by the same trait, even if thos
 
 ```mojo
 trait Codec:
-    fn raw_encode(self, data: Span[Byte]) -> List[Byte]: ...
-    fn raw_decode(self, data: Span[Byte]) -> List[Byte]: ...
+    def raw_encode(self, data: Span[Byte]) -> List[Byte]: ...
+    def raw_decode(self, data: Span[Byte]) -> List[Byte]: ...
 
-    fn encode_string(self, text: String) -> String:
+    def encode_string(self, text: String) -> String:
         var encoded = self.raw_encode(text.as_bytes())
         return String(unsafe_from_utf8=Span(encoded))
 
-    fn decode_string(self, text: String) -> String:
+    def decode_string(self, text: String) -> String:
         var decoded = self.raw_decode(text.as_bytes())
         return String(unsafe_from_utf8=Span(decoded))
 ```
@@ -2645,9 +2731,9 @@ Here `encode_string` and `decode_string` are defaults that call the abstract `ra
 
 ```mojo
 struct Base64Codec(Codec):
-    fn raw_encode(self, data: Span[Byte]) -> List[Byte]:
+    def raw_encode(self, data: Span[Byte]) -> List[Byte]:
         # ... base64 encoding logic
-    fn raw_decode(self, data: Span[Byte]) -> List[Byte]:
+    def raw_decode(self, data: Span[Byte]) -> List[Byte]:
         # ... base64 decoding logic
     # encode_string and decode_string inherited
 ```
@@ -2660,13 +2746,13 @@ Defaults can reference comptime members declared in the same trait using `Self.M
 trait ArchPrimitives:
     comptime NR_write: Int
     comptime NR_exit: Int
-    fn syscall[count: Int](self, nr: Int, *args: Int) -> Int: ...
+    def syscall[count: Int](self, nr: Int, *args: Int) -> Int: ...
 
 trait Syscalls(ArchPrimitives):
-    fn sys_write(self, fd: Int, buf: Int, count: Int) -> Int:
+    def sys_write(self, fd: Int, buf: Int, count: Int) -> Int:
         return self.syscall[3](Self.NR_write, fd, buf, count)
 
-    fn sys_exit(self, code: Int = 0):
+    def sys_exit(self, code: Int = 0):
         _ = self.syscall[1](Self.NR_exit, code)
 ```
 
@@ -2695,14 +2781,14 @@ For example, an x86_64 implementation and an aarch64 implementation might have d
 struct X86_64(Syscalls):
     comptime NR_write = 1
     comptime NR_exit = 60
-    fn syscall[count: Int](self, nr: Int, *args: Int) -> Int:
+    def syscall[count: Int](self, nr: Int, *args: Int) -> Int:
         # x86_64 register ABI via inline assembly
         ...
 
 struct AArch64(Syscalls):
     comptime NR_write = 64
     comptime NR_exit = 93
-    fn syscall[count: Int](self, nr: Int, *args: Int) -> Int:
+    def syscall[count: Int](self, nr: Int, *args: Int) -> Int:
         # aarch64 register ABI via inline assembly
         ...
 ```
@@ -2715,20 +2801,20 @@ Default method bodies can call any function in scope, not just methods on `self`
 
 ```mojo
 # In transform_utils.mojo
-fn bytes_to_text(data: Span[Byte]) -> String:
+def bytes_to_text(data: Span[Byte]) -> String:
     # ... conversion logic
 
-fn text_to_bytes(text: String) -> List[Byte]:
+def text_to_bytes(text: String) -> List[Byte]:
     # ... conversion logic
 
 # In capabilities.mojo
 from .transform_utils import bytes_to_text, text_to_bytes
 
 trait ByteTransform(Movable, ImplicitlyDestructible):
-    fn encode(self, data: Span[Byte]) -> String:
+    def encode(self, data: Span[Byte]) -> String:
         return bytes_to_text(data)
 
-    fn decode(self, text: String) -> List[Byte]:
+    def decode(self, text: String) -> List[Byte]:
         return text_to_bytes(text)
 ```
 
@@ -2736,13 +2822,13 @@ Any struct conforming to `ByteTransform` inherits both methods without writing a
 
 ```mojo
 struct StandardTransform(ByteTransform):
-    fn __init__(out self): pass
+    def __init__(out self): pass
     # encode and decode inherited from defaults
 
 struct CustomTransform(ByteTransform):
-    fn __init__(out self): pass
+    def __init__(out self): pass
 
-    fn encode(self, data: Span[Byte]) -> String:
+    def encode(self, data: Span[Byte]) -> String:
         # Custom encoding that overrides the default
         ...
     # decode still inherited from default
@@ -2754,10 +2840,10 @@ Default methods are not limited to one-liners. They can contain local variables,
 
 ```mojo
 trait QueryableMemory:
-    fn syscall[count: Int](self, nr: Int, *args: Int) -> Int: ...
+    def syscall[count: Int](self, nr: Int, *args: Int) -> Int: ...
     comptime NR_move_pages: Int
 
-    fn query_page_node(self, addr: Int) -> Int:
+    def query_page_node(self, addr: Int) -> Int:
         var pages: InlineArray[Int, 1] = [addr]
         var status: InlineArray[Int32, 1] = [Int32(-1)]
         var pages_ptr = UnsafePointer(to=pages)
@@ -2788,6 +2874,54 @@ Trait defaults are not useful when:
 - There's only one conformer — a direct implementation is simpler.
 - The method logic doesn't depend on anything that varies — make it a free function instead.
 - The "shared" behavior actually differs subtly between conformers — forced sharing creates bugs.
+
+Linear types with @explicit_destroy
+
+By default, structs conform to `ImplicitlyDestructible`, meaning the compiler automatically destroys them when their lifetime ends. Traits do not inherit `ImplicitlyDestructible` by default.
+
+Applying `@explicit_destroy` to a struct opts it out of `ImplicitlyDestructible`. The compiler no longer inserts automatic destruction for values of that type. Instead, the only way to consume an `@explicit_destroy` value is through a `deinit self` method. If a value of an explicitly destroyed type is not consumed, the compiler emits an error.
+
+This makes `@explicit_destroy` types linear types: every value must be used exactly once. This is useful for modeling resources that require explicit cleanup, synchronization tokens, or ownership transfer protocols where silent destruction would be a bug.
+
+```mojo
+@explicit_destroy
+struct PoolFence:
+    """A synchronization token that must be explicitly returned to the pool."""
+    var _pool_id: Int
+    var _fence_id: Int
+
+    def __init__(out self, pool_id: Int, fence_id: Int):
+        self._pool_id = pool_id
+        self._fence_id = fence_id
+
+    def wait_and_release(deinit self):
+        """Block until the fence signals, then release it back to the pool."""
+        _sync_fence(self._pool_id, self._fence_id)
+
+    def release(deinit self):
+        """Release the fence without waiting."""
+        _release_fence(self._pool_id, self._fence_id)
+```
+
+Using the `PoolFence`:
+
+```mojo
+def submit_work(pool: Pool) raises:
+    var fence = pool.submit(work_item)  # Returns a PoolFence
+    # ... do other work ...
+    fence.wait_and_release()  # Consumes the fence — required
+
+    # Forgetting to consume the fence is a compile error:
+    # var fence2 = pool.submit(work_item2)
+    # return  # ERROR: unconsumed value of type 'PoolFence'
+```
+
+Key points:
+
+- `@explicit_destroy` on a struct removes its implicit `ImplicitlyDestructible` conformance.
+- The struct must provide at least one `deinit self` method to consume values.
+- Unconsumed values produce a compile-time error.
+- This pattern is well-suited for synchronization tokens, file handles that must be flushed, transaction objects that must be committed or rolled back, and any resource where silent drop would be incorrect.
 
 Learn more
 

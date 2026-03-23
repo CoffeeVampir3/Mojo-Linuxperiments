@@ -2,7 +2,7 @@ from std.pathlib import Path
 
 from experimental4.model_spec import (
     Encoding, Shaped, Placed, Named, byte_count,
-    ShardStrategy, NodeLocal,
+    NodeLocal,
     WeightIterable, WeightDesc, weight_desc,
 )
 from safetensors.parser import parse_safetensors_header
@@ -108,8 +108,8 @@ def load_safetensors[
     var distributed_weights = List[WeightDesc]()
 
     @parameter
-    def collect[S: ShardStrategy, T: Encoding & Shaped & Placed & Named](prefix: String, base: Int):
-        comptime if conforms_to(S, NodeLocal):
+    def collect[T: Encoding & Shaped & Placed & Named](prefix: String, base: Int):
+        comptime if conforms_to(T, NodeLocal):
             node_local_weights.append(weight_desc[T](prefix, base))
         else:
             distributed_weights.append(weight_desc[T](prefix, base))

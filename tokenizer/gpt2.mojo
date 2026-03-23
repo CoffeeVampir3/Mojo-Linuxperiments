@@ -1,6 +1,7 @@
 from std.memory import Span
-from .capabilities import ByteTransformCapability, PreTokenizerCapability
-from .shared_capabilities import (
+from .tokenizer import (
+    ByteTransformCapability, PreTokenizerCapability,
+    UnicodeContext,
     is_ascii_letter,
     is_ascii_digit,
     is_ascii_regex_space,
@@ -15,56 +16,34 @@ from .shared_capabilities import (
     simd_ascii_letters,
     simd_ascii_digits,
     simd_spaces,
-    consume_codepoint_run,
-)
-from .unicode_props import (
-    LETTER_RANGES,
-    NUMBER_RANGES,
-    WHITESPACE_RANGES,
+    split_numbers,
 )
 
 
 @always_inline
-def is_letter_start_at(
-    data: Span[Byte, _],
-    pos: Int,
-    n: Int,
-    letter_ranges: UnsafePointer[UInt32, _],
-) -> Bool:
+def is_letter_start_at(data: Span[Byte, _], pos: Int, n: Int, ctx: UnicodeContext) -> Bool:
     var parsed = decode_utf8_codepoint(data, pos, n)
-    return is_unicode_letter_cp(parsed[0], letter_ranges)
+    return is_unicode_letter_cp(parsed[0], ctx)
 
 
 @always_inline
-def is_symbol_start_at(
-    data: Span[Byte, _],
-    pos: Int,
-    n: Int,
-    letter_ranges: UnsafePointer[UInt32, _],
-    number_ranges: UnsafePointer[UInt32, _],
-    whitespace_ranges: UnsafePointer[UInt32, _],
-) -> Bool:
+def is_symbol_start_at(data: Span[Byte, _], pos: Int, n: Int, ctx: UnicodeContext) -> Bool:
     var b = data[pos]
     if b < Byte(0x80):
         return not is_ascii_regex_space(b) and not is_ascii_letter(b) and not is_ascii_digit(b)
     var parsed = decode_utf8_codepoint(data, pos, n)
     var cp = parsed[0]
-    if is_unicode_whitespace_cp(cp, whitespace_ranges):
+    if is_unicode_whitespace_cp(cp, ctx):
         return False
-    if is_unicode_letter_cp(cp, letter_ranges):
+    if is_unicode_letter_cp(cp, ctx):
         return False
-    if is_unicode_number_cp(cp, number_ranges):
+    if is_unicode_number_cp(cp, ctx):
         return False
     return True
 
 
 @always_inline
-def consume_letter_run(
-    data: Span[Byte, _],
-    start: Int,
-    n: Int,
-    letter_ranges: UnsafePointer[UInt32, _],
-) -> Int:
+def consume_letter_run(data: Span[Byte, _], start: Int, n: Int, ctx: UnicodeContext) -> Int:
     var i = start
     while i < n:
         var b = data[i]
@@ -72,7 +51,7 @@ def consume_letter_run(
             i = skip_while_matching[is_ascii_letter, simd_ascii_letters](data, i, n)
             continue
         var parsed = decode_utf8_codepoint(data, i, n)
-        if is_unicode_letter_cp(parsed[0], letter_ranges):
+        if is_unicode_letter_cp(parsed[0], ctx):
             i += parsed[1]
             continue
         break
@@ -80,19 +59,14 @@ def consume_letter_run(
 
 
 @always_inline
-def consume_number_run(
-    data: Span[Byte, _],
-    start: Int,
-    n: Int,
-    number_ranges: UnsafePointer[UInt32, _],
-) -> Int:
+def consume_number_run(data: Span[Byte, _], start: Int, n: Int, ctx: UnicodeContext) -> Int:
     var i = start
     while i < n:
         if is_ascii_digit(data[i]):
             i = skip_while_matching[is_ascii_digit, simd_ascii_digits](data, i, n)
             continue
         var parsed = decode_utf8_codepoint(data, i, n)
-        if is_unicode_number_cp(parsed[0], number_ranges):
+        if is_unicode_number_cp(parsed[0], ctx):
             i += parsed[1]
             continue
         break
@@ -100,17 +74,10 @@ def consume_number_run(
 
 
 @always_inline
-def consume_symbol_run(
-    data: Span[Byte, _],
-    start: Int,
-    n: Int,
-    letter_ranges: UnsafePointer[UInt32, _],
-    number_ranges: UnsafePointer[UInt32, _],
-    whitespace_ranges: UnsafePointer[UInt32, _],
-) -> Int:
+def consume_symbol_run(data: Span[Byte, _], start: Int, n: Int, ctx: UnicodeContext) -> Int:
     var i = start
     while i < n:
-        if not is_symbol_start_at(data, i, n, letter_ranges, number_ranges, whitespace_ranges):
+        if not is_symbol_start_at(data, i, n, ctx):
             break
         var parsed = decode_utf8_codepoint(data, i, n)
         i += parsed[1]
@@ -119,10 +86,7 @@ def consume_symbol_run(
 
 @always_inline
 def consume_whitespace_run(
-    data: Span[Byte, _],
-    start: Int,
-    n: Int,
-    whitespace_ranges: UnsafePointer[UInt32, _],
+    data: Span[Byte, _], start: Int, n: Int, ctx: UnicodeContext,
 ) -> Tuple[Int, Int, Int]:
     var i = start
     var last_cp_start = start
@@ -142,7 +106,7 @@ def consume_whitespace_run(
             continue
 
         var parsed = decode_utf8_codepoint(data, i, n)
-        if not is_unicode_whitespace_cp(parsed[0], whitespace_ranges):
+        if not is_unicode_whitespace_cp(parsed[0], ctx):
             break
         last_cp_start = i
         cp_count += 1
@@ -166,13 +130,8 @@ def try_contraction(data: Span[Byte, _], pos: Int, n: Int) -> Int:
 
 
 def pre_tokenize_bytelevel_span(
-    data: Span[Byte, _],
-    start: Int,
-    end: Int,
-    letter_ranges: UnsafePointer[UInt32, _],
-    number_ranges: UnsafePointer[UInt32, _],
-    whitespace_ranges: UnsafePointer[UInt32, _],
-    mut result: List[String],
+    data: Span[Byte, _], start: Int, end: Int,
+    ctx: UnicodeContext, mut result: List[String],
 ):
     var i = start
     while i < end:
@@ -187,25 +146,25 @@ def pre_tokenize_bytelevel_span(
                 continue
 
         # ?\p{L}+
-        if b == Byte(32) and i + 1 < end and is_letter_start_at(data, i + 1, end, letter_ranges):
-            var letter_end = consume_letter_run(data, i + 1, end, letter_ranges)
+        if b == Byte(32) and i + 1 < end and is_letter_start_at(data, i + 1, end, ctx):
+            var letter_end = consume_letter_run(data, i + 1, end, ctx)
             result.append(span_to_string(data, i, letter_end))
             i = letter_end
             continue
-        if is_letter_start_at(data, i, end, letter_ranges):
-            var letter_end = consume_letter_run(data, i, end, letter_ranges)
+        if is_letter_start_at(data, i, end, ctx):
+            var letter_end = consume_letter_run(data, i, end, ctx)
             result.append(span_to_string(data, i, letter_end))
             i = letter_end
             continue
 
         # ?\p{N}+
-        if b == Byte(32) and i + 1 < end and is_number_start_at(data, i + 1, end, number_ranges):
-            var number_end = consume_number_run(data, i + 1, end, number_ranges)
+        if b == Byte(32) and i + 1 < end and is_number_start_at(data, i + 1, end, ctx):
+            var number_end = consume_number_run(data, i + 1, end, ctx)
             result.append(span_to_string(data, i, number_end))
             i = number_end
             continue
-        if is_number_start_at(data, i, end, number_ranges):
-            var number_end = consume_number_run(data, i, end, number_ranges)
+        if is_number_start_at(data, i, end, ctx):
+            var number_end = consume_number_run(data, i, end, ctx)
             result.append(span_to_string(data, i, number_end))
             i = number_end
             continue
@@ -214,23 +173,21 @@ def pre_tokenize_bytelevel_span(
         if (
             b == Byte(32)
             and i + 1 < end
-            and is_symbol_start_at(data, i + 1, end, letter_ranges, number_ranges, whitespace_ranges)
+            and is_symbol_start_at(data, i + 1, end, ctx)
         ):
-            var sym_end = consume_symbol_run(
-                data, i + 1, end, letter_ranges, number_ranges, whitespace_ranges
-            )
+            var sym_end = consume_symbol_run(data, i + 1, end, ctx)
             result.append(span_to_string(data, i, sym_end))
             i = sym_end
             continue
-        if is_symbol_start_at(data, i, end, letter_ranges, number_ranges, whitespace_ranges):
-            var sym_end = consume_symbol_run(data, i, end, letter_ranges, number_ranges, whitespace_ranges)
+        if is_symbol_start_at(data, i, end, ctx):
+            var sym_end = consume_symbol_run(data, i, end, ctx)
             result.append(span_to_string(data, i, sym_end))
             i = sym_end
             continue
 
         # \s+(?!\S)
-        if is_whitespace_start_at(data, i, end, whitespace_ranges):
-            var ws_run = consume_whitespace_run(data, i, end, whitespace_ranges)
+        if is_whitespace_start_at(data, i, end, ctx):
+            var ws_run = consume_whitespace_run(data, i, end, ctx)
             var ws_end = ws_run[0]
             var ws_last_start = ws_run[1]
             var ws_count = ws_run[2]
@@ -262,42 +219,16 @@ def pre_tokenize(text: String) -> List[String]:
     if n == 0:
         return result^
 
-    var letter_ranges = materialize[LETTER_RANGES]()
-    var number_ranges = materialize[NUMBER_RANGES]()
-    var whitespace_ranges = materialize[WHITESPACE_RANGES]()
+    var ctx = UnicodeContext()
 
-    var letter_ptr = letter_ranges.unsafe_ptr()
-    var number_ptr = number_ranges.unsafe_ptr()
-    var whitespace_ptr = whitespace_ranges.unsafe_ptr()
+    # Digits(individual_digits=true) — split each digit individually
+    var stage1 = List[String]()
+    split_numbers(text, 1, ctx, stage1)
 
-    # Digits(individual_digits=true)
-    var i = 0
-    var chunk_start = 0
-    while i < n:
-        if is_number_start_at(data, i, n, number_ptr):
-            var parsed = decode_utf8_codepoint(data, i, n)
-            var cp_len = parsed[1]
-            if chunk_start < i:
-                pre_tokenize_bytelevel_span(
-                    data, chunk_start, i,
-                    letter_ptr, number_ptr, whitespace_ptr, result,
-                )
-            pre_tokenize_bytelevel_span(
-                data, i, i + cp_len,
-                letter_ptr, number_ptr, whitespace_ptr, result,
-            )
-            i += cp_len
-            chunk_start = i
-            continue
-
-        var parsed = decode_utf8_codepoint(data, i, n)
-        i += parsed[1]
-
-    if chunk_start < n:
-        pre_tokenize_bytelevel_span(
-            data, chunk_start, n,
-            letter_ptr, number_ptr, whitespace_ptr, result,
-        )
+    # ByteLevel regex split
+    for piece in stage1:
+        var piece_data = piece.as_bytes()
+        pre_tokenize_bytelevel_span(piece_data, 0, len(piece_data), ctx, result)
 
     return result^
 

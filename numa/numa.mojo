@@ -21,8 +21,7 @@ def parse_cpulist(cpulist: String) raises -> List[Int]:
     if len(cpulist) == 0:
         return cpus^
     var parts = cpulist.split(",")
-    for i in range(len(parts)):
-        var part = String(parts[i])
+    for part in parts:
         var dash_pos = part.find("-")
         if dash_pos >= 0:
             var start = atol(String(part[byte=:dash_pos]))
@@ -30,16 +29,15 @@ def parse_cpulist(cpulist: String) raises -> List[Int]:
             for cpu in range(start, end + 1):
                 cpus.append(cpu)
         else:
-            cpus.append(atol(part))
+            cpus.append(atol(String(part)))
     return cpus^
 
 def parse_distances(s: String) raises -> List[Int]:
     var distances = List[Int]()
     var parts = s.split(" ")
-    for i in range(len(parts)):
-        var part = String(parts[i])
+    for part in parts:
         if len(part) > 0:
-            distances.append(atol(part))
+            distances.append(atol(String(part)))
     return distances^
 
 def parse_meminfo(path: String, field: String) raises -> Int:
@@ -48,8 +46,7 @@ def parse_meminfo(path: String, field: String) raises -> Int:
         return 0
     var content = p.read_text()
     var lines = content.split("\n")
-    for i in range(len(lines)):
-        var line = String(lines[i])
+    for line in lines:
         if field in line:
             var key_pos = line.find(field)
             if key_pos == -1:
@@ -121,8 +118,7 @@ struct NumaInfo:
             if len(online_str) == 0:
                 return
             var node_ids = parse_cpulist(online_str)
-            for i in range(len(node_ids)):
-                var node_id = node_ids[i]
+            for node_id in node_ids:
                 var base = "/sys/devices/system/node/node" + String(node_id)
                 var node = NumaNode(node_id)
                 node.cpu_ids = parse_cpulist(read_sysfs(base + "/cpulist"))
@@ -144,9 +140,8 @@ struct NumaInfo:
         var mask = CpuMask[mask_size]()
         if node_id < 0 or node_id >= self.num_nodes:
             return mask^
-        var cpus = self.nodes[node_id].cpu_ids.copy()
-        for i in range(len(cpus)):
-            mask.set(cpus[i])
+        for cpu in self.nodes[node_id].cpu_ids:
+            mask.set(cpu)
         return mask^
 
     def distance(self, from_node: Int, to_node: Int) -> Int:
@@ -172,8 +167,8 @@ struct NumaInfo:
     def total_cpus(self) -> Int:
         """Get the total number of CPUs across all nodes."""
         var total = 0
-        for i in range(self.num_nodes):
-            total += len(self.nodes[i].cpu_ids)
+        for node in self.nodes:
+            total += len(node.cpu_ids)
         return total
 
     def plan_topology(self, tp: Int) -> NumaTopology:

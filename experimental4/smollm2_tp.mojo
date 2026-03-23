@@ -9,22 +9,24 @@ Megatron-style: RowShard for output projections (no comm), ColShard
 for input projections (allreduce after). Dispatch via parallel_for.
 """
 
-from pathlib import Path
+from std.pathlib import Path
 
-from memory import UnsafePointer, memcpy
-from collections import InlineArray
+from std.memory import UnsafePointer, memcpy
+from std.collections import InlineArray
+from std.sys.info import simd_width_of
 from numa import NumaArena, NumaInfo
 from notstdcollections import HeapMoveArray
 from threading import BurstPool
 
 from experimental4.model_spec import (
     Encoding, Shaped, Placed, Named, BF16, F32,
-    ShardStrategy, RowShard, ColShard, Replicated,
+    RowShard, ColShard, Replicated,
     PrincipleNodeLocal,
     Slot, PlacedSlot, Bound, DynView, CacheView, bind, byte_count,
     WeightIterable,
     next_offset,
     DEFAULT_ALIGNMENT,
+    Dims, Attention, GQA, FFN, Vocab, Sequence, RoPEConfig, RMSNormConfig,
 )
 from experimental4.kernel_ops import (
     gemm, rmsnorm, embed_lookup, silu_mul, elem_add, rope, kv_cache_write,
@@ -33,7 +35,58 @@ from experimental4.kernel_ops import (
 )
 from experimental4.loader import load_safetensors
 from experimental4.profiler import Profiler
-from experimental4.smollm2 import SmolLM2Config, LogitsView, LogitAccess
+
+
+# =============================================================================
+# Shared types: model config, logit access
+# =============================================================================
+
+
+trait LogitAccess:
+    """Read-only access to model output logits.
+    VOCAB is comptime for SIMD loop bounds. rows() is runtime
+    (1 for decode, N for prefill). load_f32 upcasts from storage
+    dtype so consumers always work in f32."""
+    comptime DTYPE: DType
+    comptime VOCAB: Int
+    def rows(self) -> Int: ...
+    def load_f32[width: Int](self, row: Int, offset: Int) -> SIMD[DType.float32, width]: ...
+
+
+@fieldwise_init
+struct LogitsView[vocab: Int, dtype: DType = DType.bfloat16](LogitAccess):
+    """Non-owning, read-only view of logits in arena scratch memory.
+    Valid only while the backing arena is alive."""
+    comptime DTYPE = Self.dtype
+    comptime VOCAB = Self.vocab
+    var ptr: Int
+    var seq_len: Int
+
+    def rows(self) -> Int:
+        return self.seq_len
+
+    def load_f32[width: Int](self, row: Int, offset: Int) -> SIMD[DType.float32, width]:
+        var p = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
+            unsafe_from_address=self.ptr
+        )
+        return (p + row * Self.vocab + offset).load[width=width]().cast[DType.float32]()
+
+
+struct SmolLM2Config(Dims, Attention, GQA, FFN, Vocab, Sequence, RoPEConfig, RMSNormConfig):
+    comptime HIDDEN = 576
+    comptime NUM_LAYERS = 30
+    comptime NUM_HEADS = 9
+    comptime NUM_KV_HEADS = 3
+    comptime INTERMEDIATE = 1536
+    comptime VOCAB_SIZE = 49152
+    comptime MAX_SEQ_LEN = 8192
+    comptime ROPE_THETA = 100000.0
+    comptime RMS_NORM_EPS = 1e-5
+    comptime TIE_EMBEDDINGS = True
+
+    comptime HEAD_DIM = Self.HIDDEN // Self.NUM_HEADS
+    comptime KV_HIDDEN = Self.NUM_KV_HEADS * Self.HEAD_DIM
+    comptime GQA_FACTOR = Self.NUM_HEADS // Self.NUM_KV_HEADS
 
 
 # =============================================================================
@@ -59,21 +112,21 @@ struct TPLayer[E: Encoding, tp: Int]:
     comptime V_CACHE = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.KV_HIDDEN, Self.tp]
 
     @staticmethod
-    fn for_each_weight[
-        func: fn[S: ShardStrategy, T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
+    def for_each_weight[
+        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
     ](prefix: String, base: Int):
-        func[RowShard, Self.Q_PROJ](prefix, base)
-        func[RowShard, Self.K_PROJ](prefix, base)
-        func[RowShard, Self.V_PROJ](prefix, base)
-        func[ColShard, Self.O_PROJ](prefix, base)
-        func[RowShard, Self.GATE_PROJ](prefix, base)
-        func[RowShard, Self.UP_PROJ](prefix, base)
-        func[ColShard, Self.DOWN_PROJ](prefix, base)
-        func[Replicated, Self.INPUT_NORM](prefix, base)
-        func[Replicated, Self.POST_ATTN_NORM](prefix, base)
+        func[Self.Q_PROJ](prefix, base)
+        func[Self.K_PROJ](prefix, base)
+        func[Self.V_PROJ](prefix, base)
+        func[Self.O_PROJ](prefix, base)
+        func[Self.GATE_PROJ](prefix, base)
+        func[Self.UP_PROJ](prefix, base)
+        func[Self.DOWN_PROJ](prefix, base)
+        func[Self.INPUT_NORM](prefix, base)
+        func[Self.POST_ATTN_NORM](prefix, base)
 
     @staticmethod
-    fn cache_bytes() -> Int:
+    def cache_bytes() -> Int:
         return byte_count[Self.K_CACHE]() + byte_count[Self.V_CACHE]()
 
 
@@ -94,22 +147,30 @@ struct TPModel[E: Encoding, tp: Int](WeightIterable):
     comptime ROPE_SIN = Slot[F32, Replicated, C.MAX_SEQ_LEN, Self.ROPE_HALF, Self.tp]
     comptime X_MAIN = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.HIDDEN, Self.tp]
     comptime X_RESIDUAL = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.HIDDEN, Self.tp]
-    comptime Q_SCRATCH = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.HIDDEN, Self.tp]
-    comptime KV_SCRATCH = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.KV_HIDDEN, Self.tp]
-    comptime MLP_SCRATCH = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.INTERMEDIATE, Self.tp]
     comptime LOGITS = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.VOCAB_SIZE, Self.tp]
+
+    # Shared scratch: 3 slots, each full INTERMEDIATE width (no sharding).
+    # Scratch is working memory — always full-width regardless of TP.
+    # Reuse pattern per layer:
+    #   slot0: Q output      → gate output → logits (host only)
+    #   slot1: K output      → attn output → up output
+    #   slot2: V output
+    comptime SCRATCH = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.INTERMEDIATE, Self.tp]
+    comptime SCRATCH_COUNT = 3
+
+    # Typed views into scratch slots (same memory, narrower logical width).
+    comptime Q_VIEW = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.HIDDEN, Self.tp]
+    comptime KV_VIEW = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.KV_HIDDEN, Self.tp]
+    comptime MLP_VIEW = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.INTERMEDIATE, Self.tp]
 
     # Per-rank state layout.
     comptime KV_STRIDE = Self.LAYER.cache_bytes()
     comptime KV_OFF = 0
     comptime X_MAIN_OFF = Self.KV_OFF + C.NUM_LAYERS * Self.KV_STRIDE
     comptime X_RESIDUAL_OFF = Self.X_MAIN_OFF + byte_count[Self.X_MAIN]()
-    comptime Q_SCRATCH_OFF = Self.X_RESIDUAL_OFF + byte_count[Self.X_RESIDUAL]()
-    comptime KV_SCRATCH_0_OFF = Self.Q_SCRATCH_OFF + byte_count[Self.Q_SCRATCH]()
-    comptime KV_SCRATCH_1_OFF = Self.KV_SCRATCH_0_OFF + byte_count[Self.KV_SCRATCH]()
-    comptime MLP_SCRATCH_0_OFF = Self.KV_SCRATCH_1_OFF + byte_count[Self.KV_SCRATCH]()
-    comptime MLP_SCRATCH_1_OFF = Self.MLP_SCRATCH_0_OFF + byte_count[Self.MLP_SCRATCH]()
-    comptime ROPE_COS_OFF = Self.MLP_SCRATCH_1_OFF + byte_count[Self.MLP_SCRATCH]()
+    comptime SCRATCH_OFF = Self.X_RESIDUAL_OFF + byte_count[Self.X_RESIDUAL]()
+    comptime SCRATCH_STRIDE = byte_count[Self.SCRATCH]()
+    comptime ROPE_COS_OFF = Self.SCRATCH_OFF + Self.SCRATCH_COUNT * Self.SCRATCH_STRIDE
     comptime ROPE_SIN_OFF = Self.ROPE_COS_OFF + byte_count[Self.ROPE_COS]()
     comptime STATE_BYTES = Self.ROPE_SIN_OFF + byte_count[Self.ROPE_SIN]()
 
@@ -119,23 +180,22 @@ struct TPModel[E: Encoding, tp: Int](WeightIterable):
     comptime EMBED = PlacedSlot[Self.E, PrincipleNodeLocal, C.VOCAB_SIZE, C.HIDDEN, Self.tp, next_offset[Self.FINAL_NORM](), "model.embed_tokens.weight"]
 
     @staticmethod
-    fn for_each_weight[
-        func: fn[S: ShardStrategy, T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
+    def for_each_weight[
+        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
     ]():
-        @parameter
-        for i in range(C.NUM_LAYERS):
+        comptime for i in range(C.NUM_LAYERS):
             var prefix = "model.layers." + String(i) + "."
             var base = Self.LAYERS_OFF + i * Self.LAYER_STRIDE
             Self.LAYER.for_each_weight[func](prefix, base)
-        func[PrincipleNodeLocal, Self.FINAL_NORM]("", 0)
-        func[PrincipleNodeLocal, Self.EMBED]("", 0)
+        func[Self.FINAL_NORM]("", 0)
+        func[Self.EMBED]("", 0)
 
     @staticmethod
-    fn arena_bytes() -> Int:
+    def arena_bytes() -> Int:
         return Self.DISTRIBUTED_BYTES + Self.STATE_BYTES
 
     @staticmethod
-    fn host_arena_bytes() -> Int:
+    def host_arena_bytes() -> Int:
         return next_offset[Self.EMBED]()
 
 
@@ -149,52 +209,59 @@ struct RankView[E: Encoding, tp: Int]:
     comptime L = Self.M.LAYER
     var base: Int
 
-    fn __init__(out self, arena_base: Int):
+    def __init__(out self, arena_base: Int):
         self.base = arena_base
 
-    fn weight_base(self) -> Int:
+    def weight_base(self) -> Int:
         return self.base
 
-    fn state_base(self) -> Int:
+    def state_base(self) -> Int:
         return self.base + Self.M.DISTRIBUTED_BYTES
 
-    fn layer_weight[T: Encoding & Shaped & Placed & Named](self, layer: Int) -> Bound[T]:
+    def layer_weight[T: Encoding & Shaped & Placed & Named](self, layer: Int) -> Bound[T]:
         return bind[T](self.weight_base() + Self.M.LAYERS_OFF + layer * Self.M.LAYER_STRIDE)
 
-    fn weight[T: Encoding & Shaped & Placed & Named](self) -> Bound[T]:
+    def weight[T: Encoding & Shaped & Placed & Named](self) -> Bound[T]:
         return bind[T](self.weight_base())
 
-    fn k_cache(self, layer: Int) -> CacheView[Self.L.K_CACHE]:
+    def k_cache(self, layer: Int) -> CacheView[Self.L.K_CACHE]:
         return CacheView[Self.L.K_CACHE](self.state_base() + Self.M.KV_OFF + layer * Self.M.KV_STRIDE)
 
-    fn v_cache(self, layer: Int) -> CacheView[Self.L.V_CACHE]:
+    def v_cache(self, layer: Int) -> CacheView[Self.L.V_CACHE]:
         return CacheView[Self.L.V_CACHE](
             self.state_base() + Self.M.KV_OFF + layer * Self.M.KV_STRIDE + byte_count[Self.L.K_CACHE]()
         )
 
-    fn x_main(self, seq_len: Int) -> DynView[Self.M.X_MAIN]:
+    def x_main(self, seq_len: Int) -> DynView[Self.M.X_MAIN]:
         return DynView[Self.M.X_MAIN](self.state_base() + Self.M.X_MAIN_OFF, seq_len)
 
-    fn x_residual(self, seq_len: Int) -> DynView[Self.M.X_RESIDUAL]:
+    def x_residual(self, seq_len: Int) -> DynView[Self.M.X_RESIDUAL]:
         return DynView[Self.M.X_RESIDUAL](self.state_base() + Self.M.X_RESIDUAL_OFF, seq_len)
 
-    fn q_scratch(self, seq_len: Int) -> DynView[Self.M.Q_SCRATCH]:
-        return DynView[Self.M.Q_SCRATCH](self.state_base() + Self.M.Q_SCRATCH_OFF, seq_len)
+    def scratch_slot(self, index: Int) -> Int:
+        """Raw address of scratch slot `index` (0, 1, or 2)."""
+        return self.state_base() + Self.M.SCRATCH_OFF + index * Self.M.SCRATCH_STRIDE
 
-    fn kv_scratch(self, index: Int, seq_len: Int) -> DynView[Self.M.KV_SCRATCH]:
-        if index == 0:
-            return DynView[Self.M.KV_SCRATCH](self.state_base() + Self.M.KV_SCRATCH_0_OFF, seq_len)
-        return DynView[Self.M.KV_SCRATCH](self.state_base() + Self.M.KV_SCRATCH_1_OFF, seq_len)
+    def q_view(self, seq_len: Int) -> DynView[Self.M.Q_VIEW]:
+        """Q output / attn input — slot 0, Q-width view."""
+        return DynView[Self.M.Q_VIEW](self.scratch_slot(0), seq_len)
 
-    fn mlp_scratch(self, index: Int, seq_len: Int) -> DynView[Self.M.MLP_SCRATCH]:
-        if index == 0:
-            return DynView[Self.M.MLP_SCRATCH](self.state_base() + Self.M.MLP_SCRATCH_0_OFF, seq_len)
-        return DynView[Self.M.MLP_SCRATCH](self.state_base() + Self.M.MLP_SCRATCH_1_OFF, seq_len)
+    def attn_out_view(self, seq_len: Int) -> DynView[Self.M.Q_VIEW]:
+        """Attention output — slot 1, Q-width view (reuses K slot after KV cache write)."""
+        return DynView[Self.M.Q_VIEW](self.scratch_slot(1), seq_len)
 
-    fn rope_cos(self) -> Bound[Self.M.ROPE_COS]:
+    def kv_view(self, index: Int, seq_len: Int) -> DynView[Self.M.KV_VIEW]:
+        """K (index=0, slot 1) or V (index=1, slot 2) — KV-width view."""
+        return DynView[Self.M.KV_VIEW](self.scratch_slot(index + 1), seq_len)
+
+    def mlp_view(self, index: Int, seq_len: Int) -> DynView[Self.M.MLP_VIEW]:
+        """Gate (index=0, slot 0) or Up (index=1, slot 1) — per-rank intermediate width."""
+        return DynView[Self.M.MLP_VIEW](self.scratch_slot(index), seq_len)
+
+    def rope_cos(self) -> Bound[Self.M.ROPE_COS]:
         return Bound[Self.M.ROPE_COS](self.state_base() + Self.M.ROPE_COS_OFF)
 
-    fn rope_sin(self) -> Bound[Self.M.ROPE_SIN]:
+    def rope_sin(self) -> Bound[Self.M.ROPE_SIN]:
         return Bound[Self.M.ROPE_SIN](self.state_base() + Self.M.ROPE_SIN_OFF)
 
 
@@ -208,33 +275,31 @@ struct Ranks[E: Encoding, tp: Int]:
     """Rank-indexed dispatch helper. Captures base addresses and pool pointers
     for use in parallel_for closures and sequential loops."""
     var bases: InlineArray[Int, Self.tp]
-    var pool_ptrs: InlineArray[UnsafePointer[BurstPool, MutAnyOrigin], Self.tp]
+    var pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]
 
-    fn view(self, r: Int) -> RankView[Self.E, Self.tp]:
+    def view(self, r: Int) -> RankView[Self.E, Self.tp]:
         return RankView[Self.E, Self.tp](self.bases[r])
 
-    fn parallel[body: fn[rank: Int] (RankView[Self.E, Self.tp], mut BurstPool) capturing -> PoolFence](self):
+    def parallel[body: def[rank: Int] (RankView[Self.E, Self.tp], mut BurstPool[]) capturing -> PoolFence](self):
         """Dispatch body(rv, pool) for each rank in parallel, then join all."""
-        var bases = self.bases.copy()
-        var ptrs = self.pool_ptrs.copy()
         @parameter
-        fn dispatch[rank: Int]() -> PoolFence:
-            var rv = RankView[Self.E, Self.tp](bases[rank])
-            return body[rank](rv, ptrs[rank][])
+        def dispatch[rank: Int]() -> PoolFence:
+            var rv = RankView[Self.E, Self.tp](self.bases[rank])
+            return body[rank](rv, self.pool_ptrs[rank][])
         parallel_for[Self.tp, dispatch]()
 
-    fn each[body: fn (RankView[Self.E, Self.tp]) capturing -> None](self):
+    def each[body: def (RankView[Self.E, Self.tp]) capturing -> None](self):
         """Run body(rv) for each rank sequentially on the caller thread."""
         for r in range(Self.tp):
             body(self.view(r))
 
-    fn x_main_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
+    def x_main_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
         var ptrs = InlineArray[Int, Self.tp](fill=0)
         for r in range(Self.tp):
             ptrs[r] = self.view(r).x_main(seq_len).ptr
         return ptrs^
 
-    fn x_residual_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
+    def x_residual_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
         var ptrs = InlineArray[Int, Self.tp](fill=0)
         for r in range(Self.tp):
             ptrs[r] = self.view(r).x_residual(seq_len).ptr
@@ -246,16 +311,75 @@ struct Ranks[E: Encoding, tp: Int]:
 # =============================================================================
 
 
-fn allreduce_sum_missing_stub[T: Encoding & Shaped, tp: Int](
+def ring_allreduce[T: Encoding & Shaped, tp: Int](
     ptrs: InlineArray[Int, tp], seq_len: Int,
 ):
-    """Megatron-style allreduce: sum across tp rank buffers, result in all buffers.
-    Each ptr points to [seq_len, T.COLS] bf16 data.
-    STUB: no-op. Replace with real implementation."""
-    pass
+    """Ring allreduce: reduce-scatter then allgather with SIMD accumulation.
+
+    After completion, every buffer contains the element-wise sum of all tp
+    input buffers. bf16 data with f32 SIMD accumulation. Ring topology
+    ensures each communication step traverses one NUMA hop.
+    """
+    comptime cols = T.COLS
+    var total_elements = seq_len * cols
+    if total_elements <= 0 or tp <= 1:
+        return
+
+    var chunk_size = total_elements // tp
+    var remainder = total_elements - chunk_size * tp
+    comptime width = simd_width_of[DType.float32]()
+
+    @always_inline
+    def chunk_start(c: Int) -> Int:
+        return c * chunk_size
+
+    @always_inline
+    def chunk_len(c: Int) -> Int:
+        if c == tp - 1:
+            return chunk_size + remainder
+        return chunk_size
+
+    @always_inline
+    def accumulate(dst_ptr: Int, src_ptr: Int, start: Int, length: Int):
+        """dst[start:start+length] += src[start:start+length] in bf16 with f32 SIMD."""
+        var src = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=src_ptr)
+        var dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=dst_ptr)
+        var i = 0
+        while i + width <= length:
+            var s_raw = (src + start + i).bitcast[Scalar[DType.uint16]]().load[width=width]()
+            var d_raw = (dst + start + i).bitcast[Scalar[DType.uint16]]().load[width=width]()
+            var s_f32 = SIMD[DType.float32, width](from_bits=s_raw.cast[DType.uint32]() << 16)
+            var d_f32 = SIMD[DType.float32, width](from_bits=d_raw.cast[DType.uint32]() << 16)
+            (dst + start + i).store((s_f32 + d_f32).cast[DType.bfloat16]())
+            i += width
+        while i < length:
+            var s = Float32(src[start + i])
+            var d = Float32(dst[start + i])
+            dst[start + i] = Scalar[DType.bfloat16](s + d)
+            i += 1
+
+    # --- Phase 1: Reduce-scatter ---
+    for step in range(tp - 1):
+        for rank in range(tp):
+            var c = (rank - step + tp) % tp
+            var next_rank = (rank + 1) % tp
+            accumulate(ptrs[next_rank], ptrs[rank], chunk_start(c), chunk_len(c))
+
+    # --- Phase 2: Allgather ---
+    for step in range(tp - 1):
+        for rank in range(tp):
+            var c = (rank - step + 1 + tp) % tp
+            var next_rank = (rank + 1) % tp
+            var cs = chunk_start(c)
+            var cl = chunk_len(c)
+            memcpy(
+                dest=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=ptrs[next_rank] + cs * T.ELEMENT_BYTES),
+                src=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=ptrs[rank] + cs * T.ELEMENT_BYTES),
+                count=cl * T.ELEMENT_BYTES,
+            )
 
 
-fn ring_broadcast[T: Encoding & Shaped, tp: Int](
+def ring_broadcast[T: Encoding & Shaped, tp: Int](
     src_ptr: Int, dst_ptrs: InlineArray[Int, tp], seq_len: Int,
 ):
     """Ring broadcast: forward data along the ring, one hop per step.
@@ -297,44 +421,35 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
     comptime M = TPModel[Self.E, Self.tp]
 
     var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]]
-    var pools: HeapMoveArray[BurstPool]
+    var pools: HeapMoveArray[BurstPool[]]
     var bases: InlineArray[Int, Self.tp]
-    var pool_ptrs: InlineArray[UnsafePointer[BurstPool, MutAnyOrigin], Self.tp]
+    var pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]
 
-    fn __init__(out self, var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]],
-                var pools: HeapMoveArray[BurstPool]):
+    def __init__(out self, var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]],
+                var pools: HeapMoveArray[BurstPool[]]):
         self.bases = InlineArray[Int, Self.tp](fill=0)
-        self.pool_ptrs = InlineArray[UnsafePointer[BurstPool, MutAnyOrigin], Self.tp](
-            fill=UnsafePointer[BurstPool, MutAnyOrigin]()
+        self.pool_ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp](
+            fill=UnsafePointer[BurstPool[], MutAnyOrigin]()
         )
         self.arenas = arenas^
         self.pools = pools^
         for rank in range(Self.tp):
-            self.bases[rank] = Int(self.arenas[rank][].base)
-            self.pool_ptrs[rank] = UnsafePointer[BurstPool, MutAnyOrigin](
-                unsafe_from_address=Int(self.pools[rank])
+            self.bases[rank] = Int(self.arenas[rank].base)
+            self.pool_ptrs[rank] = UnsafePointer[BurstPool[], MutAnyOrigin](
+                unsafe_from_address=Int(UnsafePointer(to=self.pools[rank]))
             )
 
-    fn rank(self, r: Int) -> RankView[Self.E, Self.tp]:
+    def rank(self, r: Int) -> RankView[Self.E, Self.tp]:
         return RankView[Self.E, Self.tp](self.bases[r])
 
     @staticmethod
-    fn load(path: Path) -> Optional[Self]:
+    def load(path: Path) -> Optional[Self]:
         """Load SmolLM2 with automatic NUMA-aware rank placement.
         Discovers topology, selects the tightest node cluster,
         and orders ranks for optimal ring allreduce adjacency."""
-        constrained[
-            C.NUM_HEADS % Self.tp == 0,
-            "TP must evenly divide NUM_HEADS",
-        ]()
-        constrained[
-            C.NUM_KV_HEADS % Self.tp == 0,
-            "TP must evenly divide NUM_KV_HEADS",
-        ]()
-        constrained[
-            C.INTERMEDIATE % Self.tp == 0,
-            "TP must evenly divide INTERMEDIATE",
-        ]()
+        comptime assert C.NUM_HEADS % Self.tp == 0, "TP must evenly divide NUM_HEADS"
+        comptime assert C.NUM_KV_HEADS % Self.tp == 0, "TP must evenly divide NUM_KV_HEADS"
+        comptime assert C.INTERMEDIATE % Self.tp == 0, "TP must evenly divide INTERMEDIATE"
 
         var numa = NumaInfo()
         var topo = numa.plan_topology(Self.tp)
@@ -351,7 +466,7 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
 
         var arena_bases = List[Int]()
         for rank in range(Self.tp):
-            arena_bases.append(Int(arenas[rank][].base))
+            arena_bases.append(Int(arenas[rank].base))
 
         var result = load_safetensors[Self.M](path, arena_bases, host_index=host_rank)
         if not result:
@@ -359,11 +474,11 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
             return None
 
         for rank in range(Self.tp):
-            _ = arenas[rank][].prefault(Self.M.DISTRIBUTED_BYTES, Self.M.STATE_BYTES)
+            _ = arenas[rank].prefault(Self.M.DISTRIBUTED_BYTES, Self.M.STATE_BYTES)
 
-        var pools = HeapMoveArray[BurstPool](Self.tp)
+        var pools = HeapMoveArray[BurstPool[]](Self.tp)
         for rank in range(Self.tp):
-            pools.push(BurstPool.for_numa_node(numa, topo[rank]))
+            pools.push(BurstPool[].for_numa_node(numa, topo[rank]))
 
         var model = Self(arenas^, pools^)
 
@@ -373,7 +488,7 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
 
         return model^
 
-    fn forward(
+    def forward(
         mut self, tokens_ptr: Int, seq_len: Int, pos: Int,
         profile: Bool = False,
     ) -> LogitsView[C.VOCAB_SIZE]
@@ -382,134 +497,107 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
         comptime L = M.LAYER
         var prof = Profiler(profile)
 
-        var ranks = Ranks[Self.E, Self.tp](self.bases.copy(), self.pool_ptrs.copy())
+        var ranks = Ranks[Self.E, Self.tp](self.bases, self.pool_ptrs)
         var host = ranks.view(0)
 
         # --- Embed (host rank, then broadcast) ---
-        prof.section("embed")
         embed_lookup(host.weight[M.EMBED](), tokens_ptr, host.x_main(seq_len), ranks.pool_ptrs[0][]).join()
         ring_broadcast[M.X_MAIN, Self.tp](host.x_main(seq_len).ptr, ranks.x_main_ptrs(seq_len), seq_len)
 
         for layer_idx in range(C.NUM_LAYERS):
-
-            # --- RMSNorm ---
-            prof.section("rmsnorm")
             @parameter
-            fn do_input_norm[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool) -> PoolFence:
+            def do_input_norm[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
                 return rmsnorm(rv.x_main(seq_len), rv.layer_weight[L.INPUT_NORM](layer_idx), rv.x_residual(seq_len), pool)
             ranks.parallel[do_input_norm]()
 
-            # --- Q/K/V projections ---
-            prof.section("gemm_q")
             @parameter
-            fn do_q[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool) -> PoolFence:
-                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.Q_PROJ](layer_idx), rv.q_scratch(seq_len), pool)
+            def do_q[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
+                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.Q_PROJ](layer_idx), rv.q_view(seq_len), pool)
             ranks.parallel[do_q]()
 
-            prof.section("gemm_k")
             @parameter
-            fn do_k[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool) -> PoolFence:
-                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.K_PROJ](layer_idx), rv.kv_scratch(0, seq_len), pool)
+            def do_k[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
+                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.K_PROJ](layer_idx), rv.kv_view(0, seq_len), pool)
             ranks.parallel[do_k]()
 
-            prof.section("gemm_v")
             @parameter
-            fn do_v[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool) -> PoolFence:
-                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.V_PROJ](layer_idx), rv.kv_scratch(1, seq_len), pool)
+            def do_v[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
+                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.V_PROJ](layer_idx), rv.kv_view(1, seq_len), pool)
             ranks.parallel[do_v]()
 
-            # --- RoPE (caller-thread) ---
-            prof.section("rope")
             @parameter
-            fn do_rope(rv: RankView[Self.E, Self.tp]):
-                rope[C.HEAD_DIM, M.LOCAL_HEADS](rv.q_scratch(seq_len), rv.rope_cos(), rv.rope_sin(), pos)
-                rope[C.HEAD_DIM, M.LOCAL_KV_HEADS](rv.kv_scratch(0, seq_len), rv.rope_cos(), rv.rope_sin(), pos)
+            def do_rope(rv: RankView[Self.E, Self.tp]):
+                rope[C.HEAD_DIM, M.LOCAL_HEADS](rv.q_view(seq_len), rv.rope_cos(), rv.rope_sin(), pos)
+                rope[C.HEAD_DIM, M.LOCAL_KV_HEADS](rv.kv_view(0, seq_len), rv.rope_cos(), rv.rope_sin(), pos)
             ranks.each[do_rope]()
 
-            # --- KV cache write (caller-thread) ---
-            prof.section("kv_write")
             @parameter
-            fn do_kv_write(rv: RankView[Self.E, Self.tp]):
-                kv_cache_write(rv.kv_scratch(0, seq_len), rv.k_cache(layer_idx), pos)
-                kv_cache_write(rv.kv_scratch(1, seq_len), rv.v_cache(layer_idx), pos)
+            def do_kv_write(rv: RankView[Self.E, Self.tp]):
+                kv_cache_write(rv.kv_view(0, seq_len), rv.k_cache(layer_idx), pos)
+                kv_cache_write(rv.kv_view(1, seq_len), rv.v_cache(layer_idx), pos)
             ranks.each[do_kv_write]()
 
-            # --- Attention ---
-            prof.section("attention")
             @parameter
-            fn do_attn[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool) -> PoolFence:
+            def do_attn[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
                 return attention[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM](
-                    rv.q_scratch(seq_len), rv.k_cache(layer_idx), rv.v_cache(layer_idx),
-                    rv.q_scratch(seq_len), pos, pool)
+                    rv.q_view(seq_len), rv.k_cache(layer_idx), rv.v_cache(layer_idx),
+                    rv.attn_out_view(seq_len), pos, pool)
             ranks.parallel[do_attn]()
 
-            # --- O projection + allreduce + residual ---
-            prof.section("gemm_o")
             @parameter
-            fn do_o[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool) -> PoolFence:
-                return gemm(rv.q_scratch(seq_len), rv.layer_weight[L.O_PROJ](layer_idx), rv.x_residual(seq_len), pool)
+            def do_o[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
+                return gemm(rv.attn_out_view(seq_len), rv.layer_weight[L.O_PROJ](layer_idx), rv.x_residual(seq_len), pool)
             ranks.parallel[do_o]()
 
-            prof.section("allreduce_o")
-            allreduce_sum_missing_stub[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len)
+            ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len)
 
-            prof.section("elem_add")
             @parameter
-            fn do_res_add(rv: RankView[Self.E, Self.tp]):
+            def do_res_add(rv: RankView[Self.E, Self.tp]):
                 elem_add(rv.x_main(seq_len), rv.x_residual(seq_len), rv.x_main(seq_len))
             ranks.each[do_res_add]()
 
-            # --- MLP: RMSNorm ---
-            prof.section("rmsnorm")
             @parameter
-            fn do_post_norm[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool) -> PoolFence:
+            def do_post_norm[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
                 return rmsnorm(rv.x_main(seq_len), rv.layer_weight[L.POST_ATTN_NORM](layer_idx), rv.x_residual(seq_len), pool)
             ranks.parallel[do_post_norm]()
 
-            # --- Gate/Up projections ---
-            prof.section("gemm_gate")
             @parameter
-            fn do_gate[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool) -> PoolFence:
-                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.GATE_PROJ](layer_idx), rv.mlp_scratch(0, seq_len), pool)
+            def do_gate[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
+                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.GATE_PROJ](layer_idx), rv.mlp_view(0, seq_len), pool)
             ranks.parallel[do_gate]()
 
-            prof.section("gemm_up")
             @parameter
-            fn do_up[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool) -> PoolFence:
-                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.UP_PROJ](layer_idx), rv.mlp_scratch(1, seq_len), pool)
+            def do_up[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
+                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.UP_PROJ](layer_idx), rv.mlp_view(1, seq_len), pool)
             ranks.parallel[do_up]()
 
-            # --- SiLU * Up (caller-thread) ---
-            prof.section("silu_mul")
             @parameter
-            fn do_silu(rv: RankView[Self.E, Self.tp]):
-                silu_mul(rv.mlp_scratch(0, seq_len), rv.mlp_scratch(1, seq_len), rv.mlp_scratch(0, seq_len))
+            def do_silu(rv: RankView[Self.E, Self.tp]):
+                silu_mul(rv.mlp_view(0, seq_len), rv.mlp_view(1, seq_len), rv.mlp_view(0, seq_len))
             ranks.each[do_silu]()
 
-            # --- Down projection + allreduce + residual ---
-            prof.section("gemm_down")
             @parameter
-            fn do_down[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool) -> PoolFence:
-                return gemm(rv.mlp_scratch(0, seq_len), rv.layer_weight[L.DOWN_PROJ](layer_idx), rv.x_residual(seq_len), pool)
+            def do_down[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
+                return gemm(rv.mlp_view(0, seq_len), rv.layer_weight[L.DOWN_PROJ](layer_idx), rv.x_residual(seq_len), pool)
             ranks.parallel[do_down]()
 
-            prof.section("allreduce_down")
-            allreduce_sum_missing_stub[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len)
+            ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len)
 
-            prof.section("elem_add")
             ranks.each[do_res_add]()
 
+            _ = layer_idx  # Anchor: closures capture layer_idx but compiler doesn't see it
+
         # --- Final norm + LM head (host rank only) ---
-        prof.section("final_norm")
         rmsnorm(host.x_main(seq_len), host.weight[M.FINAL_NORM](), host.x_main(seq_len), ranks.pool_ptrs[0][]).join()
 
-        var logits = DynView[M.LOGITS](host.state_base() + M.Q_SCRATCH_OFF, seq_len)
-
-        prof.section("lm_head")
+        var logits = DynView[M.LOGITS](host.scratch_slot(0), seq_len)
         gemm(host.x_main(seq_len), host.weight[M.EMBED](), logits, ranks.pool_ptrs[0][]).join()
-
         prof.finish()
         prof.report()
+
+        _ = ranks
+        _ = self.pools
+        _ = self.arenas
 
         return LogitsView[C.VOCAB_SIZE](logits.ptr, seq_len)
 
@@ -521,18 +609,17 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
 comptime MODEL_PATH = "checkpoints/SmolLM2/model.safetensors"
 
 
-fn main():
+def main():
     var model_opt = SmolLM2TP[BF16, 3].load(Path(MODEL_PATH))
     if not model_opt:
         return
     var model = model_opt.take()
 
     var rank0 = model.rank(0)
+    var tokens_addr = rank0.scratch_slot(0)
     var tp_ptr = UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
-        unsafe_from_address=rank0.state_base() + TPModel[BF16, 3].Q_SCRATCH_OFF,
+        unsafe_from_address=tokens_addr,
     )
     tp_ptr[0] = Scalar[DType.int32](42)
-    var logits = model.forward(
-        rank0.state_base() + TPModel[BF16, 3].Q_SCRATCH_OFF, 1, 0, profile=True,
-    )
+    var logits = model.forward(tokens_addr, 1, 0, profile=True)
     _ = logits

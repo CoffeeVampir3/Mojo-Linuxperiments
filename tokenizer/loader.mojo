@@ -11,16 +11,33 @@ from jsontools.parser import (
     RBRACKET,
     QUOTE,
 )
-from .tokenizer import BPETokenizer
-from .auto import (
-    AutoPreTokenizer,
-    TOKENIZER_FLAVOR_UNSUPPORTED,
-    TOKENIZER_FLAVOR_GPT2,
-    TOKENIZER_FLAVOR_DEEPSEEK_V3,
-)
-from .capabilities import ByteTransformCapability, PreTokenizerCapability
+from .tokenizer import BPETokenizer, ByteTransformCapability, PreTokenizerCapability
 from .deepseek_v3 import DeepSeekV3ByteTransform, DeepSeekV3PreTokenizer
-from .gpt2 import GPT2ByteTransform, GPT2PreTokenizer
+from .gpt2 import GPT2ByteTransform, GPT2PreTokenizer, pre_tokenize as gpt2_pre_tokenize
+
+
+comptime TOKENIZER_FLAVOR_UNSUPPORTED = 0
+comptime TOKENIZER_FLAVOR_GPT2 = 1
+comptime TOKENIZER_FLAVOR_DEEPSEEK_V3 = 2
+
+
+struct AutoPreTokenizer(PreTokenizerCapability):
+    var flavor: Int
+    var deepseek: DeepSeekV3PreTokenizer
+
+    def __init__(out self, flavor: Int):
+        self.flavor = flavor
+        self.deepseek = DeepSeekV3PreTokenizer()
+
+    def pre_tokenize(self, text: String) -> List[String]:
+        if self.flavor == TOKENIZER_FLAVOR_GPT2:
+            return gpt2_pre_tokenize(text)
+        if self.flavor == TOKENIZER_FLAVOR_DEEPSEEK_V3:
+            return self.deepseek.pre_tokenize(text)
+
+        var out = List[String]()
+        out.append(text.copy())
+        return out^
 
 
 struct ModelOptions(Movable):
@@ -514,7 +531,7 @@ def load_tokenizer_with_capabilities[
     )
 
 
-def load_tokenizer(path: Path) -> Optional[BPETokenizer[]]:
+def load_tokenizer(path: Path) -> Optional[BPETokenizer[AutoPreTokenizer, GPT2ByteTransform]]:
     """Load a BPETokenizer by auto-detecting supported pre-tokenizer semantics."""
     var flavor = detect_tokenizer_flavor(path)
     if flavor == TOKENIZER_FLAVOR_GPT2 or flavor == TOKENIZER_FLAVOR_DEEPSEEK_V3:

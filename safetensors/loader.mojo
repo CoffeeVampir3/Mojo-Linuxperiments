@@ -319,9 +319,9 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
 
     def __del__(deinit self):
         var sys = linux.linux_sys()
-        for i in range(len(self.file_fds)):
-            if self.file_fds[i] >= 0:
-                _ = sys.sys_close(Int(self.file_fds[i]))
+        for fd in self.file_fds:
+            if fd >= 0:
+                _ = sys.sys_close(Int(fd))
 
         if self.ring_fd < 0:
             return
@@ -351,16 +351,16 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
 
         var sys = linux.linux_sys()
         self.file_fds = List[Int32](capacity=count)
-        for i in range(count):
-            var path_str = String(paths[i])
+        for path in paths:
+            var path_str = String(path)
             var fd = sys.sys_openat(
                 linux.AT_FDCWD,
                 path_str,
                 linux.OpenFlags.RDONLY | linux.OpenFlags.CLOEXEC,
             )
             if fd < 0:
-                for k in range(len(self.file_fds)):
-                    _ = sys.sys_close(Int(self.file_fds[k]))
+                for open_fd in self.file_fds:
+                    _ = sys.sys_close(Int(open_fd))
                 self.file_fds = List[Int32]()
                 return fd
 
@@ -374,8 +374,8 @@ struct IoLoader[queue_depth: Int = 2048](Movable):
         )
 
         if result < 0:
-            for i in range(len(self.file_fds)):
-                _ = sys.sys_close(Int(self.file_fds[i]))
+            for open_fd in self.file_fds:
+                _ = sys.sys_close(Int(open_fd))
             self.file_fds = List[Int32]()
             return result
 
