@@ -13,7 +13,7 @@ from experimental4.smollm2 import LogitsView, SmolLM2Loaded, SmolLM2Config, MODE
 
 comptime TOKENIZER_PATH = "checkpoints/SmolLM2/tokenizer.json"
 comptime VOCAB = SmolLM2Config.VOCAB_SIZE
-comptime MAX_NEW_TOKENS = 30
+comptime MAX_NEW_TOKENS = 512
 
 
 fn greedy_argmax(view: LogitsView[VOCAB]) -> Tuple[Int, Float32]:
@@ -97,46 +97,37 @@ He was named to the 2022 class of ACM Fellows"""
     var generated = List[Int]()
     generated.append(next_id)
 
-    var one_tok = List[Int]()
-    one_tok.append(next_id)
-    var decoded_tok = tok.decode(one_tok)
+    var prefill_tps = Float64(seq_len) / (Float64(prefill_ms) / 1000.0)
     print(
         "prefill |", seq_len, "tokens |",
-        prefill_ms, "ms | next:", next_id,
-        repr(decoded_tok),
+        prefill_ms, "ms |",
+        Int(prefill_tps), "t/s",
     )
 
-    # --- Decode: generate 29 more tokens one at a time ---
-    var pos = seq_len  # KV cache already has [0, seq_len)
+    # --- Decode ---
+    var pos = seq_len
+    var decode_start = perf_counter_ns()
 
     for step in range(1, MAX_NEW_TOKENS):
-        # Write the single token into scratch
         tp[0] = Scalar[DType.int32](next_id)
 
-        # Profile the first decode step
-        var do_profile = step == 1
-        if do_profile:
-            print("\n--- decode step 1 profile ---")
-
-        var t2 = perf_counter_ns()
-        logits = model.forward(model.scratch_ptr(), 1, pos, profile=do_profile)
-        var decode_ms = (perf_counter_ns() - t2) / 1_000_000
+        logits = model.forward(model.scratch_ptr(), 1, pos, profile=False)
 
         result = greedy_argmax(logits)
         next_id = result[0]
         generated.append(next_id)
         pos += 1
 
-        one_tok[0] = next_id
-        decoded_tok = tok.decode(one_tok)
-        print(
-            "step", step, "|",
-            decode_ms, "ms | next:", next_id,
-            repr(decoded_tok),
-        )
+    var decode_elapsed_ms = (perf_counter_ns() - decode_start) / 1_000_000
+    var decode_tokens = MAX_NEW_TOKENS - 1
+    var decode_tps = Float64(decode_tokens) / (Float64(decode_elapsed_ms) / 1000.0)
+    print(
+        "decode  |", decode_tokens, "tokens |",
+        decode_elapsed_ms, "ms |",
+        Int(decode_tps), "t/s",
+    )
 
     # --- Final output ---
-    # Combine prompt tokens + generated tokens for full decode
     var all_ids = List[Int]()
     for i in range(len(token_ids)):
         all_ids.append(token_ids[i])
