@@ -1,3 +1,46 @@
+from std.memory import UnsafePointer
+
+
+# =============================================================================
+# Packing strategy — must be defined first as Placed references PackFn
+# =============================================================================
+
+comptime PackFn = def(
+    UnsafePointer[UInt8, MutAnyOrigin],
+    UnsafePointer[UInt8, MutAnyOrigin],
+    Int, Int,
+)
+
+def pack_noop(
+    src: UnsafePointer[UInt8, MutAnyOrigin],
+    dst: UnsafePointer[UInt8, MutAnyOrigin],
+    rows: Int, cols: Int,
+):
+    pass
+
+trait PackingStrategy:
+    comptime PACK_FN: PackFn
+
+struct Unpacked(PackingStrategy):
+    comptime PACK_FN = pack_noop
+
+
+# =============================================================================
+# Weight classification
+# =============================================================================
+
+trait WeightTag: ...
+trait Quantizable: ...
+trait Passthrough: ...
+
+struct IsQuantizable(WeightTag, Quantizable): ...
+struct IsPassthrough(WeightTag, Passthrough): ...
+
+
+# =============================================================================
+# Core traits
+# =============================================================================
+
 trait Encoding:
     comptime DTYPE: DType
     comptime ELEMENT_BYTES: Int
@@ -10,6 +53,7 @@ trait Placed:
     comptime OFFSET: Int
     comptime GLOBAL_ROWS: Int
     comptime GLOBAL_COLS: Int
+    comptime PACK_FN: PackFn
 
 trait Named:
     comptime NAME: StaticString
@@ -92,9 +136,13 @@ struct PlacedSlot[
     E: Encoding, S: ShardStrategy,
     rows: Int, cols: Int, tp: Int, offset: Int,
     name: StringLiteral,
+    Tag: WeightTag = IsPassthrough,
+    Packing: PackingStrategy = Unpacked,
 ](
     Encoding, Shaped, Placed, Named, ShardStrategy,
     NodeLocal where conforms_to(S, NodeLocal),
+    Quantizable where conforms_to(Tag, Quantizable),
+    Passthrough where conforms_to(Tag, Passthrough),
 ):
     comptime DTYPE = Self.E.DTYPE
     comptime ELEMENT_BYTES = Self.E.ELEMENT_BYTES
@@ -104,6 +152,7 @@ struct PlacedSlot[
     comptime GLOBAL_ROWS = Self.rows
     comptime GLOBAL_COLS = Self.cols
     comptime NAME: StaticString = Self.name
+    comptime PACK_FN = Self.Packing.PACK_FN
 
     @staticmethod
     def shard_rows(r: Int, n: Int) -> Int:
@@ -166,15 +215,20 @@ struct WeightDesc(Copyable):
     var global_cols: Int
     var local_rows: Int
     var local_cols: Int
+    var quantizable: Bool
+    var pack_fn: PackFn
 
 def weight_desc[T: Encoding & Shaped & Placed & Named](
     prefix: String = "", base: Int = 0,
 ) -> WeightDesc:
+    comptime is_quantizable = conforms_to(T, Quantizable)
     return WeightDesc(
         name=prefix + String(T.NAME), arena_offset=base + T.OFFSET,
         dtype=T.DTYPE, element_bytes=T.ELEMENT_BYTES,
         global_rows=T.GLOBAL_ROWS, global_cols=T.GLOBAL_COLS,
         local_rows=T.ROWS, local_cols=T.COLS,
+        quantizable=is_quantizable,
+        pack_fn=T.PACK_FN,
     )
 
 

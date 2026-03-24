@@ -1,0 +1,1 @@
+Avoid leading underscores in names (_blah should be blah -- this includes members, in general, just never use leading underscores.)

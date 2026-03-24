@@ -18,23 +18,25 @@ from numa import NumaArena, NumaInfo
 from notstdcollections import HeapMoveArray
 from threading import BurstPool
 
-from experimental4.model_spec import (
+from modeling.model_spec import (
     Encoding, Shaped, Placed, Named, BF16, F32,
     RowShard, ColShard, Replicated,
     PrincipleNodeLocal,
+    IsQuantizable, IsPassthrough,
     Slot, PlacedSlot, Bound, DynView, CacheView, bind, byte_count,
     WeightIterable,
     next_offset,
     DEFAULT_ALIGNMENT,
     Dims, Attention, GQA, FFN, Vocab, Sequence, RoPEConfig, RMSNormConfig,
 )
-from experimental4.kernel_ops import (
+from kernels.kernel_ops import (
     gemm, rmsnorm, embed_lookup, silu_mul, elem_add, rope, kv_cache_write,
     attention, init_rope_tables,
     PoolFence, parallel, parallel_for,
 )
-from experimental4.loader import load_safetensors
-from experimental4.profiler import Profiler
+from modeling.loader import load_safetensors
+from kernels.profiler import Profiler
+from simd_math import bf16_load_as
 
 
 # =============================================================================
@@ -97,13 +99,13 @@ comptime C = SmolLM2Config
 
 
 struct TPLayer[E: Encoding, tp: Int]:
-    comptime Q_PROJ      = PlacedSlot[Self.E, RowShard, C.HIDDEN, C.HIDDEN, Self.tp, 0, "self_attn.q_proj.weight"]
-    comptime K_PROJ      = PlacedSlot[Self.E, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.Q_PROJ](), "self_attn.k_proj.weight"]
-    comptime V_PROJ      = PlacedSlot[Self.E, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.K_PROJ](), "self_attn.v_proj.weight"]
-    comptime O_PROJ      = PlacedSlot[Self.E, ColShard, C.HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.V_PROJ](), "self_attn.o_proj.weight"]
-    comptime GATE_PROJ   = PlacedSlot[Self.E, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.O_PROJ](), "mlp.gate_proj.weight"]
-    comptime UP_PROJ     = PlacedSlot[Self.E, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.GATE_PROJ](), "mlp.up_proj.weight"]
-    comptime DOWN_PROJ   = PlacedSlot[Self.E, ColShard, C.HIDDEN, C.INTERMEDIATE, Self.tp, next_offset[Self.UP_PROJ](), "mlp.down_proj.weight"]
+    comptime Q_PROJ      = PlacedSlot[Self.E, RowShard, C.HIDDEN, C.HIDDEN, Self.tp, 0, "self_attn.q_proj.weight", IsQuantizable]
+    comptime K_PROJ      = PlacedSlot[Self.E, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.Q_PROJ](), "self_attn.k_proj.weight", IsQuantizable]
+    comptime V_PROJ      = PlacedSlot[Self.E, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.K_PROJ](), "self_attn.v_proj.weight", IsQuantizable]
+    comptime O_PROJ      = PlacedSlot[Self.E, ColShard, C.HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.V_PROJ](), "self_attn.o_proj.weight", IsQuantizable]
+    comptime GATE_PROJ   = PlacedSlot[Self.E, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.O_PROJ](), "mlp.gate_proj.weight", IsQuantizable]
+    comptime UP_PROJ     = PlacedSlot[Self.E, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.GATE_PROJ](), "mlp.up_proj.weight", IsQuantizable]
+    comptime DOWN_PROJ   = PlacedSlot[Self.E, ColShard, C.HIDDEN, C.INTERMEDIATE, Self.tp, next_offset[Self.UP_PROJ](), "mlp.down_proj.weight", IsQuantizable]
     comptime INPUT_NORM  = PlacedSlot[BF16, Replicated, C.HIDDEN, 1, Self.tp, next_offset[Self.DOWN_PROJ](), "input_layernorm.weight"]
     comptime POST_ATTN_NORM = PlacedSlot[BF16, Replicated, C.HIDDEN, 1, Self.tp, next_offset[Self.INPUT_NORM](), "post_attention_layernorm.weight"]
     comptime STRIDE      = next_offset[Self.POST_ATTN_NORM]()
@@ -346,10 +348,8 @@ def ring_allreduce[T: Encoding & Shaped, tp: Int](
         var dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=dst_ptr)
         var i = 0
         while i + width <= length:
-            var s_raw = (src + start + i).bitcast[Scalar[DType.uint16]]().load[width=width]()
-            var d_raw = (dst + start + i).bitcast[Scalar[DType.uint16]]().load[width=width]()
-            var s_f32 = SIMD[DType.float32, width](from_bits=s_raw.cast[DType.uint32]() << 16)
-            var d_f32 = SIMD[DType.float32, width](from_bits=d_raw.cast[DType.uint32]() << 16)
+            var s_f32 = bf16_load_as[DType.float32, width](src + start, i)
+            var d_f32 = bf16_load_as[DType.float32, width](dst + start, i)
             (dst + start + i).store((s_f32 + d_f32).cast[DType.bfloat16]())
             i += width
         while i < length:

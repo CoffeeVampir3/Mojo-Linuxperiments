@@ -1,5 +1,6 @@
 from safetensors.parser import parse_safetensors_header, TensorMeta
-from safetensors.loader import IoLoader, ReadOp, Completion, print_io_load_error
+from linux.io_uring import IoRing, ReadOp, Completion
+from safetensors.loader import process_read_queue
 from std.pathlib import Path
 from std.memory import UnsafePointer, alloc
 
@@ -35,7 +36,7 @@ def main():
     var data_size = header.file_len - header.data_offset
 
     # Create loader
-    var loader = IoLoader[64]()
+    var loader = IoRing[64]()
     if not loader:
         print("Failed to create io_uring")
         return
@@ -43,9 +44,10 @@ def main():
     # Register file
     var paths = List[Path]()
     paths.append(path)
-    var count = loader.register_files(paths)
-    if count < 0:
-        print("Failed to register files, errno:", count)
+    try:
+        _ = loader.register_files(paths)
+    except err:
+        print("Failed to register files:", err.error_message())
         return
 
     # Allocate buffer for entire data section
@@ -58,7 +60,7 @@ def main():
         buf.free()
         return
 
-    var ops = List[ReadOp](capacity=tensor_count)
+    var ops = List[ReadOp[]](capacity=tensor_count)
     var names = List[String](capacity=tensor_count)
     var metas = List[TensorMeta](capacity=tensor_count)
 
@@ -67,11 +69,11 @@ def main():
         var name = item.key
         var meta = item.value.copy()
         var length = meta.byte_size()
-        ops.append(ReadOp(
+        ops.append(ReadOp[](
             file_idx=0,
             offset=header.data_offset + meta.start,
             length=length,
-            dest=Int(buf) + meta.start,
+            dest=buf + meta.start,
             id=op_idx,
         ))
         names.append(name.copy())
@@ -98,10 +100,9 @@ def main():
         else:
             print("  (unsupported dtype)")
 
-    var err = loader.process_queue_checked[on_tensor_complete](ops)
+    var err = process_read_queue[on_tensor_complete](loader, ops)
     if err:
-        print_io_load_error(err.value())
-        print("Load failed")
+        print("Load failed:", err.value().msg)
         buf.free()
         return
 

@@ -13,9 +13,10 @@ from std.sys.info import simd_width_of
 from std.time import perf_counter_ns
 from numa import NumaArena, NumaInfo, NumaTopology
 from notstdcollections import HeapMoveArray
+from simd_math import bf16_load_as
 from std.collections import InlineArray
 
-from experimental4.model_spec import (
+from modeling.model_spec import (
     Encoding, Shaped, BF16, Slot, Replicated, byte_count,
 )
 
@@ -188,10 +189,8 @@ def ring_allreduce_simd[T: Encoding & Shaped, tp: Int](
         var dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=dst_ptr)
         var i = 0
         while i + width <= length:
-            var s_raw = (src + start + i).bitcast[Scalar[DType.uint16]]().load[width=width]()
-            var d_raw = (dst + start + i).bitcast[Scalar[DType.uint16]]().load[width=width]()
-            var s_f32 = SIMD[DType.float32, width](from_bits=s_raw.cast[DType.uint32]() << 16)
-            var d_f32 = SIMD[DType.float32, width](from_bits=d_raw.cast[DType.uint32]() << 16)
+            var s_f32 = bf16_load_as[DType.float32, width](src + start, i)
+            var d_f32 = bf16_load_as[DType.float32, width](dst + start, i)
             (dst + start + i).store((s_f32 + d_f32).cast[DType.bfloat16]())
             i += width
         while i < length:
