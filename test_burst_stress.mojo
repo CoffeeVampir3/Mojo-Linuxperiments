@@ -1,11 +1,11 @@
 from threading.burst_threading import BurstPool, ArgPack
 from notstdcollections import HeapMoveArray
-from memory import UnsafePointer
-from collections import InlineArray
-from time import perf_counter_ns
+from std.memory import UnsafePointer
+from std.collections import InlineArray
+from std.time import perf_counter_ns
 
 
-fn mix64(x: Int) -> Int:
+def mix64(x: Int) -> Int:
     # SplitMix64
     var z = x + (-7046029254386353131)
     z = (z ^ (z >> 30)) * (-4658895280553007687)
@@ -13,7 +13,7 @@ fn mix64(x: Int) -> Int:
     return z ^ (z >> 31)
 
 
-fn calc_result(iter: Int, job_idx: Int) -> Int:
+def calc_result(iter: Int, job_idx: Int) -> Int:
     var x = mix64(iter ^ job_idx)
     # Variable work to allow scheduler preemption/deschedule.
     var spins = Int(x & 0xFF)
@@ -22,12 +22,12 @@ fn calc_result(iter: Int, job_idx: Int) -> Int:
     return x
 
 
-fn calc_scratch_sum(iter: Int, job_idx: Int) -> Int:
+def calc_scratch_sum(iter: Int, job_idx: Int) -> Int:
     # Sum_{i=0..127} (iter + job_idx + i)
     return (iter + job_idx) * 128 + 8128
 
 
-fn stress_kernel(out_ptr: UnsafePointer[Int, MutAnyOrigin], iter: Int, job_idx: Int):
+def stress_kernel(out_ptr: UnsafePointer[Int, MutAnyOrigin], iter: Int, job_idx: Int):
     # Heavy-ish stack usage to stress small worker stacks.
     var scratch = InlineArray[Int, 128](uninitialized=True)  # 1KB
     for i in range(128):
@@ -42,7 +42,7 @@ fn stress_kernel(out_ptr: UnsafePointer[Int, MutAnyOrigin], iter: Int, job_idx: 
     out_ptr[] = x + scratch_sum
 
 
-fn main():
+def main():
     comptime CAPACITY = 15
     comptime ITERATIONS = 5000
     comptime STACK_BYTES = 4096  # small, page-aligned stack to stress guard/reset behavior

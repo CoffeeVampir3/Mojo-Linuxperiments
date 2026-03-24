@@ -1,9 +1,9 @@
 from safetensors.parser import parse_safetensors_header, TensorMeta
 from safetensors.loader import IoLoader, ReadOp, Completion, print_io_load_error
-from pathlib import Path
-from memory import UnsafePointer, alloc
+from std.pathlib import Path
+from std.memory import UnsafePointer, alloc
 
-fn validate_f32_tensor(buf: UnsafePointer[UInt8, MutAnyOrigin], meta: TensorMeta, name: String) -> Bool:
+def validate_f32_tensor(buf: UnsafePointer[UInt8, MutAnyOrigin], meta: TensorMeta, name: String) -> Bool:
     """Validate tensor values are sequential starting from base."""
     var ptr = (buf + meta.start).bitcast[Float32]()
 
@@ -21,7 +21,7 @@ fn validate_f32_tensor(buf: UnsafePointer[UInt8, MutAnyOrigin], meta: TensorMeta
     print("  OK:", name, "shape", meta.shape, "base =", Int(base))
     return True
 
-fn main():
+def main():
     var path = Path("test_models/example_model.safetensors")
 
     # Parse header
@@ -84,7 +84,7 @@ fn main():
     var failed = 0
 
     @parameter
-    fn on_tensor_complete(c: Completion):
+    def on_tensor_complete(c: Completion):
         var idx = Int(c.id)
         var meta = metas[idx].copy()
         var name = names[idx].copy()

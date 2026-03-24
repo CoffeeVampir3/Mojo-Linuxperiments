@@ -585,7 +585,7 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
 
             ranks.each[do_res_add]()
 
-            _ = layer_idx  # Anchor: closures capture layer_idx but compiler doesn't see it
+            _ = layer_idx  # Anchor: closures capture layer_idx but compiler doesn't track it
 
         # --- Final norm + LM head (host rank only) ---
         rmsnorm(host.x_main(seq_len), host.weight[M.FINAL_NORM](), host.x_main(seq_len), ranks.pool_ptrs[0][]).join()
@@ -594,10 +594,6 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
         gemm(host.x_main(seq_len), host.weight[M.EMBED](), logits, ranks.pool_ptrs[0][]).join()
         prof.finish()
         prof.report()
-
-        _ = ranks
-        _ = self.pools
-        _ = self.arenas
 
         return LogitsView[C.VOCAB_SIZE](logits.ptr, seq_len)
 

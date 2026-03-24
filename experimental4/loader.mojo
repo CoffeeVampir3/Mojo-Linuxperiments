@@ -119,8 +119,7 @@ def load_safetensors[
     var fragments = List[ReadFragment]()
     var tp = len(arena_bases)
 
-    for i in range(len(node_local_weights)):
-        var w = node_local_weights[i].copy()
+    for w in node_local_weights:
         var meta_opt = header.tensors.get(w.name)
         if not meta_opt:
             print("missing tensor:", w.name)
@@ -130,8 +129,7 @@ def load_safetensors[
             return None
         emit_reads(w, header.data_offset + meta.start, arena_bases[host_index], host_index, fragments)
 
-    for i in range(len(distributed_weights)):
-        var w = distributed_weights[i].copy()
+    for w in distributed_weights:
         var meta_opt = header.tensors.get(w.name)
         if not meta_opt:
             print("missing tensor:", w.name)
