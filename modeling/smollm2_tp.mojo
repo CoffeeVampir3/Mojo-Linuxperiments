@@ -11,9 +11,8 @@ for input projections (allreduce after). Dispatch via parallel_for.
 
 from std.pathlib import Path
 
-from std.memory import UnsafePointer, memcpy
+from std.memory import UnsafePointer
 from std.collections import InlineArray
-from std.sys.info import simd_width_of
 from numa import NumaArena, NumaInfo
 from notstdcollections import HeapMoveArray
 from threading import BurstPool
@@ -34,9 +33,9 @@ from kernels.kernel_ops import (
     attention, init_rope_tables,
     PoolFence, parallel, parallel_for,
 )
+from kernels.reductions import ring_allreduce, ring_broadcast
 from modeling.loader import load_safetensors
 from kernels.profiler import Profiler
-from simd_math import bf16_load_as
 
 
 # =============================================================================
@@ -306,110 +305,6 @@ struct Ranks[E: Encoding, tp: Int]:
         for r in range(Self.tp):
             ptrs[r] = self.view(r).x_residual(seq_len).ptr
         return ptrs^
-
-
-# =============================================================================
-# Stubs
-# =============================================================================
-
-
-def ring_allreduce[T: Encoding & Shaped, tp: Int](
-    ptrs: InlineArray[Int, tp], seq_len: Int,
-):
-    """Ring allreduce: reduce-scatter then allgather with SIMD accumulation.
-
-    After completion, every buffer contains the element-wise sum of all tp
-    input buffers. bf16 data with f32 SIMD accumulation. Ring topology
-    ensures each communication step traverses one NUMA hop.
-    """
-    comptime cols = T.COLS
-    var total_elements = seq_len * cols
-    if total_elements <= 0 or tp <= 1:
-        return
-
-    var chunk_size = total_elements // tp
-    var remainder = total_elements - chunk_size * tp
-    comptime width = simd_width_of[DType.float32]()
-
-    @always_inline
-    def chunk_start(c: Int) -> Int:
-        return c * chunk_size
-
-    @always_inline
-    def chunk_len(c: Int) -> Int:
-        if c == tp - 1:
-            return chunk_size + remainder
-        return chunk_size
-
-    @always_inline
-    def accumulate(dst_ptr: Int, src_ptr: Int, start: Int, length: Int):
-        """dst[start:start+length] += src[start:start+length] in bf16 with f32 SIMD."""
-        var src = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=src_ptr)
-        var dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=dst_ptr)
-        var i = 0
-        while i + width <= length:
-            var s_f32 = bf16_load_as[DType.float32, width](src + start, i)
-            var d_f32 = bf16_load_as[DType.float32, width](dst + start, i)
-            (dst + start + i).store((s_f32 + d_f32).cast[DType.bfloat16]())
-            i += width
-        while i < length:
-            var s = Float32(src[start + i])
-            var d = Float32(dst[start + i])
-            dst[start + i] = Scalar[DType.bfloat16](s + d)
-            i += 1
-
-    # --- Phase 1: Reduce-scatter ---
-    for step in range(tp - 1):
-        for rank in range(tp):
-            var c = (rank - step + tp) % tp
-            var next_rank = (rank + 1) % tp
-            accumulate(ptrs[next_rank], ptrs[rank], chunk_start(c), chunk_len(c))
-
-    # --- Phase 2: Allgather ---
-    for step in range(tp - 1):
-        for rank in range(tp):
-            var c = (rank - step + 1 + tp) % tp
-            var next_rank = (rank + 1) % tp
-            var cs = chunk_start(c)
-            var cl = chunk_len(c)
-            memcpy(
-                dest=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=ptrs[next_rank] + cs * T.ELEMENT_BYTES),
-                src=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=ptrs[rank] + cs * T.ELEMENT_BYTES),
-                count=cl * T.ELEMENT_BYTES,
-            )
-
-
-def ring_broadcast[T: Encoding & Shaped, tp: Int](
-    src_ptr: Int, dst_ptrs: InlineArray[Int, tp], seq_len: Int,
-):
-    """Ring broadcast: forward data along the ring, one hop per step.
-
-    Step 0: ensure dst_ptrs[0] has the data (copy from src if needed).
-    Step s (s=0..tp-2): rank s forwards to rank s+1.
-
-    Each copy traverses one ring edge (minimum NUMA distance). Spreads
-    memory bandwidth across all controllers instead of bottlenecking
-    at the source rank.
-    """
-    var total_bytes = seq_len * T.COLS * T.ELEMENT_BYTES
-    if total_bytes <= 0 or tp <= 1:
-        return
-
-    # Ensure rank 0 has the data.
-    if src_ptr != dst_ptrs[0]:
-        memcpy(
-            dest=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=dst_ptrs[0]),
-            src=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=src_ptr),
-            count=total_bytes,
-        )
-
-    # Forward along the ring: rank 0 → 1 → 2 → ... → tp-1.
-    for step in range(tp - 1):
-        memcpy(
-            dest=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=dst_ptrs[step + 1]),
-            src=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=dst_ptrs[step]),
-            count=total_bytes,
-        )
 
 
 # =============================================================================
