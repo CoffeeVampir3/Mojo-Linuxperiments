@@ -397,7 +397,7 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
 
         # --- Embed (host rank, then broadcast) ---
         embed_lookup(host.weight[M.EMBED](), tokens_ptr, host.x_main(seq_len), ranks.pool_ptrs[0][]).join()
-        ring_broadcast[M.X_MAIN, Self.tp](host.x_main(seq_len).ptr, ranks.x_main_ptrs(seq_len), seq_len)
+        ring_broadcast[M.X_MAIN, Self.tp](host.x_main(seq_len).ptr, ranks.x_main_ptrs(seq_len), seq_len, ranks.pool_ptrs)
 
         for layer_idx in range(C.NUM_LAYERS):
             @parameter
@@ -444,7 +444,7 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
                 return gemm(rv.attn_out_view(seq_len), rv.layer_weight[L.O_PROJ](layer_idx), rv.x_residual(seq_len), pool)
             ranks.parallel[do_o]()
 
-            ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len)
+            ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
 
             @parameter
             def do_res_add(rv: RankView[Self.E, Self.tp]):
@@ -476,7 +476,7 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
                 return gemm(rv.mlp_view(0, seq_len), rv.layer_weight[L.DOWN_PROJ](layer_idx), rv.x_residual(seq_len), pool)
             ranks.parallel[do_down]()
 
-            ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len)
+            ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
 
             ranks.each[do_res_add]()
 
