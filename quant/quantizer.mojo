@@ -31,7 +31,6 @@ from threading import BurstPool
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named, Quantizable,
     WeightIterable, WeightDesc, weight_desc,
-    PackFn, pack_noop,
 )
 from .pipelines import PipelineFn, Timer
 
@@ -72,7 +71,6 @@ struct OutputTensor(Copyable, Movable):
     var src_length: Int
     var quantize: Bool
     var is_scale: Bool
-    var pack_fn: PackFn
 
 
 def build_header_json(entries: List[OutputTensor]) -> String:
@@ -136,7 +134,6 @@ def compute_output_layout(
                 src_file_offset=header.data_offset + meta.start,
                 src_length=meta.end - meta.start,
                 quantize=True, is_scale=False,
-                pack_fn=w.pack_fn,
             ))
             offset += weight_bytes
 
@@ -150,7 +147,6 @@ def compute_output_layout(
                 data_start=offset, data_end=offset + sc_bytes,
                 src_file_offset=-1, src_length=0,
                 quantize=False, is_scale=True,
-                pack_fn=pack_noop,
             ))
             offset += sc_bytes
         else:
@@ -162,7 +158,6 @@ def compute_output_layout(
                 src_file_offset=header.data_offset + meta.start,
                 src_length=byte_size,
                 quantize=False, is_scale=False,
-                pack_fn=pack_noop,
             ))
             offset += byte_size
 
@@ -364,12 +359,6 @@ def quantize[M: WeightIterable](
             # Run the pipeline
             var pipe_t0 = perf_counter_ns()
             pipeline(pool_ptr, cur_buf, weight_buf, scale_buf, rows, cols)
-
-            # Pack weight (noop for Unpacked)
-            var tp = Timer("pack")
-            entry.pack_fn(weight_buf, weight_buf, rows, cols)
-            tp^.stop()
-
             var pipe_ns = Int(perf_counter_ns() - pipe_t0)
             var pipe_us = pipe_ns // 1_000
             quant_ns += pipe_ns

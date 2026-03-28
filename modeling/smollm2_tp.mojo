@@ -31,7 +31,7 @@ from modeling.model_spec import (
 from kernels.kernel_ops import (
     gemm, rmsnorm, embed_lookup, silu_mul, elem_add, rope, kv_cache_write,
     attention, init_rope_tables,
-    PoolFence, parallel, parallel_for,
+    PoolFence, parallel_for,
 )
 from kernels.reductions import ring_allreduce, ring_broadcast
 from modeling.loader import load_safetensors

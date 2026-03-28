@@ -1,126 +1,104 @@
-"""VNNI int8 weight packing — blocked transpose for vpdpbusd layout.
+"""VNNI int8 weight packing — 6D blocked layout for vpdpbusd.
 
-The vpdpbusd instruction expects weights arranged so that 4 consecutive
-int8 values from one output channel occupy one 32-bit lane. This requires
-transposing the weight matrix in 16x16 tiles, with two-level blocking
-for cache locality.
+The vpdpbusd instruction consumes weights as 16 dwords per register,
+each dword holding 4 consecutive K values for one output channel.
+The 6D layout is:
 
-Tile and stride parameters are fixed by the VNNI instruction layout:
-    TILE_N = 16    (16 output channels per tile, matching xmm/ymm lane count)
-    N_STEP = 32    (2 tiles of 16 for ymm processing)
-    K_STEP = 64    (64 K elements per tile, matching cache line)
+    [N/N_BLOCK, K/K_BLOCK, N_BLOCK/N_STEP, K_BLOCK/K_STEP,
+     N_STEP/TILE_N, K_STEP/VNNI_BLK, TILE_N, VNNI_BLK]
+
+Innermost [TILE_N=16, VNNI_BLK=4]: 16 output channels x 4 K values = 64 bytes.
+This is achieved by copying N_STEP x K_STEP tiles and applying a 16x16
+dword transpose on each TILE_N sub-tile, keeping 4-byte K groups intact.
+
+Block sizes for cache locality:
+    K_BLOCK = K    (full K — no redundant outer iterations)
+    N_BLOCK = largest multiple of N_STEP that keeps tile <= L2_TARGET
 """
 
 from std.collections import InlineArray
-from std.memory import UnsafePointer
+from std.memory import UnsafePointer, memcpy
 
 from modeling.model_spec import PackingStrategy, PackFn
-from simd_math.matrixops import transpose_16x16, Row
+from simd_math.matrixops import transpose_generic
 
 
 # =============================================================================
-# VnniPacking — packing strategy for vpdpbusd kernels
+# VNNI packing constants
+# =============================================================================
+
+comptime L2_TARGET = 256 * 1024
+comptime VNNI_N_STEP = 32
+comptime VNNI_K_STEP = 64
+comptime VNNI_TILE_N = 16
+comptime VNNI_BLK = 4
+
+
+# =============================================================================
+# VnniPacked — packing strategy for vpdpbusd weight layout
 # =============================================================================
 
 
-def pack_vnni_runtime[n_block: Int, k_block: Int](
+@always_inline
+def compute_n_block(n: Int, k: Int) -> Int:
+    """Largest multiple of N_STEP that fits in L2_TARGET bytes.
+    K_BLOCK is always K, so tile bytes = n_block * K."""
+    var max_n = L2_TARGET // k
+    var n_block = (max_n // VNNI_N_STEP) * VNNI_N_STEP
+    if n_block >= n:
+        return n
+    if n_block >= VNNI_N_STEP:
+        return n_block
+    return VNNI_N_STEP
+
+
+def pack_vnni(
     src: UnsafePointer[UInt8, MutAnyOrigin],
     dst: UnsafePointer[UInt8, MutAnyOrigin],
     rows: Int, cols: Int,
 ):
-    """Runtime N/K, comptime N_BLOCK/K_BLOCK. Conforms to PackFn."""
-    comptime TILE_N = 16
-    comptime TILE_K = 64
-    comptime N_STEP = 32
-    comptime K_STEP = 64
+    """Pack [rows, cols] int8 from src (row-major) into dst (6D VNNI).
 
+    src and dst must not overlap. Reads row-major data from src,
+    writes packed tiles with dword-transposed sub-tiles to dst.
+    Conforms to PackFn.
+    """
     var N = rows
     var K = cols
-    var s = src.bitcast[Int8]()
-    var d = dst.bitcast[Int8]()
-    var transpose_buf = InlineArray[SIMD[DType.int8, 16], 16](uninitialized=True)
+    var n_block = compute_n_block(N, K)
+    var k_block = K
+    var scratch = InlineArray[SIMD[DType.int32, 16], 16](uninitialized=True)
 
     for n_block_begin in range(0, N, n_block):
-        var n_block_end = min(n_block_begin + n_block, N)
-        var n_block_size = n_block_end - n_block_begin
+        var n_block_size = min(n_block, N - n_block_begin)
 
         for k_block_begin in range(0, K, k_block):
-            var k_block_end = min(k_block_begin + k_block, K)
-            var k_block_size = k_block_end - k_block_begin
+            var k_block_size = min(k_block, K - k_block_begin)
 
-            for n_begin in range(0, n_block_size, N_STEP):
-                for k_begin in range(0, k_block_size, K_STEP):
+            for n_begin in range(0, n_block_size, VNNI_N_STEP):
+                for k_begin in range(0, k_block_size, VNNI_K_STEP):
                     var tile_base = (
                         n_block_begin * K
                         + k_block_begin * n_block_size
                         + n_begin * k_block_size
-                        + k_begin * N_STEP
+                        + k_begin * VNNI_N_STEP
                     )
 
-                    for i in range(N_STEP):
-                        var src_ptr = s + ((n_block_begin + n_begin + i) * K + k_block_begin + k_begin)
-                        var dst_ptr = d + (tile_base + i * K_STEP)
-                        dst_ptr.store(src_ptr.load[width=K_STEP]())
+                    for i in range(VNNI_N_STEP):
+                        var src_off = (n_block_begin + n_begin + i) * K + k_block_begin + k_begin
+                        var dst_off = tile_base + i * VNNI_K_STEP
+                        memcpy(
+                            dest=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=Int(dst) + dst_off),
+                            src=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=Int(src) + src_off),
+                            count=VNNI_K_STEP,
+                        )
 
-                    var tile0 = d + tile_base
-                    var tile1 = d + (tile_base + TILE_N * K_STEP)
-                    transpose_16x16(tile0, K_STEP, tile0, TILE_N, transpose_buf)
-                    transpose_16x16(tile1, K_STEP, tile1, TILE_N, transpose_buf)
-
-
-struct VnniPacking[n_block: Int, k_block: Int](PackingStrategy):
-    comptime N_BLOCK = Self.n_block
-    comptime K_BLOCK = Self.k_block
-    comptime PACK_FN = pack_vnni_runtime[Self.n_block, Self.k_block]
-
-
-# =============================================================================
-# Comptime-dimension pack (for use outside the quantizer pipeline)
-# =============================================================================
+                    comptime dword_stride = VNNI_K_STEP // VNNI_BLK
+                    var t0 = (dst + tile_base).bitcast[Int32]()
+                    var t1 = (dst + tile_base + VNNI_TILE_N * VNNI_K_STEP).bitcast[Int32]()
+                    transpose_generic[DType.int32, 16](t0, dword_stride, t0, VNNI_TILE_N, scratch)
+                    transpose_generic[DType.int32, 16](t1, dword_stride, t1, VNNI_TILE_N, scratch)
 
 
-def pack_vnni_int8[
-    K: Int, N: Int,
-    N_BLOCK: Int, K_BLOCK: Int,
-    TILE_K: Int = 64, TILE_N: Int = 16,
-    N_STEP: Int = 32, K_STEP: Int = 64,
-](
-    src: UnsafePointer[Int8, ImmutAnyOrigin],
-    dst: UnsafePointer[Int8, MutAnyOrigin],
-):
-    """Pack a [K, N] int8 weight matrix into blocked VNNI layout.
-    Two-level blocking: outer N_BLOCK x K_BLOCK, inner N_STEP x K_STEP tiles.
-    Each tile is copied then transposed in-place via 16x16 sub-tiles."""
-    comptime assert N % N_STEP == 0, "N must be divisible by N_STEP"
-    comptime assert K % K_STEP == 0, "K must be divisible by K_STEP"
-    comptime assert N_STEP == TILE_N * 2, "N_STEP must be 2*TILE_N"
-    comptime assert K_STEP == TILE_K, "K_STEP must equal TILE_K"
-
-    var transpose_buf = InlineArray[SIMD[DType.int8, 16], 16](uninitialized=True)
-
-    for n_block_begin in range(0, N, N_BLOCK):
-        var n_block_end = min(n_block_begin + N_BLOCK, N)
-        var n_block_size = n_block_end - n_block_begin
-
-        for k_block_begin in range(0, K, K_BLOCK):
-            var k_block_end = min(k_block_begin + K_BLOCK, K)
-            var k_block_size = k_block_end - k_block_begin
-
-            for n_begin in range(0, n_block_size, N_STEP):
-                for k_begin in range(0, k_block_size, K_STEP):
-                    var tile_base = (
-                        n_block_begin * K
-                        + k_block_begin * n_block_size
-                        + n_begin * k_block_size
-                        + k_begin * N_STEP
-                    )
-
-                    for i in range(N_STEP):
-                        var src_ptr = src + ((n_block_begin + n_begin + i) * K + k_block_begin + k_begin)
-                        var dst_ptr = dst + (tile_base + i * K_STEP)
-                        dst_ptr.store(src_ptr.load[width=K_STEP]())
-
-                    var tile0 = dst + tile_base
-                    var tile1 = dst + (tile_base + TILE_N * K_STEP)
-                    transpose_16x16(tile0, K_STEP, tile0, TILE_N, transpose_buf)
-                    transpose_16x16(tile1, K_STEP, tile1, TILE_N, transpose_buf)
+struct VnniPacked(PackingStrategy):
+    comptime PACK_FN = pack_vnni

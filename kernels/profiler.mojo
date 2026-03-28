@@ -23,16 +23,6 @@ struct Profiler:
         self.current = String("")
 
     @always_inline
-    def section(mut self, name: String):
-        if not self.enabled:
-            return
-        var now = perf_counter_ns()
-        if self.t > 0:
-            self._accumulate(now - self.t)
-        self.t = now
-        self.current = name
-
-    @always_inline
     def finish(mut self):
         if not self.enabled or self.t == 0:
             return

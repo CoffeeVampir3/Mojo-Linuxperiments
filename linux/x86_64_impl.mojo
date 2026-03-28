@@ -77,46 +77,28 @@ struct X86_64LinuxSys(LinuxSys):
 
     # --- Raw syscall mechanism (x86_64 register ABI) ---
 
-    def syscall[count: Int](self, nr: Int, *args: Int) -> Int:
-        comptime regs = ("", ",{rdi}", ",{rdi},{rsi}", ",{rdi},{rsi},{rdx}",
-                      ",{rdi},{rsi},{rdx},{rcx}", ",{rdi},{rsi},{rdx},{rcx},{r8}",
-                      ",{rdi},{rsi},{rdx},{rcx},{r8},{r9}")
-        comptime asm = "mov %rcx, %r10\nsyscall" if count > 3 else "syscall"
-        comptime constraints = "={rax},{rax}" + regs[count] + ",~{rcx},~{r10},~{r11},~{memory}"
-        comptime if count == 0:
-            return Int(inlined_assembly[asm, Int, Int, constraints=constraints](nr))
-        elif count == 1:
-            return Int(inlined_assembly[asm, Int, Int, Int, constraints=constraints](nr, args[0]))
-        elif count == 2:
-            return Int(
-                inlined_assembly[asm, Int, Int, Int, Int, constraints=constraints](nr, args[0], args[1])
-            )
-        elif count == 3:
-            return Int(
-                inlined_assembly[asm, Int, Int, Int, Int, Int, constraints=constraints](
-                    nr, args[0], args[1], args[2]
-                )
-            )
-        elif count == 4:
-            return Int(
-                inlined_assembly[asm, Int, Int, Int, Int, Int, Int, constraints=constraints](
-                    nr, args[0], args[1], args[2], args[3]
-                )
-            )
-        elif count == 5:
-            return Int(
-                inlined_assembly[asm, Int, Int, Int, Int, Int, Int, Int, constraints=constraints](
-                    nr, args[0], args[1], args[2], args[3], args[4]
-                )
-            )
-        elif count == 6:
-            return Int(
-                inlined_assembly[asm, Int, Int, Int, Int, Int, Int, Int, Int, constraints=constraints](
-                    nr, args[0], args[1], args[2], args[3], args[4], args[5]
-                )
-            )
-        else:
-            comptime assert False, "syscall supports 0-6 arguments"
+    def syscall[*Ts: Intable](self, nr: Int, *args: *Ts) -> Int:
+        comptime count = args.__len__()
+        comptime assert count <= 6, "syscall supports 0-6 arguments"
+
+        var a0 = 0
+        var a1 = 0
+        var a2 = 0
+        var a3 = 0
+        var a4 = 0
+        var a5 = 0
+        comptime if count > 0: a0 = Int(args[0])
+        comptime if count > 1: a1 = Int(args[1])
+        comptime if count > 2: a2 = Int(args[2])
+        comptime if count > 3: a3 = Int(args[3])
+        comptime if count > 4: a4 = Int(args[4])
+        comptime if count > 5: a5 = Int(args[5])
+
+        return Int(inlined_assembly[
+            "mov %rcx, %r10\nsyscall",
+            Int, Int, Int, Int, Int, Int, Int, Int,
+            constraints="={rax},{rax},{rdi},{rsi},{rdx},{rcx},{r8},{r9},~{rcx},~{r10},~{r11},~{memory}",
+        ](nr, a0, a1, a2, a3, a4, a5))
 
     # --- Architecture-specific operations ---
 
@@ -149,7 +131,7 @@ struct X86_64LinuxSys(LinuxSys):
         if Int(old) != 0:
             var kold = KernelRtSigActionX86_64()
             var kold_ptr = UnsafePointer(to=kold)
-            var result = self.syscall[4](
+            var result = self.syscall(
                 Self.NR_rt_sigaction,
                 signum,
                 Int(kact_ptr),
@@ -164,7 +146,7 @@ struct X86_64LinuxSys(LinuxSys):
             _ = kact_ptr[]
             return result
         else:
-            var result = self.syscall[4](
+            var result = self.syscall(
                 Self.NR_rt_sigaction,
                 signum,
                 Int(kact_ptr),

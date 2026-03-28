@@ -6,9 +6,9 @@ from std.memory import UnsafePointer
 # =============================================================================
 
 comptime PackFn = def(
-    UnsafePointer[UInt8, MutAnyOrigin],
-    UnsafePointer[UInt8, MutAnyOrigin],
-    Int, Int,
+    UnsafePointer[UInt8, MutAnyOrigin],  # src: row-major source
+    UnsafePointer[UInt8, MutAnyOrigin],  # dst: packed destination
+    Int, Int,                            # rows, cols
 )
 
 def pack_noop(
@@ -23,6 +23,40 @@ trait PackingStrategy:
 
 struct Unpacked(PackingStrategy):
     comptime PACK_FN = pack_noop
+
+
+# =============================================================================
+# Kernel tiling — composable per-dimension constraints
+#
+# Atomic traits: each declares one axis of the kernel's tile structure.
+# Composed structs: Kernel2DTiling (row + col), Kernel3DTiling (+ panel).
+# Consumers take trait bounds on the axes they need.
+# New dimensions are additive — one trait per axis.
+# =============================================================================
+
+trait RowTiled:
+    """Kernel tiles the row (N/output) dimension in steps of ROW_TILE."""
+    comptime ROW_TILE: Int
+
+trait ColTiled:
+    """Kernel tiles the col (K/reduction) dimension in steps of COL_TILE."""
+    comptime COL_TILE: Int
+
+trait PanelHeight:
+    """Kernel processes the activation (M) dimension in panels of PANEL."""
+    comptime PANEL: Int
+
+struct Kernel2DTiling[row_tile: Int, col_tile: Int](RowTiled, ColTiled, PanelHeight):
+    comptime ROW_TILE = Self.row_tile
+    comptime COL_TILE = Self.col_tile
+    comptime PANEL = 1
+
+struct Kernel3DTiling[row_tile: Int, col_tile: Int, panel: Int](RowTiled, ColTiled, PanelHeight):
+    comptime ROW_TILE = Self.row_tile
+    comptime COL_TILE = Self.col_tile
+    comptime PANEL = Self.panel
+
+comptime Untiled = Kernel2DTiling[1, 1]
 
 
 # =============================================================================
@@ -138,6 +172,7 @@ struct PlacedSlot[
     name: StringLiteral,
     Tag: WeightTag = IsPassthrough,
     Packing: PackingStrategy = Unpacked,
+    Tiling: RowTiled & ColTiled & PanelHeight = Untiled,
 ](
     Encoding, Shaped, Placed, Named, ShardStrategy,
     NodeLocal where conforms_to(S, NodeLocal),
@@ -195,10 +230,6 @@ def byte_count[T: Encoding & Shaped]() -> Int:
     return T.ROWS * T.COLS * T.ELEMENT_BYTES
 
 comptime DEFAULT_ALIGNMENT = 64
-
-def offset_after[T: Encoding & Shaped, base: Int, alignment: Int = DEFAULT_ALIGNMENT]() -> Int:
-    comptime aligned = ((base + alignment - 1) // alignment) * alignment
-    return aligned + byte_count[T]()
 
 def next_offset[T: Encoding & Shaped & Placed, alignment: Int = DEFAULT_ALIGNMENT]() -> Int:
     comptime aligned = ((T.OFFSET + alignment - 1) // alignment) * alignment

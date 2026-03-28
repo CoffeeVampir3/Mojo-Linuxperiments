@@ -4,7 +4,7 @@ Pool-dispatched kernels return PoolFence — a linear type (@explicit_destroy)
 representing in-flight work. Must be consumed via .join() or parallel().
 
 TP=1: gemm(...).join()
-TP=N: parallel(gemm(..., pool0), gemm(..., pool1), gemm(..., pool2))
+TP=N: parallel_for dispatches body[rank]() for each rank, then joins all
 """
 
 from std.math import sqrt
@@ -29,10 +29,9 @@ from simd_math import bf16_to_f32, SinCosResult, sincos, exp_f32
 struct PoolFence(Movable):
     """Linear token for in-flight pool work. Unconsumed fences are a compile error.
 
-    Three consumption paths:
+    Two consumption paths:
         .join()  — wait immediately (TP=1)
         .take()  — extract raw pool ptr for deferred batch join (parametric TP)
-        parallel(f0, f1, ...) — variadic barrier (fixed TP)
     """
     var pool: UnsafePointer[BurstPool[], MutAnyOrigin]
 
@@ -48,14 +47,6 @@ struct PoolFence(Movable):
     def take(deinit self) -> UnsafePointer[BurstPool[], MutAnyOrigin]:
         """Consume fence, return raw pool pointer for deferred join."""
         return self.pool
-
-
-def parallel(var *fences: PoolFence):
-    """Variadic barrier: joins all fences, consuming each."""
-    @parameter
-    def do_join(idx: Int, var fence: PoolFence) capturing:
-        fence^.join()
-    fences^.consume_elements[do_join]()
 
 
 def parallel_for[tp: Int, body: def[rank: Int] () capturing -> PoolFence]():

@@ -1,18 +1,20 @@
-"""SmolLM2-135M int8 channelwise with VNNI-packed weights.
+"""SmolLM2-135M int8 channelwise quantization.
 
 Model spec for the quantized model. Projection weights are I8 with
-per-shape VNNI packing. Norms and embeddings remain BF16.
+per-row F32 scales. Norms and embeddings remain BF16.
 
-Packing parameters are chosen per-shape for optimal cache utilization:
-  - K_BLOCK = K (full K in one block — no redundant outer iterations)
-  - N_BLOCK = largest multiple of 32 that divides N and keeps tile in L2
-
-Kernel ops are stubbed — this file defines the model layout and weight
-descriptors. The forward pass will be hand-rolled here when kernels
-are implemented.
+Weights are stored row-major (no packing). VNNI packing for kernel
+consumption is a load-time concern, applied per-shard after TP
+sharding so the quantized file is TP-agnostic.
 """
 
 from std.pathlib import Path
+from std.memory import UnsafePointer, memcpy
+from std.collections import InlineArray
+
+from numa import NumaArena, NumaInfo
+from notstdcollections import HeapMoveArray
+from threading import BurstPool
 
 from quant.quantizer import quantize as quantize_impl
 from quant.channelwise import channelwise
@@ -21,14 +23,16 @@ from modeling.model_spec import (
     Encoding, Shaped, Placed, Named, BF16, F32, I8,
     RowShard, ColShard, Replicated,
     PrincipleNodeLocal,
-    IsQuantizable, IsPassthrough, Unpacked,
+    IsQuantizable, IsPassthrough, Quantizable,
     Slot, PlacedSlot, Bound, DynView, CacheView, bind, byte_count,
     WeightIterable,
     next_offset,
     DEFAULT_ALIGNMENT,
     Dims, Attention, GQA, FFN, Vocab, Sequence, RoPEConfig, RMSNormConfig,
+    Kernel3DTiling,
 )
-from kernels.vnni import VnniPacking
+from kernels.vnni import VnniPacked
+from modeling.loader import load_safetensors
 
 
 # =============================================================================
@@ -55,30 +59,25 @@ comptime C = SmolLM2Config
 
 
 # =============================================================================
-# Int8 channelwise layer spec — VNNI packed projections
+# Int8 channelwise layer spec
 #
-# Per-shape packing:
-#   q/o_proj   [576, 576]   -> VnniPacking[288, 576]   (162KB tile)
-#   k/v_proj   [192, 576]   -> VnniPacking[192, 576]   (108KB tile)
-#   gate/up    [1536, 576]  -> VnniPacking[384, 576]   (216KB tile)
-#   down_proj  [576, 1536]  -> VnniPacking[96, 1536]   (144KB tile)
+# Weights stored row-major on disk. VnniPacked tells the loader to
+# VNNI-pack at init time (post-shard, using scratch as temp buffer).
+# Kernel3DTiling[32, 64, 32] per weight is the kernel's tiling
+# contract — consumed directly by the int8 GEMM kernel via trait bounds.
 # =============================================================================
-
-comptime PACK_QO   = VnniPacking[288, 576]
-comptime PACK_KV   = VnniPacking[192, 576]
-comptime PACK_GATE = VnniPacking[384, 576]
-comptime PACK_DOWN = VnniPacking[96, 1536]
 
 
 struct Int8TPLayer[tp: Int]:
-    # Projection weights: I8, quantizable, VNNI packed
-    comptime Q_PROJ      = PlacedSlot[I8, RowShard, C.HIDDEN, C.HIDDEN, Self.tp, 0, "self_attn.q_proj.weight", IsQuantizable, PACK_QO]
-    comptime K_PROJ      = PlacedSlot[I8, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.Q_PROJ](), "self_attn.k_proj.weight", IsQuantizable, PACK_KV]
-    comptime V_PROJ      = PlacedSlot[I8, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.K_PROJ](), "self_attn.v_proj.weight", IsQuantizable, PACK_KV]
-    comptime O_PROJ      = PlacedSlot[I8, ColShard, C.HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.V_PROJ](), "self_attn.o_proj.weight", IsQuantizable, PACK_QO]
-    comptime GATE_PROJ   = PlacedSlot[I8, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.O_PROJ](), "mlp.gate_proj.weight", IsQuantizable, PACK_GATE]
-    comptime UP_PROJ     = PlacedSlot[I8, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.GATE_PROJ](), "mlp.up_proj.weight", IsQuantizable, PACK_GATE]
-    comptime DOWN_PROJ   = PlacedSlot[I8, ColShard, C.HIDDEN, C.INTERMEDIATE, Self.tp, next_offset[Self.UP_PROJ](), "mlp.down_proj.weight", IsQuantizable, PACK_DOWN]
+    # Projection weights: I8, quantizable, VNNI-packed at load time
+    # Tiling contract per weight: Kernel3DTiling[row=32, col=64, panel=32]
+    comptime Q_PROJ      = PlacedSlot[I8, RowShard, C.HIDDEN, C.HIDDEN, Self.tp, 0, "self_attn.q_proj.weight", IsQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
+    comptime K_PROJ      = PlacedSlot[I8, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.Q_PROJ](), "self_attn.k_proj.weight", IsQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
+    comptime V_PROJ      = PlacedSlot[I8, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.K_PROJ](), "self_attn.v_proj.weight", IsQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
+    comptime O_PROJ      = PlacedSlot[I8, ColShard, C.HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.V_PROJ](), "self_attn.o_proj.weight", IsQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
+    comptime GATE_PROJ   = PlacedSlot[I8, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.O_PROJ](), "mlp.gate_proj.weight", IsQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
+    comptime UP_PROJ     = PlacedSlot[I8, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.GATE_PROJ](), "mlp.up_proj.weight", IsQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
+    comptime DOWN_PROJ   = PlacedSlot[I8, ColShard, C.HIDDEN, C.INTERMEDIATE, Self.tp, next_offset[Self.UP_PROJ](), "mlp.down_proj.weight", IsQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
 
     # Scale slots: F32, one per row, per quantized weight
     comptime Q_SCALE     = PlacedSlot[F32, RowShard, C.HIDDEN, 1, Self.tp, next_offset[Self.DOWN_PROJ](), "self_attn.q_proj.weight_scale"]
@@ -195,3 +194,125 @@ struct Int8TPModel[tp: Int](WeightIterable):
             output_path=output_path,
             num_workers=num_workers,
         )
+
+
+# =============================================================================
+# Weight packing — row-major int8 -> VNNI 6D layout, in-place via scratch
+# =============================================================================
+
+
+def pack_weights[M: WeightIterable](
+    arena_base: Int,
+    scratch: UnsafePointer[UInt8, MutAnyOrigin],
+):
+    """Pack all weights that have a non-trivial PackFn.
+
+    For each packable weight:
+      1. memcpy arena -> scratch (preserve row-major source)
+      2. PACK_FN(scratch, arena_slot, rows, cols) — pack into final location
+
+    One memcpy per weight. Scratch must be >= largest packable weight.
+    """
+    @parameter
+    def pack_if_needed[T: Encoding & Shaped & Placed & Named](prefix: String, base: Int):
+        comptime if conforms_to(T, Quantizable):
+            comptime weight_bytes = T.ROWS * T.COLS * T.ELEMENT_BYTES
+            var arena_slot = UnsafePointer[UInt8, MutAnyOrigin](
+                unsafe_from_address=arena_base + base + T.OFFSET
+            )
+            # Preserve row-major source in scratch
+            memcpy(dest=scratch, src=arena_slot, count=weight_bytes)
+            # Pack directly from scratch into arena (final location)
+            T.PACK_FN(scratch, arena_slot, T.ROWS, T.COLS)
+
+    M.for_each_weight[pack_if_needed]()
+
+
+# =============================================================================
+# Loaded model
+# =============================================================================
+
+
+struct SmolLM2Int8[tp: Int](Movable):
+    comptime M = Int8TPModel[Self.tp]
+
+    var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]]
+    var pools: HeapMoveArray[BurstPool[]]
+    var bases: InlineArray[Int, Self.tp]
+    var pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]
+
+    def __init__(out self, var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]],
+                var pools: HeapMoveArray[BurstPool[]]):
+        self.bases = InlineArray[Int, Self.tp](fill=0)
+        self.pool_ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp](
+            fill=UnsafePointer[BurstPool[], MutAnyOrigin]()
+        )
+        self.arenas = arenas^
+        self.pools = pools^
+        for rank in range(Self.tp):
+            self.bases[rank] = Int(self.arenas[rank].base)
+            self.pool_ptrs[rank] = UnsafePointer[BurstPool[], MutAnyOrigin](
+                unsafe_from_address=Int(UnsafePointer(to=self.pools[rank]))
+            )
+
+    @staticmethod
+    def load(path: Path) -> Optional[Self]:
+        """Load int8 quantized SmolLM2 with NUMA-aware rank placement.
+
+        1. Allocate NUMA arenas
+        2. Load row-major int8 weights + f32 scales from quantized safetensors
+        3. Prefault arenas
+        4. Pack quantizable weights into VNNI 6D layout (using scratch as temp)
+        5. Create BurstPools, init RoPE tables
+        """
+        comptime assert C.NUM_HEADS % Self.tp == 0, "TP must evenly divide NUM_HEADS"
+        comptime assert C.NUM_KV_HEADS % Self.tp == 0, "TP must evenly divide NUM_KV_HEADS"
+        comptime assert C.INTERMEDIATE % Self.tp == 0, "TP must evenly divide INTERMEDIATE"
+
+        var numa = NumaInfo()
+        var topo = numa.plan_topology(Self.tp)
+        comptime host_rank = 0
+
+        # --- Allocate arenas ---
+        var arenas = HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]](Self.tp)
+        for rank in range(Self.tp):
+            var size = Self.M.host_arena_bytes() if rank == host_rank else Self.M.arena_bytes()
+            var arena = NumaArena[alignment=DEFAULT_ALIGNMENT](topo[rank], size)
+            if not arena:
+                print("int8: arena allocation failed for rank", rank, "on node", topo[rank])
+                return None
+            arenas.push(arena^)
+
+        var arena_bases = List[Int]()
+        for rank in range(Self.tp):
+            arena_bases.append(Int(arenas[rank].base))
+
+        # --- Load row-major weights from quantized safetensors ---
+        var result = load_safetensors[Self.M](path, arena_bases, host_index=host_rank)
+        if not result:
+            print("int8: weight loading failed")
+            return None
+
+        # --- Prefault ---
+        for rank in range(Self.tp):
+            _ = arenas[rank].prefault(Self.M.DISTRIBUTED_BYTES, Self.M.STATE_BYTES)
+
+        # --- Pack weights into VNNI layout using scratch as temp buffer ---
+        # Scratch is within the arena at SCRATCH_OFF, already allocated.
+        for rank in range(Self.tp):
+            var base = Int(arenas[rank].base)
+            var scratch = UnsafePointer[UInt8, MutAnyOrigin](
+                unsafe_from_address=base + Self.M.DISTRIBUTED_BYTES + Self.M.SCRATCH_OFF
+            )
+            pack_weights[Self.M](base, scratch)
+
+        # --- Pools and RoPE ---
+        var pools = HeapMoveArray[BurstPool[]](Self.tp)
+        for rank in range(Self.tp):
+            pools.push(BurstPool[].for_numa_node(numa, topo[rank]))
+
+        var model = Self(arenas^, pools^)
+
+        # TODO: init RoPE tables once forward pass exists
+
+        return model^

@@ -1,7 +1,8 @@
 """SIMD matrix operations — generic transpose and layout transforms.
 
-The butterfly transpose is generic over N and emits optimal SIMD shuffle
-sequences via comptime-unrolled interleave stages. Works for any power-of-2 N.
+The butterfly transpose is generic over N and element type, emitting optimal
+SIMD shuffle sequences via comptime-unrolled interleave stages. Works for
+any power-of-2 N and any DType (int8 for byte transpose, int32 for dword).
 """
 
 from std.collections import InlineArray
@@ -49,31 +50,29 @@ def interleave_mask[N: Int, stride: Int, high: Bool]() -> IndexList[N]:
 
 
 # =============================================================================
-# Butterfly transpose — generic over N, optimal SIMD shuffles
+# Generic butterfly transpose — parameterized on element DType
 # =============================================================================
 
 
-comptime Row = SIMD[DType.int8, _]
-comptime Int8Ptr = UnsafePointer[Int8, origin = _]
-
-
 @always_inline
-def interleave[N: Int, stride: Int, high: Bool](a: Row[N], b: Row[N]) -> Row[N]:
+def simd_interleave[T: DType, N: Int, stride: Int, high: Bool](
+    a: SIMD[T, N], b: SIMD[T, N],
+) -> SIMD[T, N]:
     comptime idx = interleave_mask[N, stride, high]()
     return a.shuffle[mask=idx](b)
 
 
 @always_inline
-def transpose[N: Int](
-    src: Int8Ptr, src_stride: Int,
-    dst: Int8Ptr[MutAnyOrigin], dst_stride: Int,
-    mut scratch: InlineArray[Row[N], N],
+def transpose_generic[T: DType, N: Int](
+    src: UnsafePointer[Scalar[T], _], src_stride: Int,
+    dst: UnsafePointer[Scalar[T], MutAnyOrigin], dst_stride: Int,
+    mut scratch: InlineArray[SIMD[T, N], N],
 ):
-    """In-register NxN byte transpose via butterfly interleave network.
+    """In-register NxN transpose via butterfly interleave network.
 
-    Loads N rows of N bytes from src (strided), performs log2(N) stages
-    of interleave shuffles, then stores N rows to dst (strided).
-    The scratch buffer holds the intermediate SIMD registers.
+    Generic over element type: int8 for byte transpose, int32 for dword.
+    Loads N rows of N elements from src (strided by elements), performs
+    log2(N) stages of interleave shuffles, then stores N rows to dst.
     """
     comptime for i in range(N):
         scratch[i] = (src + i * src_stride).load[width=N]()
@@ -86,12 +85,11 @@ def transpose[N: Int](
             comptime for j in range(stride):
                 comptime idx0 = g * 2 * stride + j
                 comptime idx1 = idx0 + stride
-                var lo = interleave[N, stride, False](scratch[idx0], scratch[idx1])
-                var hi = interleave[N, stride, True](scratch[idx0], scratch[idx1])
+                var lo = simd_interleave[T, N, stride, False](scratch[idx0], scratch[idx1])
+                var hi = simd_interleave[T, N, stride, True](scratch[idx0], scratch[idx1])
                 scratch[idx0] = lo
                 scratch[idx1] = hi
 
-    # Bit-reverse to get sequential order. LLVM optimizes via register allocation.
     comptime for i in range(N):
         comptime j = bit_reverse[num_stages, i]()
         comptime if i < j:
@@ -103,19 +101,4 @@ def transpose[N: Int](
         (dst + i * dst_stride).store(scratch[i])
 
 
-@always_inline
-def transpose_16x16(
-    src: Int8Ptr, src_stride: Int,
-    dst: Int8Ptr[MutAnyOrigin], dst_stride: Int,
-    mut scratch: InlineArray[Row[16], 16],
-):
-    transpose[16](src, src_stride, dst, dst_stride, scratch)
 
-
-@always_inline
-def transpose_32x32(
-    src: Int8Ptr, src_stride: Int,
-    dst: Int8Ptr[MutAnyOrigin], dst_stride: Int,
-    mut scratch: InlineArray[Row[32], 32],
-):
-    transpose[32](src, src_stride, dst, dst_stride, scratch)

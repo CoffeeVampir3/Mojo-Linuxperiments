@@ -109,21 +109,6 @@ struct StackT(TrivialRegisterPassable):
         self.pad = 0
         self.ss_size = 0
 
-struct FutexNuma32(TrivialRegisterPassable):
-    var value: Int32
-    var node: Int32
-
-    def __init__(out self, node: Int32 = -1):
-        self.value = 0
-        self.node = node
-
-@fieldwise_init
-struct FutexWaitv(TrivialRegisterPassable):
-    var val: UInt64
-    var uaddr: KernelPtr
-    var flags: KernelFlags32
-    var reserved: UInt32
-
 struct Clone3Args(TrivialRegisterPassable):
     var flags: KernelFlags
     var pidfd: KernelPtr
@@ -160,26 +145,6 @@ struct Clone3Args(TrivialRegisterPassable):
         args.child_tid = UInt64(child_tid_addr)
         args.parent_tid = UInt64(child_tid_addr)
         return args
-
-struct Rseq(TrivialRegisterPassable):
-    var cpu_id_start: UInt32
-    var cpu_id: UInt32
-    var rseq_cs: KernelPtr
-    var flags: KernelFlags32
-    var node_id: UInt32
-    var mm_cid: UInt32
-    var padding: UInt32
-
-    def __init__(out self):
-        self.cpu_id_start = 0
-        self.cpu_id = 0
-        self.rseq_cs = 0
-        self.flags = 0
-        self.node_id = 0
-        self.mm_cid = 0
-        self.padding = 0
-
-comptime RSEQ_SIG = 0x53053053
 
 struct Prot(TrivialRegisterPassable):
     comptime NONE = 0x0
@@ -227,25 +192,6 @@ struct PageSize(TrivialRegisterPassable):
 # =============================================================================
 # io_uring types and constants
 # =============================================================================
-
-struct IoUringSetup(TrivialRegisterPassable):
-    comptime IOPOLL = 1 << 0
-    comptime SQPOLL = 1 << 1
-    comptime SQ_AFF = 1 << 2
-    comptime CQSIZE = 1 << 3
-    comptime CLAMP = 1 << 4
-    comptime ATTACH_WQ = 1 << 5
-    comptime R_DISABLED = 1 << 6
-    comptime SUBMIT_ALL = 1 << 7
-    comptime COOP_TASKRUN = 1 << 8
-    comptime TASKRUN_FLAG = 1 << 9
-    comptime SQE128 = 1 << 10
-    comptime CQE32 = 1 << 11
-    comptime SINGLE_ISSUER = 1 << 12
-    comptime DEFER_TASKRUN = 1 << 13
-    comptime NO_MMAP = 1 << 14
-    comptime REGISTERED_FD_ONLY = 1 << 15
-    comptime NO_SQARRAY = 1 << 16
 
 struct IoUringEnter(TrivialRegisterPassable):
     comptime GETEVENTS = 1 << 0
@@ -310,12 +256,6 @@ struct IoUringRegisterOp(TrivialRegisterPassable):
     comptime REGISTER_PROBE = 8
     comptime REGISTER_PERSONALITY = 9
     comptime UNREGISTER_PERSONALITY = 10
-
-struct IoUringCqeFlags(TrivialRegisterPassable):
-    comptime BUFFER = 1 << 0
-    comptime MORE = 1 << 1
-    comptime SOCK_NONEMPTY = 1 << 2
-    comptime NOTIF = 1 << 3
 
 struct SqRingOffsets(TrivialRegisterPassable):
     var head: UInt32
@@ -421,31 +361,6 @@ struct IoUringSqe(TrivialRegisterPassable):
         self.addr3 = 0
         self.pad = 0
 
-    @staticmethod
-    def read(fd: Int32, offset: UInt64, buf: UInt64, size: UInt32, user_data: UInt64) -> Self:
-        var sqe = Self()
-        sqe.opcode = IoUringOp.READ
-        sqe.fd = fd
-        sqe.off = offset
-        sqe.addr = buf
-        sqe.len = size
-        sqe.user_data = user_data
-        return sqe
-
-    @staticmethod
-    def read_fixed(file_index: Int32, offset: UInt64, buf: UInt64, size: UInt32,
-                  buf_index: UInt16, user_data: UInt64) -> Self:
-        var sqe = Self()
-        sqe.opcode = IoUringOp.READ
-        sqe.flags = IoUringSqeFlags.FIXED_FILE
-        sqe.fd = file_index
-        sqe.off = offset
-        sqe.addr = buf
-        sqe.len = size
-        sqe.buf_index = buf_index
-        sqe.user_data = user_data
-        return sqe
-
 struct IoUringCqe(TrivialRegisterPassable):
     var user_data: UInt64
     var res: Int32
@@ -455,14 +370,6 @@ struct IoUringCqe(TrivialRegisterPassable):
         self.user_data = 0
         self.res = 0
         self.flags = 0
-
-struct IoVec(TrivialRegisterPassable):
-    var base: UInt64
-    var len: UInt64
-
-    def __init__(out self, base: Int, length: Int):
-        self.base = UInt64(base)
-        self.len = UInt64(length)
 
 comptime IORING_OFF_SQ_RING: Int = 0
 comptime IORING_OFF_CQ_RING: Int = 0x8000000
@@ -536,7 +443,7 @@ trait ArchLinux:
     comptime NR_futex_wait: Int
 
     # Raw syscall mechanism (arch-specific register ABI).
-    def syscall[count: Int](self, nr: Int, *args: Int) -> Int: ...
+    def syscall[*Ts: Intable](self, nr: Int, *args: *Ts) -> Int: ...
 
     # Architecture-specific operations — functional design differs per target.
     def arch_cpu_relax(self): ...
@@ -574,10 +481,10 @@ trait LinuxSys(ArchLinux):
         prot: Int = Prot.RW,
         flags: Int = MapFlag.PRIVATE | MapFlag.ANONYMOUS,
     ](self, addr: Int, length: Int, fd: Int = -1, offset: Int = 0) -> Int:
-        return self.syscall[6](Self.NR_mmap, addr, length, prot, flags, fd, offset)
+        return self.syscall(Self.NR_mmap, addr, length, prot, flags, fd, offset)
 
     def sys_munmap(self, addr: Int, length: Int) -> Int:
-        return self.syscall[2](Self.NR_munmap, addr, length)
+        return self.syscall(Self.NR_munmap, addr, length)
 
     def sys_mbind[
         policy: Int = Mempolicy.BIND,
@@ -585,19 +492,19 @@ trait LinuxSys(ArchLinux):
     ](self, addr: Int, length: Int, nodemask: UInt64, maxnode: Int = 64) -> Int:
         var mask_storage: InlineArray[UInt64, 1] = [nodemask]
         var mask_ptr = UnsafePointer(to=mask_storage)
-        var result = self.syscall[6](Self.NR_mbind, addr, length, policy, Int(mask_ptr), maxnode, flags)
+        var result = self.syscall(Self.NR_mbind, addr, length, policy, Int(mask_ptr), maxnode, flags)
         _ = mask_ptr[]
         return result
 
     def sys_madvise[advice: Int](self, addr: Int, length: Int) -> Int:
-        return self.syscall[3](Self.NR_madvise, addr, length, advice)
+        return self.syscall(Self.NR_madvise, addr, length, advice)
 
     def sys_move_pages_query(self, addr: Int) -> Int:
         var pages: InlineArray[Int, 1] = [addr]
         var status: InlineArray[Int32, 1] = [Int32(-1)]
         var pages_ptr = UnsafePointer(to=pages)
         var status_ptr = UnsafePointer(to=status)
-        var result = self.syscall[6](Self.NR_move_pages, 0, 1, Int(pages_ptr), 0, Int(status_ptr), 0)
+        var result = self.syscall(Self.NR_move_pages, 0, 1, Int(pages_ptr), 0, Int(status_ptr), 0)
         _ = pages_ptr[]
         _ = status_ptr[]
         if result < 0:
@@ -605,19 +512,16 @@ trait LinuxSys(ArchLinux):
         return Int(status[0])
 
     def sys_mprotect(self, addr: Int, length: Int, prot: Int) -> Int:
-        return self.syscall[3](Self.NR_mprotect, addr, length, prot)
+        return self.syscall(Self.NR_mprotect, addr, length, prot)
 
     # --- I/O ---
 
-    def sys_write(self, fd: Int, buf: Int, count: Int) -> Int:
-        return self.syscall[3](Self.NR_write, fd, buf, count)
-
     def sys_openat(self, dirfd: Int, mut pathname: String, flags: Int, mode: Int = 0) -> Int:
         var cstr = pathname.as_c_string_slice()
-        return self.syscall[4](Self.NR_openat, dirfd, Int(cstr.unsafe_ptr()), flags, mode)
+        return self.syscall(Self.NR_openat, dirfd, Int(cstr.unsafe_ptr()), flags, mode)
 
     def sys_close(self, fd: Int) -> Int:
-        return self.syscall[1](Self.NR_close, fd)
+        return self.syscall(Self.NR_close, fd)
 
     # --- Signal handling ---
 
@@ -626,61 +530,48 @@ trait LinuxSys(ArchLinux):
         ss: UnsafePointer[StackT, MutAnyOrigin],
         old: UnsafePointer[StackT, MutAnyOrigin] = UnsafePointer[StackT, MutAnyOrigin](),
     ) -> Int:
-        return self.syscall[2](Self.NR_sigaltstack, Int(ss), Int(old))
+        return self.syscall(Self.NR_sigaltstack, Int(ss), Int(old))
 
     # --- Futex ---
 
     def sys_futex_wait(self, addr: Int, expected: Int, flags: Int = Futex2.SIZE_U32 | Futex2.PRIVATE) -> Int:
-        return self.syscall[6](Self.NR_futex_wait, addr, expected, FUTEX_BITSET_MATCH_ANY, flags, 0, 0)
-
-    def sys_futex_waitv(
-        self,
-        waiters: UnsafePointer[FutexWaitv, _],
-        nr_futexes: Int,
-        flags: Int = 0,
-        timeout: Int = 0,
-        clockid: Int = 0,
-    ) -> Int:
-        return self.syscall[5](Self.NR_futex_waitv, Int(waiters), nr_futexes, flags, timeout, clockid)
+        return self.syscall(Self.NR_futex_wait, addr, expected, FUTEX_BITSET_MATCH_ANY, flags, 0, 0)
 
     def sys_futex_wake(self, addr: Int, nr_wake: Int = 1, flags: Int = Futex2.SIZE_U32 | Futex2.PRIVATE) -> Int:
-        return self.syscall[4](Self.NR_futex_wake, addr, FUTEX_BITSET_MATCH_ANY, nr_wake, flags)
+        return self.syscall(Self.NR_futex_wake, addr, FUTEX_BITSET_MATCH_ANY, nr_wake, flags)
 
     # --- Process / thread ---
 
     def sys_exit(self, code: Int = 0):
-        _ = self.syscall[1](Self.NR_exit, code)
+        _ = self.syscall(Self.NR_exit, code)
 
     def sys_exit_group(self, code: Int = 0):
-        _ = self.syscall[1](Self.NR_exit_group, code)
+        _ = self.syscall(Self.NR_exit_group, code)
 
     def sys_getpid(self) -> Int:
-        return self.syscall[0](Self.NR_getpid)
+        return self.syscall(Self.NR_getpid)
 
     def sys_gettid(self) -> Int:
-        return self.syscall[0](Self.NR_gettid)
+        return self.syscall(Self.NR_gettid)
 
     def sys_getcpu(self) -> Tuple[Int, Int]:
         var cpu = UInt32(0)
         var node = UInt32(0)
         var cpu_addr = Int(UnsafePointer(to=cpu))
         var node_addr = Int(UnsafePointer(to=node))
-        _ = self.syscall[3](Self.NR_getcpu, cpu_addr, node_addr, 0)
+        _ = self.syscall(Self.NR_getcpu, cpu_addr, node_addr, 0)
         return Tuple[Int, Int](Int(cpu), Int(node))
 
     def sys_tgkill(self, pid: Int, tid: Int, sig: Int) -> Int:
-        return self.syscall[3](Self.NR_tgkill, pid, tid, sig)
-
-    def sys_rseq(self, rseq_ptr: Int, len: Int, flags: Int, sig: Int) -> Int:
-        return self.syscall[4](Self.NR_rseq, rseq_ptr, len, flags, sig)
+        return self.syscall(Self.NR_tgkill, pid, tid, sig)
 
     def sys_sched_setaffinity(self, tid: Int, mask_size: Int, mask_ptr: Int) -> Int:
-        return self.syscall[3](Self.NR_sched_setaffinity, tid, mask_size, mask_ptr)
+        return self.syscall(Self.NR_sched_setaffinity, tid, mask_size, mask_ptr)
 
     # --- io_uring ---
 
     def sys_io_uring_setup(self, entries: UInt32, params: UnsafePointer[IoUringParams, _]) -> Int:
-        return self.syscall[2](Self.NR_io_uring_setup, Int(entries), Int(params))
+        return self.syscall(Self.NR_io_uring_setup, Int(entries), Int(params))
 
     def sys_io_uring_enter(
         self,
@@ -691,7 +582,7 @@ trait LinuxSys(ArchLinux):
         sig: Int = 0,
         sigsz: Int = 0,
     ) -> Int:
-        return self.syscall[6](
+        return self.syscall(
             Self.NR_io_uring_enter,
             fd, Int(to_submit), Int(min_complete), Int(flags), sig, sigsz,
         )
@@ -703,7 +594,7 @@ trait LinuxSys(ArchLinux):
         arg: Int,
         nr_args: UInt32,
     ) -> Int:
-        return self.syscall[4](
+        return self.syscall(
             Self.NR_io_uring_register,
             fd, Int(opcode), arg, Int(nr_args),
         )

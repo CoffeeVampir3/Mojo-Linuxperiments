@@ -1,15 +1,3 @@
-"""NUMA-aware broadcast and allreduce — proven optimal strategies.
-
-Broadcast: parallel pull. All destination ranks memcpy from source
-simultaneously. ~26 GB/s aggregate on 4 NUMA nodes.
-
-Allreduce: fused multi-core reduce + flag-signaled parallel pull.
-Each node's full BurstPool reduces its chunk from all sources, the
-last worker signals completion, then all workers pull completed
-chunks from other ranks. Single dispatch, no sync between phases.
-~25 GB/s on 4 NUMA nodes.
-"""
-
 from std.memory import UnsafePointer, memcpy
 from std.sys.info import simd_width_of
 from std.time import perf_counter_ns
