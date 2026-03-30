@@ -10,6 +10,21 @@ from std.sys import llvm_intrinsic
 
 
 # =============================================================================
+# Square root
+# =============================================================================
+
+
+@always_inline
+def sqrt[dtype: DType, width: Int](x: SIMD[dtype, width]) -> SIMD[dtype, width]:
+    """SIMD sqrt — lowers to vsqrtps (f32) or vsqrtpd (f64)."""
+    return llvm_intrinsic[
+        "llvm.sqrt",
+        SIMD[dtype, width],
+        SIMD[dtype, width],
+    ](x)
+
+
+# =============================================================================
 # Rounding
 # =============================================================================
 
