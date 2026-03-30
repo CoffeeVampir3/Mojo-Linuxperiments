@@ -32,45 +32,6 @@ from experimental.hadquant_impl import fwht_block, i8_dot_row_major
 from experimental.hadquant_kv_cache import HadQuantKVCache
 
 
-struct AttnProfile:
-    """Accumulates per-section timing across calls. Reports averages."""
-    var q_prep: Int
-    var score: Int
-    var softmax: Int
-    var v_absorb: Int
-    var w_quant: Int
-    var v_agg: Int
-    var out_quant: Int
-    var calls: Int
-
-    def __init__(out self):
-        self.q_prep = 0
-        self.score = 0
-        self.softmax = 0
-        self.v_absorb = 0
-        self.w_quant = 0
-        self.v_agg = 0
-        self.out_quant = 0
-        self.calls = 0
-
-    def report(self):
-        if self.calls == 0:
-            return
-        var total = self.q_prep + self.score + self.softmax + self.v_absorb + self.w_quant + self.v_agg + self.out_quant
-        var n = self.calls
-        var pct = def (v: Int) -> Int:
-            return v * 100 // total if total > 0 else 0
-        print("attn profile (avg over " + String(n) + " calls):")
-        print("  q_prep:    " + String(self.q_prep // n // 1000) + " us (" + String(pct(self.q_prep)) + "%)")
-        print("  score:     " + String(self.score // n // 1000) + " us (" + String(pct(self.score)) + "%)")
-        print("  softmax:   " + String(self.softmax // n // 1000) + " us (" + String(pct(self.softmax)) + "%)")
-        print("  v_absorb:  " + String(self.v_absorb // n // 1000) + " us (" + String(pct(self.v_absorb)) + "%)")
-        print("  w_quant:   " + String(self.w_quant // n // 1000) + " us (" + String(pct(self.w_quant)) + "%)")
-        print("  v_agg:     " + String(self.v_agg // n // 1000) + " us (" + String(pct(self.v_agg)) + "%)")
-        print("  out_quant: " + String(self.out_quant // n // 1000) + " us (" + String(pct(self.out_quant)) + "%)")
-        print("  total:     " + String(total // n // 1000) + " us")
-
-
 def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     QT: Encoding & Shaped,
     QiT: Encoding & Shaped, ScT: Encoding & Shaped,
@@ -104,29 +65,25 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
 
     var max_ctx = pos + q.seq_len
 
-    var t_q_prep = Int(0)
-    var t_score = Int(0)
-    var t_softmax = Int(0)
-    var t_v_agg = Int(0)
-    var t_out_quant = Int(0)
-
-    # [1] Hoisted allocations — sizes known upfront, reused across rows and groups.
+    # [4] Hoist allocations out of the m loop.
     var row_f32 = alloc[Float32](q_cols)
     var qi_qs = alloc[Scalar[DType.int8]](gqa_factor * head_dim)
     var q_scales = alloc[Float32](gqa_factor)
     var q_biases = alloc[Float32](gqa_factor)
     var per_head_scores = alloc[Float32](gqa_factor * max_ctx)
-    var aggs = alloc[Float32](gqa_factor * head_dim)
+
+    # [7] Wall-clock timer.
+    var t_v_agg = Int(0)
+    var t_wall = Int(perf_counter_ns())
 
     for m in range(q.seq_len):
         var actual_pos = pos + m
-        var context = actual_pos + 1  # causal: attend to 0..actual_pos
+        var context = actual_pos + 1
         var cos_row = cp + actual_pos * half
         var sin_row = sn + actual_pos * half
         var out_row = qi_ptr + m * q_cols
 
         for g in range(num_kv_heads):
-            var t0 = Int(perf_counter_ns())
 
             # --- 1. Prep all Q heads in this GQA group ---
             for hi in range(gqa_factor):
@@ -160,7 +117,7 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
                 var q_inv = Float32(127.0) / q_absmax if q_absmax > 0 else Float32(0)
                 var q_vinv = SIMD[DType.float32, width](q_inv)
 
-                # [2] Fused quantize + i8_sum: accumulate sum during quantization.
+                # [2] Fuse i8_sum into quantization.
                 var qi_qp = qi_qs + hi * head_dim
                 var q_sum_acc = SIMD[DType.int32, width](0)
                 k = 0
@@ -170,38 +127,25 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
                     q_sum_acc += qi.cast[DType.int32]()
                     k += width
 
-                # [3] Precompute q_scale * inv_sqrt_hd — constant across all timesteps.
+                # [3] Precompute q_scale * inv_sqrt_hd.
                 q_scales[hi] = (q_absmax / Float32(127.0)) * inv_sqrt_hd
                 q_biases[hi] = Float32(128 * Int(q_sum_acc.reduce_add()))
 
-            var t1 = Int(perf_counter_ns())
-            t_q_prep += t1 - t0
-
             # --- 2. Score all heads in group ---
-            # [5] Use head_data_base for contiguous traversal.
-            var k_base = k_cache.head_data_base(g)
-            var k_sc_base = k_cache.head_scale_base(g)
             for t in range(context):
-                var k_entry = k_base + t * head_dim
-                var k_sc = k_sc_base[t]
-
+                var k_entry = k_cache.head_data(t, g)
+                var k_sc = k_cache.head_scale(t, g)
                 for hi in range(gqa_factor):
                     var qi_qp = qi_qs + hi * head_dim
                     var raw = i8_dot_row_major[head_dim](k_entry, qi_qp)
-                    # [3] inv_sqrt_hd already baked into q_scales[hi].
                     (per_head_scores + hi * max_ctx)[t] = (Float32(raw) - q_biases[hi]) * q_scales[hi] * k_sc
 
-            var t2 = Int(perf_counter_ns())
-            t_score += t2 - t1
-
-            # --- 3. Softmax + fused V scale absorption ---
-            # [4] Single pass: normalize, absorb V scale, accumulate w_sums.
+            # --- 3. Softmax + [6] fused V scale absorption ---
             var v_scale_base = v_cache.head_scale_base(g)
             var w_sums = InlineArray[Float32, gqa_factor](fill=Float32(0))
             for hi in range(gqa_factor):
                 var head_scores = per_head_scores + hi * max_ctx
 
-                # Max
                 var smax_v = SIMD[DType.float32, width](Float32(-1e30))
                 var t = 0
                 while t + width <= context:
@@ -212,7 +156,6 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
                     if head_scores[t] > smax: smax = head_scores[t]
                     t += 1
 
-                # Exp + sum
                 var exp_sum_v = SIMD[DType.float32, width](0)
                 var vsmax = SIMD[DType.float32, width](smax)
                 t = 0
@@ -245,41 +188,28 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
                     w_sums[hi] += absorbed
                     t += 1
 
-            var t3 = Int(perf_counter_ns())
-            t_softmax += t3 - t2
-
-            # --- 4. Aggregate V: f32 weights × u8 V ---
-            # [5] Use head_data_base for contiguous traversal.
-            var v_base = v_cache.head_data_base(g)
-            for i in range(gqa_factor * head_dim):
-                aggs[i] = Float32(0)
-
-            for t in range(context):
-                var v_head = v_base + t * head_dim
+            # --- 4. [5] V aggregation — transposed layout, register accumulator ---
+            var t_v_start = Int(perf_counter_ns())
+            for d in range(head_dim):
+                var v_dim = v_cache.dim_data(d, g)
                 for hi in range(gqa_factor):
-                    # w_sums already computed in softmax fusion
-                    var wt = SIMD[DType.float32, width]((per_head_scores + hi * max_ctx)[t])
-                    var aggp = aggs + hi * head_dim
-                    var d = 0
-                    while d + width <= head_dim:
-                        var vv = (v_head + d).load[width=width]().cast[DType.float32]()
-                        (aggp + d).store((aggp + d).load[width=width]() + wt * vv)
-                        d += width
+                    var h = g * gqa_factor + hi
+                    var w_ptr = per_head_scores + hi * max_ctx
+                    var acc_v = SIMD[DType.float32, width](0)
+                    var t = 0
+                    while t + width <= context:
+                        var vv = (v_dim + t).load[width=width]().cast[DType.float32]()
+                        acc_v += (w_ptr + t).load[width=width]() * vv
+                        t += width
+                    var acc = acc_v.reduce_add()
+                    while t < context:
+                        acc += w_ptr[t] * Float32(Int(v_dim[t]))
+                        t += 1
+                    row_f32[h * head_dim + d] = acc - Float32(128.0) * w_sums[hi]
 
-            # Bias correction + write to f32 row buffer
-            for hi in range(gqa_factor):
-                var h = g * gqa_factor + hi
-                var aggp = aggs + hi * head_dim
-                var bias = SIMD[DType.float32, width](Float32(128.0) * w_sums[hi])
-                var d = 0
-                while d + width <= head_dim:
-                    (row_f32 + h * head_dim + d).store((aggp + d).load[width=width]() - bias)
-                    d += width
+            t_v_agg += Int(perf_counter_ns()) - t_v_start
 
-            t_v_agg += Int(perf_counter_ns()) - t3
-
-        var t6 = Int(perf_counter_ns())
-        # --- 5. Quantize full row → i8 (SIMD along q_cols) ---
+        # --- 5. Quantize full row → i8 ---
         var rmax_v = SIMD[DType.float32, width](0)
         var d = 0
         while d + width <= q_cols:
@@ -302,24 +232,18 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
             out_row[d] = quantize_i8_scalar(row_f32[d], row_inv)
             d += 1
 
-        t_out_quant += Int(perf_counter_ns()) - t6
+    var t_total = Int(perf_counter_ns()) - t_wall
 
     row_f32.free()
     qi_qs.free()
     q_scales.free()
     q_biases.free()
     per_head_scores.free()
-    aggs.free()
 
-    var total = t_q_prep + t_score + t_softmax + t_v_agg + t_out_quant
-    if total > 0:
-        print("attn profile (" + String(q.seq_len) + " rows, " + String(num_heads)
-              + " heads, ctx=" + String(max_ctx) + "):")
-        print("  q_prep:    " + String(t_q_prep // 1000) + " us (" + String(t_q_prep * 100 // total) + "%)")
-        print("  score:     " + String(t_score // 1000) + " us (" + String(t_score * 100 // total) + "%)")
-        print("  softmax:   " + String(t_softmax // 1000) + " us (" + String(t_softmax * 100 // total) + "%)")
-        print("  v_agg:     " + String(t_v_agg // 1000) + " us (" + String(t_v_agg * 100 // total) + "%)")
-        print("  out_quant: " + String(t_out_quant // 1000) + " us (" + String(t_out_quant * 100 // total) + "%)")
-        print("  total:     " + String(total // 1000) + " us")
+    if t_total > 0:
+        print("attn wall (" + String(q.seq_len) + " rows, " + String(num_heads)
+              + " heads, ctx=" + String(max_ctx) + "): "
+              + String(t_total // 1000) + " us"
+              + " v_agg=" + String(t_v_agg // 1000))
 
     return PoolFence.completed()

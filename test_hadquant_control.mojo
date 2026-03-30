@@ -16,9 +16,8 @@ from modeling.model_spec import (
     BF16, F32, I8, Replicated, ColShard,
     Slot, Bound, DynView,
 )
-from experimental.hadquant_attn import int8_gqa_attention
+from experimental.hadquant_attn_control import int8_gqa_attention
 from std.benchmark import keep
-from std.time import perf_counter_ns
 from experimental.hadquant_impl import fwht_block
 from experimental.hadquant_kv_cache import HadQuantKVCache
 from simd_math import sqrt, exp_f32, roundeven
@@ -85,7 +84,7 @@ def main():
                 head_buf[d] = Scalar[DType.int8](Int8(max(min(Int(val * 127.0), 127), -128)))
                 var a = val if val >= 0 else -val
                 if a > v_absmax: v_absmax = a
-            v_cache.write_head(t, g, head_buf, v_absmax / Float32(127.0))
+            v_cache.write_head_transposed(t, g, head_buf, v_absmax / Float32(127.0))
 
     # --- Init RoPE tables ---
     comptime CosSlot = Slot[F32, Replicated, MAX_SEQ, HALF, 1]
@@ -164,13 +163,13 @@ def main():
             for t in range(context):
                 scores[t] = scores[t] * inv_sum
 
-            # Weighted sum of V (dequant u8 → signed f32)
+            # Weighted sum of V (transposed layout: dim_data gives contiguous [pos])
             for d in range(HEAD_DIM):
                 var acc = Float32(0)
+                var v_dim = v_cache.dim_data(d, g)
                 for t in range(context):
                     var v_sc = v_cache.head_scale(t, g)
-                    var v_data = v_cache.head_data(t, g)
-                    acc += scores[t] * Float32(Int(v_data[d]) - 128) * v_sc
+                    acc += scores[t] * Float32(Int(v_dim[t]) - 128) * v_sc
                 expected[m * HIDDEN + h * HEAD_DIM + d] = acc
 
             scores.free()
@@ -219,7 +218,7 @@ def main():
             k_cache.write_head(t, g, head_buf, Float32(0.05))
             for d in range(HEAD_DIM):
                 head_buf[d] = Scalar[DType.int8]((t * 11 + g * 17 + d * 5) % 251 - 125)
-            v_cache.write_head(t, g, head_buf, Float32(0.05))
+            v_cache.write_head_transposed(t, g, head_buf, Float32(0.05))
 
     var decode_q = alloc[Scalar[DType.bfloat16]](HIDDEN)
     for k in range(HIDDEN):
@@ -279,7 +278,7 @@ def main():
             ds_k.write_head(t, g, ds_head_buf, Float32(0.05))
             for d in range(DS_HEAD_DIM):
                 ds_head_buf[d] = Scalar[DType.int8]((t * 11 + g * DS_HEAD_DIM + d * 5) % 251 - 125)
-            ds_v.write_head(t, g, ds_head_buf, Float32(0.05))
+            ds_v.write_head_transposed(t, g, ds_head_buf, Float32(0.05))
 
     comptime DsCosSlot = Slot[F32, Replicated, DS_MAX_SEQ, DS_HALF, 1]
     comptime DsSinSlot = Slot[F32, Replicated, DS_MAX_SEQ, DS_HALF, 1]
@@ -290,7 +289,6 @@ def main():
     comptime DsScSlot = Slot[F32, Replicated, 1, 1, 1]
 
     for run in range(5):
-        var t0 = Int(perf_counter_ns())
         int8_gqa_attention[DS_NUM_HEADS, DS_NUM_KV_HEADS, DS_HEAD_DIM](
             DynView[DsQSlot](Int(ds_q), 1),
             ds_k, ds_v,
@@ -299,10 +297,9 @@ def main():
             Bound[DsCosSlot](Int(ds_cos)), Bound[DsSinSlot](Int(ds_sin)),
             DS_CTX, burst,
         ).join()
-        var wall = Int(perf_counter_ns()) - t0
-        keep(ds_qi_out[0])
-        keep(ds_sc_out[0])
-        print("  wall: " + String(wall // 1000) + " us")
+
+    keep(ds_qi_out[0])
+    keep(ds_sc_out[0])
 
     ds_q.free()
     ds_kv_mem.free()
