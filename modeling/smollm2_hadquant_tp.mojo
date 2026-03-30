@@ -5,7 +5,7 @@ scales. RMSNorm gamma is absorbed into projection weights offline — norm
 weights are consumed during quantization and absent from the quantized
 file. At runtime, RMSNorm is just x / rms(x).
 
-KV cache stores pre-rotated int8 with per-head F32 scales. K and V are
+KV cache stores pre-rotated u8 (for native vpdpbusd) with per-head F32 scales. K and V are
 written directly from the projection gemm epilogue — no bf16 intermediate.
 RoPE on K is fused into the cache write. RoPE on Q is fused into the
 attention kernel.
@@ -54,6 +54,7 @@ from modeling.model_spec import (
     DEFAULT_ALIGNMENT,
     Dims, Attention, GQA, FFN, Vocab, Sequence, RoPEConfig, RMSNormConfig,
     Kernel3DTiling,
+    LogitsView,
 )
 from kernels.vnni import VnniPacked
 from kernels.kernel_ops import (
@@ -65,12 +66,15 @@ from kernels.reductions import ring_allreduce, ring_broadcast
 from kernels.profiler import Profiler
 from modeling.loader import load_safetensors
 from quant.engine import quantize as quantize_impl
+from experimental.linear_borrow_pool import ScratchPool, ScratchLease
 from experimental.hadquant_impl import (
     rms_fwht_quantize, silu_fwht_quantize,
     int8_gemm, int8_gemm_k_to_cache, int8_gemm_v_to_cache,
-    int8_gemm_gate_up, int8_gqa_attention, rms_norm_no_gamma,
+    int8_gemm_gate_up, rms_norm_no_gamma,
     compute_column_sum,
 )
+from experimental.hadquant_attn import int8_gqa_attention
+from experimental.hadquant_kv_cache import HadQuantKVCache
 
 
 # =============================================================================
@@ -144,12 +148,10 @@ struct HadQuantTPLayer[tp: Int]:
 
     comptime STRIDE = next_offset[Self.DOWN_COLSUM]()
 
-    # --- KV cache: int8 pre-rotated (FWHT per head at write time) ---
+    # --- KV cache: per-head contiguous via HadQuantKVCache ---
 
-    comptime K_CACHE = Slot[I8, ColShard, C.MAX_SEQ_LEN, C.KV_HIDDEN, Self.tp]
-    comptime V_CACHE = Slot[I8, ColShard, C.MAX_SEQ_LEN, C.KV_HIDDEN, Self.tp]
-    comptime K_CACHE_SCALE = Slot[F32, ColShard, C.MAX_SEQ_LEN, C.NUM_KV_HEADS, Self.tp]
-    comptime V_CACHE_SCALE = Slot[F32, ColShard, C.MAX_SEQ_LEN, C.NUM_KV_HEADS, Self.tp]
+    comptime LOCAL_KV_HEADS = C.NUM_KV_HEADS // Self.tp
+    comptime KV_CACHE = HadQuantKVCache[C.MAX_SEQ_LEN, C.HEAD_DIM, Self.LOCAL_KV_HEADS]
 
     # --- Iteration: norms before the projections they feed ---
 
@@ -176,8 +178,8 @@ struct HadQuantTPLayer[tp: Int]:
 
     @staticmethod
     def cache_bytes() -> Int:
-        return (byte_count[Self.K_CACHE]() + byte_count[Self.V_CACHE]()
-              + byte_count[Self.K_CACHE_SCALE]() + byte_count[Self.V_CACHE_SCALE]())
+        """Total KV cache bytes per layer: K cache + V cache."""
+        return 2 * Self.KV_CACHE.TOTAL_BYTES
 
 
 # =============================================================================
@@ -204,25 +206,71 @@ struct HadQuantTPModel[tp: Int](WeightIterable):
     comptime X_RESIDUAL = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.HIDDEN, Self.tp]
     comptime LOGITS = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.VOCAB_SIZE, Self.tp]
 
-    # bf16 scratch: 3 slots at INTERMEDIATE width.
-    # K and V go directly to int8 cache (no bf16 intermediate).
-    # Reuse: slot0=Q/gate, slot1=up, slot2=int8 activation overlay
-    comptime SCRATCH = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.INTERMEDIATE, Self.tp]
-    comptime SCRATCH_COUNT = 3
-
-    # Typed views into scratch
+    # Typed DynView slots — used to construct views over borrowed scratch.
     comptime Q_VIEW = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.HIDDEN, Self.tp]
     comptime MLP_VIEW = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.INTERMEDIATE, Self.tp]
-
-    # --- Int8 activation scratch: overlaid on slot 2 ---
-    #
-    # Slot 2 is fully available — K and V never materialize as bf16
-    # (they go directly from gemm epilogue to int8 cache).
-    # The int8 activation and scale overlay slot 2 at zero cost.
-
     comptime ACT_I8_HIDDEN = Slot[I8, Replicated, C.MAX_SEQ_LEN, C.HIDDEN, Self.tp]
     comptime ACT_I8_INTERMEDIATE = Slot[I8, Replicated, C.MAX_SEQ_LEN, C.INTERMEDIATE, Self.tp]
     comptime ACT_SCALE = Slot[F32, Replicated, C.MAX_SEQ_LEN, 1, Self.tp]
+
+    # Scratch capacity: derived from the peak phase (MLP > attention).
+    # The pool is a bump allocator — cumulative sum of all borrows in a phase.
+    comptime SCRATCH_CAPACITY = Self.calculate_peak_scratch()
+
+    @staticmethod
+    def calculate_peak_scratch() -> Int:
+        """Peak scratch bytes across both phases of one layer.
+
+        Each phase creates a fresh ScratchPool. The pool is a bump
+        allocator (no reclaim), so the peak is the cumulative sum of
+        all borrows within the largest phase.
+
+        Attention phase borrows (in order):
+            act_i8:      MAX_SEQ_LEN * HIDDEN         (int8)
+            act_scale:   MAX_SEQ_LEN * 4               (f32, 1 per row)
+            rms_work:    HIDDEN * 4                     (f32, per-row temp)
+            q:           MAX_SEQ_LEN * HIDDEN/tp * 2   (bf16)
+            kv_scratch:  KV_HIDDEN/tp * 4              (f32, gemm intermediate)
+
+        MLP phase borrows (in order):
+            act_i8:      MAX_SEQ_LEN * HIDDEN          (int8)
+            act_scale:   MAX_SEQ_LEN * 4                (f32)
+            rms_work:    HIDDEN * 4                      (f32, per-row temp)
+            gate:        MAX_SEQ_LEN * INTERMEDIATE/tp * 2  (bf16)
+            up:          MAX_SEQ_LEN * INTERMEDIATE/tp * 2  (bf16)
+            act_i8_inter: MAX_SEQ_LEN * INTERMEDIATE   (int8)
+            act_scale_inter: MAX_SEQ_LEN * 4            (f32)
+            silu_work:   INTERMEDIATE * 4               (f32, per-row temp)
+        """
+        comptime S = C.MAX_SEQ_LEN
+        comptime H = C.HIDDEN
+        comptime I = C.INTERMEDIATE
+        comptime KV = C.KV_HIDDEN
+        comptime TP = Self.tp
+
+        comptime attn_peak = (
+            S * H              # act_i8
+            + S * 4            # act_scale
+            + H * 4            # rms_work
+            + S * (H // TP) * 2  # q (bf16)
+            + (KV // TP) * 4   # kv_scratch
+        )
+
+        comptime mlp_peak = (
+            S * H              # act_i8
+            + S * 4            # act_scale
+            + H * 4            # rms_work
+            + S * (I // TP) * 2  # gate (bf16)
+            + S * (I // TP) * 2  # up (bf16)
+            + S * I            # act_i8_inter
+            + S * 4            # act_scale_inter
+            + I * 4            # silu_work
+        )
+
+        comptime if attn_peak > mlp_peak:
+            return attn_peak
+        else:
+            return mlp_peak
 
     # --- State layout ---
 
@@ -231,8 +279,7 @@ struct HadQuantTPModel[tp: Int](WeightIterable):
     comptime X_MAIN_OFF = Self.KV_OFF + C.NUM_LAYERS * Self.KV_STRIDE
     comptime X_RESIDUAL_OFF = Self.X_MAIN_OFF + byte_count[Self.X_MAIN]()
     comptime SCRATCH_OFF = Self.X_RESIDUAL_OFF + byte_count[Self.X_RESIDUAL]()
-    comptime SCRATCH_STRIDE = byte_count[Self.SCRATCH]()
-    comptime ROPE_COS_OFF = Self.SCRATCH_OFF + Self.SCRATCH_COUNT * Self.SCRATCH_STRIDE
+    comptime ROPE_COS_OFF = Self.SCRATCH_OFF + Self.SCRATCH_CAPACITY
     comptime ROPE_SIN_OFF = Self.ROPE_COS_OFF + byte_count[Self.ROPE_COS]()
     comptime STATE_BYTES = Self.ROPE_SIN_OFF + byte_count[Self.ROPE_SIN]()
 
@@ -294,29 +341,20 @@ struct RankView[tp: Int]:
     def weight[T: Encoding & Shaped & Placed & Named](self) -> Bound[T]:
         return bind[T](self.weight_base())
 
-    # --- KV cache (int8 pre-rotated + per-head f32 scales) ---
+    # --- KV cache ---
 
     def kv_base(self, layer: Int) -> Int:
         return self.state_base() + Self.M.KV_OFF + layer * Self.M.KV_STRIDE
 
-    def k_cache(self, layer: Int) -> CacheView[Self.L.K_CACHE]:
-        return CacheView[Self.L.K_CACHE](self.kv_base(layer))
+    comptime KVCache = Self.L.KV_CACHE
 
-    def v_cache(self, layer: Int) -> CacheView[Self.L.V_CACHE]:
-        return CacheView[Self.L.V_CACHE](
-            self.kv_base(layer) + byte_count[Self.L.K_CACHE]()
-        )
+    def k_cache(self, layer: Int) -> Self.KVCache:
+        """K cache for this layer."""
+        return Self.KVCache(self.kv_base(layer))
 
-    def k_cache_scale(self, layer: Int) -> CacheView[Self.L.K_CACHE_SCALE]:
-        return CacheView[Self.L.K_CACHE_SCALE](
-            self.kv_base(layer) + byte_count[Self.L.K_CACHE]() + byte_count[Self.L.V_CACHE]()
-        )
-
-    def v_cache_scale(self, layer: Int) -> CacheView[Self.L.V_CACHE_SCALE]:
-        return CacheView[Self.L.V_CACHE_SCALE](
-            self.kv_base(layer) + byte_count[Self.L.K_CACHE]() + byte_count[Self.L.V_CACHE]()
-            + byte_count[Self.L.K_CACHE_SCALE]()
-        )
+    def v_cache(self, layer: Int) -> Self.KVCache:
+        """V cache for this layer (after K cache in memory)."""
+        return Self.KVCache(self.kv_base(layer) + Self.KVCache.TOTAL_BYTES)
 
     # --- bf16 activation views ---
 
@@ -326,31 +364,14 @@ struct RankView[tp: Int]:
     def x_residual(self, seq_len: Int) -> DynView[Self.M.X_RESIDUAL]:
         return DynView[Self.M.X_RESIDUAL](self.state_base() + Self.M.X_RESIDUAL_OFF, seq_len)
 
-    def scratch_slot(self, index: Int) -> Int:
-        return self.state_base() + Self.M.SCRATCH_OFF + index * Self.M.SCRATCH_STRIDE
+    def scratch_base(self) -> Int:
+        return self.state_base() + Self.M.SCRATCH_OFF
 
-    def q_view(self, seq_len: Int) -> DynView[Self.M.Q_VIEW]:
-        """Q projection output (slot 0)."""
-        return DynView[Self.M.Q_VIEW](self.scratch_slot(0), seq_len)
+    def scratch_view[V: Encoding & Shaped](self, read lease: ScratchLease, seq_len: Int) -> DynView[V]:
+        return DynView[V](self.scratch_base() + lease.offset, seq_len)
 
-    def mlp_view(self, index: Int, seq_len: Int) -> DynView[Self.M.MLP_VIEW]:
-        """Gate (index=0, slot 0) or Up (index=1, slot 1) output."""
-        return DynView[Self.M.MLP_VIEW](self.scratch_slot(index), seq_len)
-
-    # --- Quantized activation + scale (overlaid on slot 2) ---
-    #     Slot 2 is fully available — K and V go directly to int8 cache.
-
-    def activation_hidden(self, seq_len: Int) -> DynView[Self.M.ACT_I8_HIDDEN]:
-        """Quantized activation [M, HIDDEN] for QKV / O projections."""
-        return DynView[Self.M.ACT_I8_HIDDEN](self.scratch_slot(2), seq_len)
-
-    def activation_intermediate(self, seq_len: Int) -> DynView[Self.M.ACT_I8_INTERMEDIATE]:
-        """Quantized activation [M, INTERMEDIATE] for DOWN projection."""
-        return DynView[Self.M.ACT_I8_INTERMEDIATE](self.scratch_slot(2), seq_len)
-
-    def activation_scale(self, seq_len: Int) -> DynView[Self.M.ACT_SCALE]:
-        """Per-row f32 scale for the quantized activation."""
-        return DynView[Self.M.ACT_SCALE](self.scratch_slot(2) + byte_count[Self.M.ACT_I8_INTERMEDIATE](), seq_len)
+    def scratch_ptr[T: AnyType](self, read lease: ScratchLease) -> UnsafePointer[T, MutAnyOrigin]:
+        return UnsafePointer[T, MutAnyOrigin](unsafe_from_address=self.scratch_base() + lease.offset)
 
     # --- RoPE tables ---
 
@@ -438,26 +459,6 @@ def init_column_sums[tp: Int](arena_base: Int):
 # =============================================================================
 # Logits view
 # =============================================================================
-
-
-@fieldwise_init
-struct LogitsView[vocab: Int, dtype: DType = DType.bfloat16]:
-    comptime DTYPE = Self.dtype
-    comptime VOCAB = Self.vocab
-    var ptr: Int
-    var seq_len: Int
-
-    def rows(self) -> Int:
-        return self.seq_len
-
-    def load_f32[width: Int](self, row: Int, offset: Int) -> SIMD[DType.float32, width]:
-        var p = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=self.ptr
-        )
-        return (p + row * Self.vocab + offset).load[width=width]().cast[DType.float32]()
-
-
-# =============================================================================
 # Loaded model + forward pass
 # =============================================================================
 
@@ -467,6 +468,7 @@ struct SmolLM2HadQuant[tp: Int](Movable):
 
     var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]]
     var pools: HeapMoveArray[BurstPool[]]
+    var scratch: ScratchPool
     var bases: InlineArray[Int, Self.tp]
     var pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]
 
@@ -476,6 +478,7 @@ struct SmolLM2HadQuant[tp: Int](Movable):
         self.pool_ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp](
             fill=UnsafePointer[BurstPool[], MutAnyOrigin]()
         )
+        self.scratch = ScratchPool(Self.M.SCRATCH_CAPACITY)
         self.arenas = arenas^
         self.pools = pools^
         for rank in range(Self.tp):
@@ -561,73 +564,90 @@ struct SmolLM2HadQuant[tp: Int](Movable):
 
             # === Attention block ===
 
-            # 1. rms_fwht_quantize(x) → act_i8, act_sc
+            # Borrow scratch offsets — same for every rank
+            var act_i8 = self.scratch.borrow[Scalar[DType.int8], C.MAX_SEQ_LEN * C.HIDDEN]()
+            var act_scale = self.scratch.borrow[Float32, C.MAX_SEQ_LEN]()
+            var rms_work = self.scratch.borrow[Float32, C.HIDDEN]()
+
+            # 1. rms_fwht_quantize
             @parameter
             def do_rms_fwht_qkv[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence:
                 return rms_fwht_quantize[FWHT_BLOCK](
                     rv.x_main(seq_len),
-                    rv.activation_hidden(seq_len),
-                    rv.activation_scale(seq_len),
-                    pool,
-                    Float32(C.RMS_NORM_EPS),
+                    rv.scratch_view[M.ACT_I8_HIDDEN](act_i8, seq_len),
+                    rv.scratch_view[M.ACT_SCALE](act_scale, seq_len),
+                    rv.scratch_ptr[Float32](rms_work),
+                    pool, Float32(C.RMS_NORM_EPS),
                 )
             ranks.parallel[do_rms_fwht_qkv]()
+            rms_work^.release()
 
-            # 2. Q gemm → bf16 (only Q materializes as bf16)
+            # 2. Q gemm → bf16
+            var q = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * M.Q_VIEW.COLS]()
+
             @parameter
             def do_q[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence:
                 return int8_gemm[L.Q_PROJ, L.Q_SCALE, L.Q_COLSUM, M.ACT_I8_HIDDEN, M.ACT_SCALE, M.Q_VIEW](
-                    rv.activation_hidden(seq_len), rv.activation_scale(seq_len),
+                    rv.scratch_view[M.ACT_I8_HIDDEN](act_i8, seq_len),
+                    rv.scratch_view[M.ACT_SCALE](act_scale, seq_len),
                     rv.layer_weight[L.Q_PROJ](layer_idx), rv.layer_weight[L.Q_SCALE](layer_idx), rv.layer_weight[L.Q_COLSUM](layer_idx),
-                    rv.q_view(seq_len), pool,
+                    rv.scratch_view[M.Q_VIEW](q, seq_len), pool,
                 )
             ranks.parallel[do_q]()
 
-            # 3. K gemm → RoPE → FWHT → int8 cache (K never materializes as bf16)
+            # 3-4. K/V gemm → cache
+            var kv_work = self.scratch.borrow[Float32, M.LOCAL_KV_HEADS * C.HEAD_DIM]()
+
             @parameter
             def do_k_to_cache[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence:
-                return int8_gemm_k_to_cache[FWHT_BLOCK, C.HEAD_DIM, M.LOCAL_KV_HEADS](
-                    rv.activation_hidden(seq_len), rv.activation_scale(seq_len),
+                return int8_gemm_k_to_cache[FWHT_BLOCK, C.HEAD_DIM, M.LOCAL_KV_HEADS, C.MAX_SEQ_LEN](
+                    rv.scratch_view[M.ACT_I8_HIDDEN](act_i8, seq_len),
+                    rv.scratch_view[M.ACT_SCALE](act_scale, seq_len),
                     rv.layer_weight[L.K_PROJ](layer_idx), rv.layer_weight[L.K_SCALE](layer_idx), rv.layer_weight[L.K_COLSUM](layer_idx),
-                    rv.k_cache(layer_idx), rv.k_cache_scale(layer_idx),
+                    rv.k_cache(layer_idx),
                     rv.rope_cos(), rv.rope_sin(),
-                    pos, pool,
+                    pos, rv.scratch_ptr[Float32](kv_work), pool,
                 )
             ranks.parallel[do_k_to_cache]()
 
-            # 4. V gemm → FWHT → int8 cache (V never materializes as bf16)
             @parameter
             def do_v_to_cache[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence:
-                return int8_gemm_v_to_cache[FWHT_BLOCK, M.LOCAL_KV_HEADS](
-                    rv.activation_hidden(seq_len), rv.activation_scale(seq_len),
+                return int8_gemm_v_to_cache[FWHT_BLOCK, C.HEAD_DIM, M.LOCAL_KV_HEADS, C.MAX_SEQ_LEN](
+                    rv.scratch_view[M.ACT_I8_HIDDEN](act_i8, seq_len),
+                    rv.scratch_view[M.ACT_SCALE](act_scale, seq_len),
                     rv.layer_weight[L.V_PROJ](layer_idx), rv.layer_weight[L.V_SCALE](layer_idx), rv.layer_weight[L.V_COLSUM](layer_idx),
-                    rv.v_cache(layer_idx), rv.v_cache_scale(layer_idx),
-                    pos, pool,
+                    rv.v_cache(layer_idx),
+                    pos, rv.scratch_ptr[Float32](kv_work), pool,
                 )
             ranks.parallel[do_v_to_cache]()
+            kv_work^.release()
 
-            # 5. Int8 GQA attention (RoPE on Q fused inside) → int8 output
+            # 5. Attention → int8 output (reuses act_i8/act_scale)
             @parameter
             def do_attn[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence:
-                return int8_gqa_attention[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM](
-                    rv.q_view(seq_len),
-                    rv.k_cache(layer_idx), rv.k_cache_scale(layer_idx),
-                    rv.v_cache(layer_idx), rv.v_cache_scale(layer_idx),
-                    rv.activation_hidden(seq_len), rv.activation_scale(seq_len),
+                return int8_gqa_attention[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM, C.MAX_SEQ_LEN](
+                    rv.scratch_view[M.Q_VIEW](q, seq_len),
+                    rv.k_cache(layer_idx), rv.v_cache(layer_idx),
+                    rv.scratch_view[M.ACT_I8_HIDDEN](act_i8, seq_len),
+                    rv.scratch_view[M.ACT_SCALE](act_scale, seq_len),
                     rv.rope_cos(), rv.rope_sin(),
                     pos, pool,
                 )
             ranks.parallel[do_attn]()
+            q^.release()
 
             # 6. O projection
             @parameter
             def do_o[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence:
                 return int8_gemm[L.O_PROJ, L.O_SCALE, L.O_COLSUM, M.ACT_I8_HIDDEN, M.ACT_SCALE, M.X_RESIDUAL](
-                    rv.activation_hidden(seq_len), rv.activation_scale(seq_len),
+                    rv.scratch_view[M.ACT_I8_HIDDEN](act_i8, seq_len),
+                    rv.scratch_view[M.ACT_SCALE](act_scale, seq_len),
                     rv.layer_weight[L.O_PROJ](layer_idx), rv.layer_weight[L.O_SCALE](layer_idx), rv.layer_weight[L.O_COLSUM](layer_idx),
                     rv.x_residual(seq_len), pool,
                 )
             ranks.parallel[do_o]()
+            act_scale^.release()
+            act_i8^.release()
 
             # 7. Allreduce + residual add
             ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
@@ -639,51 +659,74 @@ struct SmolLM2HadQuant[tp: Int](Movable):
 
             # === MLP block ===
 
-            # 8. rms_fwht_quantize(x) → act_i8, act_sc
+            # 8. rms_fwht_quantize
+            var mlp_act_i8 = self.scratch.borrow[Scalar[DType.int8], C.MAX_SEQ_LEN * C.HIDDEN]()
+            var mlp_act_scale = self.scratch.borrow[Float32, C.MAX_SEQ_LEN]()
+            var mlp_rms_work = self.scratch.borrow[Float32, C.HIDDEN]()
+
             @parameter
             def do_rms_fwht_mlp[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence:
                 return rms_fwht_quantize[FWHT_BLOCK](
                     rv.x_main(seq_len),
-                    rv.activation_hidden(seq_len),
-                    rv.activation_scale(seq_len),
-                    pool,
-                    Float32(C.RMS_NORM_EPS),
+                    rv.scratch_view[M.ACT_I8_HIDDEN](mlp_act_i8, seq_len),
+                    rv.scratch_view[M.ACT_SCALE](mlp_act_scale, seq_len),
+                    rv.scratch_ptr[Float32](mlp_rms_work),
+                    pool, Float32(C.RMS_NORM_EPS),
                 )
             ranks.parallel[do_rms_fwht_mlp]()
+            mlp_rms_work^.release()
 
-            # 9. Fused GATE+UP gemm (one activation read, two outputs)
+            # 9. Gate+Up gemm → bf16
+            var gate = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * M.MLP_VIEW.COLS]()
+            var up = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * M.MLP_VIEW.COLS]()
+
             @parameter
             def do_gate_up[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence:
                 return int8_gemm_gate_up(
-                    rv.activation_hidden(seq_len), rv.activation_scale(seq_len),
+                    rv.scratch_view[M.ACT_I8_HIDDEN](mlp_act_i8, seq_len),
+                    rv.scratch_view[M.ACT_SCALE](mlp_act_scale, seq_len),
                     rv.layer_weight[L.GATE_PROJ](layer_idx), rv.layer_weight[L.GATE_SCALE](layer_idx), rv.layer_weight[L.GATE_COLSUM](layer_idx),
                     rv.layer_weight[L.UP_PROJ](layer_idx), rv.layer_weight[L.UP_SCALE](layer_idx), rv.layer_weight[L.UP_COLSUM](layer_idx),
-                    rv.mlp_view(0, seq_len), rv.mlp_view(1, seq_len),
+                    rv.scratch_view[M.MLP_VIEW](gate, seq_len),
+                    rv.scratch_view[M.MLP_VIEW](up, seq_len),
                     pool,
                 )
             ranks.parallel[do_gate_up]()
+            mlp_act_scale^.release()
+            mlp_act_i8^.release()
 
             # 10. silu_fwht_quantize(gate, up) → act_i8, act_sc
+            var act_i8_inter = self.scratch.borrow[Scalar[DType.int8], C.MAX_SEQ_LEN * C.INTERMEDIATE]()
+            var act_scale_inter = self.scratch.borrow[Float32, C.MAX_SEQ_LEN]()
+            var silu_work = self.scratch.borrow[Float32, C.INTERMEDIATE]()
+
             @parameter
             def do_silu_fwht[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence:
                 return silu_fwht_quantize[FWHT_BLOCK](
-                    rv.mlp_view(0, seq_len),
-                    rv.mlp_view(1, seq_len),
-                    rv.activation_intermediate(seq_len),
-                    rv.activation_scale(seq_len),
+                    rv.scratch_view[M.MLP_VIEW](gate, seq_len),
+                    rv.scratch_view[M.MLP_VIEW](up, seq_len),
+                    rv.scratch_view[M.ACT_I8_INTERMEDIATE](act_i8_inter, seq_len),
+                    rv.scratch_view[M.ACT_SCALE](act_scale_inter, seq_len),
+                    rv.scratch_ptr[Float32](silu_work),
                     pool,
                 )
             ranks.parallel[do_silu_fwht]()
+            silu_work^.release()
+            up^.release()
+            gate^.release()
 
             # 11. DOWN gemm
             @parameter
             def do_down[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence:
                 return int8_gemm[L.DOWN_PROJ, L.DOWN_SCALE, L.DOWN_COLSUM, M.ACT_I8_INTERMEDIATE, M.ACT_SCALE, M.X_RESIDUAL](
-                    rv.activation_intermediate(seq_len), rv.activation_scale(seq_len),
+                    rv.scratch_view[M.ACT_I8_INTERMEDIATE](act_i8_inter, seq_len),
+                    rv.scratch_view[M.ACT_SCALE](act_scale_inter, seq_len),
                     rv.layer_weight[L.DOWN_PROJ](layer_idx), rv.layer_weight[L.DOWN_SCALE](layer_idx), rv.layer_weight[L.DOWN_COLSUM](layer_idx),
                     rv.x_residual(seq_len), pool,
                 )
             ranks.parallel[do_down]()
+            act_scale_inter^.release()
+            act_i8_inter^.release()
 
             # 12. Allreduce + residual add
             ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
@@ -691,15 +734,17 @@ struct SmolLM2HadQuant[tp: Int](Movable):
 
             _ = layer_idx
 
-        # --- Final norm (no gamma — model.norm.weight is passthrough but not absorbed) ---
+        # --- Final norm + LM head ---
         rms_norm_no_gamma(host.x_main(seq_len), host.x_main(seq_len), ranks.pool_ptrs[0][]).join()
 
-        # --- LM head (bf16 gemm against embedding table — tied weights) ---
-        # Embedding is bf16 passthrough, not int8. Use bf16 gemm.
         from kernels.kernel_ops import gemm
-        var logits = DynView[M.LOGITS](host.scratch_slot(0), seq_len)
-        gemm(host.x_main(seq_len), host.weight[M.EMBED](), logits, ranks.pool_ptrs[0][]).join()
+        var last_row_off = (seq_len - 1) * C.HIDDEN * M.X_MAIN.ELEMENT_BYTES
+        var last_hidden = DynView[M.X_MAIN](host.x_main(seq_len).ptr + last_row_off, 1)
+        var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
+        gemm(last_hidden, host.weight[M.EMBED](), host.scratch_view[M.LOGITS](logit_lease, 1), ranks.pool_ptrs[0][]).join()
 
         prof.finish()
         prof.report()
-        return LogitsView[C.VOCAB_SIZE](logits.ptr, seq_len)
+        return LogitsView[C.VOCAB_SIZE](
+            host.scratch_ptr[Scalar[DType.bfloat16]](logit_lease), logit_lease^,
+        )

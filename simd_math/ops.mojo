@@ -41,6 +41,31 @@ def roundeven[dtype: DType, width: Int](x: SIMD[dtype, width]) -> SIMD[dtype, wi
 
 
 # =============================================================================
+# Int8 quantization
+# =============================================================================
+
+
+@always_inline
+def quantize_i8[width: Int](
+    v: SIMD[DType.float32, width], inv_scale: SIMD[DType.float32, width],
+) -> SIMD[DType.int8, width]:
+    """Absmax quantize f32 → i8: round(v * inv_scale), clamp [-128, 127].
+
+    inv_scale = 127.0 / absmax (precomputed by caller).
+    """
+    comptime lo = SIMD[DType.float32, width](-128.0)
+    comptime hi = SIMD[DType.float32, width](127.0)
+    return min(max(roundeven(v * inv_scale), lo), hi).cast[DType.int8]()
+
+
+@always_inline
+def quantize_i8_scalar(v: Float32, inv_scale: Float32) -> Scalar[DType.int8]:
+    """Scalar absmax quantize f32 → i8."""
+    var q = roundeven[DType.float32, 1](v * inv_scale)
+    return min(max(q, Float32(-128.0)), Float32(127.0)).cast[DType.int8]()
+
+
+# =============================================================================
 # Trigonometry
 # =============================================================================
 

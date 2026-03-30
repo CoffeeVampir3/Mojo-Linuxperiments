@@ -1,4 +1,5 @@
 from std.memory import UnsafePointer
+from experimental.linear_borrow_pool import ScratchLease
 
 
 # =============================================================================
@@ -313,3 +314,33 @@ trait RoPEConfig:
 
 trait RMSNormConfig:
     comptime RMS_NORM_EPS: Float64
+
+
+# =============================================================================
+# Logits view — non-owning read-only access to model output
+# =============================================================================
+
+
+@explicit_destroy
+struct LogitsView[vocab: Int, dtype: DType = DType.bfloat16](Movable):
+    """Owning view of one logit vector (VOCAB elements).
+
+    Holds a ScratchLease — the scratch offset is reserved until this
+    view is dropped. The caller must drop the previous LogitsView
+    before calling forward() again.
+    """
+    comptime DTYPE = Self.dtype
+    comptime VOCAB = Self.vocab
+    var ptr: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin]
+    var lease: ScratchLease
+
+    def __init__(out self, ptr: UnsafePointer[Scalar[Self.dtype], MutAnyOrigin], var lease: ScratchLease):
+        self.ptr = ptr
+        self.lease = lease^
+
+    def load_f32[width: Int](self, offset: Int) -> SIMD[DType.float32, width]:
+        return (self.ptr + offset).load[width=width]().cast[DType.float32]()
+
+    def release(deinit self):
+        """Drop the view, returning the scratch offset to the pool."""
+        self.lease^.release()

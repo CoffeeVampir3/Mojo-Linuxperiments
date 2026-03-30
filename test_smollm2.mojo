@@ -10,7 +10,8 @@ from std.pathlib import Path
 from std.time import perf_counter_ns
 
 from tokenizer import load_tokenizer
-from modeling.smollm2_tp import LogitsView, SmolLM2Config, SmolLM2TP
+from modeling.smollm2_tp import SmolLM2Config, SmolLM2TP
+from modeling.model_spec import LogitsView
 from modeling.model_spec import BF16
 
 
@@ -20,15 +21,14 @@ comptime VOCAB = SmolLM2Config.VOCAB_SIZE
 comptime MAX_NEW_TOKENS = 512
 
 
-def greedy_argmax(view: LogitsView[VOCAB]) -> Tuple[Int, Float32]:
-    """Greedy decode: return (token_id, logit) with highest value in last row."""
+def greedy_argmax(read view: LogitsView[VOCAB]) -> Tuple[Int, Float32]:
+    """Greedy decode: return (token_id, logit) with highest value."""
     comptime width = simd_width_of[DType.float32]()
-    var last = view.rows() - 1
     var best_val = Float32(-1e30)
     var best_idx = 0
 
     for j in range(0, VOCAB, width):
-        var v = view.load_f32[width](last, j)
+        var v = view.load_f32[width](j)
         for k in range(width):
             if v[k] > best_val:
                 best_val = v[k]
@@ -83,13 +83,8 @@ He was named to the 2022 class of ACM Fellows"""
     print("model loaded in", load_ms, "ms")
     print()
 
-    # --- Write tokens into rank 0's scratch area ---
-    var rv = model.rank(0)
-    var tokens_addr = rv.scratch_slot(0)
-    var tp = UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
-        unsafe_from_address=tokens_addr
-    )
-
+    # --- Write tokens ---
+    var tp = model.token_buffer()
     var seq_len = len(token_ids)
     for i in range(seq_len):
         tp[i] = Scalar[DType.int32](token_ids[i])
@@ -97,10 +92,11 @@ He was named to the 2022 class of ACM Fellows"""
     # --- Prefill: forward the full prompt ---
     print("--- prefill profile ---")
     var t1 = perf_counter_ns()
-    var logits = model.forward(tokens_addr, seq_len, 0, profile=True)
+    var logits = model.forward(Int(tp), seq_len, 0, profile=True)
     var prefill_ms = (perf_counter_ns() - t1) / 1_000_000
     var result = greedy_argmax(logits)
     var next_id = result[0]
+    logits^.release()
 
     var generated = List[Int]()
     generated.append(next_id)
@@ -119,10 +115,11 @@ He was named to the 2022 class of ACM Fellows"""
     for step in range(1, MAX_NEW_TOKENS):
         tp[0] = Scalar[DType.int32](next_id)
 
-        logits = model.forward(tokens_addr, 1, pos, profile=False)
+        logits = model.forward(Int(tp), 1, pos, profile=False)
 
         result = greedy_argmax(logits)
         next_id = result[0]
+        logits^.release()
         generated.append(next_id)
         pos += 1
 

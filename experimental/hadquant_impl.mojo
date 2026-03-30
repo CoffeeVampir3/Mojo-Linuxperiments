@@ -9,8 +9,8 @@ Contents:
   - rms_fwht_quantize: fused RMSNorm + FWHT + int8 quantization
   - silu_fwht_quantize: fused SiLU + FWHT + int8 quantization
   - int8_gemm: VNNI u8/i8 matmul with bias correction
-  - int8_gemm_k_to_cache: fused K projection → RoPE → FWHT → int8 cache
-  - int8_gemm_v_to_cache: fused V projection → FWHT → int8 cache
+  - int8_gemm_k_to_cache: fused K projection → RoPE → FWHT → u8 cache
+  - int8_gemm_v_to_cache: fused V projection → FWHT → u8 cache
   - int8_gemm_gate_up: fused GATE+UP projection (one activation read)
   - int8_gqa_attention: full int8 GQA with fused RoPE, V scale absorption
   - rms_norm_no_gamma: plain RMSNorm for final layer
@@ -24,7 +24,6 @@ via Parseval's theorem: <Hx, Hy> = <x, y> for any orthonormal H.
 """
 
 from std.memory import UnsafePointer, memcpy
-from std.memory.unsafe_pointer import alloc
 from std.sys.info import simd_width_of, CompilationTarget
 from std.sys import llvm_intrinsic
 from std.collections import InlineArray
@@ -36,10 +35,11 @@ from modeling.model_spec import (
     Slot, PlacedSlot, Bound, DynView, CacheView, bind, byte_count,
 )
 from kernels.kernel_ops import PoolFence
+from experimental.hadquant_kv_cache import HadQuantKVCache
 from kernels.vnni import (
     VNNI_N_STEP, VNNI_K_STEP, VNNI_TILE_N, VNNI_BLK, compute_n_block,
 )
-from simd_math import sqrt, roundeven
+from simd_math import sqrt, roundeven, exp_f32, quantize_i8, quantize_i8_scalar
 from simd_math.matrixops import log2
 
 
@@ -189,6 +189,7 @@ def rms_fwht_quantize[block: Int,
     input: DynView[InT],
     qi_out: DynView[QiT],
     scale_out: DynView[ScT],
+    work: UnsafePointer[Float32, MutAnyOrigin],
     mut pool: BurstPool[],
     eps: Float32 = 1e-5,
 ) -> PoolFence:
@@ -198,9 +199,7 @@ def rms_fwht_quantize[block: Int,
     quantize to int8. The rms normalization is folded into scale_out
     so the int8_gemm epilogue reconstructs W * RMSNorm(x) via Parseval.
 
-    qi[k] uses standard absmax quantization of the rotated values.
-    scale encodes absmax / (rms * 127) — the 1/rms factor makes the
-    gemm output equivalent to matmul against the normalized input.
+    work: f32 scratch buffer, at least InT.COLS elements. Reused across rows.
     """
     comptime assert InT.DTYPE == DType.bfloat16, "rms_fwht_quantize: input must be bf16"
     comptime assert QiT.DTYPE == DType.int8, "rms_fwht_quantize: qi output must be int8"
@@ -218,9 +217,6 @@ def rms_fwht_quantize[block: Int,
     var sc_ptr = UnsafePointer[Float32, MutAnyOrigin](
         unsafe_from_address=scale_out.ptr
     )
-
-    # Per-row f32 work buffer — fits in L1 (e.g. 576 * 4 = 2.3 KB)
-    var work = alloc[Float32](cols)
 
     for m in range(input.seq_len):
         var row_in = in_ptr + m * cols
@@ -266,21 +262,14 @@ def rms_fwht_quantize[block: Int,
         # --- Quantize: standard absmax int8 ---
         var inv = Float32(127.0) / absmax if absmax > 0 else Float32(0)
         var vinv = SIMD[DType.float32, width](inv)
-        comptime vlo = SIMD[DType.float32, width](-128.0)
-        comptime vhi = SIMD[DType.float32, width](127.0)
         k = 0
         while k + width <= cols:
-            var v = (work + k).load[width=width]()
-            var q = min(max(roundeven(v * vinv), vlo), vhi)
-            (row_qi + k).store(q.cast[DType.int8]())
+            (row_qi + k).store(quantize_i8((work + k).load[width=width](), vinv))
             k += width
         while k < cols:
-            var v = roundeven[DType.float32, 1](work[k] * inv)
-            var q = min(max(v, Float32(-128.0)), Float32(127.0))
-            row_qi[k] = q.cast[DType.int8]()
+            row_qi[k] = quantize_i8_scalar(work[k], inv)
             k += 1
 
-    work.free()
     return PoolFence.completed()
 
 
@@ -304,20 +293,74 @@ def silu_fwht_quantize[block: Int,
     up: DynView[UT],
     qi_out: DynView[QiT],
     scale_out: DynView[ScT],
+    work: UnsafePointer[Float32, MutAnyOrigin],
     mut pool: BurstPool[],
 ) -> PoolFence:
-    """Fused: SiLU(gate) * up → FWHT(blocks) → absmax → int8.
+    """Fused: SiLU(gate) * up → FWHT → absmax → int8.
 
-    Two bf16 reads (gate + up), one int8 write. SiLU involves exp() —
-    fast f32 approximation available in simd_math/ops.mojo (exp_f32).
-    The sigmoid is 1 / (1 + exp(-x)).
+    Per row: load gate + up as f32, compute SiLU(gate) * up, FWHT,
+    absmax quantize to int8. Two bf16 reads, one int8 write.
+
+    work: f32 scratch buffer, at least GT.COLS elements. Reused across rows.
+    SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x)).
     """
     comptime assert GT.DTYPE == DType.bfloat16, "silu_fwht_quantize: gate must be bf16"
     comptime assert UT.DTYPE == DType.bfloat16, "silu_fwht_quantize: up must be bf16"
     comptime assert QiT.DTYPE == DType.int8, "silu_fwht_quantize: qi output must be int8"
     comptime assert ScT.DTYPE == DType.float32, "silu_fwht_quantize: scale output must be f32"
-    print("    [stub] silu_fwht_quantize [" + String(gate.seq_len)
-          + "x" + String(GT.COLS) + "] block=" + String(block))
+
+    comptime cols = GT.COLS
+    comptime width = simd_width_of[DType.float32]()
+
+    var gp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=gate.ptr)
+    var up_ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=up.ptr)
+    var qi_ptr = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=qi_out.ptr)
+    var sc_ptr = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=scale_out.ptr)
+
+    for m in range(gate.seq_len):
+        var row_g = gp + m * cols
+        var row_u = up_ptr + m * cols
+        var row_qi = qi_ptr + m * cols
+
+        # --- SiLU(gate) * up → f32 work buffer ---
+        var k = 0
+        while k + width <= cols:
+            var g = (row_g + k).load[width=width]().cast[DType.float32]()
+            var u = (row_u + k).load[width=width]().cast[DType.float32]()
+            # sigmoid(g) = 1 / (1 + exp(-g))
+            var sig = SIMD[DType.float32, width](1.0) / (SIMD[DType.float32, width](1.0) + exp_f32(-g))
+            (work + k).store(g * sig * u)
+            k += width
+        while k < cols:
+            var g = Float32(row_g[k])
+            var u = Float32(row_u[k])
+            var sig = Float32(1.0) / (Float32(1.0) + exp_f32[1](-g))
+            work[k] = g * sig * u
+            k += 1
+
+        # --- FWHT ---
+        fwht_row[DType.float32, block](work, cols)
+
+        # --- Absmax + quantize ---
+        var vmax = SIMD[DType.float32, width](0)
+        k = 0
+        while k + width <= cols:
+            vmax = max(vmax, (work + k).load[width=width]().__abs__())
+            k += width
+        var absmax = vmax.reduce_max()
+
+        sc_ptr[m] = absmax / Float32(127.0)
+        var inv = Float32(127.0) / absmax if absmax > 0 else Float32(0)
+        var vinv = SIMD[DType.float32, width](inv)
+        k = 0
+        while k + width <= cols:
+            (row_qi + k).store(quantize_i8((work + k).load[width=width](), vinv))
+            k += width
+        while k < cols:
+            row_qi[k] = quantize_i8_scalar(work[k], inv)
+            k += 1
+
+    work.free()
     return PoolFence.completed()
 
 
@@ -348,13 +391,12 @@ def silu_fwht_quantize[block: Int,
 @always_inline
 def vpdpbusd[width: Int](
     acc: SIMD[DType.int32, width],
-    a: SIMD[DType.int8, width * 4],
+    a: SIMD[DType.uint8, width * 4],
     b: SIMD[DType.int8, width * 4],
 ) -> SIMD[DType.int32, width]:
     """AVX-VNNI / AVX-512 VNNI: u8 × i8 → i32 dot product accumulate.
 
     Per dword lane i: acc[i] += Σ_{j=0..3} u8(a[i].byte[j]) * i8(b[i].byte[j])
-    a bytes are interpreted as unsigned by hardware regardless of Mojo signedness.
     """
     return llvm_intrinsic[
         "llvm.x86.avx512.vpdpbusd." + String(width * 32),
@@ -401,16 +443,15 @@ def int8_gemm_dot_vnni[width: Int](
     bytes, XORs 0x80 per byte for u8 conversion, broadcasts the 4-byte
     pattern across all dword lanes. Single vpdpbusd accumulates the result.
     """
-    # Weight: width*4 packed bytes
+    # Weight (signed operand): width*4 packed i8 bytes
     var w = wpacked.bitcast[Scalar[DType.int8]]().load[width = width * 4]()
 
-    # Activation: load 4 bytes as one dword, XOR all bytes with 0x80
-    # simultaneously, broadcast dword to all lanes, bitcast to int8.
-    # No InlineArray indexing — avoids bounds check pollution.
+    # Activation (unsigned operand): load 4 i8 bytes as dword, XOR 0x80,
+    # broadcast, load as uint8 for vpdpbusd.
     var dword = (act_row + k_pos).bitcast[Scalar[DType.uint32]]()[0] ^ UInt32(0x80808080)
     var dwords = SIMD[DType.uint32, width](dword)
     var tmp = InlineArray[SIMD[DType.uint32, width], 1](fill=dwords)
-    var a = UnsafePointer(to=tmp).bitcast[Scalar[DType.int8]]().load[width = width * 4]()
+    var a = UnsafePointer(to=tmp).bitcast[UInt8]().load[width = width * 4]()
 
     return vpdpbusd[width](acc, a, w)
 
@@ -434,19 +475,140 @@ def int8_gemm_dot[width: Int](
         return int8_gemm_dot_simd[width](acc, act_row, wpacked, k_pos)
 
 
+# --- Shared gemm row: accumulate + bias correct + scale → store as OutDType ---
+
 @always_inline
-def int8_gemm_epilogue[width: Int](
-    acc: SIMD[DType.int32, width],
+# =============================================================================
+# Row-major i8 dot product (for attention scoring / V aggregation)
+#
+# Same vpdpbusd instruction as the VNNI-packed gemm, but on contiguous
+# row-major data. Both operands are HEAD_DIM contiguous bytes.
+# Uses u8×i8 convention: operand a is XORed with 0x80, producing a bias
+# of 128 * sum(b) that must be corrected by the caller.
+# =============================================================================
+
+
+@always_inline
+def i8_dot_row_major[head_dim: Int](
+    a_u8: UnsafePointer[UInt8, MutAnyOrigin],
+    b_i8: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+) -> Int32:
+    """Row-major dot product: u8 × i8 → i32, length head_dim.
+
+    a_u8 is the unsigned operand (e.g. KV cache entry, stored as u8).
+    b_i8 is the signed operand (e.g. quantized Q or attention weight).
+    Returns raw u8×i8 accumulation. Caller corrects bias:
+        true_dot = raw - 128 * sum(b_i8)
+    where sum(b_i8) is computed once per head (constant across entries).
+
+    vpdpbusd when available (4x throughput), widen-to-i32 fallback.
+    """
+    comptime width = simd_width_of[DType.int32]()
+    var acc = SIMD[DType.int32, width](0)
+
+    comptime if CompilationTarget.has_vnni():
+        var d = 0
+        while d + width * 4 <= head_dim:
+            var av = (a_u8 + d).load[width = width * 4]()
+            var bv = (b_i8 + d).load[width = width * 4]()
+            acc = vpdpbusd[width](acc, av, bv)
+            d += width * 4
+        while d + width <= head_dim:
+            var av = (a_u8 + d).load[width=width]().cast[DType.int32]()
+            var bv = (b_i8 + d).load[width=width]().cast[DType.int32]()
+            acc += av * bv
+            d += width
+    else:
+        var d = 0
+        while d + width <= head_dim:
+            # Widen u8 → u32 and i8 → i32
+            var av = (a_u8 + d).load[width=width]().cast[DType.int32]()
+            var bv = (b_i8 + d).load[width=width]().cast[DType.int32]()
+            acc += av * bv
+            d += width
+
+    return acc.reduce_add()
+
+
+@always_inline
+def i8_sum[head_dim: Int](
+    data: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+) -> Int:
+    """Sum all i8 values in a vector of length head_dim.
+
+    Used for vpdpbusd bias correction: true_dot = raw - 128 * sum.
+    """
+    comptime width = simd_width_of[DType.int32]()
+    var acc = SIMD[DType.int32, width](0)
+    var d = 0
+    while d + width <= head_dim:
+        acc += (data + d).load[width=width]().cast[DType.int32]()
+        d += width
+    return Int(acc.reduce_add())
+
+
+# =============================================================================
+# VNNI-packed GEMM row (for projections with packed weights)
+# =============================================================================
+
+
+def int8_gemm_row[N: Int, K: Int, OutDType: DType](
+    act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    wpacked: UnsafePointer[UInt8, MutAnyOrigin],
     act_sc: Float32,
     wsc: UnsafePointer[Float32, MutAnyOrigin],
     wcs: UnsafePointer[Float32, MutAnyOrigin],
-    dst: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    n_base: Int,
+    dst: UnsafePointer[Scalar[OutDType], MutAnyOrigin],
 ):
-    """Epilogue for `width` output channels: bias correction + scale + bf16 cast."""
-    var corrected = acc.cast[DType.float32]() - Float32(128.0) * (wcs + n_base).load[width=width]()
-    var result = corrected * act_sc * (wsc + n_base).load[width=width]()
-    (dst + n_base).store(result.cast[DType.bfloat16]())
+    """One activation row × VNNI-packed weight → N output elements.
+
+    Parameterized on OutDType: bfloat16 for terminal gemm, float32 when
+    the output feeds further per-head processing (RoPE, FWHT, etc.).
+    cast[float32] on f32 is identity; cast[bfloat16] truncates.
+    """
+    comptime width = simd_width_of[DType.int32]()
+    comptime passes_per_subtile = VNNI_TILE_N // width
+    comptime bytes_per_pass = width * VNNI_BLK
+    comptime acc_count = VNNI_N_STEP // width
+
+    var n_block = compute_n_block(N, K)
+    var packed_off = 0
+
+    for nb in range(0, N, n_block):
+        var nb_size = min(n_block, N - nb)
+
+        for ns in range(0, nb_size, VNNI_N_STEP):
+            var acc_buf = InlineArray[SIMD[DType.int32, width], acc_count](
+                fill=SIMD[DType.int32, width](0)
+            )
+            var acc = UnsafePointer(to=acc_buf).bitcast[SIMD[DType.int32, width]]()
+
+            for ks in range(0, K, VNNI_K_STEP):
+                for dc in range(VNNI_K_STEP // VNNI_BLK):
+                    var k_pos = ks + dc * VNNI_BLK
+                    for p in range(passes_per_subtile):
+                        acc[p] = int8_gemm_dot[width](
+                            acc[p], act_row,
+                            wpacked + packed_off + p * bytes_per_pass,
+                            k_pos,
+                        )
+                    packed_off += VNNI_TILE_N * VNNI_BLK
+
+                for dc in range(VNNI_K_STEP // VNNI_BLK):
+                    var k_pos = ks + dc * VNNI_BLK
+                    for p in range(passes_per_subtile):
+                        acc[passes_per_subtile + p] = int8_gemm_dot[width](
+                            acc[passes_per_subtile + p], act_row,
+                            wpacked + packed_off + p * bytes_per_pass,
+                            k_pos,
+                        )
+                    packed_off += VNNI_TILE_N * VNNI_BLK
+
+            for a in range(acc_count):
+                var n_base = nb + ns + a * width
+                var corrected = acc[a].cast[DType.float32]() - Float32(128.0) * (wcs + n_base).load[width=width]()
+                var result = corrected * act_sc * (wsc + n_base).load[width=width]()
+                (dst + n_base).store(result.cast[OutDType]())
 
 
 def int8_gemm[
@@ -463,13 +625,7 @@ def int8_gemm[
     output: DynView[OutT],
     mut pool: BurstPool[],
 ) -> PoolFence:
-    """Int8 GEMM over VNNI-packed weights with u8/i8 bias correction.
-
-    Iterates the packed weight in memory order (sequential reads).
-    The packed sub-tile is VNNI_TILE_N(16) channels wide. The kernel
-    processes it in SIMD chunks of `width` = simd_width_of[int32],
-    so 2 passes on 256-bit hardware, 1 pass on 512-bit.
-    """
+    """Int8 GEMM: int8_gemm_row[bfloat16] per activation row."""
     comptime assert QiT.DTYPE == DType.int8, "int8_gemm: activation must be int8"
     comptime assert ScT.DTYPE == DType.float32, "int8_gemm: act scale must be f32"
     comptime assert WT.DTYPE == DType.int8, "int8_gemm: weight must be int8"
@@ -479,11 +635,6 @@ def int8_gemm[
 
     comptime N = WT.ROWS
     comptime K = WT.COLS
-    comptime width = simd_width_of[DType.int32]()
-    # How many SIMD passes to cover one packed sub-tile of VNNI_TILE_N channels
-    comptime passes_per_subtile = VNNI_TILE_N // width
-    # Bytes per SIMD load: width dwords × 4 bytes
-    comptime bytes_per_pass = width * VNNI_BLK
 
     var act = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=act_qi.ptr)
     var wpacked = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=weight.ptr)
@@ -492,55 +643,13 @@ def int8_gemm[
     var asc = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=act_scale.ptr)
     var dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=output.ptr)
 
-    var n_block = compute_n_block(N, K)
-
     for m in range(act_qi.seq_len):
-        var act_row = act + m * K
-        var out_row = dst + m * N
-        var act_sc_m = asc[m]
-        var packed_off = 0
-
-        for nb in range(0, N, n_block):
-            var nb_size = min(n_block, N - nb)
-
-            for ns in range(0, nb_size, VNNI_N_STEP):
-                # Accumulators accessed via raw pointer to avoid bounds check pollution.
-                comptime acc_count = VNNI_N_STEP // width
-                var acc_buf = InlineArray[SIMD[DType.int32, width], acc_count](
-                    fill=SIMD[DType.int32, width](0)
-                )
-                var acc = UnsafePointer(to=acc_buf).bitcast[SIMD[DType.int32, width]]()
-
-                for ks in range(0, K, VNNI_K_STEP):
-                    # Sub-tile 0: first VNNI_TILE_N channels of this N_STEP
-                    for dc in range(VNNI_K_STEP // VNNI_BLK):
-                        var k_pos = ks + dc * VNNI_BLK
-                        for p in range(passes_per_subtile):
-                            acc[p] = int8_gemm_dot[width](
-                                acc[p], act_row,
-                                wpacked + packed_off + p * bytes_per_pass,
-                                k_pos,
-                            )
-                        packed_off += VNNI_TILE_N * VNNI_BLK
-
-                    # Sub-tile 1: next VNNI_TILE_N channels
-                    for dc in range(VNNI_K_STEP // VNNI_BLK):
-                        var k_pos = ks + dc * VNNI_BLK
-                        for p in range(passes_per_subtile):
-                            acc[passes_per_subtile + p] = int8_gemm_dot[width](
-                                acc[passes_per_subtile + p], act_row,
-                                wpacked + packed_off + p * bytes_per_pass,
-                                k_pos,
-                            )
-                        packed_off += VNNI_TILE_N * VNNI_BLK
-
-                # Epilogue for all accumulators
-                for a in range(acc_count):
-                    int8_gemm_epilogue[width](
-                        acc[a], act_sc_m, wsc, wcs, out_row, nb + ns + a * width,
-                    )
+        int8_gemm_row[N, K, DType.bfloat16](
+            act + m * K, wpacked, asc[m], wsc, wcs, dst + m * N,
+        )
 
     return PoolFence.completed()
+
 
 
 # =============================================================================
@@ -560,40 +669,95 @@ def int8_gemm[
 # =============================================================================
 
 
-def int8_gemm_k_to_cache[block: Int, head_dim: Int, num_kv_heads: Int,
+def int8_gemm_k_to_cache[block: Int, head_dim: Int, num_kv_heads: Int, max_seq: Int,
     WT: Encoding & Shaped & Placed, WsT: Encoding & Shaped & Placed,
     CsT: Encoding & Shaped & Placed,
     QiT: Encoding & Shaped, ScT: Encoding & Shaped,
-    KcT: Encoding & Shaped, KsT: Encoding & Shaped,
     CosT: Encoding & Shaped, SinT: Encoding & Shaped](
     act_qi: DynView[QiT],
     act_scale: DynView[ScT],
     weight: Bound[WT],
     weight_scale: Bound[WsT],
     weight_colsum: Bound[CsT],
-    k_cache: CacheView[KcT],
-    k_cache_scale: CacheView[KsT],
+    cache: HadQuantKVCache[max_seq, head_dim, num_kv_heads],
     cos_table: Bound[CosT],
     sin_table: Bound[SinT],
     pos: Int,
+    f32_buf: UnsafePointer[Float32, MutAnyOrigin],
     mut pool: BurstPool[],
 ) -> PoolFence:
-    """Fused K projection → cache: int8_gemm epilogue → RoPE → FWHT → quantize → write.
+    """Fused K projection → u8 cache: gemm → RoPE → FWHT → quantize → write.
 
-    Computes the K projection one head at a time (HEAD_DIM output elements).
-    The tile epilogue applies RoPE + FWHT per head and writes int8 directly
-    to the KV cache. K never materializes as bf16.
+    Two passes per row:
+      1. Int8 gemm → f32_buf [N = num_kv_heads * head_dim]
+      2. Per head: RoPE(pos+m) → FWHT → quantize i8 → cache.write_head() (XORs to u8)
 
-    Writes seq_len rows to cache positions pos..pos+seq_len-1.
-    Row m gets RoPE at position pos+m.
+    f32_buf: scratch buffer, at least N elements. Reused across rows.
+    K never materializes as bf16. Cache stores u8 for native vpdpbusd.
     """
     comptime assert QiT.DTYPE == DType.int8, "int8_gemm_k_to_cache: act must be int8"
     comptime assert WT.DTYPE == DType.int8, "int8_gemm_k_to_cache: weight must be int8"
-    comptime assert KcT.DTYPE == DType.int8, "int8_gemm_k_to_cache: K cache must be int8"
-    print("    [stub] int8_gemm_k_to_cache pos=" + String(pos)
-          + " seq_len=" + String(act_qi.seq_len)
-          + " [" + String(act_qi.seq_len) + "x" + String(WT.COLS)
-          + "] -> K cache[" + String(pos) + ".." + String(pos + act_qi.seq_len - 1) + "]")
+
+    comptime N = WT.ROWS
+    comptime K = WT.COLS
+    comptime half = head_dim // 2
+    comptime f32_width = simd_width_of[DType.float32]()
+
+    var act = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=act_qi.ptr)
+    var wpacked = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=weight.ptr)
+    var wsc = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=weight_scale.ptr)
+    var wcs = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=weight_colsum.ptr)
+    var asc = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=act_scale.ptr)
+    var cp = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cos_table.ptr)
+    var sn = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=sin_table.ptr)
+
+    # Stack buffer for per-head quantize output
+    var qi_head = InlineArray[Scalar[DType.int8], head_dim](fill=Scalar[DType.int8](0))
+    var qi_ptr = UnsafePointer(to=qi_head).bitcast[Scalar[DType.int8]]()
+
+    for m in range(act_qi.seq_len):
+        int8_gemm_row[N, K, DType.float32](
+            act + m * K, wpacked, asc[m], wsc, wcs, f32_buf,
+        )
+
+        var actual_pos = pos + m
+        var cos_row = cp + actual_pos * half
+        var sin_row = sn + actual_pos * half
+
+        for g in range(num_kv_heads):
+            var head = f32_buf + g * head_dim
+
+            # RoPE
+            var j = 0
+            while j + f32_width <= half:
+                var x_lo = (head + j).load[width=f32_width]()
+                var x_hi = (head + half + j).load[width=f32_width]()
+                var cv = (cos_row + j).load[width=f32_width]()
+                var sv = (sin_row + j).load[width=f32_width]()
+                (head + j).store(x_lo * cv - x_hi * sv)
+                (head + half + j).store(x_hi * cv + x_lo * sv)
+                j += f32_width
+
+            # FWHT + quantize
+            fwht_block[DType.float32, block](head)
+
+            var vmax = SIMD[DType.float32, f32_width](0)
+            j = 0
+            while j + f32_width <= head_dim:
+                vmax = max(vmax, (head + j).load[width=f32_width]().__abs__())
+                j += f32_width
+            var absmax = vmax.reduce_max()
+            var scale = absmax / Float32(127.0)
+            var inv = Float32(127.0) / absmax if absmax > 0 else Float32(0)
+            var vinv = SIMD[DType.float32, f32_width](inv)
+
+            j = 0
+            while j + f32_width <= head_dim:
+                (qi_ptr + j).store(quantize_i8((head + j).load[width=f32_width](), vinv))
+                j += f32_width
+
+            cache.write_head(actual_pos, g, qi_ptr, scale)
+
     return PoolFence.completed()
 
 
@@ -604,33 +768,72 @@ def int8_gemm_k_to_cache[block: Int, head_dim: Int, num_kv_heads: Int,
 # =============================================================================
 
 
-def int8_gemm_v_to_cache[block: Int, num_kv_heads: Int,
+def int8_gemm_v_to_cache[block: Int, head_dim: Int, num_kv_heads: Int, max_seq: Int,
     WT: Encoding & Shaped & Placed, WsT: Encoding & Shaped & Placed,
     CsT: Encoding & Shaped & Placed,
-    QiT: Encoding & Shaped, ScT: Encoding & Shaped,
-    VcT: Encoding & Shaped, VsT: Encoding & Shaped](
+    QiT: Encoding & Shaped, ScT: Encoding & Shaped](
     act_qi: DynView[QiT],
     act_scale: DynView[ScT],
     weight: Bound[WT],
     weight_scale: Bound[WsT],
     weight_colsum: Bound[CsT],
-    v_cache: CacheView[VcT],
-    v_cache_scale: CacheView[VsT],
+    cache: HadQuantKVCache[max_seq, head_dim, num_kv_heads],
     pos: Int,
+    f32_buf: UnsafePointer[Float32, MutAnyOrigin],
     mut pool: BurstPool[],
 ) -> PoolFence:
-    """Fused V projection → cache: int8_gemm epilogue → FWHT → quantize → write.
+    """Fused V projection → u8 cache: gemm → FWHT → quantize → write.
 
     Same as K but without RoPE. V never materializes as bf16.
-    Writes seq_len rows to cache positions pos..pos+seq_len-1.
+    Cache stores u8 for native vpdpbusd.
+    f32_buf: scratch buffer, at least N elements. Reused across rows.
     """
     comptime assert QiT.DTYPE == DType.int8, "int8_gemm_v_to_cache: act must be int8"
     comptime assert WT.DTYPE == DType.int8, "int8_gemm_v_to_cache: weight must be int8"
-    comptime assert VcT.DTYPE == DType.int8, "int8_gemm_v_to_cache: V cache must be int8"
-    print("    [stub] int8_gemm_v_to_cache pos=" + String(pos)
-          + " seq_len=" + String(act_qi.seq_len)
-          + " [" + String(act_qi.seq_len) + "x" + String(WT.COLS)
-          + "] -> V cache[" + String(pos) + ".." + String(pos + act_qi.seq_len - 1) + "]")
+
+    comptime N = WT.ROWS
+    comptime K = WT.COLS
+    comptime head_dim = cache.head_dim
+    comptime f32_width = simd_width_of[DType.float32]()
+
+    var act = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=act_qi.ptr)
+    var wpacked = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=weight.ptr)
+    var wsc = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=weight_scale.ptr)
+    var wcs = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=weight_colsum.ptr)
+    var asc = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=act_scale.ptr)
+
+    var qi_head = InlineArray[Scalar[DType.int8], head_dim](fill=Scalar[DType.int8](0))
+    var qi_ptr = UnsafePointer(to=qi_head).bitcast[Scalar[DType.int8]]()
+
+    for m in range(act_qi.seq_len):
+        int8_gemm_row[N, K, DType.float32](
+            act + m * K, wpacked, asc[m], wsc, wcs, f32_buf,
+        )
+
+        var actual_pos = pos + m
+
+        for g in range(num_kv_heads):
+            var head = f32_buf + g * head_dim
+
+            fwht_block[DType.float32, block](head)
+
+            var vmax = SIMD[DType.float32, f32_width](0)
+            var j = 0
+            while j + f32_width <= head_dim:
+                vmax = max(vmax, (head + j).load[width=f32_width]().__abs__())
+                j += f32_width
+            var absmax = vmax.reduce_max()
+            var scale = absmax / Float32(127.0)
+            var inv = Float32(127.0) / absmax if absmax > 0 else Float32(0)
+            var vinv = SIMD[DType.float32, f32_width](inv)
+
+            j = 0
+            while j + f32_width <= head_dim:
+                (qi_ptr + j).store(quantize_i8((head + j).load[width=f32_width](), vinv))
+                j += f32_width
+
+            cache.write_head(actual_pos, g, qi_ptr, scale)
+
     return PoolFence.completed()
 
 
@@ -655,86 +858,40 @@ def int8_gemm_gate_up[
     up_out: DynView[UOutT],
     mut pool: BurstPool[],
 ) -> PoolFence:
-    """Fused GATE+UP: reads int8 activation once, produces both bf16 outputs.
+    """Fused GATE+UP: two int8_gemm_row calls sharing one activation row.
 
-    Each output element computes two independent dot products against the
-    same activation row — one for GATE, one for UP. Maximize reuse of
-    loaded activation tiles across both weight matrices.
+    Both projections read the same i8 activation and produce bf16 output.
+    The activation stays in cache across both calls.
     """
     comptime assert QiT.DTYPE == DType.int8, "int8_gemm_gate_up: act must be int8"
     comptime assert GOutT.DTYPE == DType.bfloat16, "int8_gemm_gate_up: gate output must be bf16"
     comptime assert UOutT.DTYPE == DType.bfloat16, "int8_gemm_gate_up: up output must be bf16"
-    print("    [stub] int8_gemm_gate_up [" + String(act_qi.seq_len)
-          + "x" + String(GWT.COLS) + "] -> gate[" + String(GWT.ROWS)
-          + "] + up[" + String(UWT.ROWS) + "]")
+
+    comptime G_N = GWT.ROWS
+    comptime U_N = UWT.ROWS
+    comptime K = GWT.COLS
+
+    var act = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=act_qi.ptr)
+    var asc = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=act_scale.ptr)
+    var g_wp = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=gate_weight.ptr)
+    var g_sc = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=gate_scale.ptr)
+    var g_cs = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=gate_colsum.ptr)
+    var u_wp = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=up_weight.ptr)
+    var u_sc = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=up_scale.ptr)
+    var u_cs = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=up_colsum.ptr)
+    var g_dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=gate_out.ptr)
+    var u_dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=up_out.ptr)
+
+    for m in range(act_qi.seq_len):
+        var act_row = act + m * K
+        var act_sc_m = asc[m]
+        int8_gemm_row[G_N, K, DType.bfloat16](act_row, g_wp, act_sc_m, g_sc, g_cs, g_dst + m * G_N)
+        int8_gemm_row[U_N, K, DType.bfloat16](act_row, u_wp, act_sc_m, u_sc, u_cs, u_dst + m * U_N)
+
     return PoolFence.completed()
 
 
-# =============================================================================
-# Kernel: int8_gqa_attention
-#
-# Full int8 GQA attention with fused RoPE on Q, pre-rotated int8 KV
-# cache, V scale absorption, and direct int8 output.
-#
-# Per query row m, per head h (kv group g = h / GQA_FACTOR):
-#   1. RoPE(Q[m, h], pos + m)
-#   2. FWHT + quantize Q per head
-#   3. Int8 scoring: score[t] = dot(qi_q, qi_K[t,g]) * scales / sqrt(HD)
-#   4. Masked softmax in f32 (causal: m attends to 0..pos+m)
-#   5. Absorb V per-entry scales into attention weights
-#   6. Quantize absorbed weights to int8
-#   7. Int8 aggregation: out[d] = sum_t qi_w[t] * qi_V[t,g,d]
-#   8. Quantize output → int8 directly
-#
-# V scale absorption: w_abs[t] = softmax[t] * v_scale[t,g]
-# This folds varying V scales into attention weights, enabling a single
-# scalar w_sc for the aggregation epilogue (clean i32 accumulation).
-# =============================================================================
-
-
-def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
-    QT: Encoding & Shaped,
-    KcT: Encoding & Shaped, VcT: Encoding & Shaped,
-    KsT: Encoding & Shaped, VsT: Encoding & Shaped,
-    QiT: Encoding & Shaped, ScT: Encoding & Shaped,
-    CosT: Encoding & Shaped, SinT: Encoding & Shaped](
-    q: DynView[QT],
-    k_cache: CacheView[KcT], k_cache_scale: CacheView[KsT],
-    v_cache: CacheView[VcT], v_cache_scale: CacheView[VsT],
-    qi_out: DynView[QiT],
-    scale_out: DynView[ScT],
-    cos_table: Bound[CosT],
-    sin_table: Bound[SinT],
-    pos: Int,
-    mut pool: BurstPool[],
-) -> PoolFence:
-    """Int8 GQA attention with fused RoPE on Q and pre-rotated int8 KV cache.
-
-    Q is bf16 [seq_len, num_heads * head_dim] in original domain (no RoPE).
-    K and V cache entries are int8, pre-rotated per head with per-head scales.
-
-    pos is the cache position of the FIRST query in the batch:
-      - Decode (seq_len=1): single query at position pos.
-        Context = pos+1 cache entries. GEMV per head.
-      - Prefill (seq_len>1): queries at positions pos..pos+seq_len-1.
-        Causal mask: query m attends to cache positions 0..pos+m.
-        GEMM per head with triangular mask.
-
-    Output is int8 + f32 scale in per-head rotated domain. Feeds the O
-    projection whose weight is rotated with block=HEAD_DIM — rotation
-    cancels: <H*attn_out, H*O_weight[n]> = <attn_out, O_weight[n]>.
-    """
-    comptime assert QT.DTYPE == DType.bfloat16, "int8_gqa_attention: Q must be bf16"
-    comptime assert KcT.DTYPE == DType.int8, "int8_gqa_attention: K cache must be int8"
-    comptime assert VcT.DTYPE == DType.int8, "int8_gqa_attention: V cache must be int8"
-    comptime assert QiT.DTYPE == DType.int8, "int8_gqa_attention: qi output must be int8"
-    comptime assert ScT.DTYPE == DType.float32, "int8_gqa_attention: scale output must be f32"
-    var ctx = pos + q.seq_len
-    print("    [stub] int8_gqa_attention seq_len=" + String(q.seq_len)
-          + " heads=" + String(num_heads)
-          + " ctx=" + String(ctx)
-          + (" (decode)" if q.seq_len == 1 else " (prefill)"))
-    return PoolFence.completed()
+# int8_gqa_attention is in experimental/hadquant_attn.mojo
 
 
 # =============================================================================
@@ -753,12 +910,43 @@ def rms_norm_no_gamma[InT: Encoding & Shaped, OutT: Encoding & Shaped](
     """RMSNorm without gamma: output = input / rms(input).
 
     Used for final_norm where gamma is not absorbed (the final norm
-    has no downstream projection to absorb into).
+    has no downstream projection to absorb into). In-place safe
+    (input and output may alias).
     """
     comptime assert InT.DTYPE == DType.bfloat16, "rms_norm_no_gamma: input must be bf16"
     comptime assert OutT.DTYPE == DType.bfloat16, "rms_norm_no_gamma: output must be bf16"
-    print("    [stub] rms_norm_no_gamma [" + String(input.seq_len)
-          + "x" + String(InT.COLS) + "]")
+
+    comptime cols = InT.COLS
+    comptime width = simd_width_of[DType.float32]()
+
+    var inp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=input.ptr)
+    var out = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=output.ptr)
+
+    for m in range(input.seq_len):
+        var row_in = inp + m * cols
+        var row_out = out + m * cols
+
+        # Sum of squares
+        var vsum = SIMD[DType.float32, width](0)
+        var k = 0
+        while k + width <= cols:
+            var v = (row_in + k).load[width=width]().cast[DType.float32]()
+            vsum = v.fma(v, vsum)
+            k += width
+        var sum_sq = vsum.reduce_add()
+
+        # rms = sqrt(sum_sq / cols + eps), inv_rms = 1/rms
+        var rms = sqrt[DType.float32, 1](sum_sq / Float32(cols) + eps)
+        var inv_rms = Float32(1.0) / rms
+        var vinv = SIMD[DType.float32, width](inv_rms)
+
+        # Normalize
+        k = 0
+        while k + width <= cols:
+            var v = (row_in + k).load[width=width]().cast[DType.float32]()
+            (row_out + k).store((v * vinv).cast[DType.bfloat16]())
+            k += width
+
     return PoolFence.completed()
 
 

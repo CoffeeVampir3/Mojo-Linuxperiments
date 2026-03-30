@@ -27,6 +27,7 @@ from modeling.model_spec import (
     next_offset,
     DEFAULT_ALIGNMENT,
     Dims, Attention, GQA, FFN, Vocab, Sequence, RoPEConfig, RMSNormConfig,
+    LogitsView,
 )
 from kernels.kernel_ops import (
     gemm, rmsnorm, embed_lookup, silu_mul, elem_add, rope, kv_cache_write,
@@ -36,41 +37,13 @@ from kernels.kernel_ops import (
 from kernels.reductions import ring_allreduce, ring_broadcast
 from modeling.loader import load_safetensors
 from kernels.profiler import Profiler
+from experimental.linear_borrow_pool import ScratchPool, ScratchLease
 
 
 # =============================================================================
 # Shared types: model config, logit access
 # =============================================================================
 
-
-trait LogitAccess:
-    """Read-only access to model output logits.
-    VOCAB is comptime for SIMD loop bounds. rows() is runtime
-    (1 for decode, N for prefill). load_f32 upcasts from storage
-    dtype so consumers always work in f32."""
-    comptime DTYPE: DType
-    comptime VOCAB: Int
-    def rows(self) -> Int: ...
-    def load_f32[width: Int](self, row: Int, offset: Int) -> SIMD[DType.float32, width]: ...
-
-
-@fieldwise_init
-struct LogitsView[vocab: Int, dtype: DType = DType.bfloat16](LogitAccess):
-    """Non-owning, read-only view of logits in arena scratch memory.
-    Valid only while the backing arena is alive."""
-    comptime DTYPE = Self.dtype
-    comptime VOCAB = Self.vocab
-    var ptr: Int
-    var seq_len: Int
-
-    def rows(self) -> Int:
-        return self.seq_len
-
-    def load_f32[width: Int](self, row: Int, offset: Int) -> SIMD[DType.float32, width]:
-        var p = UnsafePointer[Scalar[Self.dtype], MutAnyOrigin](
-            unsafe_from_address=self.ptr
-        )
-        return (p + row * Self.vocab + offset).load[width=width]().cast[DType.float32]()
 
 
 struct SmolLM2Config(Dims, Attention, GQA, FFN, Vocab, Sequence, RoPEConfig, RMSNormConfig):
@@ -150,19 +123,57 @@ struct TPModel[E: Encoding, tp: Int](WeightIterable):
     comptime X_RESIDUAL = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.HIDDEN, Self.tp]
     comptime LOGITS = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.VOCAB_SIZE, Self.tp]
 
-    # Shared scratch: 3 slots, each full INTERMEDIATE width (no sharding).
-    # Scratch is working memory — always full-width regardless of TP.
-    # Reuse pattern per layer:
-    #   slot0: Q output      → gate output → logits (host only)
-    #   slot1: K output      → attn output → up output
-    #   slot2: V output
-    comptime SCRATCH = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.INTERMEDIATE, Self.tp]
-    comptime SCRATCH_COUNT = 3
-
-    # Typed views into scratch slots (same memory, narrower logical width).
+    # Typed DynView slots — used to construct views over borrowed scratch.
     comptime Q_VIEW = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.HIDDEN, Self.tp]
     comptime KV_VIEW = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.KV_HIDDEN, Self.tp]
     comptime MLP_VIEW = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.INTERMEDIATE, Self.tp]
+
+    # Scratch capacity: derived from the peak phase.
+    comptime SCRATCH_CAPACITY = Self.calculate_peak_scratch()
+
+    @staticmethod
+    def calculate_peak_scratch() -> Int:
+        """Peak scratch bytes across both phases of one layer.
+
+        Each phase creates a fresh ScratchPool. The pool is a bump
+        allocator (no reclaim), so the peak is the cumulative sum of
+        all borrows within the largest phase.
+
+        Attention phase borrows (in order, all bf16):
+            q:        MAX_SEQ_LEN * HIDDEN/tp * 2
+            k:        MAX_SEQ_LEN * KV_HIDDEN/tp * 2
+            v:        MAX_SEQ_LEN * KV_HIDDEN/tp * 2
+            attn_out: MAX_SEQ_LEN * HIDDEN/tp * 2
+
+        MLP phase borrows (in order, all bf16):
+            gate:     MAX_SEQ_LEN * INTERMEDIATE/tp * 2
+            up:       MAX_SEQ_LEN * INTERMEDIATE/tp * 2
+
+        Post-loop: logits reuse scratch from offset 0 (fresh pool).
+        An assert verifies they fit within the layer-phase capacity.
+        """
+        comptime S = C.MAX_SEQ_LEN
+        comptime H = C.HIDDEN
+        comptime KV = C.KV_HIDDEN
+        comptime I = C.INTERMEDIATE
+        comptime TP = Self.tp
+
+        comptime attn_peak = (
+            S * (H // TP) * 2      # q
+            + S * (KV // TP) * 2   # k
+            + S * (KV // TP) * 2   # v
+            + S * (H // TP) * 2    # attn_out
+        )
+
+        comptime mlp_peak = (
+            S * (I // TP) * 2      # gate
+            + S * (I // TP) * 2    # up
+        )
+
+        comptime if attn_peak > mlp_peak:
+            return attn_peak
+        else:
+            return mlp_peak
 
     # Per-rank state layout.
     comptime KV_STRIDE = Self.LAYER.cache_bytes()
@@ -170,8 +181,7 @@ struct TPModel[E: Encoding, tp: Int](WeightIterable):
     comptime X_MAIN_OFF = Self.KV_OFF + C.NUM_LAYERS * Self.KV_STRIDE
     comptime X_RESIDUAL_OFF = Self.X_MAIN_OFF + byte_count[Self.X_MAIN]()
     comptime SCRATCH_OFF = Self.X_RESIDUAL_OFF + byte_count[Self.X_RESIDUAL]()
-    comptime SCRATCH_STRIDE = byte_count[Self.SCRATCH]()
-    comptime ROPE_COS_OFF = Self.SCRATCH_OFF + Self.SCRATCH_COUNT * Self.SCRATCH_STRIDE
+    comptime ROPE_COS_OFF = Self.SCRATCH_OFF + Self.SCRATCH_CAPACITY
     comptime ROPE_SIN_OFF = Self.ROPE_COS_OFF + byte_count[Self.ROPE_COS]()
     comptime STATE_BYTES = Self.ROPE_SIN_OFF + byte_count[Self.ROPE_SIN]()
 
@@ -239,25 +249,16 @@ struct RankView[E: Encoding, tp: Int]:
     def x_residual(self, seq_len: Int) -> DynView[Self.M.X_RESIDUAL]:
         return DynView[Self.M.X_RESIDUAL](self.state_base() + Self.M.X_RESIDUAL_OFF, seq_len)
 
-    def scratch_slot(self, index: Int) -> Int:
-        """Raw address of scratch slot `index` (0, 1, or 2)."""
-        return self.state_base() + Self.M.SCRATCH_OFF + index * Self.M.SCRATCH_STRIDE
+    def scratch_base(self) -> Int:
+        return self.state_base() + Self.M.SCRATCH_OFF
 
-    def q_view(self, seq_len: Int) -> DynView[Self.M.Q_VIEW]:
-        """Q output / attn input — slot 0, Q-width view."""
-        return DynView[Self.M.Q_VIEW](self.scratch_slot(0), seq_len)
+    def scratch_view[V: Encoding & Shaped](self, read lease: ScratchLease, seq_len: Int) -> DynView[V]:
+        """Materialize a DynView from a scratch lease offset."""
+        return DynView[V](self.scratch_base() + lease.offset, seq_len)
 
-    def attn_out_view(self, seq_len: Int) -> DynView[Self.M.Q_VIEW]:
-        """Attention output — slot 1, Q-width view (reuses K slot after KV cache write)."""
-        return DynView[Self.M.Q_VIEW](self.scratch_slot(1), seq_len)
-
-    def kv_view(self, index: Int, seq_len: Int) -> DynView[Self.M.KV_VIEW]:
-        """K (index=0, slot 1) or V (index=1, slot 2) — KV-width view."""
-        return DynView[Self.M.KV_VIEW](self.scratch_slot(index + 1), seq_len)
-
-    def mlp_view(self, index: Int, seq_len: Int) -> DynView[Self.M.MLP_VIEW]:
-        """Gate (index=0, slot 0) or Up (index=1, slot 1) — per-rank intermediate width."""
-        return DynView[Self.M.MLP_VIEW](self.scratch_slot(index), seq_len)
+    def scratch_ptr[T: AnyType](self, read lease: ScratchLease) -> UnsafePointer[T, MutAnyOrigin]:
+        """Materialize a typed pointer from a scratch lease offset."""
+        return UnsafePointer[T, MutAnyOrigin](unsafe_from_address=self.scratch_base() + lease.offset)
 
     def rope_cos(self) -> Bound[Self.M.ROPE_COS]:
         return Bound[Self.M.ROPE_COS](self.state_base() + Self.M.ROPE_COS_OFF)
@@ -273,8 +274,7 @@ struct RankView[E: Encoding, tp: Int]:
 
 @fieldwise_init
 struct Ranks[E: Encoding, tp: Int]:
-    """Rank-indexed dispatch helper. Captures base addresses and pool pointers
-    for use in parallel_for closures and sequential loops."""
+    """Rank-indexed dispatch helper."""
     var bases: InlineArray[Int, Self.tp]
     var pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]
 
@@ -282,7 +282,6 @@ struct Ranks[E: Encoding, tp: Int]:
         return RankView[Self.E, Self.tp](self.bases[r])
 
     def parallel[body: def[rank: Int] (RankView[Self.E, Self.tp], mut BurstPool[]) capturing -> PoolFence](self):
-        """Dispatch body(rv, pool) for each rank in parallel, then join all."""
         @parameter
         def dispatch[rank: Int]() -> PoolFence:
             var rv = RankView[Self.E, Self.tp](self.bases[rank])
@@ -290,7 +289,6 @@ struct Ranks[E: Encoding, tp: Int]:
         parallel_for[Self.tp, dispatch]()
 
     def each[body: def (RankView[Self.E, Self.tp]) capturing -> None](self):
-        """Run body(rv) for each rank sequentially on the caller thread."""
         for r in range(Self.tp):
             body(self.view(r))
 
@@ -317,6 +315,7 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
 
     var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]]
     var pools: HeapMoveArray[BurstPool[]]
+    var scratch: ScratchPool
     var bases: InlineArray[Int, Self.tp]
     var pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]
 
@@ -326,6 +325,7 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
         self.pool_ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp](
             fill=UnsafePointer[BurstPool[], MutAnyOrigin]()
         )
+        self.scratch = ScratchPool(Self.M.SCRATCH_CAPACITY)
         self.arenas = arenas^
         self.pools = pools^
         for rank in range(Self.tp):
@@ -336,6 +336,29 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
 
     def rank(self, r: Int) -> RankView[Self.E, Self.tp]:
         return RankView[Self.E, Self.tp](self.bases[r])
+
+    @staticmethod
+    def print_memory():
+        """Print total memory required to run this model."""
+        comptime arena_per_rank = Self.M.arena_bytes()
+        comptime host_arena = Self.M.host_arena_bytes()
+        comptime total = host_arena + (Self.tp - 1) * arena_per_rank
+
+        print("SmolLM2 TP=" + String(Self.tp) + ": " + String(total // (1024 * 1024)) + " MB total")
+        comptime if Self.tp == 1:
+            print("  rank 0 (host): " + String(host_arena // (1024 * 1024)) + " MB")
+        else:
+            print("  rank 0 (host): " + String(host_arena // (1024 * 1024)) + " MB")
+            comptime for r in range(1, Self.tp):
+                print("  rank " + String(r) + ":        " + String(arena_per_rank // (1024 * 1024)) + " MB")
+
+    def token_buffer(self) -> UnsafePointer[Scalar[DType.int32], MutAnyOrigin]:
+        """Pointer for writing input token IDs. Points to rank 0's scratch region.
+        Valid until the next forward() call (which borrows scratch for computation).
+        """
+        return UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
+            unsafe_from_address=self.rank(0).state_base() + Self.M.SCRATCH_OFF
+        )
 
     @staticmethod
     def load(path: Path) -> Optional[Self]:
@@ -400,6 +423,15 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
         ring_broadcast[M.X_MAIN, Self.tp](host.x_main(seq_len).ptr, ranks.x_main_ptrs(seq_len), seq_len, ranks.pool_ptrs)
 
         for layer_idx in range(C.NUM_LAYERS):
+
+            # === Attention block ===
+
+            # Borrow scratch for Q, K, V (offsets, same for every rank)
+            var q = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.Q_VIEW.COLS]()
+            var k = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.KV_VIEW.COLS]()
+            var v = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.KV_VIEW.COLS]()
+
+            # This serves as a way to get the right pointers in parallel easily.
             @parameter
             def do_input_norm[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
                 return rmsnorm(rv.x_main(seq_len), rv.layer_weight[L.INPUT_NORM](layer_idx), rv.x_residual(seq_len), pool)
@@ -407,42 +439,52 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
 
             @parameter
             def do_q[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
-                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.Q_PROJ](layer_idx), rv.q_view(seq_len), pool)
+                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.Q_PROJ](layer_idx), rv.scratch_view[M.Q_VIEW](q, seq_len), pool)
             ranks.parallel[do_q]()
 
             @parameter
             def do_k[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
-                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.K_PROJ](layer_idx), rv.kv_view(0, seq_len), pool)
+                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.K_PROJ](layer_idx), rv.scratch_view[M.KV_VIEW](k, seq_len), pool)
             ranks.parallel[do_k]()
 
             @parameter
             def do_v[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
-                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.V_PROJ](layer_idx), rv.kv_view(1, seq_len), pool)
+                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.V_PROJ](layer_idx), rv.scratch_view[M.KV_VIEW](v, seq_len), pool)
             ranks.parallel[do_v]()
 
             @parameter
             def do_rope(rv: RankView[Self.E, Self.tp]):
-                rope[C.HEAD_DIM, M.LOCAL_HEADS](rv.q_view(seq_len), rv.rope_cos(), rv.rope_sin(), pos)
-                rope[C.HEAD_DIM, M.LOCAL_KV_HEADS](rv.kv_view(0, seq_len), rv.rope_cos(), rv.rope_sin(), pos)
+                rope[C.HEAD_DIM, M.LOCAL_HEADS](rv.scratch_view[M.Q_VIEW](q, seq_len), rv.rope_cos(), rv.rope_sin(), pos)
+                rope[C.HEAD_DIM, M.LOCAL_KV_HEADS](rv.scratch_view[M.KV_VIEW](k, seq_len), rv.rope_cos(), rv.rope_sin(), pos)
             ranks.each[do_rope]()
 
             @parameter
             def do_kv_write(rv: RankView[Self.E, Self.tp]):
-                kv_cache_write(rv.kv_view(0, seq_len), rv.k_cache(layer_idx), pos)
-                kv_cache_write(rv.kv_view(1, seq_len), rv.v_cache(layer_idx), pos)
+                kv_cache_write(rv.scratch_view[M.KV_VIEW](k, seq_len), rv.k_cache(layer_idx), pos)
+                kv_cache_write(rv.scratch_view[M.KV_VIEW](v, seq_len), rv.v_cache(layer_idx), pos)
             ranks.each[do_kv_write]()
+
+            # K, V written to cache — release and borrow attn_out in their place
+            v^.release()
+            k^.release()
+
+            var attn_out = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.Q_VIEW.COLS]()
 
             @parameter
             def do_attn[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
                 return attention[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM](
-                    rv.q_view(seq_len), rv.k_cache(layer_idx), rv.v_cache(layer_idx),
-                    rv.attn_out_view(seq_len), pos, pool)
+                    rv.scratch_view[M.Q_VIEW](q, seq_len), rv.k_cache(layer_idx), rv.v_cache(layer_idx),
+                    rv.scratch_view[M.Q_VIEW](attn_out, seq_len), pos, pool)
             ranks.parallel[do_attn]()
+
+            q^.release()
 
             @parameter
             def do_o[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
-                return gemm(rv.attn_out_view(seq_len), rv.layer_weight[L.O_PROJ](layer_idx), rv.x_residual(seq_len), pool)
+                return gemm(rv.scratch_view[M.Q_VIEW](attn_out, seq_len), rv.layer_weight[L.O_PROJ](layer_idx), rv.x_residual(seq_len), pool)
             ranks.parallel[do_o]()
+
+            attn_out^.release()
 
             ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
 
@@ -451,46 +493,59 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
                 elem_add(rv.x_main(seq_len), rv.x_residual(seq_len), rv.x_main(seq_len))
             ranks.each[do_res_add]()
 
+            # === MLP block ===
+
             @parameter
             def do_post_norm[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
                 return rmsnorm(rv.x_main(seq_len), rv.layer_weight[L.POST_ATTN_NORM](layer_idx), rv.x_residual(seq_len), pool)
             ranks.parallel[do_post_norm]()
 
+            var gate = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.MLP_VIEW.COLS]()
+            var up = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.MLP_VIEW.COLS]()
+
             @parameter
             def do_gate[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
-                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.GATE_PROJ](layer_idx), rv.mlp_view(0, seq_len), pool)
+                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.GATE_PROJ](layer_idx), rv.scratch_view[M.MLP_VIEW](gate, seq_len), pool)
             ranks.parallel[do_gate]()
 
             @parameter
             def do_up[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
-                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.UP_PROJ](layer_idx), rv.mlp_view(1, seq_len), pool)
+                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.UP_PROJ](layer_idx), rv.scratch_view[M.MLP_VIEW](up, seq_len), pool)
             ranks.parallel[do_up]()
 
             @parameter
             def do_silu(rv: RankView[Self.E, Self.tp]):
-                silu_mul(rv.mlp_view(0, seq_len), rv.mlp_view(1, seq_len), rv.mlp_view(0, seq_len))
+                silu_mul(rv.scratch_view[M.MLP_VIEW](gate, seq_len), rv.scratch_view[M.MLP_VIEW](up, seq_len), rv.scratch_view[M.MLP_VIEW](gate, seq_len))
             ranks.each[do_silu]()
+
+            up^.release()
 
             @parameter
             def do_down[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
-                return gemm(rv.mlp_view(0, seq_len), rv.layer_weight[L.DOWN_PROJ](layer_idx), rv.x_residual(seq_len), pool)
+                return gemm(rv.scratch_view[M.MLP_VIEW](gate, seq_len), rv.layer_weight[L.DOWN_PROJ](layer_idx), rv.x_residual(seq_len), pool)
             ranks.parallel[do_down]()
 
-            ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
+            gate^.release()
 
+            ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
             ranks.each[do_res_add]()
 
-            _ = layer_idx  # Anchor: closures capture layer_idx but compiler doesn't track it
+            _ = layer_idx
 
         # --- Final norm + LM head (host rank only) ---
         rmsnorm(host.x_main(seq_len), host.weight[M.FINAL_NORM](), host.x_main(seq_len), ranks.pool_ptrs[0][]).join()
 
-        var logits = DynView[M.LOGITS](host.scratch_slot(0), seq_len)
-        gemm(host.x_main(seq_len), host.weight[M.EMBED](), logits, ranks.pool_ptrs[0][]).join()
+        var last_row_off = (seq_len - 1) * C.HIDDEN * M.X_MAIN.ELEMENT_BYTES
+        var last_hidden = DynView[M.X_MAIN](host.x_main(seq_len).ptr + last_row_off, 1)
+        var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
+        var logit_view = host.scratch_view[M.LOGITS](logit_lease, 1)
+        gemm(last_hidden, host.weight[M.EMBED](), logit_view, ranks.pool_ptrs[0][]).join()
         prof.finish()
         prof.report()
 
-        return LogitsView[C.VOCAB_SIZE](logits.ptr, seq_len)
+        return LogitsView[C.VOCAB_SIZE](
+            host.scratch_ptr[Scalar[DType.bfloat16]](logit_lease), logit_lease^,
+        )
 
 
 # =============================================================================
@@ -506,11 +561,7 @@ def main():
         return
     var model = model_opt.take()
 
-    var rank0 = model.rank(0)
-    var tokens_addr = rank0.scratch_slot(0)
-    var tp_ptr = UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
-        unsafe_from_address=tokens_addr,
-    )
-    tp_ptr[0] = Scalar[DType.int32](42)
-    var logits = model.forward(tokens_addr, 1, 0, profile=True)
-    _ = logits
+    var tp = model.token_buffer()
+    tp[0] = Scalar[DType.int32](42)
+    var logits = model.forward(Int(tp), 1, 0, profile=True)
+    logits^.release()
