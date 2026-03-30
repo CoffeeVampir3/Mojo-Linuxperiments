@@ -6,7 +6,6 @@ from std.collections import InlineArray
 from numa import NumaArena, NumaInfo
 from notstdcollections import HeapMoveArray
 from threading import BurstPool
-from simd_math import bf16_load_as
 import linux.sys as linux
 
 comptime PoolPtr = UnsafePointer[BurstPool[], MutAnyOrigin]
@@ -127,10 +126,10 @@ def fused_reduce_gather_kernel(
 
     var i = start_element
     while i + width <= end_element:
-        var acc = bf16_load_as[DType.float32, width](src0, i)
-        acc += bf16_load_as[DType.float32, width](src1, i)
-        acc += bf16_load_as[DType.float32, width](src2, i)
-        acc += bf16_load_as[DType.float32, width](src3, i)
+        var acc = (src0 + i).load[width=width]().cast[DType.float32]()
+        acc += (src1 + i).load[width=width]().cast[DType.float32]()
+        acc += (src2 + i).load[width=width]().cast[DType.float32]()
+        acc += (src3 + i).load[width=width]().cast[DType.float32]()
         (dst + i).store(acc.cast[DType.bfloat16]())
         i += width
     while i < end_element:
@@ -255,8 +254,8 @@ def naive_allreduce(bases: InlineArray[Int, TP], total_elements: Int):
         var src = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=bases[r])
         var i = 0
         while i + width <= total_elements:
-            var d = bf16_load_as[DType.float32, width](dst, i)
-            var s = bf16_load_as[DType.float32, width](src, i)
+            var d = (dst + i).load[width=width]().cast[DType.float32]()
+            var s = (src + i).load[width=width]().cast[DType.float32]()
             (dst + i).store((d + s).cast[DType.bfloat16]())
             i += width
         while i < total_elements:

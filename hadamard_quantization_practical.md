@@ -19,6 +19,14 @@ The strategy has been validated with working Mojo implementations at
 - `block_sweep.mojo` — FWHT block size vs quality tradeoff
 - `hadamard_layer.mojo` — full single-layer operational flow (projections only)
 - `hadamard_layer_int8.mojo` — full single-layer flow including int8 attention
+- `hadamard_layer_int8_kv.mojo` — int8 KV cache with RoPE, numerical validation
+
+The offline quantization pipeline is implemented in `quant/` and validated
+against a Python reference (`validation/validate_hadquant.py`): 422/422 tensors
+pass, 100% exact match on int8 weights, zero relative error on scales.
+
+The model spec, execution interface, and loader are implemented in
+`modeling/smollm2_hadquant_tp.mojo`.
 
 ---
 
@@ -126,15 +134,15 @@ For int8 attention (per-head rotation), block size = head_dim. This constrains
 the O projection's weight rotation to also use block = head_dim for its K
 dimension.
 
-A practical default: block = min(64, head_dim) for all operations. This
-satisfies all constraints for standard architectures and captures nearly all
-of the quality benefit.
+For SmolLM2 (head_dim=64), block=64 is set as a model-level constant
+(`FWHT_BLOCK = HEAD_DIM`) and used for all operations.
 
 ---
 
 ## 3. Offline Weight Preparation
 
-Three steps, applied once per weight matrix at model load or export time.
+Three steps, applied once per weight matrix at quantization time. Implemented
+in `quant/ops.mojo` and orchestrated by `quant/engine.mojo`.
 
 ### 3.1 RMSNorm Gamma Absorption
 
@@ -168,6 +176,9 @@ After absorption, runtime RMSNorm reduces to scalar division:
 ```
 x_normed = x / rms(x)     # no gamma, no elementwise product
 ```
+
+The norm weights are marked `IsAbsorbed` in the model spec — consumed during
+quantization, absent from the output file, not loaded at runtime.
 
 ### 3.2 FWHT Rotation
 
@@ -215,8 +226,8 @@ No cross-rank communication is needed for any offline preparation step.
 
 ### 4.1 Fused Quantization Kernels
 
-Four fused kernels replace the separate quantization passes. Each reads bf16,
-performs the rotation in registers, and writes int8.
+Two fused kernels handle activation quantization. Each reads bf16, performs
+the rotation in registers, and writes int8.
 
 **rms_fwht_quantize** — 2 per layer (before QKV, before GATE/UP)
 
@@ -224,36 +235,18 @@ performs the rotation in registers, and writes int8.
 input:  bf16 x[M, K]
 output: int8 qi[M, K], f32 scale[M]
 
-Per row:
+Implementation (fused single-pass):
   1. FWHT(x[m, :]) in blocks → x_rot
   2. Dual reduction: sum(x_rot^2) → rms, max(|x_rot|) → absmax
   3. scale[m] = absmax / (rms * 127)
-  4. qi[m, k] = round(x_rot[k] * 127 / absmax)
+  4. qi[m, k] = round(x_rot[k] * rms * 127 / absmax)
 ```
 
-The rms cancels in the qi values and is encoded in the scale. The int8_gemm
-epilogue applies `acc * act_scale * w_scale`, which includes the 1/rms factor
-via act_scale. The result equals `W' * (x / rms)` = `W * gamma * (x / rms)`
-= `W * RMSNorm(x)`.
-
-Fusion structure: 1 read (bf16 activation), butterfly in registers/L1 per
-block, dual reduction (sum-of-squares + absmax in one pass), quantize, 1 write
-(int8). For block=512, the entire block (2KB f32) fits in the AVX-512 register
-file (32 x 16 floats = 512 floats).
-
-**fwht_quantize** — 1 per layer (before O_PROJ)
-
-```
-input:  bf16 x[M, K]
-output: int8 qi[M, K], f32 scale[M]
-
-Same as rms_fwht_quantize but without the rms computation.
-scale[m] = max(|FWHT(x[m])|) / 127
-```
-
-For the O projection specifically: when int8 attention is used, the attention
-output is already in the per-head rotated domain. This kernel becomes a plain
-quantize (no FWHT) since the rotation was already done inside the attention.
+The FWHT preserves norms (Parseval), so rms(FWHT(x)) = rms(x). The rms and
+absmax are computed in a single dual reduction over the rotated values. The
+rms factor is folded into the scale so the int8_gemm epilogue produces
+`W * gamma * (x / rms)` = `W * RMSNorm(x)` without materializing a normalized
+bf16 intermediate.
 
 **silu_fwht_quantize** — 1 per layer (before DOWN)
 
@@ -273,113 +266,138 @@ single pass.
 
 ### 4.2 Int8 GEMM
 
-Identical to channelwise int8:
-
 ```
-acc_i32[m, n] = sum_k int8(act[m, k]) * int8(weight[n, k])
-out_bf16[m, n] = float(acc_i32) * act_scale[m] * weight_scale[n]
-```
-
-Maps to vpdpbusd (AVX-512 VNNI) or tdpbusd/tdpbssd (AMX). Same VNNI 6D
-packing. Same tiling contracts. Same epilogue. The kernel does not know
-the values were Hadamard-rotated.
-
-For the u8/i8 signedness convention with vpdpbusd: activations are clamped
-to [-128, 127] then shifted by +128 to [0, 255] for u8 storage. This
-clamp-and-shift happens after the FWHT, in the quantization step. Unchanged
-from channelwise.
-
-### 4.3 Single-Layer Flow (Projections Only)
-
-```
- 1. rms_fwht_quantize(x)         → x_i8, x_sc
- 2. int8_gemm(x_i8, Q')         → q             ┐
- 3. int8_gemm(x_i8, K')         → k             ├ shared x_i8
- 4. int8_gemm(x_i8, V')         → v             ┘
- 5. rope(q), rope(k)                              bf16, unchanged
- 6. kv_cache_write(k, v)                          bf16 → cache
- 7. attention(q, k_cache, v_cache) → attn         bf16, unchanged
- 8. fwht_quantize(attn)         → attn_i8, a_sc  (or plain quantize if int8 attn)
- 9. int8_gemm(attn_i8, O')      → o_out
-10. elem_add(x, o_out)          → x              residual
-11. rms_fwht_quantize(x)        → x_i8, x_sc
-12. int8_gemm(x_i8, GATE')      → gate           ┐ shared x_i8
-13. int8_gemm(x_i8, UP')        → up             ┘
-14. silu_fwht_quantize(gate, up) → silu_i8, s_sc
-15. int8_gemm(silu_i8, DOWN)    → down_out
-16. elem_add(x, down_out)       → x              residual
+raw_acc[m,n] = sum_k u8(act[m,k] ^ 0x80) * i8(weight[n,k])
+corrected    = float(raw_acc[m,n]) - 128.0 * weight_colsum[n]
+output[m,n]  = bf16(corrected * act_scale[m] * weight_scale[n])
 ```
 
-Allreduce slots between steps 9-10 and 15-16 for TP > 1.
+Maps to vpdpbusd (AVX-512 VNNI) or tdpbusd (AMX). Activations are stored as
+i8 and converted to u8 via sign-bit XOR at register load for VNNI's u8 x i8
+convention. This introduces a per-output-channel bias of `128 * colsum[n]`
+where `colsum[n] = sum_k weight[n,k]`. The column sums are precomputed at load
+time from the packed i8 weights and stored in the arena alongside each weight.
+The bias is subtracted in the epilogue before scale multiplication.
 
-Per layer: 4 fused quantization kernels, 7 int8 GEMMs, standard bf16 ops
-(rope, attention, cache write, residual add, allreduce) unchanged.
+Same VNNI 6D packing. Same tiling contracts. The kernel does not know the
+values were Hadamard-rotated.
 
-### 4.4 Int8 Attention (Prefill Optimization)
+### 4.3 Int8 KV Cache
 
-For prefill (large M), the attention matmuls (Q*K^T scoring, weights*V
-aggregation) are large enough to benefit from AMX int8. The approach:
+The KV cache stores pre-rotated int8 values with per-head f32 scales. This
+eliminates repeated FWHT rotation of the entire context at every attention
+call.
 
-**Scoring (Q * K^T):**
+**At K cache write — `rope_fwht_quantize_k_write` (once per token per layer):**
 
-Q and K arrive as bf16 from the projection int8_gemms (original domain).
-Apply per-head FWHT over head_dim, then quantize to int8. The rotated inner
-products equal the original inner products (Parseval). Int8 dot products
-produce scores, rescaled to f32 for softmax.
-
-**Aggregation (weights * V):**
-
-V cache entries are FWHT-rotated per kv_head over head_dim and quantized.
-The softmax attention weights (f32) have the per-entry V scales absorbed
-into them before quantizing to int8. This absorption enables clean i32
-accumulation:
+K arrives as bf16 from int8_gemm (original domain). RoPE, FWHT, and int8
+quantize are fused in a single per-head loop — one read, one write:
 
 ```
-for each t:
-    w_absorbed[t] = softmax_weight[t] * v_scale[t]
-quantize(w_absorbed) → w_i8, w_sc
-
-for each d:
-    acc = sum_t int(w_i8[t]) * int(v_i8[t, d])
-    out[d] = float(acc) * w_sc
+For each kv_head g:
+    k_head = K[g*head_dim : (g+1)*head_dim]
+    k_roped = RoPE(k_head, pos)
+    k_rot = FWHT(k_roped)
+    k_scale[pos, g] = max(|k_rot|) / 127
+    k_qi[pos, g, :] = round(k_rot / k_scale)
 ```
 
-Without scale absorption, the per-entry V scales would vary across the
-contraction dimension (T), preventing factorization out of the i32
-accumulator. The absorption folds the varying scales into the attention
-weights (which are being quantized anyway), leaving a single scalar w_sc
-for the epilogue.
+This eliminates the separate RoPE pass on K. RoPE and FWHT both operate
+per-head, so they share the same loop.
 
-**Output domain:**
+**At V cache write — `fwht_quantize_v_write` (once per token per layer):**
 
-The attention output is in the per-head rotated domain. It feeds directly into
-the O projection quantization step — no FWHT needed, just a plain quantize.
-The O projection weight is rotated with block = head_dim on its K dimension,
-matching the per-head rotation. H cancels in the matmul.
-
-**Decode vs prefill split:**
-
-For decode (M=1), attention is GEMV — AMX tile setup overhead dominates, and
-int8 scoring provides minimal benefit. Use bf16 attention for decode, int8
-attention for prefill. This is the same split KTransformers uses (AMX for
-prefill, AVX-512 VNNI for decode), just with the Hadamard rotation added to
-the quantization boundary.
-
-The layer flow with int8 attention differs at steps 7-8:
+V arrives as bf16 from int8_gemm (original domain). No RoPE.
 
 ```
- 7. int8_gqa_attention(q, k_cache, v_cache) → attn_rot
-      fwht+quantize Q per head
-      fwht+quantize K cache per kv_head
-      int8 scoring (Parseval)
-      softmax (f32)
-      fwht+quantize V cache per kv_head
-      absorb V scales, quantize weights
-      int8 aggregation → output in rotated domain
- 8. quantize(attn_rot)          → attn_i8    (no FWHT, already rotated)
+For each kv_head g:
+    v_rot = FWHT(V[g*head_dim : (g+1)*head_dim])
+    v_scale[pos, g] = max(|v_rot|) / 127
+    v_qi[pos, g, :] = round(v_rot / v_scale)
 ```
 
-### 4.5 Block Size Compatibility
+**Cache layout per layer:**
+
+```
+K_CACHE:       int8  [MAX_SEQ_LEN, KV_HIDDEN]
+V_CACHE:       int8  [MAX_SEQ_LEN, KV_HIDDEN]
+K_CACHE_SCALE: f32   [MAX_SEQ_LEN, NUM_KV_HEADS]
+V_CACHE_SCALE: f32   [MAX_SEQ_LEN, NUM_KV_HEADS]
+```
+
+For SmolLM2 (KV_HIDDEN=192, NUM_KV_HEADS=3, MAX_SEQ_LEN=8192): 408 bytes per
+position vs 768 bytes for bf16 — 47% reduction, 89 MB saved across 30 layers.
+
+**Correctness with RoPE:**
+
+RoPE is applied to K in the original domain before cache write. The FWHT
+rotation is applied after RoPE. At attention time, Q is also FWHT-rotated
+per head (after RoPE). Parseval guarantees:
+
+```
+<FWHT(RoPE(Q)), FWHT(RoPE(K))> = <RoPE(Q), RoPE(K)>
+```
+
+Validated numerically at SmolLM2 dimensions (HEAD_DIM=64, CONTEXT=256):
+bf16 KV and int8 KV paths produce bit-identical outputs (999 dB difference).
+Int8 attention SQNR is 30 dB vs f32 reference.
+
+### 4.4 Int8 GQA Attention
+
+Reads pre-rotated int8 K and V from cache. Q arrives as bf16 without RoPE —
+RoPE is applied inside the attention kernel per head, fused with the FWHT.
+
+```
+For each query head h (kv group g = h // GQA_FACTOR):
+
+  1. RoPE(Q_head, pos)
+  2. FWHT + quantize Q per head → qi_Q, q_scale
+  3. Int8 scoring: score[t] = float(qi_Q · qi_K[t]) * q_scale * k_scale[t,g] / sqrt(d)
+  4. Softmax in f32
+  5. Absorb V scales: w_absorbed[t] = softmax[t] * v_scale[t, g]
+  6. Quantize absorbed weights → qi_w, w_scale
+  7. Int8 aggregation: out[d] = float(sum_t qi_w[t] * qi_V[t,d]) * w_scale
+  8. Quantize output → int8 directly (absmax + round from f32, no bf16 step)
+
+Output is int8 + f32 scale in per-head rotated domain.
+```
+
+V scale absorption (step 5) folds the per-entry V scales into the attention
+weights before quantizing them. This enables clean i32 accumulation — without
+absorption, the varying V scales across the contraction dimension (T) would
+prevent factoring them out of the accumulator.
+
+The output is quantized to int8 directly from the f32 aggregation result —
+no bf16 intermediate. The int8 output feeds the O projection's int8_gemm
+directly. The O weight is rotated with block = head_dim, so H cancels.
+
+### 4.5 Single-Layer Flow
+
+```
+ 1. rms_fwht_quantize(x)              → act_i8, act_sc
+ 2. int8_gemm(act_i8, Q')             → q (bf16, only projection materialized)
+ 3. int8_gemm_k_to_cache(act_i8, K')  → K cache (fused gemm + RoPE + FWHT + quant)
+ 4. int8_gemm_v_to_cache(act_i8, V')  → V cache (fused gemm + FWHT + quant)
+ 5. int8_gqa_attention(q, kv_cache)   → act_i8, act_sc (RoPE on Q fused, int8 out)
+ 6. int8_gemm(act_i8, O')            → o_out
+ 7. allreduce, residual add
+ 8. rms_fwht_quantize(x')            → act_i8, act_sc
+ 9. int8_gemm_gate_up(act_i8, G', U') → gate, up (one activation read)
+10. silu_fwht_quantize(gate, up)      → act_i8, act_sc
+11. int8_gemm(act_i8, DOWN')          → down_out
+12. allreduce, residual add
+```
+
+Per layer: 12 steps. 2 fused activation quantize kernels, 3 standard int8
+GEMMs (Q, O, DOWN), 2 gemm-to-cache kernels (K with fused RoPE, V), 1 fused
+gate+up gemm, 1 int8 attention (fused RoPE on Q, int8 output), 1 fused SiLU
+quantize. bf16 intermediates: only Q (slot 0) and gate/up (slots 0, 1). K and
+V never materialize as bf16.
+
+Validated numerically: the 12-step fused flow produces bit-identical output
+to the unfused 15-step flow (999 dB, `design_analysis/optimal_flow.mojo`).
+
+### 4.6 Block Size Compatibility
 
 Using block = head_dim for all operations guarantees compatibility between
 the per-head attention rotation and the projection weight rotations. The
@@ -389,11 +407,6 @@ tensors.
 For SmolLM2 (head_dim=64), block=64 lands at the plateau of the quality
 curve. For architectures with head_dim=128, block=128 is slightly beyond
 the plateau but still near-optimal.
-
-If int8 attention is not used (bf16 attention path), the block size for
-projections can be chosen independently of head_dim. Larger blocks (256,
-512) may be used for the activation rotations, giving slightly better
-isotropization.
 
 ---
 
@@ -427,17 +440,6 @@ qi=0 fraction (%)
   Hadamard                1.04       1.11      1.05       0.64
 ```
 
-Key observations from the data:
-
-- On uniform data (no outliers), channelwise is 0.57 dB better. The rotation
-  adds floating point noise to values that didn't need redistribution.
-- The Hadamard rows are flat across all distributions. Channelwise degrades
-  with outlier severity.
-- Effective bits: channelwise drops to 1.5/8 at extreme outliers (99.99% of
-  non-outlier values collapse to zero). Hadamard maintains 7.99/8 regardless.
-- The column RMS ratio after rotation is consistently ~1.6-2.1 regardless of
-  the input ratio (which ranges from 1.9 to 1595).
-
 ---
 
 ## 6. Architectural Generality
@@ -446,8 +448,8 @@ Key observations from the data:
 
 Fully covered. The 7 projection matrices per layer (Q, K, V, O, GATE, UP,
 DOWN) are the only learned weights in the layer. All become int8 GEMMs with
-Hadamard-rotated inputs. The 2 norm gains are absorbed offline. Attention,
-RoPE, residual connections, and allreduce are unchanged.
+Hadamard-rotated inputs. The 2 norm gains are absorbed offline. RoPE and
+residual connections are unchanged. Allreduce positions are unchanged.
 
 ### 6.2 Mixture of Experts (MoE)
 
@@ -456,31 +458,25 @@ int8_gemm treatment. Each expert MLP (gate, up, down) gets the same offline
 preparation and online flow independently. Gamma absorption from the pre-MLP
 norm applies to the router weight and all expert gate/up weights.
 
-Token routing (top-k selection, dispatch, combine) operates on bf16 values
-produced by int8_gemm. The FWHT and quantization are per-row (per-token),
-so routing tokens to different experts after quantization preserves
-correctness — each token's qi and scale travel together.
-
 ### 6.3 Grouped Query Attention / Multi-Query Attention
 
 Fully covered. GQA and MQA change the number of KV heads but not the
-structure. The per-head FWHT in int8 attention operates on head_dim
-regardless of how many heads share a KV group.
+structure. The per-head FWHT in the KV cache and attention operates on
+head_dim regardless of how many heads share a KV group.
 
 ### 6.4 Alternative Nonlinearities
 
 SiLU, GELU, ReLU, etc. change one line in the silu_fwht_quantize kernel
 (the elementwise function). The FWHT and quantization steps are identical.
-The fusion structure (read bf16, compute nonlinearity, butterfly, quantize,
-write int8) is the same for any elementwise activation.
 
 ### 6.5 Alternative Position Encodings
 
-RoPE operates in the original domain (bf16) between the QKV projections and
-attention. It is unchanged. ALiBi (additive bias on attention scores) is also
-unchanged — it operates on scalar scores, orthogonal to the feature-space
-rotation. Absolute position embeddings are added before the first layer and
-are unchanged.
+RoPE is applied to Q in bf16 as a separate step. For K, RoPE is fused into
+the K cache write kernel (`rope_fwht_quantize_k_write`) — applied per head
+before the FWHT rotation and int8 quantize, in a single pass. Parseval
+guarantees the rotated dot products are correct:
+`<FWHT(RoPE(Q)), FWHT(RoPE(K))> = <RoPE(Q), RoPE(K)>`.
+ALiBi and absolute position embeddings are unchanged.
 
 ---
 
@@ -488,14 +484,15 @@ are unchanged.
 
 ### 7.1 AVX-512 VNNI (vpdpbusd)
 
-The int8_gemm uses u8 activations x i8 weights → i32 accumulation. The VNNI
-6D packing layout is unchanged. Weight packing is applied to the Hadamard-
-rotated, quantized int8 values — the packing is a permutation of bytes and
-doesn't interact with the rotation.
+The int8_gemm uses u8 activations x i8 weights → i32 accumulation.
+Activations are stored as i8 and XOR'd with 0x80 at register load to produce
+u8. This introduces a bias of `128 * column_sum[n]` per output channel,
+corrected in the epilogue. Column sums are precomputed at load time and stored
+in the arena as f32 per weight row.
 
-The FWHT in the fused quantization kernels uses f32 butterfly operations in
-AVX-512 registers. For block=512, the block (2KB as f32) fits exactly in the
-32-register AVX-512 file. Smaller blocks use fewer registers.
+The VNNI 6D packing layout is unchanged. Weight packing is applied to the
+Hadamard-rotated, quantized int8 values — the packing is a permutation of
+bytes and doesn't interact with the rotation.
 
 ### 7.2 AMX (tdpbusd / tdpbssd)
 
@@ -505,19 +502,17 @@ operations. The FWHT runs in AVX-512 registers as a pre-pass, writes int8
 to memory, then AMX loads the int8 tiles.
 
 Tile configuration (LDTILECFG) is unchanged. Tile dimensions, the
-accumulation datatype (i32), and the epilogue rescale are all identical
-to channelwise.
-
-For prefill with int8 attention, AMX handles the Q*K^T and weights*V
-matmuls. For decode, the attention path remains bf16 (GEMV, not GEMM).
+accumulation datatype (i32), and the epilogue rescale are all identical.
 
 ### 7.3 Epilogue
 
 ```
-out_bf16[m, n] = float(acc_i32[m, n]) * act_scale[m] * weight_scale[n]
+raw_acc    = vpdpbusd(u8_act, i8_weight)
+corrected  = float(raw_acc) - 128.0 * float(colsum[n])
+output[m,n] = bf16(corrected * act_scale[m] * weight_scale[n])
 ```
 
-Two f32 multiplies per output element, identical to channelwise. For
+Three f32 ops per output element (subtract, multiply, multiply). For
 rms_fwht_quantize, the act_scale encodes both the quantization range and
 the rms normalization factor:
 
@@ -533,102 +528,112 @@ The kernel does not distinguish this from a standard per-row scale.
 
 ### 8.1 Weights
 
-Stored as int8 with per-row f32 scales, same as channelwise. The Hadamard
-rotation and gamma absorption are applied before quantization and do not
-affect the stored format. VNNI packing is applied at load time to the int8
-values, same as channelwise.
+Stored as int8 with per-row f32 scales, same format as channelwise. The
+Hadamard rotation and gamma absorption are applied before quantization and do
+not affect the stored format. VNNI packing is applied at load time.
+
+Per-row f32 column sums are computed at load time from the packed i8 weights
+for the VNNI u8/i8 bias correction.
 
 The norm gain vectors (input_layernorm.weight, post_attention_layernorm.weight)
-are consumed during offline preparation and are not needed at runtime. They
-can be dropped from the runtime memory layout.
+are consumed during quantization and absent from the output file. They are
+marked `IsAbsorbed` in the model spec — the loader skips them.
 
 ### 8.2 Activations
 
-All activations between operations are bf16, same as channelwise. The int8
-quantized activations are transient — produced by a fused kernel and consumed
-by the immediately following int8_gemm. They live in scratch memory and are
-overwritten each layer.
+All activations between operations are bf16. The int8 quantized activations
+are transient — produced by a fused kernel and consumed by the immediately
+following int8_gemm. They live in scratch memory (overlaid on scratch slot 2)
+and are overwritten each phase.
 
 ### 8.3 KV Cache
 
-Stored as bf16 in the original domain (after RoPE, before any Hadamard
-rotation). For int8 attention, the cache entries are FWHT-rotated and
-quantized on the fly during the attention computation.
+Stored as int8 with per-head f32 scales, pre-rotated via per-head FWHT at
+cache write time. K has RoPE applied before rotation. V is rotated directly.
 
-Optionally, the cache could store pre-rotated int8 values to avoid repeated
-FWHT on the same entries. This trades cache memory (int8 vs bf16, but with
-per-entry scales) for compute. For long contexts with prefill, the savings
-from avoiding redundant rotation may be significant.
+This eliminates repeated FWHT rotation of the entire context at every
+attention call. At attention time, only Q needs rotation (once per token).
+
+Cache layout per layer:
+
+```
+K_CACHE:       int8  [MAX_SEQ_LEN, KV_HIDDEN]        # pre-rotated
+V_CACHE:       int8  [MAX_SEQ_LEN, KV_HIDDEN]        # pre-rotated
+K_CACHE_SCALE: f32   [MAX_SEQ_LEN, NUM_KV_HEADS]     # per-head scale
+V_CACHE_SCALE: f32   [MAX_SEQ_LEN, NUM_KV_HEADS]     # per-head scale
+```
+
+Memory savings vs bf16 cache: 47% per position (408 vs 768 bytes for SmolLM2).
 
 ---
 
-## 9. Comparison with Channelwise Int8
+## 9. Memory Savings Summary (SmolLM2-135M, TP=1)
 
-What changes:
+```
+                    bf16        hadquant    savings
+Weights (dist):     212 MB      107 MB      105 MB  (int8 + scales)
+State (KV+act):     285 MB      197 MB       88 MB  (int8 KV cache)
+Total arena:        497 MB      304 MB      193 MB  (39% reduction)
+```
 
-- 4 fused quantization kernels gain a butterfly pass (5-10 additions/element)
-- Offline weight preparation adds gamma absorption + FWHT (one-time cost)
-- Norm gain vectors are eliminated from runtime layout
-
-What does not change:
-
-- Int8 GEMM kernel (same instruction, same packing, same epilogue)
-- Weight storage format (int8 + per-row f32 scale)
-- Activation storage format (bf16 between ops)
-- Tensor parallelism (same sharding, same allreduce positions)
-- Attention mechanism (bf16 path identical; int8 path is additive)
-- RoPE, residual connections, allreduce
-
-The operational overhead of the FWHT is bounded by `K * (log2(block) + 1)`
-additions per activation row per quantization point. For K=4096 and block=64,
-that is 7 additions per element, applied 4 times per layer. The 7 int8 GEMMs
-per layer each do K*N multiply-accumulates per row. The rotation is a fraction
-of a percent of the matmul compute at any practical model size.
+The int8 activation scratch is overlaid on existing bf16 scratch slot 2 at
+zero additional cost. Column sums add ~622 KB to the weight stride (negligible).
 
 ---
 
 ## 10. Implementation Checklist
 
-### Offline (model export / load time)
+### Offline (quantization)
 
-1. For each norm: extract gamma vector
+1. For each norm: read gamma vector from source (marked `IsAbsorbed`)
 2. For each projection following a norm: `W'[n,k] = W[n,k] * gamma[k]`
-3. For each projection: FWHT each row (K dimension) with chosen block size
+3. For each projection: FWHT each row (K dimension) with block = FWHT_BLOCK
 4. Per-row absmax quantize to int8
-5. VNNI/AMX pack as usual
-6. Store int8 weights + f32 per-row scales (same format as channelwise)
+5. Store int8 weights + f32 per-row scales (norms absent from output)
+
+Orchestrated by `quant/engine.mojo`. The model spec drives dispatch via
+`for_each_weight` with `conforms_to` gating on `Absorbed`, `Gamma`,
+`Quantizable`, and `Passthrough` traits.
+
+### Load time
+
+1. Load int8 weights + f32 scales from quantized safetensors (loader skips
+   `IsAbsorbed` entries)
+2. VNNI-pack weights in-place using scratch as temp
+3. Compute per-row column sums from packed i8 weights (`init_column_sums`)
+4. Initialize RoPE cos/sin tables
 
 ### Online (per layer, per token)
 
-1. `rms_fwht_quantize(x)` — fused norm + rotation + quantize
-2. 3x `int8_gemm` for Q, K, V (shared quantized activation)
-3. RoPE on bf16 Q, K
-4. KV cache write (bf16)
-5. Attention (bf16 for decode, optionally int8 for prefill)
-6. `fwht_quantize(attn_out)` or `quantize(attn_rot)` if int8 attention
-7. `int8_gemm` for O
-8. Allreduce (TP > 1), residual add
-9. `rms_fwht_quantize(x)` — fused norm + rotation + quantize
-10. 2x `int8_gemm` for GATE, UP (shared quantized activation)
-11. `silu_fwht_quantize(gate, up)` — fused nonlinearity + rotation + quantize
-12. `int8_gemm` for DOWN
-13. Allreduce (TP > 1), residual add
+```
+ 1. rms_fwht_quantize(x)              → act_i8, act_sc
+ 2. int8_gemm(act_i8, Q')             → q (bf16)
+ 3. int8_gemm_k_to_cache(act_i8, K')  → K cache (fused gemm + RoPE + FWHT + quant)
+ 4. int8_gemm_v_to_cache(act_i8, V')  → V cache (fused gemm + FWHT + quant)
+ 5. int8_gqa_attention(q, kv_cache)   → act_i8, act_sc (RoPE on Q fused, int8 out)
+ 6. int8_gemm(act_i8, O')            → o_out
+ 7. allreduce, residual add
+ 8. rms_fwht_quantize(x')            → act_i8, act_sc
+ 9. int8_gemm_gate_up(act_i8, G', U') → gate, up (one activation read)
+10. silu_fwht_quantize(gate, up)      → act_i8, act_sc
+11. int8_gemm(act_i8, DOWN')          → down_out
+12. allreduce, residual add
+```
 
-### New code required
+### New kernels
 
-- `fwht_inplace(buf, n)` — ~15 lines, pure additions + final scale
-- `fwht_rows(mat, rows, cols, block)` — 5 lines, calls fwht_inplace per block
-- `absorb_gamma(weight, gamma, rows, cols)` — 3 lines, column-wise multiply
-- 3 fused quantization kernels (rms_fwht_quantize, fwht_quantize,
-  silu_fwht_quantize) — each wraps FWHT + existing quantize logic
-- Optionally: int8_gqa_attention with per-head FWHT and scale absorption
+- `rms_fwht_quantize` — fused norm + FWHT rotation + dual reduction + int8 quantize
+- `silu_fwht_quantize` — fused SiLU + FWHT rotation + int8 quantize
+- `int8_gemm` — VNNI/AMX with column sum bias correction
+- `int8_gemm_k_to_cache` — fused K gemm epilogue + RoPE + FWHT + int8 cache write
+- `int8_gemm_v_to_cache` — fused V gemm epilogue + FWHT + int8 cache write
+- `int8_gemm_gate_up` — fused GATE+UP gemm (one activation read, two outputs)
+- `int8_gqa_attention` — fused RoPE on Q + int8 scoring + V scale absorption + int8 output
 
-### Code that does not change
+### Unchanged from bf16
 
-- int8_gemm kernel
-- VNNI packing
-- Weight loading / safetensors I/O (format is identical)
-- Epilogue rescale
-- Attention (bf16 path)
-- RoPE, KV cache, residual add, allreduce
+- Residual connections
+- Allreduce (same positions, same data)
+- Embedding lookup
+- Final norm (gamma-free: x / rms(x))
 - BurstPool dispatch, NUMA arena layout, TP sharding logic

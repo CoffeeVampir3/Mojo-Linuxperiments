@@ -61,14 +61,24 @@ comptime Untiled = Kernel2DTiling[1, 1]
 
 # =============================================================================
 # Weight classification
+#
+# Lifecycle traits — a weight tag declares the full pipeline disposition:
+#   Quantizable  : quantized (FWHT + int8), int8+scale in output, loaded, used
+#   Gamma         : quantized with gamma absorption from preceding norm
+#   Passthrough   : copied through quantizer unchanged, loaded, used
+#   Absorbed      : consumed during quantization (gamma source), absent from output
 # =============================================================================
 
 trait WeightTag: ...
 trait Quantizable: ...
+trait Gamma: ...
 trait Passthrough: ...
+trait Absorbed: ...
 
 struct IsQuantizable(WeightTag, Quantizable): ...
+struct IsGammaQuantizable(WeightTag, Quantizable, Gamma): ...
 struct IsPassthrough(WeightTag, Passthrough): ...
+struct IsAbsorbed(WeightTag, Absorbed): ...
 
 
 # =============================================================================
@@ -177,7 +187,9 @@ struct PlacedSlot[
     Encoding, Shaped, Placed, Named, ShardStrategy,
     NodeLocal where conforms_to(S, NodeLocal),
     Quantizable where conforms_to(Tag, Quantizable),
+    Gamma where conforms_to(Tag, Gamma),
     Passthrough where conforms_to(Tag, Passthrough),
+    Absorbed where conforms_to(Tag, Absorbed),
 ):
     comptime DTYPE = Self.E.DTYPE
     comptime ELEMENT_BYTES = Self.E.ELEMENT_BYTES
@@ -247,18 +259,21 @@ struct WeightDesc(Copyable):
     var local_rows: Int
     var local_cols: Int
     var quantizable: Bool
+    var absorbed: Bool
     var pack_fn: PackFn
 
 def weight_desc[T: Encoding & Shaped & Placed & Named](
     prefix: String = "", base: Int = 0,
 ) -> WeightDesc:
     comptime is_quantizable = conforms_to(T, Quantizable)
+    comptime is_absorbed = conforms_to(T, Absorbed)
     return WeightDesc(
         name=prefix + String(T.NAME), arena_offset=base + T.OFFSET,
         dtype=T.DTYPE, element_bytes=T.ELEMENT_BYTES,
         global_rows=T.GLOBAL_ROWS, global_cols=T.GLOBAL_COLS,
         local_rows=T.ROWS, local_cols=T.COLS,
         quantizable=is_quantizable,
+        absorbed=is_absorbed,
         pack_fn=T.PACK_FN,
     )
 

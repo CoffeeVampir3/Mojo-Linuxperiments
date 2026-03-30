@@ -1,7 +1,9 @@
-"""SmolLM2-135M int8 channelwise quantization.
+"""SmolLM2-135M int8 Hadamard quantization.
 
-Model spec for the quantized model. Projection weights are I8 with
-per-row F32 scales. Norms and embeddings remain BF16.
+Model spec for the Hadamard-rotated int8 quantized model. Projection
+weights are I8 with per-row F32 scales. Gamma from RMSNorm is absorbed
+into projection weights offline — norm weights are consumed during
+quantization and absent from the output file.
 
 Weights are stored row-major (no packing). VNNI packing for kernel
 consumption is a load-time concern, applied per-shard after TP
@@ -16,14 +18,11 @@ from numa import NumaArena, NumaInfo
 from notstdcollections import HeapMoveArray
 from threading import BurstPool
 
-from quant.quantizer import quantize as quantize_impl
-from quant.channelwise import channelwise
-
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named, BF16, F32, I8,
     RowShard, ColShard, Replicated,
     PrincipleNodeLocal,
-    IsQuantizable, IsPassthrough, Quantizable,
+    IsQuantizable, IsGammaQuantizable, IsPassthrough, IsAbsorbed, Quantizable,
     Slot, PlacedSlot, Bound, DynView, CacheView, bind, byte_count,
     WeightIterable,
     next_offset,
@@ -33,6 +32,7 @@ from modeling.model_spec import (
 )
 from kernels.vnni import VnniPacked
 from modeling.loader import load_safetensors
+from quant.engine import quantize as quantize_impl
 
 
 # =============================================================================
@@ -59,24 +59,32 @@ comptime C = SmolLM2Config
 
 
 # =============================================================================
-# Int8 channelwise layer spec
+# Int8 Hadamard layer spec
+#
+# Gamma absorption: input_layernorm → Q, K, V
+#                   post_attention_layernorm → GATE, UP
+#                   O, DOWN get no gamma (no preceding norm)
+#
+# Iteration order: absorbed norms before the projections they feed.
+# The quantizer stashes gamma on Absorbed, uses it on Gamma.
 #
 # Weights stored row-major on disk. VnniPacked tells the loader to
 # VNNI-pack at init time (post-shard, using scratch as temp buffer).
-# Kernel3DTiling[32, 64, 32] per weight is the kernel's tiling
-# contract — consumed directly by the int8 GEMM kernel via trait bounds.
 # =============================================================================
 
 
 struct Int8TPLayer[tp: Int]:
-    # Projection weights: I8, quantizable, VNNI-packed at load time
-    # Tiling contract per weight: Kernel3DTiling[row=32, col=64, panel=32]
-    comptime Q_PROJ      = PlacedSlot[I8, RowShard, C.HIDDEN, C.HIDDEN, Self.tp, 0, "self_attn.q_proj.weight", IsQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
-    comptime K_PROJ      = PlacedSlot[I8, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.Q_PROJ](), "self_attn.k_proj.weight", IsQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
-    comptime V_PROJ      = PlacedSlot[I8, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.K_PROJ](), "self_attn.v_proj.weight", IsQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
+    # Norms: absorbed during quantization (gamma → projection weights)
+    comptime INPUT_NORM     = PlacedSlot[BF16, Replicated, C.HIDDEN, 1, Self.tp, 0, "input_layernorm.weight", IsAbsorbed]
+    comptime POST_ATTN_NORM = PlacedSlot[BF16, Replicated, C.HIDDEN, 1, Self.tp, 0, "post_attention_layernorm.weight", IsAbsorbed]
+
+    # Projection weights: I8, VNNI-packed at load time
+    comptime Q_PROJ      = PlacedSlot[I8, RowShard, C.HIDDEN, C.HIDDEN, Self.tp, 0, "self_attn.q_proj.weight", IsGammaQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
+    comptime K_PROJ      = PlacedSlot[I8, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.Q_PROJ](), "self_attn.k_proj.weight", IsGammaQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
+    comptime V_PROJ      = PlacedSlot[I8, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.K_PROJ](), "self_attn.v_proj.weight", IsGammaQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
     comptime O_PROJ      = PlacedSlot[I8, ColShard, C.HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.V_PROJ](), "self_attn.o_proj.weight", IsQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
-    comptime GATE_PROJ   = PlacedSlot[I8, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.O_PROJ](), "mlp.gate_proj.weight", IsQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
-    comptime UP_PROJ     = PlacedSlot[I8, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.GATE_PROJ](), "mlp.up_proj.weight", IsQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
+    comptime GATE_PROJ   = PlacedSlot[I8, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.O_PROJ](), "mlp.gate_proj.weight", IsGammaQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
+    comptime UP_PROJ     = PlacedSlot[I8, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.GATE_PROJ](), "mlp.up_proj.weight", IsGammaQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
     comptime DOWN_PROJ   = PlacedSlot[I8, ColShard, C.HIDDEN, C.INTERMEDIATE, Self.tp, next_offset[Self.UP_PROJ](), "mlp.down_proj.weight", IsQuantizable, VnniPacked, Kernel3DTiling[32, 64, 32]]
 
     # Scale slots: F32, one per row, per quantized weight
@@ -88,10 +96,7 @@ struct Int8TPLayer[tp: Int]:
     comptime UP_SCALE    = PlacedSlot[F32, RowShard, C.INTERMEDIATE, 1, Self.tp, next_offset[Self.GATE_SCALE](), "mlp.up_proj.weight_scale"]
     comptime DOWN_SCALE  = PlacedSlot[F32, ColShard, C.HIDDEN, 1, Self.tp, next_offset[Self.UP_SCALE](), "mlp.down_proj.weight_scale"]
 
-    # Norms: BF16, passthrough, unpacked
-    comptime INPUT_NORM  = PlacedSlot[BF16, Replicated, C.HIDDEN, 1, Self.tp, next_offset[Self.DOWN_SCALE](), "input_layernorm.weight"]
-    comptime POST_ATTN_NORM = PlacedSlot[BF16, Replicated, C.HIDDEN, 1, Self.tp, next_offset[Self.INPUT_NORM](), "post_attention_layernorm.weight"]
-    comptime STRIDE      = next_offset[Self.POST_ATTN_NORM]()
+    comptime STRIDE      = next_offset[Self.DOWN_SCALE]()
 
     # KV cache (bf16, same as source model)
     comptime K_CACHE = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.KV_HIDDEN, Self.tp]
@@ -101,13 +106,20 @@ struct Int8TPLayer[tp: Int]:
     def for_each_weight[
         func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
     ](prefix: String, base: Int):
+        # Absorbed norms first — quantizer stashes gamma
+        func[Self.INPUT_NORM](prefix, base)
+        # Gamma projections — use stashed gamma
         func[Self.Q_PROJ](prefix, base)
         func[Self.K_PROJ](prefix, base)
         func[Self.V_PROJ](prefix, base)
+        # No-gamma projection
         func[Self.O_PROJ](prefix, base)
+        # Second norm group
+        func[Self.POST_ATTN_NORM](prefix, base)
         func[Self.GATE_PROJ](prefix, base)
         func[Self.UP_PROJ](prefix, base)
         func[Self.DOWN_PROJ](prefix, base)
+        # Scales (passthrough from quantized file)
         func[Self.Q_SCALE](prefix, base)
         func[Self.K_SCALE](prefix, base)
         func[Self.V_SCALE](prefix, base)
@@ -115,8 +127,6 @@ struct Int8TPLayer[tp: Int]:
         func[Self.GATE_SCALE](prefix, base)
         func[Self.UP_SCALE](prefix, base)
         func[Self.DOWN_SCALE](prefix, base)
-        func[Self.INPUT_NORM](prefix, base)
-        func[Self.POST_ATTN_NORM](prefix, base)
 
     @staticmethod
     def cache_bytes() -> Int:
@@ -183,16 +193,9 @@ struct Int8TPModel[tp: Int](WeightIterable):
         return next_offset[Self.EMBED]()
 
     @staticmethod
-    def quantize(source_path: Path, output_path: Path, num_workers: Int = 4) -> Bool:
-        return quantize_impl[Self](
-            pipeline=channelwise[source=DType.bfloat16, target=DType.int8],
-            weight_dtype=DType.int8,
-            weight_element_bits=8,
-            scale_dtype=DType.float32,
-            scale_element_bits=32,
-            source_path=source_path,
-            output_path=output_path,
-            num_workers=num_workers,
+    def quantize(source_path: Path, output_path: Path) -> Bool:
+        return quantize_impl[Self, DType.float32, DType.int8, C.HEAD_DIM](
+            source_path, output_path,
         )
 
 

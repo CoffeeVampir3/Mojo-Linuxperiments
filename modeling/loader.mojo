@@ -3,7 +3,7 @@ from std.memory import UnsafePointer
 
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named, byte_count,
-    NodeLocal,
+    NodeLocal, Absorbed,
     WeightIterable, WeightDesc, weight_desc,
 )
 from safetensors.parser import parse_safetensors_header
@@ -111,7 +111,9 @@ def load_safetensors[
 
     @parameter
     def collect[T: Encoding & Shaped & Placed & Named](prefix: String, base: Int):
-        comptime if conforms_to(T, NodeLocal):
+        comptime if conforms_to(T, Absorbed):
+            pass  # consumed during quantization, not in file
+        elif conforms_to(T, NodeLocal):
             node_local_weights.append(weight_desc[T](prefix, base))
         else:
             distributed_weights.append(weight_desc[T](prefix, base))

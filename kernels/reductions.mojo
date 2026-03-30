@@ -18,7 +18,6 @@ from threading import BurstPool
 import linux.sys as linux
 
 from modeling.model_spec import Encoding, Shaped
-from simd_math import bf16_load_as
 
 comptime AtomicInt32 = Atomic[DType.int32]
 
@@ -94,10 +93,10 @@ def fused_reduce_gather_kernel(
     var src0 = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=ptrs[0])
     var i = start_element
     while i + width <= end_element:
-        var acc = bf16_load_as[DType.float32, width](src0, i)
+        var acc = (src0 + i).load[width=width]().cast[DType.float32]()
         for r in range(1, tp):
             var src_r = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=ptrs[r])
-            acc += bf16_load_as[DType.float32, width](src_r, i)
+            acc += (src_r + i).load[width=width]().cast[DType.float32]()
         (dst + i).store(acc.cast[DType.bfloat16]())
         i += width
     while i < end_element:
@@ -247,8 +246,8 @@ def ring_allreduce[T: Encoding & Shaped, tp: Int](
             var src = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=ptrs[r])
             var i = 0
             while i + width <= total_elements:
-                var d = bf16_load_as[DType.float32, width](dst, i)
-                var s = bf16_load_as[DType.float32, width](src, i)
+                var d = (dst + i).load[width=width]().cast[DType.float32]()
+                var s = (src + i).load[width=width]().cast[DType.float32]()
                 (dst + i).store((d + s).cast[DType.bfloat16]())
                 i += width
             while i < total_elements:

@@ -16,7 +16,14 @@ import linux.sys as linux
 from modeling.model_spec import (
     Encoding, Shaped, Bound, DynView, CacheView,
 )
-from simd_math import bf16_to_f32, SinCosResult, sincos, exp_f32
+from simd_math import SinCosResult, sincos, exp_f32
+
+comptime PtrBF16 = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
+
+@always_inline
+def bf16_f32[width: Int](ptr: PtrBF16, offset: Int) -> SIMD[DType.float32, width]:
+    """Load bf16 and cast to f32. Native cast now emits vpmovzxwd + vpslld."""
+    return (ptr + offset).load[width=width]().cast[DType.float32]()
 
 
 # ================================================================
@@ -84,8 +91,8 @@ def gemm_kernel[K: Int, N: Int](
             var row_w = wp + n * K
             var acc = SIMD[DType.float32, width](0)
             for k in range(0, K, width):
-                var x = bf16_to_f32[width](row_in, k)
-                var w = bf16_to_f32[width](row_w, k)
+                var x = bf16_f32[width](row_in, k)
+                var w = bf16_f32[width](row_w, k)
                 acc = x.fma(w, acc)
             row_out[n] = acc.reduce_add().cast[DType.bfloat16]()
 
@@ -118,11 +125,11 @@ def gemv_kernel[K: Int, N: Int](
             var acc2 = SIMD[DType.float32, width](0)
             var acc3 = SIMD[DType.float32, width](0)
             for k in range(0, K, width):
-                var x = bf16_to_f32[width](row_in, k)
-                acc0 = x.fma(bf16_to_f32[width](w0, k), acc0)
-                acc1 = x.fma(bf16_to_f32[width](w1, k), acc1)
-                acc2 = x.fma(bf16_to_f32[width](w2, k), acc2)
-                acc3 = x.fma(bf16_to_f32[width](w3, k), acc3)
+                var x = bf16_f32[width](row_in, k)
+                acc0 = x.fma(bf16_f32[width](w0, k), acc0)
+                acc1 = x.fma(bf16_f32[width](w1, k), acc1)
+                acc2 = x.fma(bf16_f32[width](w2, k), acc2)
+                acc3 = x.fma(bf16_f32[width](w3, k), acc3)
             row_out[n] = acc0.reduce_add().cast[DType.bfloat16]()
             row_out[n + 1] = acc1.reduce_add().cast[DType.bfloat16]()
             row_out[n + 2] = acc2.reduce_add().cast[DType.bfloat16]()
@@ -132,7 +139,7 @@ def gemv_kernel[K: Int, N: Int](
             var row_w = wp + n * K
             var acc = SIMD[DType.float32, width](0)
             for k in range(0, K, width):
-                acc = bf16_to_f32[width](row_in, k).fma(bf16_to_f32[width](row_w, k), acc)
+                acc = bf16_f32[width](row_in, k).fma(bf16_f32[width](row_w, k), acc)
             row_out[n] = acc.reduce_add().cast[DType.bfloat16]()
 
 
@@ -154,15 +161,15 @@ def rmsnorm_kernel[cols: Int](
 
         var acc = SIMD[DType.float32, width](0)
         for j in range(0, cols, width):
-            var x = bf16_to_f32[width](row_in, j)
+            var x = bf16_f32[width](row_in, j)
             acc = x.fma(x, acc)
         var sum_sq = acc.reduce_add()
         var scale = Float32(1.0) / sqrt(sum_sq / Float32(cols) + eps)
 
         var sv = SIMD[DType.float32, width](scale)
         for j in range(0, cols, width):
-            var x = bf16_to_f32[width](row_in, j)
-            var w = bf16_to_f32[width](wp, j)
+            var x = bf16_f32[width](row_in, j)
+            var w = bf16_f32[width](wp, j)
             (row_out + j).store((x * sv * w).cast[DType.bfloat16]())
 
 
@@ -230,8 +237,8 @@ def gqa_kernel[
                     var dot_acc = SIMD[DType.float32, width](0)
                     comptime for c in range(chunks):
                         comptime off = c * width
-                        var qv = bf16_to_f32[width](q_head, off)
-                        var kv = bf16_to_f32[width](k_row, off)
+                        var qv = bf16_f32[width](q_head, off)
+                        var kv = bf16_f32[width](k_row, off)
                         dot_acc = qv.fma(kv, dot_acc)
                     var score = dot_acc.reduce_add() * scale_f32
 
@@ -249,7 +256,7 @@ def gqa_kernel[
                     comptime for c in range(chunks):
                         comptime off = c * width
                         var prior = acc.slice[width, offset=off]()
-                        var vv = bf16_to_f32[width](v_row, off)
+                        var vv = bf16_f32[width](v_row, off)
                         acc = acc.insert[offset=off](prior * correction + vv * w)
 
                     running_sum = correction * running_sum + w
@@ -427,8 +434,8 @@ def silu_mul[GT: Encoding & Shaped, UT: Encoding & Shaped, DstT: Encoding & Shap
     comptime width = simd_width_of[DType.float32]()
 
     for i in range(0, seq_len * cols, width):
-        var g = bf16_to_f32[width](gp, i)
-        var u = bf16_to_f32[width](up_, i)
+        var g = bf16_f32[width](gp, i)
+        var u = bf16_f32[width](up_, i)
         var sig = 1.0 / (1.0 + exp_f32[width](-g))
         (dp + i).store((g * sig * u).cast[DType.bfloat16]())
 
@@ -460,8 +467,8 @@ def elem_add[AT: Encoding & Shaped, BT: Encoding & Shaped, DstT: Encoding & Shap
     comptime width = simd_width_of[DType.float32]()
 
     for i in range(0, seq_len * AT.COLS, width):
-        var av = bf16_to_f32[width](ap, i)
-        var bv = bf16_to_f32[width](bp, i)
+        var av = bf16_f32[width](ap, i)
+        var bv = bf16_f32[width](bp, i)
         (dp + i).store((av + bv).cast[DType.bfloat16]())
 
 
@@ -535,8 +542,8 @@ def rope[head_dim: Int, num_heads: Int,
         for h in range(num_heads):
             var head_base = row_base + h * head_dim
             for j in range(0, half, width):
-                var x_lo = bf16_to_f32[width](head_base, j)
-                var x_hi = bf16_to_f32[width](head_base, half + j)
+                var x_lo = bf16_f32[width](head_base, j)
+                var x_hi = bf16_f32[width](head_base, half + j)
                 var cv = (cos_row + j).load[width=width]()
                 var sv = (sin_row + j).load[width=width]()
                 (head_base + j).store(

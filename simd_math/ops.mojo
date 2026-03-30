@@ -8,45 +8,6 @@ from std.memory import UnsafePointer
 from std.sys import llvm_intrinsic
 
 
-# =============================================================================
-# Type casting
-# =============================================================================
-
-
-@always_inline
-def bf16_to_f32[width: Int](
-    ptr: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin], offset: Int,
-) -> SIMD[DType.float32, width]:
-    """bf16 -> f32 via zero-extend + shift (vpmovzxwd + vpslld $16).
-
-    The Mojo compiler lowers SIMD[bf16,N].cast[float32]() to scalar
-    extract/shift/insert sequences. bf16 is f32 with the low 16 bits
-    truncated, so reinterpreting as uint16 -> zero-extending to uint32
-    -> shifting left 16 produces the identical IEEE 754 f32 bit pattern.
-    """
-    var raw = (ptr + offset).bitcast[Scalar[DType.uint16]]().load[width=width]()
-    var wide = raw.cast[DType.uint32]()
-    var shifted = wide << 16
-    var tmp = UnsafePointer(to=shifted)
-    return tmp.bitcast[Scalar[DType.float32]]().load[width=width]()
-
-
-@always_inline
-def bf16_load_as[target: DType, width: Int](
-    ptr: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin], offset: Int,
-) -> SIMD[target, width]:
-    """Load bf16 and convert to any target dtype via f32 intermediate.
-
-    Always goes through the bf16->f32 bit-shift path to avoid the
-    compiler's scalarized cast lowering. The f32->target cast is a
-    single SIMD instruction for all standard types.
-    """
-    var f32 = bf16_to_f32[width](ptr, offset)
-    comptime if target == DType.float32:
-        return rebind[SIMD[target, width]](f32)
-    else:
-        return f32.cast[target]()
-
 
 # =============================================================================
 # Rounding
