@@ -1,18 +1,20 @@
-"""Int8 GQA attention with fused RoPE on Q, pre-rotated u8 KV cache,
-V scale absorption, and direct int8 output.
+"""Int8 GQA attention with blocked online softmax and VNNI V aggregation.
+
+Based on INT-FlashAttention (Chen et al., 2024): process KV in blocks,
+quantize attention weights to i8, use vpdpbusd for P×V aggregation.
 
 KV cache stores u8 (i8 XOR'd at write time) for native vpdpbusd. Q and
 attention weights are i8 (signed operand). Bias correction is one scalar
 per head: 128 * sum(signed_operand), computed once, not per cache entry.
 
 Per query row m, per head h (kv group g = h / GQA_FACTOR):
-  1. Load Q head bf16 → f32, RoPE, FWHT, quantize → qi_q (i8) + q_scale
-  2. Score: dot(K_u8[t,g], qi_q_i8) via vpdpbusd, bias correct with sum(qi_q)
-  3. Online softmax in f32 (batched SIMD)
-  4. Absorb V per-entry scales into softmax weights
-  5. Quantize absorbed weights to i8
-  6. Aggregate: sum_t w_i8[t] * V_u8[t,g,d] via f32, bias correct with sum(w)
-  7. Quantize output to i8 (stays in rotated domain for O projection)
+  1. Load Q head bf16 -> f32, RoPE, FWHT, quantize -> qi_q (i8) + q_scale
+  2. For each block of B_c KV entries:
+     a. Score: dot(K_u8[t,g], qi_q_i8) via vpdpbusd
+     b. Online softmax: update running max, rescale accumulator
+     c. Absorb V scales, quantize weights -> w_i8
+     d. Transpose V block -> [dim][pos], VNNI dot w_i8 x V_u8 per dim
+  3. Final: normalize by 1/l, quantize output row to i8
 """
 
 from std.memory import UnsafePointer
@@ -32,45 +34,6 @@ from experimental.hadquant_impl import fwht_block, i8_dot_row_major
 from experimental.hadquant_kv_cache import HadQuantKVCache
 
 
-struct AttnProfile:
-    """Accumulates per-section timing across calls. Reports averages."""
-    var q_prep: Int
-    var score: Int
-    var softmax: Int
-    var v_absorb: Int
-    var w_quant: Int
-    var v_agg: Int
-    var out_quant: Int
-    var calls: Int
-
-    def __init__(out self):
-        self.q_prep = 0
-        self.score = 0
-        self.softmax = 0
-        self.v_absorb = 0
-        self.w_quant = 0
-        self.v_agg = 0
-        self.out_quant = 0
-        self.calls = 0
-
-    def report(self):
-        if self.calls == 0:
-            return
-        var total = self.q_prep + self.score + self.softmax + self.v_absorb + self.w_quant + self.v_agg + self.out_quant
-        var n = self.calls
-        var pct = def (v: Int) -> Int:
-            return v * 100 // total if total > 0 else 0
-        print("attn profile (avg over " + String(n) + " calls):")
-        print("  q_prep:    " + String(self.q_prep // n // 1000) + " us (" + String(pct(self.q_prep)) + "%)")
-        print("  score:     " + String(self.score // n // 1000) + " us (" + String(pct(self.score)) + "%)")
-        print("  softmax:   " + String(self.softmax // n // 1000) + " us (" + String(pct(self.softmax)) + "%)")
-        print("  v_absorb:  " + String(self.v_absorb // n // 1000) + " us (" + String(pct(self.v_absorb)) + "%)")
-        print("  w_quant:   " + String(self.w_quant // n // 1000) + " us (" + String(pct(self.w_quant)) + "%)")
-        print("  v_agg:     " + String(self.v_agg // n // 1000) + " us (" + String(pct(self.v_agg)) + "%)")
-        print("  out_quant: " + String(self.out_quant // n // 1000) + " us (" + String(pct(self.out_quant)) + "%)")
-        print("  total:     " + String(total // n // 1000) + " us")
-
-
 def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     QT: Encoding & Shaped,
     QiT: Encoding & Shaped, ScT: Encoding & Shaped,
@@ -85,7 +48,7 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
     pos: Int,
     mut pool: BurstPool[],
 ) -> PoolFence:
-    """Int8 GQA attention with fused RoPE on Q and pre-rotated int8 KV cache."""
+    """Int8 GQA attention with blocked online softmax and VNNI V aggregation."""
     comptime assert QT.DTYPE == DType.bfloat16, "int8_gqa_attention: Q must be bf16"
     comptime assert QiT.DTYPE == DType.int8, "int8_gqa_attention: qi output must be int8"
     comptime assert ScT.DTYPE == DType.float32, "int8_gqa_attention: scale output must be f32"
@@ -95,6 +58,7 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
     comptime gqa_factor = num_heads // num_kv_heads
     comptime q_cols = QT.COLS
     comptime inv_sqrt_hd = Float32(1.0 / Float64(sqrt[DType.float32, 1](Float32(head_dim))))
+    comptime B_c = 64  # KV block size — fits V block + transposed in L1
 
     var q_ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=q.ptr)
     var qi_ptr = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=qi_out.ptr)
@@ -102,25 +66,26 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
     var cp = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cos_table.ptr)
     var sn = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=sin_table.ptr)
 
-    var max_ctx = pos + q.seq_len
-
     var t_q_prep = Int(0)
-    var t_score = Int(0)
-    var t_softmax = Int(0)
-    var t_v_agg = Int(0)
+    var t_blocked = Int(0)
     var t_out_quant = Int(0)
 
-    # [1] Hoisted allocations — sizes known upfront, reused across rows and groups.
+    # Hoisted allocations.
     var row_f32 = alloc[Float32](q_cols)
     var qi_qs = alloc[Scalar[DType.int8]](gqa_factor * head_dim)
     var q_scales = alloc[Float32](gqa_factor)
     var q_biases = alloc[Float32](gqa_factor)
-    var per_head_scores = alloc[Float32](gqa_factor * max_ctx)
-    var aggs = alloc[Float32](gqa_factor * head_dim)
+    # Blocked processing buffers (all fit in L1).
+    var block_scores = alloc[Float32](gqa_factor * B_c)    # 16*64*4 = 4 KB
+    var v_transposed = alloc[UInt8](head_dim * B_c)         # 128*64  = 8 KB
+    var w_block = alloc[Scalar[DType.int8]](B_c)            # 64 B
+    var running_o = alloc[Float32](gqa_factor * head_dim)   # 16*128*4 = 8 KB
+    var running_m = alloc[Float32](gqa_factor)
+    var running_l = alloc[Float32](gqa_factor)
 
     for m in range(q.seq_len):
         var actual_pos = pos + m
-        var context = actual_pos + 1  # causal: attend to 0..actual_pos
+        var context = actual_pos + 1
         var cos_row = cp + actual_pos * half
         var sin_row = sn + actual_pos * half
         var out_row = qi_ptr + m * q_cols
@@ -160,7 +125,6 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
                 var q_inv = Float32(127.0) / q_absmax if q_absmax > 0 else Float32(0)
                 var q_vinv = SIMD[DType.float32, width](q_inv)
 
-                # [2] Fused quantize + i8_sum: accumulate sum during quantization.
                 var qi_qp = qi_qs + hi * head_dim
                 var q_sum_acc = SIMD[DType.int32, width](0)
                 k = 0
@@ -170,116 +134,153 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
                     q_sum_acc += qi.cast[DType.int32]()
                     k += width
 
-                # [3] Precompute q_scale * inv_sqrt_hd — constant across all timesteps.
                 q_scales[hi] = (q_absmax / Float32(127.0)) * inv_sqrt_hd
                 q_biases[hi] = Float32(128 * Int(q_sum_acc.reduce_add()))
 
             var t1 = Int(perf_counter_ns())
             t_q_prep += t1 - t0
 
-            # --- 2. Score all heads in group ---
-            # [5] Use head_data_base for contiguous traversal.
+            # --- 2. Blocked score + online softmax + VNNI V agg ---
+            # Initialize running online softmax state.
+            for hi in range(gqa_factor):
+                running_m[hi] = Float32(-1e30)
+                running_l[hi] = Float32(0)
+            for i in range(gqa_factor * head_dim):
+                running_o[i] = Float32(0)
+
             var k_base = k_cache.head_data_base(g)
             var k_sc_base = k_cache.head_scale_base(g)
-            for t in range(context):
-                var k_entry = k_base + t * head_dim
-                var k_sc = k_sc_base[t]
-
-                for hi in range(gqa_factor):
-                    var qi_qp = qi_qs + hi * head_dim
-                    var raw = i8_dot_row_major[head_dim](k_entry, qi_qp)
-                    # [3] inv_sqrt_hd already baked into q_scales[hi].
-                    (per_head_scores + hi * max_ctx)[t] = (Float32(raw) - q_biases[hi]) * q_scales[hi] * k_sc
-
-            var t2 = Int(perf_counter_ns())
-            t_score += t2 - t1
-
-            # --- 3. Softmax + fused V scale absorption ---
-            # [4] Single pass: normalize, absorb V scale, accumulate w_sums.
-            var v_scale_base = v_cache.head_scale_base(g)
-            var w_sums = InlineArray[Float32, gqa_factor](fill=Float32(0))
-            for hi in range(gqa_factor):
-                var head_scores = per_head_scores + hi * max_ctx
-
-                # Max
-                var smax_v = SIMD[DType.float32, width](Float32(-1e30))
-                var t = 0
-                while t + width <= context:
-                    smax_v = max(smax_v, (head_scores + t).load[width=width]())
-                    t += width
-                var smax = smax_v.reduce_max()
-                while t < context:
-                    if head_scores[t] > smax: smax = head_scores[t]
-                    t += 1
-
-                # Exp + sum
-                var exp_sum_v = SIMD[DType.float32, width](0)
-                var vsmax = SIMD[DType.float32, width](smax)
-                t = 0
-                while t + width <= context:
-                    var ev = exp_f32((head_scores + t).load[width=width]() - vsmax)
-                    (head_scores + t).store(ev)
-                    exp_sum_v += ev
-                    t += width
-                var exp_sum = exp_sum_v.reduce_add()
-                while t < context:
-                    head_scores[t] = exp_f32[1](head_scores[t] - smax)
-                    exp_sum += head_scores[t]
-                    t += 1
-
-                # Normalize + absorb V scale + accumulate w_sum
-                var vinv_sum = SIMD[DType.float32, width](Float32(1.0) / exp_sum)
-                var wsum_v = SIMD[DType.float32, width](0)
-                t = 0
-                while t + width <= context:
-                    var normed = (head_scores + t).load[width=width]() * vinv_sum
-                    var absorbed = normed * (v_scale_base + t).load[width=width]()
-                    (head_scores + t).store(absorbed)
-                    wsum_v += absorbed
-                    t += width
-                w_sums[hi] = wsum_v.reduce_add()
-                var inv_sum = Float32(1.0) / exp_sum
-                while t < context:
-                    var absorbed = head_scores[t] * inv_sum * v_scale_base[t]
-                    head_scores[t] = absorbed
-                    w_sums[hi] += absorbed
-                    t += 1
-
-            var t3 = Int(perf_counter_ns())
-            t_softmax += t3 - t2
-
-            # --- 4. Aggregate V: f32 weights × u8 V ---
-            # [5] Use head_data_base for contiguous traversal.
             var v_base = v_cache.head_data_base(g)
-            for i in range(gqa_factor * head_dim):
-                aggs[i] = Float32(0)
+            var v_sc_base = v_cache.head_scale_base(g)
 
-            for t in range(context):
-                var v_head = v_base + t * head_dim
+            var num_full_blocks = context // B_c
+            var remainder = context - num_full_blocks * B_c
+            var num_blocks = num_full_blocks + (1 if remainder > 0 else 0)
+
+            for b in range(num_blocks):
+                var t_start = b * B_c
+                var block_len = min(B_c, context - t_start)
+
+                # --- 2a. Score this block ---
+                for tl in range(block_len):
+                    var t = t_start + tl
+                    var k_entry = k_base + t * head_dim
+                    var k_sc = k_sc_base[t]
+                    for hi in range(gqa_factor):
+                        var qi_qp = qi_qs + hi * head_dim
+                        var raw = i8_dot_row_major[head_dim](k_entry, qi_qp)
+                        block_scores[hi * B_c + tl] = (Float32(raw) - q_biases[hi]) * q_scales[hi] * k_sc
+
+                # --- 2b. Transpose V block: [block_len, head_dim] -> [head_dim, B_c] ---
+                for tl in range(block_len):
+                    var v_row = v_base + (t_start + tl) * head_dim
+                    for d in range(head_dim):
+                        v_transposed[d * B_c + tl] = v_row[d]
+                # Zero-pad: V_u8=128 is neutral (true value 0 after bias correction).
+                if block_len < B_c:
+                    for tl in range(block_len, B_c):
+                        for d in range(head_dim):
+                            v_transposed[d * B_c + tl] = UInt8(128)
+
+                # --- 2c. Per head: online softmax + quantize weights + VNNI V agg ---
                 for hi in range(gqa_factor):
-                    # w_sums already computed in softmax fusion
-                    var wt = SIMD[DType.float32, width]((per_head_scores + hi * max_ctx)[t])
-                    var aggp = aggs + hi * head_dim
+                    var scores = block_scores + hi * B_c
+
+                    # Block max (SIMD).
+                    var smax_v = SIMD[DType.float32, width](Float32(-1e30))
+                    var tl = 0
+                    while tl + width <= block_len:
+                        smax_v = max(smax_v, (scores + tl).load[width=width]())
+                        tl += width
+                    var block_max = smax_v.reduce_max()
+                    while tl < block_len:
+                        if scores[tl] > block_max: block_max = scores[tl]
+                        tl += 1
+
+                    # Online softmax update.
+                    var m_old = running_m[hi]
+                    var m_new = max(m_old, block_max)
+                    var correction = exp_f32[1](m_old - m_new)
+
+                    # Rescale running output by exp(m_old - m_new).
+                    var op = running_o + hi * head_dim
+                    var vcorr = SIMD[DType.float32, width](correction)
                     var d = 0
                     while d + width <= head_dim:
-                        var vv = (v_head + d).load[width=width]().cast[DType.float32]()
-                        (aggp + d).store((aggp + d).load[width=width]() + wt * vv)
+                        (op + d).store((op + d).load[width=width]() * vcorr)
                         d += width
 
-            # Bias correction + write to f32 row buffer
+                    running_l[hi] = running_l[hi] * correction
+                    running_m[hi] = m_new
+
+                    # Exp + l accumulation + V scale absorption (fused).
+                    # absorbed[tl] = exp(score - m_new) * v_scale[t], stored in-place.
+                    # l tracks sum of exp(score - m_new) WITHOUT v_scale.
+                    var vm_new = SIMD[DType.float32, width](m_new)
+                    var l_acc_v = SIMD[DType.float32, width](0)
+                    tl = 0
+                    while tl + width <= block_len:
+                        var ev = exp_f32((scores + tl).load[width=width]() - vm_new)
+                        l_acc_v += ev
+                        var vs = (v_sc_base + t_start + tl).load[width=width]()
+                        (scores + tl).store(ev * vs)
+                        tl += width
+                    var l_contrib = l_acc_v.reduce_add()
+                    while tl < block_len:
+                        var e = exp_f32[1](scores[tl] - m_new)
+                        l_contrib += e
+                        scores[tl] = e * v_sc_base[t_start + tl]
+                        tl += 1
+                    running_l[hi] += l_contrib
+
+                    # Zero absorbed weights for padding.
+                    for tl in range(block_len, B_c):
+                        scores[tl] = Float32(0)
+
+                    # Quantize absorbed weights -> i8 (SIMD).
+                    # Weights are non-negative, so absmax = max.
+                    var wmax_v = SIMD[DType.float32, width](0)
+                    tl = 0
+                    while tl + width <= B_c:
+                        wmax_v = max(wmax_v, (scores + tl).load[width=width]())
+                        tl += width
+                    var w_absmax = wmax_v.reduce_max()
+
+                    var w_inv = Float32(127.0) / w_absmax if w_absmax > 0 else Float32(0)
+                    var vw_inv = SIMD[DType.float32, width](w_inv)
+                    var w_sum_v = SIMD[DType.int32, width](0)
+                    tl = 0
+                    while tl + width <= B_c:
+                        var qi = quantize_i8((scores + tl).load[width=width](), vw_inv)
+                        (w_block + tl).store(qi)
+                        w_sum_v += qi.cast[DType.int32]()
+                        tl += width
+                    var w_i8_sum = Int(w_sum_v.reduce_add())
+
+                    # VNNI V aggregation: for each dim d, dot V_T[d,:] with w_block.
+                    # raw = sum_t V_u8[t,d] * w_i8[t]
+                    # true = (raw - 128 * w_i8_sum) * w_scale
+                    var w_scale = w_absmax / Float32(127.0) if w_absmax > 0 else Float32(0)
+                    var bias = Float32(128 * w_i8_sum) * w_scale
+                    for d in range(head_dim):
+                        var raw = i8_dot_row_major[B_c](v_transposed + d * B_c, w_block)
+                        op[d] += Float32(raw) * w_scale - bias
+
+            # --- Final normalization: O /= l ---
             for hi in range(gqa_factor):
                 var h = g * gqa_factor + hi
-                var aggp = aggs + hi * head_dim
-                var bias = SIMD[DType.float32, width](Float32(128.0) * w_sums[hi])
-                var d = 0
+                var inv_l = Float32(1.0) / running_l[hi]
+                var vinv_l = SIMD[DType.float32, width](inv_l)
+                var op = running_o + hi * head_dim
+                d = 0
                 while d + width <= head_dim:
-                    (row_f32 + h * head_dim + d).store((aggp + d).load[width=width]() - bias)
+                    (row_f32 + h * head_dim + d).store((op + d).load[width=width]() * vinv_l)
                     d += width
 
-            t_v_agg += Int(perf_counter_ns()) - t3
+            t_blocked += Int(perf_counter_ns()) - t1
 
         var t6 = Int(perf_counter_ns())
-        # --- 5. Quantize full row → i8 (SIMD along q_cols) ---
+        # --- 3. Quantize full row -> i8 (SIMD along q_cols) ---
         var rmax_v = SIMD[DType.float32, width](0)
         var d = 0
         while d + width <= q_cols:
@@ -308,17 +309,19 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
     qi_qs.free()
     q_scales.free()
     q_biases.free()
-    per_head_scores.free()
-    aggs.free()
+    block_scores.free()
+    v_transposed.free()
+    w_block.free()
+    running_o.free()
+    running_m.free()
+    running_l.free()
 
-    var total = t_q_prep + t_score + t_softmax + t_v_agg + t_out_quant
+    var total = t_q_prep + t_blocked + t_out_quant
     if total > 0:
         print("attn profile (" + String(q.seq_len) + " rows, " + String(num_heads)
-              + " heads, ctx=" + String(max_ctx) + "):")
+              + " heads, ctx=" + String(pos + q.seq_len) + "):")
         print("  q_prep:    " + String(t_q_prep // 1000) + " us (" + String(t_q_prep * 100 // total) + "%)")
-        print("  score:     " + String(t_score // 1000) + " us (" + String(t_score * 100 // total) + "%)")
-        print("  softmax:   " + String(t_softmax // 1000) + " us (" + String(t_softmax * 100 // total) + "%)")
-        print("  v_agg:     " + String(t_v_agg // 1000) + " us (" + String(t_v_agg * 100 // total) + "%)")
+        print("  blocked:   " + String(t_blocked // 1000) + " us (" + String(t_blocked * 100 // total) + "%)")
         print("  out_quant: " + String(t_out_quant // 1000) + " us (" + String(t_out_quant * 100 // total) + "%)")
         print("  total:     " + String(total // 1000) + " us")
 
