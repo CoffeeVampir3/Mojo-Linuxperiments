@@ -546,6 +546,11 @@ def int8_gqa_attention_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int, max
     var total = Int64(0)
     for p in range(NUM_PHASES):
         total += phase_max_ptr[p]
-    _ = total  # phase printing suppressed for sweep
+    if total > 0:
+        print("  Phases (max worker, us):")
+        for p in range(NUM_PHASES):
+            var us = Int(phase_max_ptr[p]) // 1000
+            var pct = Int(phase_max_ptr[p] * 100 // total)
+            print("    " + phase_name(p) + ": " + String(us) + " (" + String(pct) + "%)")
 
     return PoolFence.completed()

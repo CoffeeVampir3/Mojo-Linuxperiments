@@ -141,3 +141,14 @@ def tdpbsud[dst: Int, src_a: Int, src_b: Int]():
     comptime assert dst >= 0 and dst < 8 and src_a >= 0 and src_a < 8 and src_b >= 0 and src_b < 8
     llvm_intrinsic["llvm.x86.tdpbsud", NoneType](
         Int8(dst), Int8(src_a), Int8(src_b))
+
+@always_inline
+def tdpbf16ps[dst: Int, src_a: Int, src_b: Int]():
+    """Tile dot product: bf16 x bf16 -> f32. TMM<dst> += TMM<src_a>(bf16) x TMM<src_b>(bf16).
+
+    VNNI groups of 2: each dword lane accumulates 2 bf16 multiplies.
+    TILE_K for bf16 = 32 elements (64 bytes). Same tile dimensions.
+    """
+    comptime assert dst >= 0 and dst < 8 and src_a >= 0 and src_a < 8 and src_b >= 0 and src_b < 8
+    llvm_intrinsic["llvm.x86.tdpbf16ps", NoneType](
+        Int8(dst), Int8(src_a), Int8(src_b))

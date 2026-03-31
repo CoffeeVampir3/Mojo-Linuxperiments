@@ -1,24 +1,15 @@
-"""Chunked AMX int8 GQA attention.
+"""Fused AMX int8 GQA attention (FlashAttention-style).
 
-Two large AMX GEMMs per chunk, one softmax pass between them.
-Online softmax state rolls across chunks for unbounded context.
+One pass over KV cache: for each tile of 64 positions, fuse
+score → dequant → online softmax → W quantize → V agg.
 
-Scoring:  S^T[chunk, gqa] = K_u8[chunk, hd] x Q_vnni[hd, gqa]
-          K loaded directly from cache (A, row-major). Zero packing.
-          Q written to VNNI during quantize step (B). Zero packing.
+Score buffer (4KB) and W VNNI (1KB) live on stack, deep L1.
+No separate passes over score data. Softmax work overlaps with
+memory stalls from KV cache streaming.
 
-V agg:   O^T[hd, gqa] = V_u8[hd, chunk] x W_vnni[chunk, gqa]
-          V loaded directly from transposed cache (A). Zero packing.
-          W written to VNNI during weight quantize (B). Zero packing.
-
-Both use tdpbusd: A=u8 (cache data), B=i8 (Q or W, VNNI-packed).
-Bias correction: true_dot = raw - 128 * sum(B_i8_column).
-
-Scratch per worker:
-  running_o:  gqa * head_dim * 4             (~8 KB)
-  score_buf:  CHUNK * TILE_N * 4             (~256 KB)
-  w_vnni:     (CHUNK / K_STEP) * TILE_BYTES  (~64 KB)
-  Total: ~330 KB per worker, ~2.6 MB for 8 workers.
+Scoring:  S^T[64, gqa] = K_u8[64, hd] x Q_vnni[hd, gqa]
+V agg:    O^T[hd, gqa] += V_u8[hd, 64] x W_vnni[64, gqa]
+Both use tdpbusd: A=u8 (cache), B=i8 (Q/W VNNI-packed).
 """
 
 from std.memory import UnsafePointer
@@ -43,46 +34,47 @@ from experimental.amx import (
 )
 
 
-comptime ATTN_CHUNK = 512
-
-
 # ============================================================================
-# Scratch Sizing
-# ============================================================================
-
-def attn_scratch_bytes_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int,
-                           num_workers: Int = 1]() -> Int:
-    """Scratch required for chunked AMX attention."""
-    comptime gqa_factor = num_heads // num_kv_heads
-    comptime q_cols = num_heads * head_dim
-    comptime w_vnni_bytes = (ATTN_CHUNK // K_STEP) * TILE_BYTES
-    comptime per_worker = (
-        head_dim * TILE_N * size_of[Float32]()           # running_o [hd, TILE_N]
-        + ATTN_CHUNK * TILE_N * size_of[Int32]()        # score_buf
-        + w_vnni_bytes                                   # w_vnni
-    )
-    return q_cols * size_of[Float32]() + num_workers * per_worker
-
-
-# ============================================================================
-# Per-worker timing (8 phases, written by worker, read after join)
+# Timing phases
 # ============================================================================
 
 comptime NUM_PHASES = 8
 comptime PHASE_QPREP = 0
 comptime PHASE_SCORE_GEMM = 1
 comptime PHASE_DEQUANT_MAX = 2
-comptime PHASE_SOFTMAX = 3       # rescale + exp + vscale
-comptime PHASE_W_QUANT = 4       # w_zero + w quantize
+comptime PHASE_SOFTMAX = 3
+comptime PHASE_W_QUANT = 4
 comptime PHASE_VAGG_GEMM = 5
 comptime PHASE_VAGG_DEQUANT = 6
 comptime PHASE_NORMALIZE = 7
 
 comptime TIMING_BYTES = NUM_PHASES * size_of[Int64]()
 
+def phase_name(p: Int) -> String:
+    if p == 0: return "Q prep"
+    if p == 1: return "Score GEMM"
+    if p == 2: return "Dequant+Max"
+    if p == 3: return "Softmax+WQ"
+    if p == 4: return "W Quantize"
+    if p == 5: return "V agg GEMM"
+    if p == 6: return "V agg Dequant"
+    if p == 7: return "Normalize"
+    return "?"
+
 
 # ============================================================================
-# Dispatched Kernel
+# Scratch sizing (simplified: only running_o needed in scratch)
+# ============================================================================
+
+def attn_scratch_bytes_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int,
+                           num_workers: Int = 1]() -> Int:
+    comptime q_cols = num_heads * head_dim
+    comptime per_worker = head_dim * TILE_N * size_of[Float32]()  # running_o [hd, TILE_N]
+    return q_cols * size_of[Float32]() + num_workers * per_worker
+
+
+# ============================================================================
+# Dispatched Kernel (fused tile loop)
 # ============================================================================
 
 def had_attn_groups_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
@@ -96,17 +88,11 @@ def had_attn_groups_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_se
     comptime gqa_factor = num_heads // num_kv_heads
     comptime q_cols = num_heads * head_dim
     comptime inv_sqrt_hd = Float32(1.0 / Float64(sqrt[DType.float32, 1](Float32(head_dim))))
-    comptime CHUNK = ATTN_CHUNK
+    comptime FUSED_TILE = K_STEP  # 64 positions per fused tile
 
     comptime DATA_HEAD_STRIDE = max_seq * head_dim
     comptime SCALE_HEAD_STRIDE = max_seq * size_of[Float32]()
-    comptime W_VNNI_BYTES = (CHUNK // K_STEP) * TILE_BYTES
     comptime QI_VNNI_TILES = head_dim // K_STEP
-
-    # Scratch layout
-    comptime RUNNING_O_OFF = 0
-    comptime SCORE_OFF = RUNNING_O_OFF + head_dim * TILE_N * size_of[Float32]()
-    comptime W_VNNI_OFF = SCORE_OFF + CHUNK * TILE_N * size_of[Int32]()
 
     var actual_pos = ctx[].pos + m
     var context = actual_pos + 1
@@ -114,26 +100,25 @@ def had_attn_groups_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_se
     var sin_row = ctx[].sin + actual_pos * half
 
     var running_o = UnsafePointer[Float32, MutAnyOrigin](
-        unsafe_from_address=worker_scratch + RUNNING_O_OFF)
-    var score_i32 = UnsafePointer[Int32, MutAnyOrigin](
-        unsafe_from_address=worker_scratch + SCORE_OFF)
-    var score_f32 = UnsafePointer[Float32, MutAnyOrigin](
-        unsafe_from_address=worker_scratch + SCORE_OFF)
-    var w_vnni = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](
-        unsafe_from_address=worker_scratch + W_VNNI_OFF)
-
-    # Stack buffers
-    var qi_vnni_arr = InlineArray[Scalar[DType.int8], QI_VNNI_TILES * TILE_BYTES](
-        fill=Scalar[DType.int8](0))
-    var qi_vnni = UnsafePointer(to=qi_vnni_arr).bitcast[Scalar[DType.int8]]()
-    var vagg_arr = InlineArray[Int32, M_STEP * TILE_N](fill=Int32(0))
-    var vagg_buf = UnsafePointer(to=vagg_arr).bitcast[Int32]()
+        unsafe_from_address=worker_scratch)
 
     # Tile config
     var cfg = make_224_i8_config()
     ldtilecfg(UnsafePointer(to=cfg))
 
-    # TILE_N-wide for SIMD-over-heads loading (extra lanes stay 0 = inert)
+    # Stack buffers (all L1-resident)
+    var qi_vnni_arr = InlineArray[Scalar[DType.int8], QI_VNNI_TILES * TILE_BYTES](
+        fill=Scalar[DType.int8](0))
+    var qi_vnni = UnsafePointer(to=qi_vnni_arr).bitcast[Scalar[DType.int8]]()
+    var score_arr = InlineArray[Int32, FUSED_TILE * TILE_N](fill=Int32(0))
+    var score_i32 = UnsafePointer(to=score_arr).bitcast[Int32]()
+    var score_f32 = UnsafePointer(to=score_arr).bitcast[Float32]()
+    var w_vnni_arr = InlineArray[Scalar[DType.int8], TILE_BYTES](
+        fill=Scalar[DType.int8](0))
+    var w_vnni = UnsafePointer(to=w_vnni_arr).bitcast[Scalar[DType.int8]]()
+    var vagg_arr = InlineArray[Int32, M_STEP * TILE_N](fill=Int32(0))
+    var vagg_buf = UnsafePointer(to=vagg_arr).bitcast[Int32]()
+
     var q_scales_arr = InlineArray[Float32, TILE_N](fill=Float32(0))
     var q_biases_arr = InlineArray[Float32, TILE_N](fill=Float32(0))
     var q_scales = UnsafePointer(to=q_scales_arr).bitcast[Float32]()
@@ -158,7 +143,6 @@ def had_attn_groups_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_se
                 (qp + k).store((q_row + k).load[width=width]().cast[DType.float32]())
                 k += width
 
-            # RoPE
             var j = 0
             while j + width <= half:
                 var x_lo = (qp + j).load[width=width]()
@@ -171,7 +155,6 @@ def had_attn_groups_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_se
 
             fwht_block[DType.float32, head_dim](qp)
 
-            # Absmax
             var vmax = SIMD[DType.float32, width](0)
             k = 0
             while k + width <= head_dim:
@@ -180,7 +163,6 @@ def had_attn_groups_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_se
             var q_absmax = vmax.reduce_max()
             var q_inv = Float32(127.0) / q_absmax if q_absmax > 0 else Float32(0)
 
-            # Quantize directly to VNNI: 4 values at a time = 1 VNNI dword
             var q_sum = Int32(0)
             for d in range(0, head_dim, VNNI_BLK):
                 var qi = quantize_i8(
@@ -197,15 +179,12 @@ def had_attn_groups_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_se
         timing[PHASE_QPREP] += Int64(perf_counter_ns() - t0)
 
         # =================================================================
-        # 2. Init running state
+        # 2. Init running state + precompute fixed W quantize scale
         # =================================================================
-        var running_m_arr = InlineArray[Float32, TILE_N](fill=Float32(-1e30))
-        var running_l_arr = InlineArray[Float32, TILE_N](fill=Float32(0))
-        var running_m = UnsafePointer(to=running_m_arr).bitcast[Float32]()
-        var running_l = UnsafePointer(to=running_l_arr).bitcast[Float32]()
-        # running_o stored as [head_dim, TILE_N] for SIMD-friendly V agg dequant
         for i in range(head_dim * TILE_N):
             running_o[i] = Float32(0)
+        var running_m_vec = SIMD[DType.float32, TILE_N](Float32(-1e30))
+        var running_l_vec = SIMD[DType.float32, TILE_N](Float32(0))
 
         var k_base = UnsafePointer[UInt8, MutAnyOrigin](
             unsafe_from_address=ctx[].k_data + g * DATA_HEAD_STRIDE)
@@ -216,26 +195,37 @@ def had_attn_groups_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_se
         var v_head = UnsafePointer[UInt8, MutAnyOrigin](
             unsafe_from_address=ctx[].v_data + g * DATA_HEAD_STRIDE)
 
-        # =================================================================
-        # 3. Chunk loop
-        # =================================================================
-        for chunk_start in range(0, context, CHUNK):
-            var chunk_len = min(CHUNK, context - chunk_start)
-            var chunk_m_iters = (chunk_len + M_STEP - 1) // M_STEP
-            var chunk_k_iters = (chunk_len + K_STEP - 1) // K_STEP
+        # Fixed W quantize scale from global v_scale_max
+        var v_sc_max = Float32(0)
+        for t in range(context):
+            if v_sc_base[t] > v_sc_max:
+                v_sc_max = v_sc_base[t]
+        var w_scale_vec = SIMD[DType.float32, TILE_N](v_sc_max / Float32(127.0))
+        var w_inv_vec = SIMD[DType.float32, TILE_N](
+            Float32(127.0) / v_sc_max if v_sc_max > 0 else Float32(0))
 
-            # --- 3a. Scoring GEMM ---
+        var q_bias_vec = q_biases.load[width=TILE_N]()
+        var q_scale_vec = q_scales.load[width=TILE_N]()
+
+        # =================================================================
+        # 3. Fused tile loop — one pass over KV cache
+        # =================================================================
+        for tile_start in range(0, context, FUSED_TILE):
+            var tile_len = min(FUSED_TILE, context - tile_start)
+            var tile_m_iters = (tile_len + M_STEP - 1) // M_STEP
+
+            # --- Score GEMM ---
             t0 = perf_counter_ns()
-            for m_idx in range(chunk_m_iters):
+            for m_idx in range(tile_m_iters):
                 var m_blk = m_idx * M_STEP
                 tilezero[4]()
                 tilezero[6]()
                 for k_blk in range(0, head_dim, K_STEP):
                     tileload[0](
-                        k_base + (chunk_start + m_blk) * head_dim + k_blk,
+                        k_base + (tile_start + m_blk) * head_dim + k_blk,
                         head_dim)
                     tileload[1](
-                        k_base + (chunk_start + m_blk + TILE_M) * head_dim + k_blk,
+                        k_base + (tile_start + m_blk + TILE_M) * head_dim + k_blk,
                         head_dim)
                     tileload[2](
                         qi_vnni + (k_blk // K_STEP) * TILE_BYTES,
@@ -244,180 +234,112 @@ def had_attn_groups_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_se
                     tdpbusd[6, 1, 2]()
                 tilestore[4](score_i32 + m_blk * TILE_N, score_stride)
                 tilestore[6](score_i32 + (m_blk + TILE_M) * TILE_N, score_stride)
-
             timing[PHASE_SCORE_GEMM] += Int64(perf_counter_ns() - t0)
 
-            # --- 3b. Dequant + softmax + W quantize (SIMD over heads) ---
+            # --- Fused dequant + softmax + W quantize ---
             t0 = perf_counter_ns()
 
-            # Zero w_vnni for this chunk (SIMD)
-            var i8zero = SIMD[DType.int8, TILE_K](0)
-            for zi in range(0, W_VNNI_BYTES, TILE_K):
-                (w_vnni + zi).store(i8zero)
-
-            # Build per-head SIMD vectors
-            var q_bias_vec = q_biases.load[width=TILE_N]()
-            var q_scale_vec = q_scales.load[width=TILE_N]()
-
-            # Precompute fixed W quantize scale from max V scale in this chunk.
-            # Attention weights after softmax are in [0, 1], so after V-scale
-            # absorption: w <= v_scale_max. Use this as a conservative bound.
-            var v_sc_max = Float32(0)
-            for t in range(chunk_len):
-                var vs = v_sc_base[chunk_start + t]
-                if vs > v_sc_max:
-                    v_sc_max = vs
-            var w_scale_vec = SIMD[DType.float32, TILE_N](v_sc_max / Float32(127.0))
-            var w_inv_vec = SIMD[DType.float32, TILE_N](
-                Float32(127.0) / v_sc_max if v_sc_max > 0 else Float32(0))
-
-            # Pass 1: Dequant i32 -> f32 + find chunk max (all heads at once)
-            var chunk_max_vec = SIMD[DType.float32, TILE_N](Float32(-1e30))
-            for t in range(chunk_len):
+            # Dequant i32→f32 + find tile max (4KB, L1-hot from tilestore)
+            var tile_max_vec = SIMD[DType.float32, TILE_N](Float32(-1e30))
+            for t in range(tile_len):
                 var raw = (score_i32 + t * TILE_N).load[width=TILE_N]().cast[DType.float32]()
-                var ksc = SIMD[DType.float32, TILE_N](k_sc_base[chunk_start + t])
+                var ksc = SIMD[DType.float32, TILE_N](k_sc_base[tile_start + t])
                 var dequant = (raw - q_bias_vec) * q_scale_vec * ksc
                 (score_f32 + t * TILE_N).store(dequant)
-                chunk_max_vec = max(chunk_max_vec, dequant)
+                tile_max_vec = max(tile_max_vec, dequant)
 
-            timing[PHASE_DEQUANT_MAX] += Int64(perf_counter_ns() - t0)
-
-            # Online softmax: update running state
-            t0 = perf_counter_ns()
-            var running_m_vec = running_m.load[width=TILE_N]()
-            var running_l_vec = running_l.load[width=TILE_N]()
-            var m_new_vec = max(running_m_vec, chunk_max_vec)
+            # Online softmax update + rescale running_o
+            var m_new_vec = max(running_m_vec, tile_max_vec)
             var correction_vec = exp_f32(running_m_vec - m_new_vec)
             running_m_vec = m_new_vec
             running_l_vec = running_l_vec * correction_vec
-            running_m.store(running_m_vec)
-
-            # Rescale running_o [head_dim, TILE_N] — SIMD over heads, loop over dims
             for d in range(head_dim):
                 var row = (running_o + d * TILE_N).load[width=TILE_N]()
                 (running_o + d * TILE_N).store(row * correction_vec)
 
-            # Fused pass 2+3: Exp + V scale + quantize to VNNI + accumulate l
-            # w_inv_vec is precomputed from v_scale_max — no absmax pass needed.
+            # Exp + V scale + quantize to W VNNI (fused, 4KB L1-hot)
+            # Zero w_vnni for partial last tile
+            var i8zero = SIMD[DType.int8, TILE_K](0)
+            for zi in range(0, TILE_BYTES, TILE_K):
+                (w_vnni + zi).store(i8zero)
+
             var l_contrib_vec = SIMD[DType.float32, TILE_N](0)
             var w_sum_vec = SIMD[DType.int32, TILE_N](0)
 
             var t = 0
-            while t + VNNI_BLK <= chunk_len:
-                # Exp + V scale for 4 positions
-                var vs0 = SIMD[DType.float32, TILE_N](v_sc_base[chunk_start + t + 0])
-                var vs1 = SIMD[DType.float32, TILE_N](v_sc_base[chunk_start + t + 1])
-                var vs2 = SIMD[DType.float32, TILE_N](v_sc_base[chunk_start + t + 2])
-                var vs3 = SIMD[DType.float32, TILE_N](v_sc_base[chunk_start + t + 3])
-
+            while t + VNNI_BLK <= tile_len:
                 var e0 = exp_f32_fast((score_f32 + (t + 0) * TILE_N).load[width=TILE_N]() - m_new_vec)
                 var e1 = exp_f32_fast((score_f32 + (t + 1) * TILE_N).load[width=TILE_N]() - m_new_vec)
                 var e2 = exp_f32_fast((score_f32 + (t + 2) * TILE_N).load[width=TILE_N]() - m_new_vec)
                 var e3 = exp_f32_fast((score_f32 + (t + 3) * TILE_N).load[width=TILE_N]() - m_new_vec)
                 l_contrib_vec += e0 + e1 + e2 + e3
 
-                # Quantize V-absorbed weights directly to VNNI
+                var vs0 = SIMD[DType.float32, TILE_N](v_sc_base[tile_start + t + 0])
+                var vs1 = SIMD[DType.float32, TILE_N](v_sc_base[tile_start + t + 1])
+                var vs2 = SIMD[DType.float32, TILE_N](v_sc_base[tile_start + t + 2])
+                var vs3 = SIMD[DType.float32, TILE_N](v_sc_base[tile_start + t + 3])
+
                 var q0 = quantize_i8(e0 * vs0, w_inv_vec)
                 var q1 = quantize_i8(e1 * vs1, w_inv_vec)
                 var q2 = quantize_i8(e2 * vs2, w_inv_vec)
                 var q3 = quantize_i8(e3 * vs3, w_inv_vec)
                 w_sum_vec += q0.cast[DType.int32]() + q1.cast[DType.int32]() + q2.cast[DType.int32]() + q3.cast[DType.int32]()
 
-                # SIMD interleave → one 64-byte VNNI row store
                 var d0 = q0.cast[DType.uint8]().cast[DType.uint32]()
                 var d1 = q1.cast[DType.uint8]().cast[DType.uint32]()
                 var d2 = q2.cast[DType.uint8]().cast[DType.uint32]()
                 var d3 = q3.cast[DType.uint8]().cast[DType.uint32]()
                 var dwords = d0 | (d1 << 8) | (d2 << 16) | (d3 << 24)
-
-                var tile_idx = t // K_STEP
-                var kg = (t % K_STEP) // VNNI_BLK
-                (w_vnni + tile_idx * TILE_BYTES + kg * 64).bitcast[Scalar[DType.uint32]]().store(dwords)
+                (w_vnni + (t // VNNI_BLK) * 64).bitcast[Scalar[DType.uint32]]().store(dwords)
                 t += VNNI_BLK
-            # Remainder
-            while t < chunk_len:
+
+            while t < tile_len:
                 var e = exp_f32_fast((score_f32 + t * TILE_N).load[width=TILE_N]() - m_new_vec)
                 l_contrib_vec += e
-                var vs = SIMD[DType.float32, TILE_N](v_sc_base[chunk_start + t])
+                var vs = SIMD[DType.float32, TILE_N](v_sc_base[tile_start + t])
                 var qi = quantize_i8(e * vs, w_inv_vec)
                 w_sum_vec += qi.cast[DType.int32]()
-                var tile_idx = t // K_STEP
-                var kg = (t % K_STEP) // VNNI_BLK
                 var b = t % VNNI_BLK
-                var base = w_vnni + tile_idx * TILE_BYTES + kg * 64
+                var kg = t // VNNI_BLK
                 for hi in range(gqa_factor):
-                    base[hi * VNNI_BLK + b] = qi[hi]
+                    w_vnni[kg * 64 + hi * VNNI_BLK + b] = qi[hi]
                 t += 1
 
             running_l_vec = running_l_vec + l_contrib_vec
-            running_l.store(running_l_vec)
-
             var w_bias_vec = SIMD[DType.float32, TILE_N](128.0) * w_sum_vec.cast[DType.float32]() * w_scale_vec
-
             timing[PHASE_SOFTMAX] += Int64(perf_counter_ns() - t0)
-            timing[PHASE_W_QUANT] += Int64(0)  # fused into softmax
 
-            # --- 3c. V agg GEMM ---
+            # --- V agg GEMM + dequant ---
             t0 = perf_counter_ns()
-            # O^T[hd, gqa] = V_u8[hd, chunk] x W_vnni[chunk, gqa]
             for m_blk in range(0, head_dim, M_STEP):
                 tilezero[4]()
                 tilezero[6]()
-                for k_idx in range(chunk_k_iters):
-                    var k_blk = k_idx * K_STEP
-                    tileload[0](
-                        v_head + m_blk * max_seq + chunk_start + k_blk,
-                        max_seq)
-                    tileload[1](
-                        v_head + (m_blk + TILE_M) * max_seq + chunk_start + k_blk,
-                        max_seq)
-                    tileload[2](
-                        w_vnni + k_idx * TILE_BYTES,
-                        TILE_N * VNNI_BLK)
-                    tdpbusd[4, 0, 2]()
-                    tdpbusd[6, 1, 2]()
+                tileload[0](v_head + m_blk * max_seq + tile_start, max_seq)
+                tileload[1](v_head + (m_blk + TILE_M) * max_seq + tile_start, max_seq)
+                tileload[2](w_vnni, TILE_N * VNNI_BLK)
+                tdpbusd[4, 0, 2]()
+                tdpbusd[6, 1, 2]()
                 tilestore[4](vagg_buf, vagg_stride)
                 tilestore[6](vagg_buf + TILE_M * TILE_N, vagg_stride)
 
-                timing[PHASE_VAGG_GEMM] += Int64(perf_counter_ns() - t0)
-                t0 = perf_counter_ns()
-                # Dequant + accumulate to running_o [head_dim, TILE_N]
                 for r in range(M_STEP):
                     var raw = (vagg_buf + r * TILE_N).load[width=TILE_N]().cast[DType.float32]()
                     var dequant = raw * w_scale_vec - w_bias_vec
                     var existing = (running_o + (m_blk + r) * TILE_N).load[width=TILE_N]()
                     (running_o + (m_blk + r) * TILE_N).store(existing + dequant)
-
-                timing[PHASE_VAGG_DEQUANT] += Int64(perf_counter_ns() - t0)
-                t0 = perf_counter_ns()
+            timing[PHASE_VAGG_GEMM] += Int64(perf_counter_ns() - t0)
 
         # =================================================================
-        # 4. Final normalization — transpose [hd, TILE_N] → [gqa, hd]
+        # 4. Final normalization
         # =================================================================
         t0 = perf_counter_ns()
-        var inv_l_vec = SIMD[DType.float32, TILE_N](1.0) / running_l.load[width=TILE_N]()
+        var inv_l_vec = SIMD[DType.float32, TILE_N](1.0) / running_l_vec
         for d in range(head_dim):
             var row = (running_o + d * TILE_N).load[width=TILE_N]() * inv_l_vec
             for hi in range(gqa_factor):
                 var h = g * gqa_factor + hi
                 ctx[].row_f32[h * head_dim + d] = row[hi]
         timing[PHASE_NORMALIZE] += Int64(perf_counter_ns() - t0)
-
-
-# ============================================================================
-# Phase names for printing
-# ============================================================================
-
-def phase_name(p: Int) -> String:
-    if p == 0: return "Q prep"
-    if p == 1: return "Score GEMM"
-    if p == 2: return "Dequant+Max"
-    if p == 3: return "Softmax"
-    if p == 4: return "W Quantize"
-    if p == 5: return "V agg GEMM"
-    if p == 6: return "V agg Dequant"
-    if p == 7: return "Normalize"
-    return "?"
 
 
 # ============================================================================
@@ -439,11 +361,7 @@ def int8_gqa_attention_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int, max
     pos: Int,
     mut pool: BurstPool[],
 ) -> PoolFence:
-    """Chunked AMX int8 GQA attention. Drop-in replacement for int8_gqa_attention.
-
-    Caller must have called init_intel_amx() once per process.
-    Scratch >= attn_scratch_bytes_amx[..., num_workers]().
-    """
+    """Fused AMX int8 GQA attention. Drop-in replacement for int8_gqa_attention."""
     comptime assert QT.DTYPE == DType.bfloat16, "Q must be bf16"
     comptime assert QiT.DTYPE == DType.int8, "qi output must be int8"
     comptime assert ScT.DTYPE == DType.float32, "scale output must be f32"
@@ -451,13 +369,8 @@ def int8_gqa_attention_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int, max
     comptime width = simd_width_of[DType.float32]()
     comptime gqa_factor = num_heads // num_kv_heads
     comptime q_cols = QT.COLS
-    comptime w_vnni_bytes = (ATTN_CHUNK // K_STEP) * TILE_BYTES
 
-    comptime PER_WORKER = (
-        head_dim * TILE_N * size_of[Float32]()
-        + ATTN_CHUNK * TILE_N * size_of[Int32]()
-        + w_vnni_bytes
-    )
+    comptime PER_WORKER = head_dim * TILE_N * size_of[Float32]()
     comptime ROW_F32_OFF = 0
     comptime WORKERS_OFF = q_cols * size_of[Float32]()
 
@@ -470,24 +383,18 @@ def int8_gqa_attention_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int, max
 
     var ctx = HadAttnCtx(
         q=UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=q.ptr),
-        qi=qi_ptr,
-        sc=sc_ptr,
+        qi=qi_ptr, sc=sc_ptr,
         cos=UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cos_table.ptr),
         sin=UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=sin_table.ptr),
-        k_data=k_cache.data_base,
-        k_scale=k_cache.scale_base,
-        v_data=v_cache.data_base,
-        v_scale=v_cache.scale_base,
-        row_f32=row_f32,
-        pos=pos,
-        seq_len=q.seq_len,
+        k_data=k_cache.data_base, k_scale=k_cache.scale_base,
+        v_data=v_cache.data_base, v_scale=v_cache.scale_base,
+        row_f32=row_f32, pos=pos, seq_len=q.seq_len,
     )
 
     var ctx_ptr = UnsafePointer(to=ctx)
     var num_jobs = min(num_kv_heads, pool.capacity)
     var groups_per_job = (num_kv_heads + num_jobs - 1) // num_jobs
 
-    # Per-worker timing slots (after all worker scratch)
     comptime MAX_WORKERS = 16
     var timing_arr = InlineArray[Int64, MAX_WORKERS * NUM_PHASES](fill=Int64(0))
     var timing_base = UnsafePointer(to=timing_arr).bitcast[Int64]()
@@ -510,7 +417,7 @@ def int8_gqa_attention_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int, max
         )
         pool.join()
 
-        # Output quantization (inside for m loop)
+        # Output quantization
         var out_row = qi_ptr + m * q_cols
         var rmax_v = SIMD[DType.float32, width](0)
         var d = 0
@@ -535,7 +442,7 @@ def int8_gqa_attention_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int, max
             out_row[d] = quantize_i8_scalar(row_f32[d], row_inv)
             d += 1
 
-    # Aggregate timing: max across workers (wall time = slowest worker)
+    # Timing report
     var phase_max = InlineArray[Int64, NUM_PHASES](fill=Int64(0))
     var phase_max_ptr = UnsafePointer(to=phase_max).bitcast[Int64]()
     for i in range(num_jobs):
@@ -546,6 +453,11 @@ def int8_gqa_attention_amx[num_heads: Int, num_kv_heads: Int, head_dim: Int, max
     var total = Int64(0)
     for p in range(NUM_PHASES):
         total += phase_max_ptr[p]
-    _ = total  # phase printing suppressed for sweep
+    if total > 0:
+        print("  Phases (max worker, us):")
+        for p in range(NUM_PHASES):
+            var us = Int(phase_max_ptr[p]) // 1000
+            var pct = Int(phase_max_ptr[p] * 100 // total)
+            print("    " + phase_name(p) + ": " + String(us) + " (" + String(pct) + "%)")
 
     return PoolFence.completed()
