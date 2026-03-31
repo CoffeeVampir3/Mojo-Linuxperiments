@@ -164,10 +164,13 @@ def exp_f32_fast[width: Int](x: SIMD[DType.float32, width]) -> SIMD[DType.float3
     comptime LN2 = Float32(0.6931471805599453)
     comptime INV_LN2 = Float32(1.4426950408889634)
 
+    # Clamp input to avoid i32 overflow in range reduction
+    var xc = max(x, SIMD[DType.float32, width](-87.0))
+
     # n = round(x / ln2), r = x - n*ln2, exp(x) = 2^n * exp(r)
-    var xn = x * INV_LN2
+    var xn = xc * INV_LN2
     var n = roundeven(xn).cast[DType.int32]()
-    var r = x - n.cast[DType.float32]() * LN2
+    var r = xc - n.cast[DType.float32]() * LN2
 
     # Degree-3 minimax on [-ln2/2, ln2/2]: max error ~3e-4
     var p = SIMD[DType.float32, width](1.0) + r * (
