@@ -14,6 +14,7 @@ from modeling.model_spec import (
     Slot, Bound, DynView,
 )
 from experimental.hadquant_attn_amx import int8_gqa_attention_amx, attn_scratch_bytes_amx
+from experimental.hadquant_attn import int8_gqa_attention, attn_scratch_bytes
 from experimental.hadquant_impl import fwht_block
 from experimental.hadquant_kv_cache import HadQuantKVCache
 from experimental.amx import init_intel_amx
@@ -246,11 +247,47 @@ def main():
     comptime DsQiSlot = Slot[I8, Replicated, 1, DS_HIDDEN, 1]
     comptime DsScSlot = Slot[F32, Replicated, 1, 1, 1]
 
-    for run in range(5):
+    # --- VNNI baseline first (clean caches) ---
+    print("\n=== VNNI baseline ===")
+    comptime DS_VNNI_SCRATCH = attn_scratch_bytes[DS_NUM_HEADS, DS_NUM_KV_HEADS, DS_HEAD_DIM, DS_NUM_KV_HEADS]()
+    var vnni_scratch = ds_arena.alloc[UInt8](DS_VNNI_SCRATCH)
+
+    for run in range(3):
+        int8_gqa_attention[DS_NUM_HEADS, DS_NUM_KV_HEADS, DS_HEAD_DIM](
+            DynView[DsQSlot](Int(ds_q), 1), ds_k, ds_v,
+            DynView[DsQiSlot](Int(ds_qi_out), 1),
+            DynView[DsScSlot](Int(ds_sc_out), 1),
+            Bound[DsCosSlot](Int(ds_cos)), Bound[DsSinSlot](Int(ds_sin)),
+            Int(vnni_scratch), DS_CTX, burst,
+        ).join()
+    for run in range(10):
+        var t0 = Int(perf_counter_ns())
+        int8_gqa_attention[DS_NUM_HEADS, DS_NUM_KV_HEADS, DS_HEAD_DIM](
+            DynView[DsQSlot](Int(ds_q), 1), ds_k, ds_v,
+            DynView[DsQiSlot](Int(ds_qi_out), 1),
+            DynView[DsScSlot](Int(ds_sc_out), 1),
+            Bound[DsCosSlot](Int(ds_cos)), Bound[DsSinSlot](Int(ds_sin)),
+            Int(vnni_scratch), DS_CTX, burst,
+        ).join()
+        var wall = Int(perf_counter_ns()) - t0
+        keep(ds_qi_out[0])
+        keep(ds_sc_out[0])
+        print("  VNNI: " + String(wall // 1000) + " us")
+
+    # --- AMX ---
+    print("\n=== AMX (CHUNK=512) ===")
+    for run in range(3):
+        int8_gqa_attention_amx[DS_NUM_HEADS, DS_NUM_KV_HEADS, DS_HEAD_DIM](
+            DynView[DsQSlot](Int(ds_q), 1), ds_k, ds_v,
+            DynView[DsQiSlot](Int(ds_qi_out), 1),
+            DynView[DsScSlot](Int(ds_sc_out), 1),
+            Bound[DsCosSlot](Int(ds_cos)), Bound[DsSinSlot](Int(ds_sin)),
+            Int(ds_scratch), DS_CTX, burst,
+        ).join()
+    for run in range(10):
         var t0 = Int(perf_counter_ns())
         int8_gqa_attention_amx[DS_NUM_HEADS, DS_NUM_KV_HEADS, DS_HEAD_DIM](
-            DynView[DsQSlot](Int(ds_q), 1),
-            ds_k, ds_v,
+            DynView[DsQSlot](Int(ds_q), 1), ds_k, ds_v,
             DynView[DsQiSlot](Int(ds_qi_out), 1),
             DynView[DsScSlot](Int(ds_sc_out), 1),
             Bound[DsCosSlot](Int(ds_cos)), Bound[DsSinSlot](Int(ds_sin)),
@@ -259,4 +296,4 @@ def main():
         var wall = Int(perf_counter_ns()) - t0
         keep(ds_qi_out[0])
         keep(ds_sc_out[0])
-        print("  wall: " + String(wall // 1000) + " us")
+        print("  AMX:  " + String(wall // 1000) + " us")
