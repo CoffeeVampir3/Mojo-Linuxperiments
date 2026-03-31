@@ -2,13 +2,12 @@
 
 Reference computes standard GQA attention in f32:
   1. RoPE on Q per head
-  2. dot(Q, K) / sqrt(HD) → scores
+  2. dot(Q, K) / sqrt(HD) -> scores
   3. causal masked softmax
   4. weighted sum of V
 Then compares the dequantized int8 output against the f32 reference.
 """
 
-from std.memory.unsafe_pointer import alloc
 from std.sys.info import simd_width_of
 from std.math import sqrt as std_sqrt
 
@@ -16,14 +15,15 @@ from modeling.model_spec import (
     BF16, F32, I8, Replicated, ColShard,
     Slot, Bound, DynView,
 )
-from experimental.hadquant_attn import int8_gqa_attention
+from experimental.hadquant_attn import int8_gqa_attention, attn_scratch_bytes
 from std.benchmark import keep
 from std.time import perf_counter_ns
 from experimental.hadquant_impl import fwht_block
 from experimental.hadquant_kv_cache import HadQuantKVCache
 from simd_math import sqrt, exp_f32, roundeven
 from threading import BurstPool
-from numa import NumaInfo
+from numa import NumaInfo, get_current_cpu_and_node
+from numa.arena import NumaArena
 from kernels.kernel_ops import PoolFence, init_rope_tables
 
 
@@ -46,17 +46,27 @@ def main():
     print("heads=" + String(NUM_HEADS) + " kv_heads=" + String(NUM_KV_HEADS)
           + " head_dim=" + String(HEAD_DIM) + " prefill=" + String(PREFILL_LEN))
 
-    # --- Allocate ---
+    # --- Allocate from NumaArena ---
     comptime KVCacheType = HadQuantKVCache[MAX_SEQ, HEAD_DIM, NUM_KV_HEADS]
+    comptime SCRATCH_BYTES = attn_scratch_bytes[NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, NUM_KV_HEADS]()
 
-    var q_bf16 = alloc[Scalar[DType.bfloat16]](PREFILL_LEN * HIDDEN)
-    var kv_mem = alloc[UInt8](2 * KVCacheType.TOTAL_BYTES)  # K + V caches
+    var numa = NumaInfo()
+    var local_node = get_current_cpu_and_node()[1]
+    var arena = NumaArena(local_node, 4 * 1024 * 1024)  # 4 MB
+
+    var q_bf16 = arena.alloc[Scalar[DType.bfloat16]](PREFILL_LEN * HIDDEN)
+    var kv_mem = arena.alloc[UInt8](2 * KVCacheType.TOTAL_BYTES)
     var k_cache = KVCacheType(Int(kv_mem))
     var v_cache = KVCacheType(Int(kv_mem) + KVCacheType.TOTAL_BYTES)
-    var qi_out = alloc[Scalar[DType.int8]](PREFILL_LEN * HIDDEN)
-    var scale_out = alloc[Float32](PREFILL_LEN)
-    var cos_table = alloc[Float32](MAX_SEQ * HALF)
-    var sin_table = alloc[Float32](MAX_SEQ * HALF)
+    var qi_out = arena.alloc[Scalar[DType.int8]](PREFILL_LEN * HIDDEN)
+    var scale_out = arena.alloc[Float32](PREFILL_LEN)
+    var cos_table = arena.alloc[Float32](MAX_SEQ * HALF)
+    var sin_table = arena.alloc[Float32](MAX_SEQ * HALF)
+    var attn_scratch = arena.alloc[UInt8](SCRATCH_BYTES)
+    var expected = arena.alloc[Float32](PREFILL_LEN * HIDDEN)
+    var q_head = arena.alloc[Float32](HEAD_DIM)
+    var head_buf = arena.alloc[Scalar[DType.int8]](HEAD_DIM)
+    var decode_q = arena.alloc[Scalar[DType.bfloat16]](HIDDEN)
 
     # --- Fill Q with deterministic data ---
     for m in range(PREFILL_LEN):
@@ -66,7 +76,6 @@ def main():
             )
 
     # --- Fill KV cache via write_head ---
-    var head_buf = alloc[Scalar[DType.int8]](HEAD_DIM)
     for t in range(PREFILL_LEN):
         for g in range(NUM_KV_HEADS):
             # K cache
@@ -97,7 +106,6 @@ def main():
     comptime QiSlot = Slot[I8, Replicated, 1, HIDDEN, 1]
     comptime ScSlot = Slot[F32, Replicated, 1, 1, 1]
 
-    var numa = NumaInfo()
     var burst = BurstPool[].for_numa_node(numa, 0)
 
     int8_gqa_attention[NUM_HEADS, NUM_KV_HEADS, HEAD_DIM](
@@ -106,17 +114,10 @@ def main():
         DynView[QiSlot](Int(qi_out), PREFILL_LEN),
         DynView[ScSlot](Int(scale_out), PREFILL_LEN),
         Bound[CosSlot](Int(cos_table)), Bound[SinSlot](Int(sin_table)),
-        POS, burst,
+        Int(attn_scratch), POS, burst,
     ).join()
 
     # --- F32 reference ---
-    # For each query row m, head h:
-    #   1. Load Q bf16 → f32, RoPE, FWHT
-    #   2. Dequant K cache → f32, dot with Q / sqrt(HD)
-    #   3. Softmax, absorb V scales
-    #   4. Dequant V cache → f32, weighted sum
-    var expected = alloc[Float32](PREFILL_LEN * HIDDEN)
-    var q_head = alloc[Float32](HEAD_DIM)
     var inv_sqrt_hd = Float32(1.0) / sqrt[DType.float32, 1](Float32(HEAD_DIM))
 
     for m in range(PREFILL_LEN):
@@ -142,8 +143,10 @@ def main():
             # FWHT
             fwht_block[DType.float32, BLOCK](q_head)
 
-            # Score against K cache (dequant u8 → signed f32)
-            var scores = alloc[Float32](context)
+            # Score against K cache (dequant u8 -> signed f32)
+            # Scores allocated from arena, reset per head via mark/reset_to.
+            var scores_mark = arena.mark()
+            var scores = arena.alloc[Float32](context)
             for t in range(context):
                 var dot = Float32(0)
                 var k_sc = k_cache.head_scale(t, g)
@@ -173,11 +176,9 @@ def main():
                     acc += scores[t] * Float32(Int(v_dim[t]) - 128) * v_sc
                 expected[m * HIDDEN + h * HEAD_DIM + d] = acc
 
-            scores.free()
+            arena.reset_to(scores_mark)
 
     # --- Compare ---
-    # The kernel output is int8 quantized. Dequantize and compare against f32 reference.
-    # We expect quantization error but the attention pattern should be correct.
     var max_err = Float64(0)
     var sum_err = Float64(0)
     var count = 0
@@ -195,15 +196,11 @@ def main():
 
     var avg_err = sum_err / Float64(count)
 
-    # Int8 quantization introduces ~1% error per stage.
-    # Three quantization stages (Q, weights, output) compound.
-    # The reference uses f32 throughout, so some divergence is expected.
     print("max_err=" + String(max_err) + " avg_err=" + String(avg_err))
     if avg_err < 0.05:
         print("PASS: attention output within expected int8 quantization error")
     else:
         print("WARN: avg_err=" + String(avg_err) + " — higher than expected")
-        # Print a few values for debugging
         for d in range(min(8, HIDDEN)):
             var got = Float64(qi_out[d]) * Float64(scale_out[0])
             var exp_val = Float64(expected[d])
@@ -221,7 +218,6 @@ def main():
                 head_buf[d] = Scalar[DType.int8]((t * 11 + g * 17 + d * 5) % 251 - 125)
             v_cache.write_head_transposed(t, g, head_buf, Float32(0.05))
 
-    var decode_q = alloc[Scalar[DType.bfloat16]](HIDDEN)
     for k in range(HIDDEN):
         decode_q[k] = Scalar[DType.bfloat16](Float32(k) / Float32(HIDDEN) - 0.5)
 
@@ -232,22 +228,12 @@ def main():
             DynView[QiSlot](Int(qi_out), 1),
             DynView[ScSlot](Int(scale_out), 1),
             Bound[CosSlot](Int(cos_table)), Bound[SinSlot](Int(sin_table)),
-            512, burst,
+            Int(attn_scratch), 512, burst,
         ).join()
 
-    decode_q.free()
-    q_bf16.free()
-    kv_mem.free()
-    qi_out.free()
-    scale_out.free()
-    cos_table.free()
-    sin_table.free()
-    expected.free()
-    q_head.free()
-    head_buf.free()
+    # Small arena freed by destructor at end of scope.
 
     # === Large-scale profile: DeepSeek-V3-like dimensions ===
-    # 128 heads, 8 KV heads (GQA=16), head_dim=128, context=4096
     print("\n=== DeepSeek-V3-like profile ===")
     print("128 heads, 8 kv_heads, head_dim=128, context=4096, decode")
 
@@ -259,19 +245,23 @@ def main():
     comptime DS_MAX_SEQ = 8192
     comptime DS_CTX = 4096
     comptime DsKVCache = HadQuantKVCache[DS_MAX_SEQ, DS_HEAD_DIM, DS_NUM_KV_HEADS]
+    comptime DS_SCRATCH_BYTES = attn_scratch_bytes[DS_NUM_HEADS, DS_NUM_KV_HEADS, DS_HEAD_DIM, DS_NUM_KV_HEADS]()
 
-    var ds_q = alloc[Scalar[DType.bfloat16]](DS_HIDDEN)
-    var ds_kv_mem = alloc[UInt8](2 * DsKVCache.TOTAL_BYTES)
+    var ds_arena = NumaArena(local_node, 32 * 1024 * 1024)  # 32 MB
+
+    var ds_q = ds_arena.alloc[Scalar[DType.bfloat16]](DS_HIDDEN)
+    var ds_kv_mem = ds_arena.alloc[UInt8](2 * DsKVCache.TOTAL_BYTES)
     var ds_k = DsKVCache(Int(ds_kv_mem))
     var ds_v = DsKVCache(Int(ds_kv_mem) + DsKVCache.TOTAL_BYTES)
-    var ds_qi_out = alloc[Scalar[DType.int8]](DS_HIDDEN)
-    var ds_sc_out = alloc[Float32](1)
-    var ds_cos = alloc[Float32](DS_MAX_SEQ * DS_HALF)
-    var ds_sin = alloc[Float32](DS_MAX_SEQ * DS_HALF)
+    var ds_qi_out = ds_arena.alloc[Scalar[DType.int8]](DS_HIDDEN)
+    var ds_sc_out = ds_arena.alloc[Float32](1)
+    var ds_cos = ds_arena.alloc[Float32](DS_MAX_SEQ * DS_HALF)
+    var ds_sin = ds_arena.alloc[Float32](DS_MAX_SEQ * DS_HALF)
+    var ds_scratch = ds_arena.alloc[UInt8](DS_SCRATCH_BYTES)
+    var ds_head_buf = ds_arena.alloc[Scalar[DType.int8]](DS_HEAD_DIM)
 
     for k in range(DS_HIDDEN):
         ds_q[k] = Scalar[DType.bfloat16](Float32(k % 256 - 128) / 128.0)
-    var ds_head_buf = alloc[Scalar[DType.int8]](DS_HEAD_DIM)
     for t in range(DS_CTX):
         for g in range(DS_NUM_KV_HEADS):
             for d in range(DS_HEAD_DIM):
@@ -297,17 +287,11 @@ def main():
             DynView[DsQiSlot](Int(ds_qi_out), 1),
             DynView[DsScSlot](Int(ds_sc_out), 1),
             Bound[DsCosSlot](Int(ds_cos)), Bound[DsSinSlot](Int(ds_sin)),
-            DS_CTX, burst,
+            Int(ds_scratch), DS_CTX, burst,
         ).join()
         var wall = Int(perf_counter_ns()) - t0
         keep(ds_qi_out[0])
         keep(ds_sc_out[0])
         print("  wall: " + String(wall // 1000) + " us")
 
-    ds_q.free()
-    ds_kv_mem.free()
-    ds_qi_out.free()
-    ds_sc_out.free()
-    ds_cos.free()
-    ds_sin.free()
-    ds_head_buf.free()
+    # Arenas freed by destructors at end of scope.
