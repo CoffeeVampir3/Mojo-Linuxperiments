@@ -58,7 +58,7 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
     comptime gqa_factor = num_heads // num_kv_heads
     comptime q_cols = QT.COLS
     comptime inv_sqrt_hd = Float32(1.0 / Float64(sqrt[DType.float32, 1](Float32(head_dim))))
-    comptime B_c = 64  # KV block size — fits V block + transposed in L1
+    comptime B_c = 64  # KV block size
 
     var q_ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=q.ptr)
     var qi_ptr = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=qi_out.ptr)
@@ -77,7 +77,6 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
     var q_biases = alloc[Float32](gqa_factor)
     # Blocked processing buffers (all fit in L1).
     var block_scores = alloc[Float32](gqa_factor * B_c)    # 16*64*4 = 4 KB
-    var v_transposed = alloc[UInt8](head_dim * B_c)         # 128*64  = 8 KB
     var w_block = alloc[Scalar[DType.int8]](B_c)            # 64 B
     var running_o = alloc[Float32](gqa_factor * head_dim)   # 16*128*4 = 8 KB
     var running_m = alloc[Float32](gqa_factor)
@@ -150,7 +149,6 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
 
             var k_base = k_cache.head_data_base(g)
             var k_sc_base = k_cache.head_scale_base(g)
-            var v_base = v_cache.head_data_base(g)
             var v_sc_base = v_cache.head_scale_base(g)
 
             var num_full_blocks = context // B_c
@@ -171,18 +169,7 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
                         var raw = i8_dot_row_major[head_dim](k_entry, qi_qp)
                         block_scores[hi * B_c + tl] = (Float32(raw) - q_biases[hi]) * q_scales[hi] * k_sc
 
-                # --- 2b. Transpose V block: [block_len, head_dim] -> [head_dim, B_c] ---
-                for tl in range(block_len):
-                    var v_row = v_base + (t_start + tl) * head_dim
-                    for d in range(head_dim):
-                        v_transposed[d * B_c + tl] = v_row[d]
-                # Zero-pad: V_u8=128 is neutral (true value 0 after bias correction).
-                if block_len < B_c:
-                    for tl in range(block_len, B_c):
-                        for d in range(head_dim):
-                            v_transposed[d * B_c + tl] = UInt8(128)
-
-                # --- 2c. Per head: online softmax + quantize weights + VNNI V agg ---
+                # --- 2b. Per head: online softmax + quantize weights + VNNI V agg ---
                 for hi in range(gqa_factor):
                     var scores = block_scores + hi * B_c
 
@@ -257,13 +244,15 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
                         tl += width
                     var w_i8_sum = Int(w_sum_v.reduce_add())
 
-                    # VNNI V aggregation: for each dim d, dot V_T[d,:] with w_block.
+                    # VNNI V aggregation: V stored as [head][dim][pos] (transposed).
+                    # For each dim, positions are contiguous -> direct VNNI dot.
                     # raw = sum_t V_u8[t,d] * w_i8[t]
                     # true = (raw - 128 * w_i8_sum) * w_scale
                     var w_scale = w_absmax / Float32(127.0) if w_absmax > 0 else Float32(0)
                     var bias = Float32(128 * w_i8_sum) * w_scale
                     for d in range(head_dim):
-                        var raw = i8_dot_row_major[B_c](v_transposed + d * B_c, w_block)
+                        var v_dim = v_cache.dim_data(d, g) + t_start
+                        var raw = i8_dot_row_major[B_c](v_dim, w_block)
                         op[d] += Float32(raw) * w_scale - bias
 
             # --- Final normalization: O /= l ---
@@ -310,7 +299,6 @@ def int8_gqa_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
     q_scales.free()
     q_biases.free()
     block_scores.free()
-    v_transposed.free()
     w_block.free()
     running_o.free()
     running_m.free()

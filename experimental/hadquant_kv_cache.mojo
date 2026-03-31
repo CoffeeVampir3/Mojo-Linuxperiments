@@ -90,3 +90,37 @@ struct HadQuantKVCache[max_seq: Int, head_dim: Int, num_heads: Int]:
         return UnsafePointer[Float32, MutAnyOrigin](
             unsafe_from_address=self.scale_base + head * Self.SCALE_HEAD_STRIDE
         )
+
+    # --- Transposed layout: [head][dim][pos] ---
+    # Same total memory, but data is rearranged so that for a fixed
+    # dimension, positions are contiguous. This enables VNNI dot products
+    # over the position (time) dimension during V aggregation.
+
+    def write_head_transposed(self, pos: Int, head: Int,
+        data_i8: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+        scale: Float32,
+    ):
+        """Write HEAD_DIM values in transposed layout: data[head][dim][pos].
+
+        Each byte is XOR'd with 0x80 (i8 -> u8) and written to its
+        transposed location. Amortized over many reads per write.
+        """
+        var head_base = self.data_base + head * Self.DATA_HEAD_STRIDE
+        for d in range(Self.head_dim):
+            UnsafePointer[UInt8, MutAnyOrigin](
+                unsafe_from_address=head_base + d * Self.max_seq + pos
+            )[0] = UInt8(Int(data_i8[d]) ^ 0x80)
+
+        UnsafePointer[Float32, MutAnyOrigin](
+            unsafe_from_address=self.scale_base + head * Self.SCALE_HEAD_STRIDE + pos * size_of[Float32]()
+        )[0] = scale
+
+    def dim_data(self, dim: Int, head: Int) -> UnsafePointer[UInt8, MutAnyOrigin]:
+        """Pointer to MAX_SEQ contiguous u8 values for one dim of one head.
+
+        In transposed layout [head][dim][pos], positions are contiguous
+        for a fixed dimension, enabling VNNI reduction over time.
+        """
+        return UnsafePointer[UInt8, MutAnyOrigin](
+            unsafe_from_address=self.data_base + head * Self.DATA_HEAD_STRIDE + dim * Self.max_seq
+        )
