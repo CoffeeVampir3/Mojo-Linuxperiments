@@ -108,7 +108,7 @@ def main():
                 head_buf[d] = Scalar[DType.int8](Int8(max(min(Int(val * 127.0), 127), -128)))
                 var a = val if val >= 0 else -val
                 if a > v_absmax: v_absmax = a
-            v_cache.write_head_transposed(t, g, head_buf, v_absmax / Float32(127.0))
+            v_cache.write_head(t, g, head_buf, v_absmax / Float32(127.0))
 
     comptime CosSlot = Slot[F32, Replicated, MAX_SEQ, HALF, 1]
     comptime SinSlot = Slot[F32, Replicated, MAX_SEQ, HALF, 1]
@@ -155,11 +155,12 @@ def main():
             for t in range(context):
                 scores[t] = scores[t] * inv_sum
             for d in range(HD):
-                var acc = Float32(0)
-                var v_dim = v_cache.dim_data(d, g)
-                for t in range(context):
-                    acc += scores[t] * Float32(Int(v_dim[t]) - 128) * v_cache.head_scale(t, g)
-                expected[m * HIDDEN + h * HD + d] = acc
+                expected[m * HIDDEN + h * HD + d] = Float32(0)
+            for t in range(context):
+                var v_data = v_cache.head_data(t, g)
+                var vsc = v_cache.head_scale(t, g)
+                for d in range(HD):
+                    expected[m * HIDDEN + h * HD + d] += scores[t] * Float32(Int(v_data[d]) - 128) * vsc
             corr_arena.reset_to(scores_mark)
 
     # Run kernel, join, output quantize
@@ -270,7 +271,7 @@ def main():
                 k_node.write_head(t, lg, hb, Float32(0.05))
                 for d in range(HD2):
                     hb[d] = Scalar[DType.int8]((t * 11 + global_g * HD2 + d * 5) % 251 - 125)
-                v_node.write_head_transposed(t, lg, hb, Float32(0.05))
+                v_node.write_head(t, lg, hb, Float32(0.05))
 
         qi_ptrs[node] = Int(perf_arenas[node].alloc[Scalar[DType.int8]](MAX_SL * LOCAL_HIDDEN2))
         sc_ptrs[node] = Int(perf_arenas[node].alloc[Float32](MAX_SL))
