@@ -13,7 +13,7 @@ from modeling.model_spec import (
     BF16, F32, I8, Replicated,
     Slot, Bound, DynView,
 )
-from experimental.hadquant_attn_amx_prefill import int8_gqa_attention_amx_prefill, attn_scratch_bytes_amx_prefill
+from experimental.hadquant_attn_amx_prefill import int8_gqa_attention_amx_prefill, attn_scratch_bytes_amx_prefill, attn_per_worker_bytes
 from experimental.hadquant_impl import fwht_block
 from experimental.hadquant_kv_cache import HadQuantKVCache
 from experimental.amx import init_intel_amx
@@ -74,7 +74,7 @@ def main():
     var corr_arena = NumaArena[](topo[0], 256 * 1024 * 1024)
 
     comptime KVC = HadQuantKVCache[MAX_SEQ, HD, NKV]
-    comptime SCRATCH = attn_scratch_bytes_amx_prefill[NH, NKV, HD, SL, NKV]()
+    var corr_scratch_bytes = attn_scratch_bytes_amx_prefill[NH, NKV, HD, SL](pools[0].capacity)
 
     var q_bf16 = corr_arena.alloc[Scalar[DType.bfloat16]](SL * HIDDEN)
     var kv_mem = corr_arena.alloc[UInt8](2 * KVC.TOTAL_BYTES)
@@ -84,7 +84,7 @@ def main():
     var sc_out = corr_arena.alloc[Float32](SL)
     var cos_tab = corr_arena.alloc[Float32](MAX_SEQ * HALF)
     var sin_tab = corr_arena.alloc[Float32](MAX_SEQ * HALF)
-    var scratch = corr_arena.alloc[UInt8](SCRATCH)
+    var scratch = corr_arena.alloc[UInt8](corr_scratch_bytes)
     var expected = corr_arena.alloc[Float32](SL * HIDDEN)
     var q_head = corr_arena.alloc[Float32](HD)
     var head_buf = corr_arena.alloc[Scalar[DType.int8]](HD)
@@ -220,7 +220,7 @@ def main():
     comptime LOCAL_HIDDEN2 = LOCAL_NH2 * HD2
 
     comptime LOCAL_KVC = HadQuantKVCache[MAX_SEQ2, HD2, LOCAL_KV2]
-    comptime LOCAL_SCRATCH = attn_scratch_bytes_amx_prefill[LOCAL_NH2, LOCAL_KV2, HD2, MAX_SL, LOCAL_KV2]()
+    var local_scratch_bytes = attn_scratch_bytes_amx_prefill[LOCAL_NH2, LOCAL_KV2, HD2, MAX_SL](pools[0].capacity)
 
     print("\n=== Performance: bf16 V-agg, 128h/8kv, hd=128, "
           + String(NUM_NODES) + " NUMA nodes ===")
@@ -274,7 +274,7 @@ def main():
 
         qi_ptrs[node] = Int(perf_arenas[node].alloc[Scalar[DType.int8]](MAX_SL * LOCAL_HIDDEN2))
         sc_ptrs[node] = Int(perf_arenas[node].alloc[Float32](MAX_SL))
-        scratch_ptrs[node] = Int(perf_arenas[node].alloc[UInt8](LOCAL_SCRATCH))
+        scratch_ptrs[node] = Int(perf_arenas[node].alloc[UInt8](local_scratch_bytes))
 
     comptime QS2 = Slot[BF16, Replicated, 1, LOCAL_HIDDEN2, 1]
     comptime QI2 = Slot[I8, Replicated, 1, LOCAL_HIDDEN2, 1]
