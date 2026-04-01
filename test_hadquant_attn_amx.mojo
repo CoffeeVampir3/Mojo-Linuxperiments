@@ -13,7 +13,7 @@ from modeling.model_spec import (
     BF16, F32, I8, Replicated,
     Slot, Bound, DynView,
 )
-from experimental.hadquant_attn_amx_prefill import int8_gqa_attention_amx_prefill, attn_scratch_bytes_amx_prefill, attn_per_worker_bytes
+from experimental.hadquant_attn_amx_prefill import int8_gqa_attention_amx_prefill, attn_scratch_bytes_amx_prefill
 from experimental.hadquant_impl import fwht_block
 from experimental.hadquant_kv_cache import HadQuantKVCache
 from experimental.amx import init_intel_amx

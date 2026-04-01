@@ -1,14 +1,14 @@
 """AMX prefill attention — KV-outer, query-inner with Q-row parallelism.
 
 Workers split Q rows across cores within each KV group. Each worker
-redundantly packs K and converts V (no barriers needed), but processes
-only its assigned Q rows. K/V cache data read once per KV block per worker.
+redundantly packs K and converts V (parallel across cores, no barriers),
+then processes only its assigned Q rows.
 
 For each KV block:
-  1. Pack K and convert V (redundant per worker, amortized by Q reuse)
+  1. Pack K and convert V (redundant per worker, all cores active)
   2. For each query batch (Q_BATCH=32 rows → running_o fits L1):
      - Score GEMM (tdpbsud): Q_i8 × K_vnni → i32 scores
-     - Softmax: dequant + online update
+     - Softmax + fused bf16 W convert
      - V agg GEMM (tdpbf16ps): W_bf16 × V_vnni → f32 output
 
 running_o per batch = Q_BATCH × head_dim × 4 = 16KB → L1.
@@ -39,27 +39,7 @@ from experimental.amx import (
 
 comptime PREFILL_BLOCK_N = 512
 comptime BF16_K_STEP = 32
-comptime Q_BATCH = 32  # running_o = 32*128*4 = 16KB → L1
-
-# Profiling
-comptime PF_NUM_PHASES = 7
-comptime PF_QPREP = 0
-comptime PF_K_PACK = 1
-comptime PF_SCORE_GEMM = 2
-comptime PF_SOFTMAX = 3
-comptime PF_W_CONVERT = 4
-comptime PF_V_CONVERT = 5
-comptime PF_VAGG_GEMM = 6
-
-def pf_phase_name(p: Int) -> String:
-    if p == 0: return "Q prep"
-    if p == 1: return "K pack"
-    if p == 2: return "Score GEMM"
-    if p == 3: return "Softmax"
-    if p == 4: return "W convert"
-    if p == 5: return "V convert+pack"
-    if p == 6: return "V agg GEMM"
-    return "?"
+comptime Q_BATCH = 32
 
 
 @always_inline
@@ -88,12 +68,12 @@ def attn_per_worker_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int,
     comptime total_q_max = ((max_prefill * gqa_factor + M_STEP - 1) // M_STEP) * M_STEP
     comptime padded_bn = PREFILL_BLOCK_N
     return (
-        total_q_max * head_dim                                      # qi_buf [total_q, hd] i8
+        total_q_max * head_dim                                      # qi_buf
         + total_q_max * size_of[Float32]() * 2                      # qi_scales, qi_biases
-        + total_q_max * head_dim * size_of[Float32]()               # running_o [total_q, hd] f32
+        + total_q_max * head_dim * size_of[Float32]()               # running_o
         + total_q_max * size_of[Float32]() * 2                      # running_m, running_l
-        + Q_BATCH * padded_bn * size_of[Float32]()                  # score_buf [batch, block_n] f32
-        + Q_BATCH * padded_bn * size_of[Scalar[DType.bfloat16]]()   # w_bf16 [batch, block_n] bf16
+        + Q_BATCH * padded_bn * size_of[Float32]()                  # score_buf
+        + Q_BATCH * padded_bn * size_of[Scalar[DType.bfloat16]]()   # w_bf16
         + (head_dim // K_STEP) * 2 * TILE_BYTES                     # k_vnni
         + 2 * padded_bn * head_dim * size_of[Scalar[DType.bfloat16]]()  # v_bf16 flat + packed
     )
@@ -111,10 +91,9 @@ def attn_scratch_bytes_amx_prefill[num_heads: Int, num_kv_heads: Int, head_dim: 
 
 def had_attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
     ctx_addr: Int, group: Int, q_row_start: Int, q_row_end: Int,
-    worker_scratch: Int, timing_addr: Int,
+    worker_scratch: Int, unused: Int,
 ):
     var ctx = UnsafePointer[HadAttnCtx, MutAnyOrigin](unsafe_from_address=ctx_addr)
-    var timing = UnsafePointer[Int64, MutAnyOrigin](unsafe_from_address=timing_addr)
     comptime width = simd_width_of[DType.float32]()
     comptime half = head_dim // 2
     comptime gqa_factor = num_heads // num_kv_heads
@@ -138,7 +117,7 @@ def had_attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: 
     var cfg = make_224_i8_config()
     ldtilecfg(UnsafePointer(to=cfg))
 
-    # Scratch layout — sized for this worker's Q rows
+    # Per-worker scratch layout
     var off = 0
     var qi_buf = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=worker_scratch + off)
     off += my_q_rows * head_dim
@@ -173,9 +152,8 @@ def had_attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: 
         unsafe_from_address=ctx[].v_scale + g * SCALE_HEAD_STRIDE)
 
     # =================================================================
-    # 1. Q prep — only this worker's rows
+    # 1. Q prep
     # =================================================================
-    var t0 = perf_counter_ns()
     for local_idx in range(my_q_rows):
         var abs_row = q_row_start + local_idx
         var m = abs_row // gqa_factor
@@ -219,16 +197,22 @@ def had_attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: 
             k += width
         qi_scales[local_idx] = (q_absmax / Float32(127.0)) * inv_sqrt_hd
         qi_biases[local_idx] = Float32(128 * Int(q_sum_acc.reduce_add()))
-    timing[PF_QPREP] += Int64(perf_counter_ns() - t0)
 
     # =================================================================
-    # 2. Init running state
+    # 2. Init running state (SIMD)
     # =================================================================
-    for i in range(padded_q_rows * head_dim):
-        running_o[i] = Float32(0)
-    for i in range(padded_q_rows):
-        running_m[i] = Float32(-1e30)
-        running_l[i] = Float32(0)
+    var vzero = SIMD[DType.float32, width](0)
+    var vinf = SIMD[DType.float32, width](Float32(-1e30))
+    var ro_count = padded_q_rows * head_dim
+    var i = 0
+    while i + width <= ro_count:
+        (running_o + i).store(vzero)
+        i += width
+    i = 0
+    while i + width <= padded_q_rows:
+        (running_m + i).store(vinf)
+        (running_l + i).store(vzero)
+        i += width
 
     var max_context = pos + seq_len
 
@@ -240,8 +224,7 @@ def had_attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: 
         var padded_bn = ((block_len + BF16_K_STEP - 1) // BF16_K_STEP) * BF16_K_STEP
         var bf16_k_iters = padded_bn // BF16_K_STEP
 
-        # --- Pack K (redundant per worker in same group) ---
-        t0 = perf_counter_ns()
+        # --- Pack K ---
         var n_tiles = (block_len + TILE_N - 1) // TILE_N
         var k_scratch_arr = InlineArray[SIMD[DType.uint32, TILE_N], TILE_N](
             fill=SIMD[DType.uint32, TILE_N](0))
@@ -269,10 +252,8 @@ def had_attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: 
                 else:
                     pack_k_tile_vnni(k_base, head_dim, k_off, n_off + TILE_N, n1,
                                      k_vnni + ki * 2 * TILE_BYTES + TILE_BYTES)
-        timing[PF_K_PACK] += Int64(perf_counter_ns() - t0)
 
-        # --- Convert V + VNNI pack (redundant per worker in same group) ---
-        t0 = perf_counter_ns()
+        # --- Convert V + VNNI pack ---
         comptime V128 = SIMD[DType.float32, width](128.0)
         var hd_n_iters = head_dim // TILE_N
         for d in range(head_dim):
@@ -302,15 +283,13 @@ def had_attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: 
                     padded_bn // 2,
                     (v_packed + (nt * bf16_k_iters + kt) * (BF16_TILE_BYTES // 2)).bitcast[Scalar[DType.uint32]](),
                     TILE_N, v_scratch_arr)
-        timing[PF_V_CONVERT] += Int64(perf_counter_ns() - t0)
 
-        # --- Query-inner loop: process Q_BATCH rows at a time ---
+        # --- Query-inner loop ---
         for qb_start in range(0, my_q_rows, Q_BATCH):
             var qb_len = min(Q_BATCH, my_q_rows - qb_start)
             var qb_m_iters = (qb_len + M_STEP - 1) // M_STEP
 
-            # Score GEMM for this batch
-            t0 = perf_counter_ns()
+            # Score GEMM
             for nt in range(0, n_tiles, 2):
                 for mi in range(qb_m_iters):
                     var m_off = qb_start + mi * M_STEP
@@ -332,10 +311,8 @@ def had_attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: 
                     tilestore[5](sb + TILE_N, score_stride_i32)
                     tilestore[6](sb + TILE_M * BLOCK_N, score_stride_i32)
                     tilestore[7](sb + TILE_M * BLOCK_N + TILE_N, score_stride_i32)
-            timing[PF_SCORE_GEMM] += Int64(perf_counter_ns() - t0)
 
-            # Softmax for this batch
-            t0 = perf_counter_ns()
+            # Softmax + fused bf16 W convert
             for qi_local in range(qb_len):
                 var qi_row = qb_start + qi_local
                 var abs_row = q_row_start + qi_row
@@ -383,43 +360,28 @@ def had_attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: 
                     (ro + d).store((ro + d).load[width=width]() * vcorr)
                     d += width
 
-                # Exp
+                # Exp → bf16 attention weights (fused W convert)
                 var vm_new = SIMD[DType.float32, width](m_new)
                 var l_acc = SIMD[DType.float32, width](0)
+                var w_row = w_bf16_buf + qi_local * padded_bn
                 t = 0
                 while t + width <= block_len:
                     var e = exp_f32_fast((s_row + t).load[width=width]() - vm_new)
-                    (s_row + t).store(e)
+                    (w_row + t).store(e.cast[DType.bfloat16]())
                     l_acc += e
                     t += width
                 var l_contrib = l_acc.reduce_add()
                 while t < block_len:
                     var e = exp_f32_fast[1](s_row[t] - m_new)
-                    s_row[t] = e
+                    w_row[t] = Scalar[DType.bfloat16](e)
                     l_contrib += e
                     t += 1
-                running_l[qi_row] += l_contrib
-            timing[PF_SOFTMAX] += Int64(perf_counter_ns() - t0)
-
-            # W convert for this batch
-            t0 = perf_counter_ns()
-            for qi_local in range(qb_len):
-                var s_row = score_buf + qi_local * BLOCK_N
-                var w_row = w_bf16_buf + qi_local * padded_bn
-                var t = 0
-                while t + width <= block_len:
-                    (w_row + t).store((s_row + t).load[width=width]().cast[DType.bfloat16]())
-                    t += width
                 while t < padded_bn:
-                    if t < block_len:
-                        w_row[t] = Scalar[DType.bfloat16](s_row[t])
-                    else:
-                        w_row[t] = Scalar[DType.bfloat16](0)
+                    w_row[t] = Scalar[DType.bfloat16](0)
                     t += 1
-            timing[PF_W_CONVERT] += Int64(perf_counter_ns() - t0)
+                running_l[qi_row] += l_contrib
 
-            # V agg bf16 GEMM for this batch
-            t0 = perf_counter_ns()
+            # V agg bf16 GEMM
             var hd_ns = head_dim // N_STEP
             for ns in range(hd_ns):
                 var d_off = ns * N_STEP
@@ -446,10 +408,9 @@ def had_attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: 
                     tilestore[5](c_base + TILE_N, c_stride)
                     tilestore[6](c_base + TILE_M * head_dim, c_stride)
                     tilestore[7](c_base + TILE_M * head_dim + TILE_N, c_stride)
-            timing[PF_VAGG_GEMM] += Int64(perf_counter_ns() - t0)
 
     # =================================================================
-    # 4. Final normalize — write to shared row_f32 at absolute positions
+    # 4. Final normalize
     # =================================================================
     for local_idx in range(my_q_rows):
         var abs_row = q_row_start + local_idx
@@ -495,20 +456,7 @@ def int8_gqa_attention_amx_prefill[num_heads: Int, num_kv_heads: Int, head_dim: 
     comptime gqa_factor = num_heads // num_kv_heads
     comptime q_cols = QT.COLS
     comptime max_prefill = 512
-    comptime total_q_max = ((max_prefill * gqa_factor + M_STEP - 1) // M_STEP) * M_STEP
-    comptime padded_bn = PREFILL_BLOCK_N
-    comptime BF16_TILE_BYTES = (BF16_K_STEP // 2) * TILE_N * 4
-
-    comptime PER_WORKER = (
-        total_q_max * head_dim
-        + total_q_max * size_of[Float32]() * 2
-        + total_q_max * head_dim * size_of[Float32]()
-        + total_q_max * size_of[Float32]() * 2
-        + Q_BATCH * padded_bn * size_of[Float32]()
-        + Q_BATCH * padded_bn * size_of[Scalar[DType.bfloat16]]()
-        + (head_dim // K_STEP) * 2 * TILE_BYTES
-        + 2 * padded_bn * head_dim * size_of[Scalar[DType.bfloat16]]()
-    )
+    comptime per_worker = attn_per_worker_bytes[num_heads, num_kv_heads, head_dim, max_prefill]()
     comptime WORKERS_OFF = max_prefill * q_cols * size_of[Float32]()
 
     var ctx = HadAttnCtx(
@@ -524,15 +472,10 @@ def int8_gqa_attention_amx_prefill[num_heads: Int, num_kv_heads: Int, head_dim: 
     )
     var ctx_ptr = UnsafePointer(to=ctx)
 
-    # Split Q rows across workers within each KV group
     var workers_per_group = max(1, pool.capacity // num_kv_heads)
     var total_q_rows = q.seq_len * gqa_factor
     var rows_per_worker = (total_q_rows + workers_per_group - 1) // workers_per_group
     var total_jobs = num_kv_heads * workers_per_group
-
-    comptime MAX_TOTAL_WORKERS = 64
-    var timing_arr = InlineArray[Int64, MAX_TOTAL_WORKERS * PF_NUM_PHASES](fill=Int64(0))
-    var timing_base = UnsafePointer(to=timing_arr).bitcast[Int64]()
 
     for g in range(num_kv_heads):
         for w in range(workers_per_group):
@@ -544,8 +487,8 @@ def int8_gqa_attention_amx_prefill[num_heads: Int, num_kv_heads: Int, head_dim: 
             pack[].arg1 = g
             pack[].arg2 = q_start
             pack[].arg3 = q_end
-            pack[].arg4 = scratch + WORKERS_OFF + job_idx * PER_WORKER
-            pack[].arg5 = Int(timing_base + job_idx * PF_NUM_PHASES)
+            pack[].arg4 = scratch + WORKERS_OFF + job_idx * per_worker
+            pack[].arg5 = 0
 
     pool.dispatch(
         had_attn_prefill[num_heads, num_kv_heads, head_dim, max_seq],
