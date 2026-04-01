@@ -476,7 +476,11 @@ def int8_gqa_attention_amx_prefill[num_heads: Int, num_kv_heads: Int, head_dim: 
     pos: Int,
     mut pool: BurstPool[],
 ) -> PoolFence:
-    """AMX prefill attention — KV-outer, query-inner."""
+    """Async AMX prefill attention — dispatches and returns immediately.
+
+    Caller must join the returned PoolFence, then do output quantization
+    of row_f32 (scratch base) which holds seq_len * q_cols f32 values.
+    """
     comptime assert QT.DTYPE == DType.bfloat16
     comptime assert QiT.DTYPE == DType.int8
     comptime assert ScT.DTYPE == DType.float32
@@ -540,47 +544,6 @@ def int8_gqa_attention_amx_prefill[num_heads: Int, num_kv_heads: Int, head_dim: 
         had_attn_prefill[num_heads, num_kv_heads, head_dim, max_seq],
         pool.args_base, num_jobs,
     )
-    pool.join()
-
-    # Output quantization
-    for m in range(q.seq_len):
-        var src = row_f32 + m * q_cols
-        var out_row = qi_ptr + m * q_cols
-        var rmax_v = SIMD[DType.float32, width](0)
-        var d = 0
-        while d + width <= q_cols:
-            rmax_v = max(rmax_v, (src + d).load[width=width]().__abs__())
-            d += width
-        var row_absmax = rmax_v.reduce_max()
-        while d < q_cols:
-            var a = src[d] if src[d] >= 0 else -src[d]
-            if a > row_absmax: row_absmax = a
-            d += 1
-        sc_ptr[m] = row_absmax / Float32(127.0)
-        var row_inv = Float32(127.0) / row_absmax if row_absmax > 0 else Float32(0)
-        var vrow_inv = SIMD[DType.float32, width](row_inv)
-        d = 0
-        while d + width <= q_cols:
-            (out_row + d).store(quantize_i8((src + d).load[width=width](), vrow_inv))
-            d += width
-        while d < q_cols:
-            out_row[d] = quantize_i8_scalar(src[d], row_inv)
-            d += 1
-
-    # Timing
-    var pmp = InlineArray[Int64, PF_NUM_PHASES](fill=Int64(0))
-    var pp = UnsafePointer(to=pmp).bitcast[Int64]()
-    for i in range(num_jobs):
-        var wt = timing_base + i * PF_NUM_PHASES
-        for p in range(PF_NUM_PHASES):
-            if wt[p] > pp[p]: pp[p] = wt[p]
-    var total = Int64(0)
-    for p in range(PF_NUM_PHASES):
-        total += pp[p]
-    if total > 0:
-        print("  Phases (max worker, us):")
-        for p in range(PF_NUM_PHASES):
-            print("    " + pf_phase_name(p) + ": " + String(Int(pp[p]) // 1000)
-                  + " (" + String(Int(pp[p] * 100 // total)) + "%)")
-
-    return PoolFence.completed()
+    return PoolFence(UnsafePointer[BurstPool[], MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))
+    ))
