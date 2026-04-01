@@ -106,7 +106,7 @@ def attn_per_worker_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int,
         + Q_BATCH * padded_bn * size_of[Float32]()          # score_buf (also prescale temp)
         + Q_BATCH * padded_bn                               # w_u8_buf [batch, bn] u8
         + Q_BATCH * size_of[Float32]()                      # w_scales [batch] f32
-        + (head_dim // K_STEP) * 2 * TILE_BYTES             # k_vnni
+        + (padded_bn // TILE_N // 2) * (head_dim // K_STEP) * 2 * TILE_BYTES  # k_vnni [all N-tile pairs]
         + chunk_k_max * hd_n_tiles * TILE_BYTES             # v_vnni
     )
 
@@ -170,7 +170,9 @@ def had_attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: 
     var w_scales = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=worker_scratch + off)
     off += Q_BATCH * size_of[Float32]()
     var k_vnni = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=worker_scratch + off)
-    off += (head_dim // K_STEP) * 2 * TILE_BYTES
+    # k_vnni sized for all N-tile pairs: index as k_vnni + (nt_pair * k_iters + ki) * 2 * TILE_BYTES
+    comptime K_PAIR_BYTES = (head_dim // K_STEP) * 2 * TILE_BYTES  # bytes per N-tile pair
+    off += (BLOCK_N // TILE_N // 2) * K_PAIR_BYTES
     var v_vnni = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=worker_scratch + off)
 
     comptime score_stride_i32 = BLOCK_N * size_of[Int32]()
@@ -267,7 +269,9 @@ def had_attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: 
         var k_scratch_arr = InlineArray[SIMD[DType.uint32, TILE_N], TILE_N](
             fill=SIMD[DType.uint32, TILE_N](0))
         for nt in range(0, n_tiles, 2):
+            var nt_pair = nt // 2
             var n_off = block_start + nt * TILE_N
+            var k_pair_base = k_vnni + nt_pair * K_PAIR_BYTES
             for ki in range(head_dim // K_STEP):
                 var k_off = ki * K_STEP
                 var n0 = min(TILE_N, block_len - nt * TILE_N)
@@ -275,21 +279,21 @@ def had_attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: 
                     transpose_generic[DType.uint32, TILE_N](
                         (k_base + n_off * head_dim + k_off).bitcast[Scalar[DType.uint32]](),
                         head_dim // 4,
-                        (k_vnni + ki * 2 * TILE_BYTES).bitcast[Scalar[DType.uint32]](),
+                        (k_pair_base + ki * 2 * TILE_BYTES).bitcast[Scalar[DType.uint32]](),
                         TILE_N, k_scratch_arr)
                 else:
                     pack_k_tile_vnni(k_base, head_dim, k_off, n_off, n0,
-                                     k_vnni + ki * 2 * TILE_BYTES)
+                                     k_pair_base + ki * 2 * TILE_BYTES)
                 var n1 = max(0, min(TILE_N, block_len - (nt + 1) * TILE_N))
                 if n1 == TILE_N:
                     transpose_generic[DType.uint32, TILE_N](
                         (k_base + (n_off + TILE_N) * head_dim + k_off).bitcast[Scalar[DType.uint32]](),
                         head_dim // 4,
-                        (k_vnni + ki * 2 * TILE_BYTES + TILE_BYTES).bitcast[Scalar[DType.uint32]](),
+                        (k_pair_base + ki * 2 * TILE_BYTES + TILE_BYTES).bitcast[Scalar[DType.uint32]](),
                         TILE_N, k_scratch_arr)
                 else:
                     pack_k_tile_vnni(k_base, head_dim, k_off, n_off + TILE_N, n1,
-                                     k_vnni + ki * 2 * TILE_BYTES + TILE_BYTES)
+                                     k_pair_base + ki * 2 * TILE_BYTES + TILE_BYTES)
 
         # --- Pack V to VNNI (XOR → i8) ---
         for nt in range(hd_n_tiles):
@@ -307,6 +311,7 @@ def had_attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: 
 
             # Score GEMM: Q_i8 × K_u8_vnni → i32
             for nt in range(0, n_tiles, 2):
+                var k_nt_base = k_vnni + (nt // 2) * K_PAIR_BYTES
                 for mi in range(qb_m_iters):
                     var m_off = qb_start + mi * M_STEP
                     tilezero[4]()
@@ -316,8 +321,8 @@ def had_attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: 
                     for ki in range(head_dim // K_STEP):
                         tileload[0](qi_buf + m_off * head_dim + ki * K_STEP, head_dim)
                         tileload[1](qi_buf + (m_off + TILE_M) * head_dim + ki * K_STEP, head_dim)
-                        tileload[2](k_vnni + ki * 2 * TILE_BYTES, TILE_N * VNNI_BLK)
-                        tileload[3](k_vnni + ki * 2 * TILE_BYTES + TILE_BYTES, TILE_N * VNNI_BLK)
+                        tileload[2](k_nt_base + ki * 2 * TILE_BYTES, TILE_N * VNNI_BLK)
+                        tileload[3](k_nt_base + ki * 2 * TILE_BYTES + TILE_BYTES, TILE_N * VNNI_BLK)
                         tdpbsud[4, 0, 2]()
                         tdpbsud[5, 0, 3]()
                         tdpbsud[6, 1, 2]()
@@ -461,9 +466,13 @@ def had_attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: 
         var hi = abs_row % gqa_factor
         var h = g * gqa_factor + hi
         var inv_l = Float32(1.0) / running_l[local_idx]
+        var vinv_l = SIMD[DType.float32, width](inv_l)
         var ro = running_o + local_idx * head_dim
-        for d in range(head_dim):
-            ctx[].row_f32[m * q_cols + h * head_dim + d] = ro[d] * inv_l
+        var out = ctx[].row_f32 + m * q_cols + h * head_dim
+        var d = 0
+        while d + width <= head_dim:
+            (out + d).store((ro + d).load[width=width]() * vinv_l)
+            d += width
 
 
 # ============================================================================

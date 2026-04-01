@@ -66,7 +66,7 @@ def main():
     comptime HALF = HD // 2
     comptime MAX_SEQ = 1024
     comptime SL = 16
-    comptime POS = 0
+    comptime POS = 48  # context=64, exercises K VNNI multi-tile packing
 
     print("\n=== Correctness: " + String(NH) + "h/" + String(NKV)
           + "kv, hd=" + String(HD) + ", sl=" + String(SL) + " ===")
@@ -93,7 +93,7 @@ def main():
         for k in range(HIDDEN):
             q_bf16[m * HIDDEN + k] = Scalar[DType.bfloat16](
                 Float32(m * HIDDEN + k + 1) / Float32(SL * HIDDEN) - 0.5)
-    for t in range(SL):
+    for t in range(POS + SL):
         for g in range(NKV):
             var k_absmax = Float32(0)
             for d in range(HD):
