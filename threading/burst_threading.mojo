@@ -302,13 +302,15 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
                 AtomicInt32.store[ordering=Consistency.RELEASE](ready_ptr, 1)
                 _ = sys.sys_futex_wake(Int(ready_ptr), 1, self.futex_flags)
 
-            comptime shared_futex_flags = linux.Futex2.SIZE_U32
+            # Spin-wait for workers to exit.  Workers are already shutting
+            # down so this completes in microseconds.  We avoid futex_wait
+            # here because (a) a TOCTOU race between is_alive() and the
+            # expected-value read can cause an infinite sleep, and (b) the
+            # kernel's CHILD_CLEARTID uses old-style futex(FUTEX_WAKE)
+            # which may not match our futex2 wait queue.
             for i in range(self.capacity):
                 while self.slots[i].is_alive():
-                    _ = sys.sys_futex_wait(
-                        Int(self.slots[i].child_tid),
-                        Int(self.slots[i].child_tid[]),
-                        shared_futex_flags)
+                    sys.arch_cpu_relax()
 
         var mailbox_bytes = self.capacity * size_of[WorkerMailbox]()
         var args_bytes = self.capacity * size_of[ArgPack]()
