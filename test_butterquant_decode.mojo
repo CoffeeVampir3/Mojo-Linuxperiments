@@ -12,7 +12,7 @@ from modeling.model_spec import (
     BF16, F32, I8, Replicated,
     Slot, Bound, DynView,
 )
-from experimental2.attn_amx_decode import decode, scratch_bytes, collect_profiles
+from experimental2.attn_amx_decode import decode, decode_merge, scratch_bytes, collect_profiles
 from experimental.hadquant_impl import fwht_block
 from experimental2.kv_cache import KVCache
 from experimental.amx import init_intel_amx
@@ -177,8 +177,11 @@ def main():
         Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
         Int(scratch), POS,
         q_layer_scale, k_layer_scale, v_layer_scale,
+        1,
         pool_ptrs[0][],
     ).join()
+    var corr_vagg_scale = v_layer_scale / (Float32(255.0) * Float32(127.0))
+    decode_merge[NH, NKV, HD](Int(scratch), 1, corr_vagg_scale)
 
     # Compare
     var rf32 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(scratch))
@@ -212,7 +215,9 @@ def main():
     comptime LOCAL_HIDDEN2 = LOCAL_NH2 * HD2
 
     comptime LOCAL_KVC = KVCache[MAX_SEQ2, HD2, LOCAL_KV2]
-    var local_scratch_bytes = scratch_bytes[LOCAL_NH2, LOCAL_KV2, HD2](LOCAL_KV2)
+    # Size scratch for max workers: up to 16 per group × 2 groups = 32
+    comptime MAX_WPG = 16
+    var local_scratch_bytes = scratch_bytes[LOCAL_NH2, LOCAL_KV2, HD2](LOCAL_KV2 * MAX_WPG)
 
     print("\n=== Performance: 128h/8kv, hd=128, " + String(NUM_NODES) + " NUMA nodes ===")
     print("  Per node: " + String(LOCAL_NH2) + "h/" + String(LOCAL_KV2) + "kv, "
@@ -265,115 +270,67 @@ def main():
 
     comptime QS2 = Slot[BF16, Replicated, 1, LOCAL_HIDDEN2, 1]
 
-    # -----------------------------------------------------------------
-    # Dispatch/join overhead: decode at ctx=1 (near-zero kernel work)
-    # -----------------------------------------------------------------
-    print("\n--- Dispatch/join overhead ---")
-
-    # Single node, 2 workers
-    for warmup in range(5):
-        decode[LOCAL_NH2, LOCAL_KV2, HD2](
-            DynView[QS2](q_ptrs[0], 1),
-            LOCAL_KVC(kv_bases[0]), LOCAL_KVC(kv_bases[0]),
-            Bound[CS2](cos_ptrs[0]), Bound[SS2](sin_ptrs[0]),
-            scratch_ptrs[0], 0,
-            perf_q_scale, perf_k_scale, perf_v_scale,
-            pool_ptrs[0][],
-        ).join()
-
-    var best_1node = Int(1 << 60)
-    for trial in range(20):
-        var t0 = Int(perf_counter_ns())
-        decode[LOCAL_NH2, LOCAL_KV2, HD2](
-            DynView[QS2](q_ptrs[0], 1),
-            LOCAL_KVC(kv_bases[0]), LOCAL_KVC(kv_bases[0]),
-            Bound[CS2](cos_ptrs[0]), Bound[SS2](sin_ptrs[0]),
-            scratch_ptrs[0], 0,
-            perf_q_scale, perf_k_scale, perf_v_scale,
-            pool_ptrs[0][],
-        ).join()
-        var wall = Int(perf_counter_ns()) - t0
-        if wall < best_1node: best_1node = wall
-    print("  1 node, 2 workers, ctx=1: " + String(best_1node // 1000) + " us")
-    var oh_agg = collect_profiles[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[0])
-    oh_agg.print_summary()
-
-    # 4 nodes, 8 workers total
-    for warmup in range(5):
-        @parameter
-        def wu_oh[node: Int]() -> PoolFence:
-            return decode[LOCAL_NH2, LOCAL_KV2, HD2](
-                DynView[QS2](q_ptrs[node], 1),
-                LOCAL_KVC(kv_bases[node]), LOCAL_KVC(kv_bases[node]),
-                Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
-                scratch_ptrs[node], 0,
-                perf_q_scale, perf_k_scale, perf_v_scale,
-                pool_ptrs[node][],
-            )
-        parallel_for[NUM_NODES, wu_oh]()
-    var best_4node = Int(1 << 60)
-    for trial in range(20):
-        var t0 = Int(perf_counter_ns())
-        @parameter
-        def run_oh[node: Int]() -> PoolFence:
-            return decode[LOCAL_NH2, LOCAL_KV2, HD2](
-                DynView[QS2](q_ptrs[node], 1),
-                LOCAL_KVC(kv_bases[node]), LOCAL_KVC(kv_bases[node]),
-                Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
-                scratch_ptrs[node], 0,
-                perf_q_scale, perf_k_scale, perf_v_scale,
-                pool_ptrs[node][],
-            )
-        parallel_for[NUM_NODES, run_oh]()
-        var wall = Int(perf_counter_ns()) - t0
-        if wall < best_4node: best_4node = wall
-    print("  4 nodes, 8 workers, ctx=1: " + String(best_4node // 1000) + " us")
-
-    # Higher worker count test: use a config with more "KV heads" to dispatch more jobs
-    # 32h/32kv gives 32 workers per node (1 Q head per KV group)
-    comptime OH_NH = 32
-    comptime OH_NKV = 32
-    comptime OH_HD = HD2
-    comptime OH_HIDDEN = OH_NH * OH_HD
-    comptime OH_KVC = KVCache[MAX_SEQ2, OH_HD, OH_NKV]
-    var oh32_scratch_bytes = scratch_bytes[OH_NH, OH_NKV, OH_HD](OH_NKV)
-    var oh32_scratch = perf_arenas[0].alloc[UInt8](oh32_scratch_bytes)
-    var oh32_q = perf_arenas[0].alloc[Scalar[DType.bfloat16]](OH_HIDDEN)
-    for i in range(OH_HIDDEN):
-        oh32_q[i] = Scalar[DType.bfloat16](Float32(i % 256 - 128) / 128.0)
-    var oh32_kv = perf_arenas[0].alloc[UInt8](OH_KVC.TOTAL_BYTES)
-    comptime OH_QS = Slot[BF16, Replicated, 1, OH_HIDDEN, 1]
-    comptime OH_HALF = OH_HD // 2
-    comptime OH_CS = Slot[F32, Replicated, MAX_SEQ2, OH_HALF, 1]
-    comptime OH_SS = Slot[F32, Replicated, MAX_SEQ2, OH_HALF, 1]
-
-    for warmup in range(5):
-        decode[OH_NH, OH_NKV, OH_HD](
-            DynView[OH_QS](Int(oh32_q), 1),
-            OH_KVC(Int(oh32_kv)), OH_KVC(Int(oh32_kv)),
-            Bound[OH_CS](cos_ptrs[0]), Bound[OH_SS](sin_ptrs[0]),
-            Int(oh32_scratch), 0,
-            perf_q_scale, perf_k_scale, perf_v_scale,
-            pool_ptrs[0][],
-        ).join()
-    var best_32w = Int(1 << 60)
-    for trial in range(20):
-        var t0 = Int(perf_counter_ns())
-        decode[OH_NH, OH_NKV, OH_HD](
-            DynView[OH_QS](Int(oh32_q), 1),
-            OH_KVC(Int(oh32_kv)), OH_KVC(Int(oh32_kv)),
-            Bound[OH_CS](cos_ptrs[0]), Bound[OH_SS](sin_ptrs[0]),
-            Int(oh32_scratch), 0,
-            perf_q_scale, perf_k_scale, perf_v_scale,
-            pool_ptrs[0][],
-        ).join()
-        var wall = Int(perf_counter_ns()) - t0
-        if wall < best_32w: best_32w = wall
-    print("  1 node, 32 workers, ctx=1: " + String(best_32w // 1000) + " us")
+    var perf_vagg_scale = perf_v_scale / (Float32(255.0) * Float32(127.0))
 
     # -----------------------------------------------------------------
-    # Main performance sweep
+    # Worker scaling sweep at ctx=32000
     # -----------------------------------------------------------------
+    print("\n--- Worker scaling at ctx=32000 ---")
+    var ctx_pos_scale = 32000
+
+    for wpg_idx in range(5):
+        var wpg = 1
+        if wpg_idx == 1: wpg = 2
+        if wpg_idx == 2: wpg = 4
+        if wpg_idx == 3: wpg = 8
+        if wpg_idx == 4: wpg = 16
+
+        for warmup in range(2):
+            @parameter
+            def wu_s[node: Int]() -> PoolFence:
+                return decode[LOCAL_NH2, LOCAL_KV2, HD2](
+                    DynView[QS2](q_ptrs[node], 1),
+                    LOCAL_KVC(kv_bases[node]), LOCAL_KVC(kv_bases[node]),
+                    Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
+                    scratch_ptrs[node], ctx_pos_scale,
+                    perf_q_scale, perf_k_scale, perf_v_scale,
+                    wpg,
+                    pool_ptrs[node][],
+                )
+            parallel_for[NUM_NODES, wu_s]()
+            decode_merge[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[0], wpg, perf_vagg_scale)
+
+        var best = Int(1 << 60)
+        for trial in range(5):
+            var t0 = Int(perf_counter_ns())
+            @parameter
+            def run_s[node: Int]() -> PoolFence:
+                return decode[LOCAL_NH2, LOCAL_KV2, HD2](
+                    DynView[QS2](q_ptrs[node], 1),
+                    LOCAL_KVC(kv_bases[node]), LOCAL_KVC(kv_bases[node]),
+                    Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
+                    scratch_ptrs[node], ctx_pos_scale,
+                    perf_q_scale, perf_k_scale, perf_v_scale,
+                    wpg,
+                    pool_ptrs[node][],
+                )
+            parallel_for[NUM_NODES, run_s]()
+            for node in range(NUM_NODES):
+                decode_merge[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[node], wpg, perf_vagg_scale)
+            var wall = Int(perf_counter_ns()) - t0
+            keep(UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=scratch_ptrs[0])[0])
+            if wall < best: best = wall
+
+        var total_us = best // 1000
+        var total_workers = LOCAL_KV2 * wpg
+        print("  wpg=" + String(wpg) + " (" + String(total_workers) + "w/node)  wall=" + String(total_us) + " us")
+        var agg = collect_profiles[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[0], wpg)
+        agg.print_summary()
+
+    # -----------------------------------------------------------------
+    # Context sweep at max workers (wpg=16)
+    # -----------------------------------------------------------------
+    print("\n--- Context sweep (wpg=16) ---")
     for ctx_idx in range(7):
         var ctx_pos = 128
         if ctx_idx == 1: ctx_pos = 512
@@ -392,9 +349,11 @@ def main():
                     Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
                     scratch_ptrs[node], ctx_pos,
                     perf_q_scale, perf_k_scale, perf_v_scale,
+                    MAX_WPG,
                     pool_ptrs[node][],
                 )
             parallel_for[NUM_NODES, wu]()
+            decode_merge[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[0], MAX_WPG, perf_vagg_scale)
 
         var best = Int(1 << 60)
         for trial in range(5):
@@ -407,14 +366,15 @@ def main():
                     Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
                     scratch_ptrs[node], ctx_pos,
                     perf_q_scale, perf_k_scale, perf_v_scale,
+                    MAX_WPG,
                     pool_ptrs[node][],
                 )
             parallel_for[NUM_NODES, run]()
+            for node in range(NUM_NODES):
+                decode_merge[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[node], MAX_WPG, perf_vagg_scale)
             var wall = Int(perf_counter_ns()) - t0
             keep(UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=scratch_ptrs[0])[0])
             if wall < best: best = wall
 
         var total_us = best // 1000
-        print("\n--- ctx=" + String(ctx_pos) + "  wall=" + String(total_us) + " us ---")
-        var agg = collect_profiles[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[0])
-        agg.print_summary()
+        print("  ctx=" + String(ctx_pos) + "  wall=" + String(total_us) + " us")

@@ -1,11 +1,8 @@
-"""AMX decode attention — 1-3-3 tile layout, VNNI-primary K cache.
+"""AMX decode attention — 1-3-3 tiles, VNNI-primary K, multi-worker context split.
 
-Uses TMM0(A) × TMM1-3(B) → TMM4-6(C) for decode where gqa_factor ≤ 16
-fits exactly in one A tile. Processes 3 N-tiles per A load.
-
-K cache is stored natively in VNNI tile format — no runtime transpose.
-V cache is row-major, packed into VNNI per-block (position-outer for
-cache locality).
+Workers within each KV group split the context range. Each worker processes
+its block range independently, then decode_merge combines their online
+softmax states and writes the final output.
 
 Score:  Q_i8 × K_u8_vnni → i32      (tdpbsud, signed Q × unsigned K)
 V-agg: W_u8 × V_i8_vnni → i32      (tdpbusd, unsigned W × signed V)
@@ -22,6 +19,7 @@ from modeling.model_spec import (
 )
 from kernels.kernel_ops import PoolFence
 from simd_math import sqrt
+from simd_math import exp_f32_fast
 from experimental2.kv_cache import KVCache
 from experimental2.helpers import AttnCtx, pack_v_tile_vnni, amx_gemm_1x3, prep_q_row, softmax_row
 from experimental2.kernel_profile import KernelProfile, tap, ProfileAggregator
@@ -44,6 +42,8 @@ comptime N_STEP_133 = 3 * TILE_N  # 48
 @fieldwise_init
 struct DecodeWorkerScratch:
     var group: Int
+    var ctx_start: Int
+    var ctx_end: Int
     var k_vnni_head: UnsafePointer[UInt8, MutAnyOrigin]
     var qi_buf: UnsafePointer[Int8, MutAnyOrigin]
     var qi_biases: UnsafePointer[Float32, MutAnyOrigin]
@@ -87,7 +87,7 @@ def scratch_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int](
 
 
 # ============================================================================
-# Kernel — 1-3-3 layout, VNNI-primary K, one worker per KV group
+# Kernel — processes [ctx_start, ctx_end), no final normalize
 # ============================================================================
 
 def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
@@ -110,8 +110,9 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
 
     var pos = ctx[].pos
     var score_scale = ctx[].score_scale
-    var vagg_scale = ctx[].vagg_scale
     var g = ws[].group
+    var ctx_start = ws[].ctx_start
+    var ctx_end = ws[].ctx_end
 
     var t0 = tap()
 
@@ -133,7 +134,7 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
     var v_base = ctx[].v_base + g * V_HEAD_STRIDE
 
     # =================================================================
-    # Q prep — RoPE → FWHT → quantize (gqa_factor rows, all at pos)
+    # Q prep — replicated per worker (fast, avoids sync)
     # =================================================================
     var q_quant_inv = ctx[].q_quant_inv
     for hi in range(gqa_factor):
@@ -165,7 +166,6 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
 
     var t3 = tap()
 
-    var context = pos + 1
     var vagg_arr = InlineArray[Int32, TILE_M * N_STEP_133](fill=Int32(0))
     var vagg_i32 = UnsafePointer(to=vagg_arr).bitcast[Int32]()
 
@@ -176,23 +176,20 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
     var ns_vagg = 0
 
     # =================================================================
-    # KV-outer loop
+    # KV-outer loop over this worker's context range
     # =================================================================
-    for block_start in range(0, context, BLOCK_N):
-        var block_len = min(BLOCK_N, context - block_start)
+    for block_start in range(ctx_start, ctx_end, BLOCK_N):
+        var block_len = min(BLOCK_N, ctx_end - block_start)
         var padded_chunk = ((block_len + K_STEP - 1) // K_STEP) * K_STEP
         var chunk_k_iters = padded_chunk // K_STEP
         var n_tiles = (block_len + TILE_N - 1) // TILE_N
         var n_groups = (n_tiles + 2) // 3
-        var block_tile_off = (block_start // TILE_N) * K_TILE_K_BYTES
+        var block_tile_base = (block_start // TILE_N) * K_TILE_K_BYTES
 
         var tb0 = tap()
-
-        # --- K: read directly from VNNI-primary cache (no packing) ---
-
         var tb1 = tap()
 
-        # --- Pack V (K-outer for cache locality on position rows) ---
+        # --- Pack V ---
         for kt in range(chunk_k_iters):
             var kt_n_pos = min(K_STEP, block_len - kt * K_STEP)
             var kt_pos_off = block_start + kt * K_STEP
@@ -208,12 +205,12 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
 
         var tb2 = tap()
 
-        # --- Score GEMM: i8 Q × u8 K_vnni → i32 (1-3-3 triple groups) ---
+        # --- Score GEMM ---
         for ng in range(n_groups):
             var nt_base = ng * 3
-            var b0 = k_vnni_head + block_tile_off + nt_base * K_TILE_K_BYTES
-            var b1 = k_vnni_head + block_tile_off + (nt_base + 1) * K_TILE_K_BYTES
-            var b2 = k_vnni_head + block_tile_off + (nt_base + 2) * K_TILE_K_BYTES
+            var b0 = k_vnni_head + block_tile_base + nt_base * K_TILE_K_BYTES
+            var b1 = k_vnni_head + block_tile_base + (nt_base + 1) * K_TILE_K_BYTES
+            var b2 = k_vnni_head + block_tile_base + (nt_base + 2) * K_TILE_K_BYTES
             for mi in range(m_iters):
                 amx_gemm_1x3[DType.int8, DType.uint8, SCORE_N](
                     qi_buf + mi * TILE_M * head_dim,
@@ -225,7 +222,7 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
 
         var tb3 = tap()
 
-        # --- Softmax (stride = SCORE_N, all rows share causal_limit = block_len) ---
+        # --- Softmax ---
         for hi in range(gqa_factor):
             softmax_row[head_dim](
                 score_i32 + hi * SCORE_N,
@@ -238,7 +235,7 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
 
         var tb4 = tap()
 
-        # --- V-agg: u8 W × i8 V → i32 (1-3-3 triple groups) ---
+        # --- V-agg ---
         for ng in range(hd_n_padded // 3):
             var d_off = ng * N_STEP_133
             var nt0 = ng * 3
@@ -271,20 +268,8 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
         ns_softmax += tb4 - tb3
         ns_vagg += tb5 - tb4
 
-    # =================================================================
-    # Final normalize
-    # =================================================================
-    var t_fn0 = tap()
-    for hi in range(gqa_factor):
-        var h = g * gqa_factor + hi
-        var final_scale = vagg_scale / running_l[hi]
-        var ro = running_o + hi * head_dim
-        var out = ctx[].row_f32 + h * head_dim
-        var d = 0
-        while d + width <= head_dim:
-            (out + d).store((ro + d).load[width=width]() * final_scale)
-            d += width
-    var t_fn1 = tap()
+    # No final normalize — decode_merge handles it
+    var t_end = tap()
 
     var prof = ws[].profile
     prof[].amx_config = t1 - t0
@@ -296,8 +281,67 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
     prof[].softmax = ns_softmax
     prof[].vagg = ns_vagg
     prof[].merge_wait = 0
-    prof[].merge_work = t_fn1 - t_fn0
-    prof[].total = t_fn1 - t0
+    prof[].merge_work = 0
+    prof[].total = t_end - t0
+
+
+# ============================================================================
+# Merge — combine partial softmax states, write final output
+# ============================================================================
+
+def decode_merge[num_heads: Int, num_kv_heads: Int, head_dim: Int](
+    scratch: Int,
+    workers_per_group: Int,
+    vagg_scale: Float32,
+):
+    """Merge partial online softmax states from context-split workers."""
+    comptime gqa_factor = num_heads // num_kv_heads
+    comptime q_cols = num_heads * head_dim
+    comptime pw = per_worker_bytes[num_heads, num_kv_heads, head_dim]()
+    comptime WORKERS_OFF = q_cols * size_of[Float32]()
+    comptime width = simd_width_of[DType.float32]()
+    var output = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=scratch)
+
+    for g in range(num_kv_heads):
+        var ws0_base = scratch + WORKERS_OFF + (g * workers_per_group) * pw
+        var ws0 = UnsafePointer[DecodeWorkerScratch, MutAnyOrigin](unsafe_from_address=ws0_base)
+        var o0 = ws0[].running_o
+        var m0 = ws0[].running_m
+        var l0 = ws0[].running_l
+
+        # Merge subsequent workers into worker 0's state
+        for w in range(1, workers_per_group):
+            var wsw_base = scratch + WORKERS_OFF + (g * workers_per_group + w) * pw
+            var wsw = UnsafePointer[DecodeWorkerScratch, MutAnyOrigin](unsafe_from_address=wsw_base)
+            var ow = wsw[].running_o
+            var mw = wsw[].running_m
+            var lw = wsw[].running_l
+
+            for hi in range(gqa_factor):
+                var m_new = max(m0[hi], mw[hi])
+                var c0 = exp_f32_fast[1](m0[hi] - m_new)
+                var cw = exp_f32_fast[1](mw[hi] - m_new)
+                m0[hi] = m_new
+                l0[hi] = c0 * l0[hi] + cw * lw[hi]
+                var ro0 = o0 + hi * head_dim
+                var row = ow + hi * head_dim
+                var vc0 = SIMD[DType.float32, width](c0)
+                var vcw = SIMD[DType.float32, width](cw)
+                var d = 0
+                while d + width <= head_dim:
+                    (ro0 + d).store(vc0 * (ro0 + d).load[width=width]() + vcw * (row + d).load[width=width]())
+                    d += width
+
+        # Final normalize
+        for hi in range(gqa_factor):
+            var h = g * gqa_factor + hi
+            var final_scale = vagg_scale / l0[hi]
+            var ro = o0 + hi * head_dim
+            var out = output + h * head_dim
+            var d = 0
+            while d + width <= head_dim:
+                (out + d).store((ro + d).load[width=width]() * final_scale)
+                d += width
 
 
 # ============================================================================
@@ -306,15 +350,16 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
 
 def collect_profiles[num_heads: Int, num_kv_heads: Int, head_dim: Int](
     scratch: Int,
+    workers_per_group: Int,
 ) -> ProfileAggregator:
     comptime q_cols = num_heads * head_dim
     comptime pw = per_worker_bytes[num_heads, num_kv_heads, head_dim]()
     comptime WORKERS_OFF = q_cols * size_of[Float32]()
+    var total = num_kv_heads * workers_per_group
     var agg = ProfileAggregator()
-    for g in range(num_kv_heads):
-        var ws_base = scratch + WORKERS_OFF + g * pw
-        var ws = UnsafePointer[DecodeWorkerScratch, MutAnyOrigin](
-            unsafe_from_address=ws_base)
+    for j in range(total):
+        var ws_base = scratch + WORKERS_OFF + j * pw
+        var ws = UnsafePointer[DecodeWorkerScratch, MutAnyOrigin](unsafe_from_address=ws_base)
         agg.add(ws[].profile[])
     return agg^
 
@@ -336,9 +381,10 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     q_layer_scale: Float32,
     k_layer_scale: Float32,
     v_layer_scale: Float32,
+    workers_per_group: Int,
     mut pool: BurstPool[],
 ) -> PoolFence:
-    """Async AMX decode — 1-3-3 layout, VNNI-primary K, one worker per KV group."""
+    """Async AMX decode — multi-worker context split within each KV group."""
     comptime gqa_factor = num_heads // num_kv_heads
     comptime q_cols = QT.COLS
     comptime pw = per_worker_bytes[num_heads, num_kv_heads, head_dim]()
@@ -366,45 +412,60 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     )
     var ctx_ptr = UnsafePointer(to=ctx)
 
-    for g in range(num_kv_heads):
-        var ws_base = scratch + WORKERS_OFF + g * pw
-        var ws = UnsafePointer[DecodeWorkerScratch, MutAnyOrigin](
-            unsafe_from_address=ws_base)
-        var data = ws_base + size_of[DecodeWorkerScratch]()
-        var off = 0
-        ws[].group = g
-        ws[].k_vnni_head = UnsafePointer[UInt8, MutAnyOrigin](
-            unsafe_from_address=k_cache.k_base + g * k_head_stride)
-        ws[].qi_buf = UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=data + off)
-        off += padded_q * head_dim
-        ws[].qi_biases = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
-        off += gqa_factor * size_of[Float32]()
-        ws[].running_o = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
-        off += padded_q * head_dim * size_of[Float32]()
-        ws[].running_m = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
-        off += padded_q * size_of[Float32]()
-        ws[].running_l = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
-        off += padded_q * size_of[Float32]()
-        ws[].score_i32 = UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=data + off)
-        off += padded_q * SCORE_N * size_of[Int32]()
-        ws[].w_u8_buf = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=data + off)
-        off += padded_q * BLOCK_N
-        ws[].v_vnni = UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=data + off)
-        off += hd_n_padded * v_k_tiles * TILE_BYTES
-        ws[].profile = UnsafePointer[KernelProfile, MutAnyOrigin](unsafe_from_address=data + off)
-        ws[].profile[] = KernelProfile()
+    var context = pos + 1
+    var max_blocks = (context + BLOCK_N - 1) // BLOCK_N
+    var wpg = min(workers_per_group, max_blocks)
+    var blocks_per_worker = (max_blocks + wpg - 1) // wpg
+    var total_jobs = num_kv_heads * wpg
 
-        var pack = pool.args_base + g
-        pack[].arg0 = Int(ctx_ptr)
-        pack[].arg1 = ws_base
-        pack[].arg2 = 0
-        pack[].arg3 = 0
-        pack[].arg4 = 0
-        pack[].arg5 = 0
+    for g in range(num_kv_heads):
+        for w in range(wpg):
+            var first_block = w * blocks_per_worker
+            var last_block = min((w + 1) * blocks_per_worker, max_blocks)
+            var ctx_s = first_block * BLOCK_N
+            var ctx_e = min(last_block * BLOCK_N, context)
+
+            var job_idx = g * wpg + w
+            var ws_base = scratch + WORKERS_OFF + job_idx * pw
+            var ws = UnsafePointer[DecodeWorkerScratch, MutAnyOrigin](
+                unsafe_from_address=ws_base)
+            var data = ws_base + size_of[DecodeWorkerScratch]()
+            var off = 0
+            ws[].group = g
+            ws[].ctx_start = ctx_s
+            ws[].ctx_end = ctx_e
+            ws[].k_vnni_head = UnsafePointer[UInt8, MutAnyOrigin](
+                unsafe_from_address=k_cache.k_base + g * k_head_stride)
+            ws[].qi_buf = UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=data + off)
+            off += padded_q * head_dim
+            ws[].qi_biases = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
+            off += gqa_factor * size_of[Float32]()
+            ws[].running_o = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
+            off += padded_q * head_dim * size_of[Float32]()
+            ws[].running_m = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
+            off += padded_q * size_of[Float32]()
+            ws[].running_l = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
+            off += padded_q * size_of[Float32]()
+            ws[].score_i32 = UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=data + off)
+            off += padded_q * SCORE_N * size_of[Int32]()
+            ws[].w_u8_buf = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=data + off)
+            off += padded_q * BLOCK_N
+            ws[].v_vnni = UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=data + off)
+            off += hd_n_padded * v_k_tiles * TILE_BYTES
+            ws[].profile = UnsafePointer[KernelProfile, MutAnyOrigin](unsafe_from_address=data + off)
+            ws[].profile[] = KernelProfile()
+
+            var pack = pool.args_base + job_idx
+            pack[].arg0 = Int(ctx_ptr)
+            pack[].arg1 = ws_base
+            pack[].arg2 = 0
+            pack[].arg3 = 0
+            pack[].arg4 = 0
+            pack[].arg5 = 0
 
     pool.dispatch(
         attn_decode[num_heads, num_kv_heads, head_dim, max_seq],
-        pool.args_base, num_kv_heads,
+        pool.args_base, total_jobs,
     )
     return PoolFence(UnsafePointer[BurstPool[], MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
