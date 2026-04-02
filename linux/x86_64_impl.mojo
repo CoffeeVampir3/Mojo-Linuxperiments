@@ -55,6 +55,7 @@ struct X86_64LinuxSys(LinuxSys):
     comptime NR_getpid = 39
     comptime NR_gettid = 186
     comptime NR_getcpu = 309
+    comptime NR_sched_yield = 24
     comptime NR_sched_setaffinity = 203
     comptime NR_exit_group = 231
     comptime NR_tgkill = 234

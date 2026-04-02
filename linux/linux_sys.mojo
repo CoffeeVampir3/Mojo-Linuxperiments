@@ -425,6 +425,7 @@ trait ArchLinux:
     comptime NR_getpid: Int
     comptime NR_gettid: Int
     comptime NR_getcpu: Int
+    comptime NR_sched_yield: Int
     comptime NR_sched_setaffinity: Int
     comptime NR_exit_group: Int
     comptime NR_tgkill: Int
@@ -564,6 +565,9 @@ trait LinuxSys(ArchLinux):
 
     def sys_tgkill(self, pid: Int, tid: Int, sig: Int) -> Int:
         return self.syscall(Self.NR_tgkill, pid, tid, sig)
+
+    def sys_sched_yield(self):
+        _ = self.syscall(Self.NR_sched_yield)
 
     def sys_sched_setaffinity(self, tid: Int, mask_size: Int, mask_ptr: Int) -> Int:
         return self.syscall(Self.NR_sched_setaffinity, tid, mask_size, mask_ptr)

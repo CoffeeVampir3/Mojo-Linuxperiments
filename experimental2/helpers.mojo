@@ -9,6 +9,8 @@ from std.memory import UnsafePointer
 from std.sys.info import simd_width_of, size_of
 from std.collections import InlineArray
 
+from simd_math import roundeven, exp_f32_fast, quantize_i8
+from experimental.hadquant_impl import fwht_apply, fwht_width
 from experimental.amx import (
     TILE_M, TILE_K, TILE_N, VNNI_BLK, M_STEP, N_STEP, K_STEP, TILE_BYTES,
     tilezero, tileload, tilestore, tile_dp,
@@ -32,6 +34,115 @@ struct AttnCtx:
     var vagg_scale: Float32
     var pos: Int
     var seq_len: Int
+
+
+# ============================================================================
+# Q row prep — RoPE → FWHT → quantize (one row)
+# ============================================================================
+
+@always_inline
+def prep_q_row[head_dim: Int](
+    q_row: UnsafePointer[BFloat16, MutAnyOrigin],
+    cos_row: UnsafePointer[Float32, MutAnyOrigin],
+    sin_row: UnsafePointer[Float32, MutAnyOrigin],
+    q_quant_inv: Float32,
+    qi_out: UnsafePointer[Int8, MutAnyOrigin],
+) -> Float32:
+    """RoPE → FWHT → quantize one Q row. Returns qi_bias (128 * sum)."""
+    comptime half = head_dim // 2
+    comptime fwht_w = fwht_width[DType.float32, head_dim]()
+    comptime fwht_regs = head_dim // fwht_w
+    comptime half_regs = fwht_regs // 2
+    var vq_inv = SIMD[DType.float32, fwht_w](q_quant_inv)
+
+    var r = InlineArray[SIMD[DType.float32, fwht_w], fwht_regs](
+        fill=SIMD[DType.float32, fwht_w](0))
+    for ri in range(half_regs):
+        var j = ri * fwht_w
+        var x_lo = (q_row + j).load[width=fwht_w]().cast[DType.float32]()
+        var x_hi = (q_row + half + j).load[width=fwht_w]().cast[DType.float32]()
+        var cv = (cos_row + j).load[width=fwht_w]()
+        var sv = (sin_row + j).load[width=fwht_w]()
+        r[ri] = x_lo * cv - x_hi * sv
+        r[half_regs + ri] = x_hi * cv + x_lo * sv
+
+    fwht_apply[DType.float32, head_dim](r)
+
+    var q_sum_acc = SIMD[DType.int32, fwht_w](0)
+    for ri in range(fwht_regs):
+        var qi = quantize_i8[fwht_w](r[ri], vq_inv)
+        (qi_out + ri * fwht_w).store(qi)
+        q_sum_acc += qi.cast[DType.int32]()
+    return Float32(q_sum_acc.reduce_add()) * Float32(128)
+
+
+# ============================================================================
+# Softmax row — max pass, correction, exp→u8, zero-pad (one row)
+# ============================================================================
+
+@always_inline
+def softmax_row[head_dim: Int](
+    si_row: UnsafePointer[Int32, MutAnyOrigin],
+    q_bias: Float32,
+    score_scale: Float32,
+    causal_limit: Int,
+    padded_chunk: Int,
+    running_m_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    running_l_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    running_o: UnsafePointer[Float32, MutAnyOrigin],
+    w_row: UnsafePointer[UInt8, MutAnyOrigin],
+):
+    """Online softmax for one Q row: max, correct running state, exp→u8."""
+    comptime width = simd_width_of[DType.float32]()
+
+    # Max pass
+    var vmax = SIMD[DType.float32, width](Float32(-1e30))
+    var t = 0
+    while t + width <= causal_limit:
+        var dq = ((si_row + t).load[width=width]().cast[DType.float32]() - q_bias) * score_scale
+        vmax = max(vmax, dq)
+        t += width
+    var scalar_max = Float32(-1e30)
+    while t < causal_limit:
+        scalar_max = max(scalar_max, (Float32(si_row[t]) - q_bias) * score_scale)
+        t += 1
+    var row_max = max(vmax.reduce_max(), scalar_max)
+
+    # Correction
+    var m_old = running_m_ptr[]
+    var m_new = max(m_old, row_max)
+    running_m_ptr[] = m_new
+    if m_new > m_old:
+        var correction = exp_f32_fast[1](m_old - m_new)
+        running_l_ptr[] = running_l_ptr[] * correction
+        var d = 0
+        while d + width <= head_dim:
+            (running_o + d).store((running_o + d).load[width=width]() * correction)
+            d += width
+
+    # Fused dequant + exp → u8
+    var l_acc = SIMD[DType.float32, width](0)
+    t = 0
+    while t + width <= causal_limit:
+        var dq = ((si_row + t).load[width=width]().cast[DType.float32]() - q_bias) * score_scale
+        var e = exp_f32_fast(dq - m_new)
+        (w_row + t).store(roundeven(e * Float32(255)).cast[DType.uint8]())
+        l_acc += e
+        t += width
+    var l_contrib = l_acc.reduce_add()
+    while t < causal_limit:
+        var dq = (Float32(si_row[t]) - q_bias) * score_scale
+        var e = exp_f32_fast[1](dq - m_new)
+        w_row[t] = roundeven[DType.float32, 1](e * Float32(255)).cast[DType.uint8]()
+        l_contrib += e
+        t += 1
+    # Zero-pad
+    comptime u8w = simd_width_of[DType.uint8]()
+    comptime u8zeros = SIMD[DType.uint8, u8w](0)
+    while t + u8w <= padded_chunk:
+        (w_row + t).store(u8zeros)
+        t += u8w
+    running_l_ptr[] += l_contrib
 
 
 # ============================================================================

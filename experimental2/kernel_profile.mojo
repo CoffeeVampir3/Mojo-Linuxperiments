@@ -18,6 +18,8 @@ struct KernelProfile:
     var score_gemm: Int
     var softmax: Int
     var vagg: Int
+    var merge_wait: Int
+    var merge_work: Int
     var total: Int
 
     def __init__(out self):
@@ -29,6 +31,8 @@ struct KernelProfile:
         self.score_gemm = 0
         self.softmax = 0
         self.vagg = 0
+        self.merge_wait = 0
+        self.merge_work = 0
         self.total = 0
 
 
@@ -49,8 +53,11 @@ struct ProfileAggregator:
     var sum_score_gemm: Int
     var sum_softmax: Int
     var sum_vagg: Int
+    var sum_merge_wait: Int
+    var sum_merge_work: Int
     var sum_total: Int
     var max_total: Int
+    var max_merge_wait: Int
 
     def __init__(out self):
         self.count = 0
@@ -62,8 +69,11 @@ struct ProfileAggregator:
         self.sum_score_gemm = 0
         self.sum_softmax = 0
         self.sum_vagg = 0
+        self.sum_merge_wait = 0
+        self.sum_merge_work = 0
         self.sum_total = 0
         self.max_total = 0
+        self.max_merge_wait = 0
 
     def add(mut self, p: KernelProfile):
         self.count += 1
@@ -75,9 +85,13 @@ struct ProfileAggregator:
         self.sum_score_gemm += p.score_gemm
         self.sum_softmax += p.softmax
         self.sum_vagg += p.vagg
+        self.sum_merge_wait += p.merge_wait
+        self.sum_merge_work += p.merge_work
         self.sum_total += p.total
         if p.total > self.max_total:
             self.max_total = p.total
+        if p.merge_wait > self.max_merge_wait:
+            self.max_merge_wait = p.merge_wait
 
     def print_summary(self):
         if self.count == 0:
@@ -94,6 +108,9 @@ struct ProfileAggregator:
         _print_phase("score_gemm", self.sum_score_gemm, n, wall)
         _print_phase("softmax", self.sum_softmax, n, wall)
         _print_phase("vagg", self.sum_vagg, n, wall)
+        _print_phase("merge_wait", self.sum_merge_wait, n, wall)
+        print("    merge_wait(max): " + String(self.max_merge_wait // 1000) + " us")
+        _print_phase("merge_work", self.sum_merge_work, n, wall)
 
 
 def _print_phase(name: String, total_ns: Int, count: Int, wall_ns: Int):

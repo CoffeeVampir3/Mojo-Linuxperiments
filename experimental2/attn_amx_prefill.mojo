@@ -24,11 +24,10 @@ from modeling.model_spec import (
     Bound, DynView,
 )
 from kernels.kernel_ops import PoolFence
-from simd_math import sqrt, roundeven, exp_f32_fast, quantize_i8
+from simd_math import sqrt
 from simd_math.matrixops import transpose_rows
-from experimental.hadquant_impl import fwht_apply, fwht_width
 from experimental2.kv_cache import KVCache
-from experimental2.helpers import AttnCtx, pack_v_tile_vnni, amx_gemm_2x2
+from experimental2.helpers import AttnCtx, pack_v_tile_vnni, amx_gemm_2x2, prep_q_row, softmax_row
 from experimental.amx import (
     TILE_M, TILE_K, TILE_N, VNNI_BLK, M_STEP, N_STEP, K_STEP, TILE_BYTES,
     TileConfig, make_224_i8_config,
@@ -140,47 +139,22 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
     var v_base = ctx[].v_base + g * HEAD_STRIDE
 
     # =================================================================
-    # Q prep — fused RoPE → FWHT → quantize, register-resident
+    # Q prep — fused RoPE → FWHT → quantize
     # =================================================================
     var q_quant_inv = ctx[].q_quant_inv
-    comptime fwht_w = fwht_width[DType.float32, head_dim]()
-    var vq_inv = SIMD[DType.float32, fwht_w](q_quant_inv)
-    comptime fwht_regs = head_dim // fwht_w
-    comptime half_regs = fwht_regs // 2
-
     for local_idx in range(my_q_rows):
         var abs_row = q_row_start + local_idx
         var m = abs_row // gqa_factor
         var hi = abs_row % gqa_factor
         var h = g * gqa_factor + hi
         var actual_pos = pos + m
-        var cos_row = ctx[].cos + actual_pos * half
-        var sin_row = ctx[].sin + actual_pos * half
-        var q_row = ctx[].q + m * q_cols + h * head_dim
-
-        # RoPE → register array (no intermediate buffer)
-        var r = InlineArray[SIMD[DType.float32, fwht_w], fwht_regs](
-            fill=SIMD[DType.float32, fwht_w](0))
-        for ri in range(half_regs):
-            var j = ri * fwht_w
-            var x_lo = (q_row + j).load[width=fwht_w]().cast[DType.float32]()
-            var x_hi = (q_row + half + j).load[width=fwht_w]().cast[DType.float32]()
-            var cv = (cos_row + j).load[width=fwht_w]()
-            var sv = (sin_row + j).load[width=fwht_w]()
-            r[ri] = x_lo * cv - x_hi * sv
-            r[half_regs + ri] = x_hi * cv + x_lo * sv
-
-        # FWHT butterfly in-register (no memory access)
-        fwht_apply[DType.float32, head_dim](r)
-
-        # Quantize directly from registers → qi_buf
-        var qi_row = qi_buf + local_idx * head_dim
-        var q_sum_acc = SIMD[DType.int32, fwht_w](0)
-        for ri in range(fwht_regs):
-            var qi = quantize_i8[fwht_w](r[ri], vq_inv)
-            (qi_row + ri * fwht_w).store(qi)
-            q_sum_acc += qi.cast[DType.int32]()
-        qi_biases[local_idx] = Float32(q_sum_acc.reduce_add()) * Float32(128)
+        qi_biases[local_idx] = prep_q_row[head_dim](
+            ctx[].q + m * q_cols + h * head_dim,
+            ctx[].cos + actual_pos * half,
+            ctx[].sin + actual_pos * half,
+            q_quant_inv,
+            qi_buf + local_idx * head_dim,
+        )
 
     # =================================================================
     # Init running state
@@ -260,60 +234,14 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
                 var abs_row = q_row_start + qi_row
                 var m_pos = abs_row // gqa_factor
                 var causal_limit = min(pos + m_pos + 1 - block_start, block_len)
-                var q_bi = qi_biases[qi_row]
-                var q_sc = score_scale
-                var si_row = score_i32 + qi_local * BLOCK_N
-
-                # Max pass (i32 → dequant inline, no f32 store)
-                var vmax = SIMD[DType.float32, width](Float32(-1e30))
-                var t = 0
-                while t + width <= causal_limit:
-                    var dq = ((si_row + t).load[width=width]().cast[DType.float32]() - q_bi) * q_sc
-                    vmax = max(vmax, dq)
-                    t += width
-                var scalar_max = Float32(-1e30)
-                while t < causal_limit:
-                    scalar_max = max(scalar_max, (Float32(si_row[t]) - q_bi) * q_sc)
-                    t += 1
-                var row_max = max(vmax.reduce_max(), scalar_max)
-
-                # Correction
-                var m_old = running_m[qi_row]
-                var m_new = max(m_old, row_max)
-                running_m[qi_row] = m_new
-                if m_new > m_old:
-                    var correction = exp_f32_fast[1](m_old - m_new)
-                    running_l[qi_row] = running_l[qi_row] * correction
-                    var ro = running_o + qi_row * head_dim
-                    var d = 0
-                    while d + width <= head_dim:
-                        (ro + d).store((ro + d).load[width=width]() * correction)
-                        d += width
-
-                # Fused dequant + exp → u8 (re-reads i32, no score_buf)
-                var l_acc = SIMD[DType.float32, width](0)
-                var w_row = w_u8_buf + qi_local * padded_chunk
-                t = 0
-                while t + width <= causal_limit:
-                    var dq = ((si_row + t).load[width=width]().cast[DType.float32]() - q_bi) * q_sc
-                    var e = exp_f32_fast(dq - m_new)
-                    (w_row + t).store(roundeven(e * Float32(255)).cast[DType.uint8]())
-                    l_acc += e
-                    t += width
-                var l_contrib = l_acc.reduce_add()
-                while t < causal_limit:
-                    var dq = (Float32(si_row[t]) - q_bi) * q_sc
-                    var e = exp_f32_fast[1](dq - m_new)
-                    w_row[t] = roundeven[DType.float32, 1](e * Float32(255)).cast[DType.uint8]()
-                    l_contrib += e
-                    t += 1
-                # padded_chunk is a multiple of K_STEP (64) = simd_width_of[uint8]
-                comptime u8w = simd_width_of[DType.uint8]()
-                comptime u8zeros = SIMD[DType.uint8, u8w](0)
-                while t + u8w <= padded_chunk:
-                    (w_row + t).store(u8zeros)
-                    t += u8w
-                running_l[qi_row] += l_contrib
+                softmax_row[head_dim](
+                    score_i32 + qi_local * BLOCK_N,
+                    qi_biases[qi_row], score_scale,
+                    causal_limit, padded_chunk,
+                    running_m + qi_row, running_l + qi_row,
+                    running_o + qi_row * head_dim,
+                    w_u8_buf + qi_local * padded_chunk,
+                )
 
             # V-agg: u8 W × i8 V → i32
             for ns in range(head_dim // N_STEP):

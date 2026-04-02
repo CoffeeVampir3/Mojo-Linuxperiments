@@ -1,7 +1,7 @@
-"""ButterQuant AMX decode attention — profiled with hot-mode BurstPool.
+"""ButterQuant AMX decode attention — correctness + performance.
 
-Runs control (wpg=1) and best chunked configs with per-phase profiling
-to identify optimization targets now that dispatch overhead is eliminated.
+Zero per-token scales. KV cache is flat u8. Fixed layer-level scales.
+Specialized for SL=1 (single token decode).
 """
 
 from std.sys.info import simd_width_of, size_of
@@ -12,29 +12,19 @@ from modeling.model_spec import (
     BF16, F32, I8, Replicated,
     Slot, Bound, DynView,
 )
-from experimental2.attn_amx_decode_control import (
-    decode_hot,
-    scratch_bytes as control_scratch_bytes,
-    collect_profiles as control_collect_profiles,
-)
-from experimental2.attn_amx_decode import (
-    decode as decode_chunked,
-    scratch_bytes as chunked_scratch_bytes,
-    collect_profiles as chunk_collect_profiles,
-    read_caller_profile as chunk_read_caller,
-)
+from experimental2.attn_amx_decode import decode, scratch_bytes
+from experimental.hadquant_impl import fwht_block
 from experimental2.kv_cache import KVCache
-from experimental2.kernel_profile import ProfileAggregator
 from experimental.amx import init_intel_amx
-from simd_math import sqrt
+from simd_math import sqrt, exp_f32, quantize_i8
 from threading import BurstPool
-from numa import NumaInfo
+from numa import NumaInfo, get_current_cpu_and_node
 from numa.arena import NumaArena
 from notstdcollections import HeapMoveArray
-from kernels.kernel_ops import init_rope_tables
+from kernels.kernel_ops import init_rope_tables, parallel_for, PoolFence
 
 
-comptime HEADROOM = 2
+comptime NUM_NODES = 4
 
 
 def main():
@@ -43,211 +33,280 @@ def main():
         return
 
     var numa = NumaInfo()
-    var node = numa.plan_topology(1)[0]
-    var ncpus = numa.cpus_on_node(node)
-    print("Node " + String(node) + ": " + String(ncpus) + " cpus")
-
-    var pool = BurstPool[].for_numa_node(numa, node, HEADROOM)
-    if not pool:
-        print("pool creation failed")
+    if numa.num_nodes < NUM_NODES:
+        print("SKIP: need " + String(NUM_NODES) + " NUMA nodes, have " + String(numa.num_nodes))
         return
-    var cap = pool.capacity
-    print("Pool: " + String(cap) + " workers (headroom=" + String(HEADROOM) + ")")
+    var topo = numa.plan_topology(NUM_NODES)
 
-    comptime HD = 128
-    comptime NH = 32
-    comptime NKV = 2
-    comptime HALF = HD // 2
-    comptime MAX_SEQ = 16384
+    print("NUMA: " + String(NUM_NODES) + " nodes")
+    for i in range(NUM_NODES):
+        print("  node " + String(topo[i]) + ": " + String(numa.cpus_on_node(topo[i])) + " cpus")
+
+    var pools = HeapMoveArray[BurstPool[]](NUM_NODES)
+    for i in range(NUM_NODES):
+        pools.push(BurstPool[].for_numa_node(numa, topo[i]))
+    var pool_ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], NUM_NODES](
+        fill=UnsafePointer[BurstPool[], MutAnyOrigin]())
+    for i in range(NUM_NODES):
+        pool_ptrs[i] = UnsafePointer[BurstPool[], MutAnyOrigin](
+            unsafe_from_address=Int(UnsafePointer(to=pools[i])))
+
+    # =====================================================================
+    # Correctness test
+    # =====================================================================
+    comptime HD = 64
+    comptime NH = 12
+    comptime NKV = 4
+    comptime GQA = NH // NKV
     comptime HIDDEN = NH * HD
+    comptime HALF = HD // 2
+    comptime MAX_SEQ = 1024
+    comptime POS = 48
+
+    var q_layer_scale = Float32(0.15)
+    var k_layer_scale = Float32(0.15)
+    var v_layer_scale = Float32(0.15)
+    var q_quant_inv = Float32(127.0) / q_layer_scale
+
+    print("\n=== Correctness: " + String(NH) + "h/" + String(NKV)
+          + "kv, hd=" + String(HD) + ", pos=" + String(POS) + " ===")
+
+    var corr_arena = NumaArena[](topo[0], 256 * 1024 * 1024)
 
     comptime KVC = KVCache[MAX_SEQ, HD, NKV]
-    var ctrl_sz = control_scratch_bytes[NH, NKV, HD]()
-    var chunk_sz = chunked_scratch_bytes[NH, NKV, HD](cap)
-    var max_scratch = max(ctrl_sz, chunk_sz)
+    var corr_scratch_bytes = scratch_bytes[NH, NKV, HD](NKV)
 
-    print("Config: " + String(NH) + "h/" + String(NKV) + "kv, hd=" + String(HD))
-
-    var arena = NumaArena[](node, 1024 * 1024 * 1024)
-
-    var q_scale = Float32(0.15)
-    var k_scale = Float32(0.15)
-    var v_scale = Float32(0.15)
-
-    var q_bf16 = arena.alloc[Scalar[DType.bfloat16]](HIDDEN)
-    for i in range(HIDDEN):
-        q_bf16[i] = Scalar[DType.bfloat16](Float32(i % 256 - 128) / 128.0)
-
-    var kv_mem = arena.alloc[UInt8](2 * KVC.TOTAL_BYTES)
+    var q_bf16 = corr_arena.alloc[Scalar[DType.bfloat16]](HIDDEN)
+    var kv_mem = corr_arena.alloc[UInt8](2 * KVC.TOTAL_BYTES)
     var k_cache = KVC(Int(kv_mem))
     var v_cache = KVC(Int(kv_mem) + KVC.TOTAL_BYTES)
-    var hb = arena.alloc[Scalar[DType.int8]](HD)
-    for t in range(MAX_SEQ):
+    var cos_tab = corr_arena.alloc[Float32](MAX_SEQ * HALF)
+    var sin_tab = corr_arena.alloc[Float32](MAX_SEQ * HALF)
+    var scratch = corr_arena.alloc[UInt8](corr_scratch_bytes)
+    var expected = corr_arena.alloc[Float32](HIDDEN)
+    var q_head = corr_arena.alloc[Float32](HD)
+    var head_buf = corr_arena.alloc[Scalar[DType.int8]](HD)
+
+    # Fill Q (single row)
+    for k in range(HIDDEN):
+        q_bf16[k] = Scalar[DType.bfloat16](Float32(k + 1) / Float32(HIDDEN) - 0.5)
+
+    # Fill KV cache with fixed-scale quantized data
+    for t in range(POS + 1):
         for g in range(NKV):
             for d in range(HD):
-                hb[d] = Scalar[DType.int8]((t * 7 + g * HD + d * 3) % 251 - 125)
-            k_cache.write_k(t, g, hb)
+                var val = Float32((t * 7 + g * 13 + d * 3) % 251 - 125) / 125.0
+                head_buf[d] = Scalar[DType.int8](Int8(max(min(Int(val * 127.0), 127), -128)))
+            k_cache.write_k(t, g, head_buf)
             for d in range(HD):
-                hb[d] = Scalar[DType.int8]((t * 11 + g * HD + d * 5) % 251 - 125)
-            v_cache.write_v(t, g, hb)
+                var val = Float32((t * 11 + g * 17 + d * 5) % 251 - 125) / 125.0
+                head_buf[d] = Scalar[DType.int8](Int8(max(min(Int(val * 127.0), 127), -128)))
+            v_cache.write_v(t, g, head_buf)
 
     comptime CosSlot = Slot[F32, Replicated, MAX_SEQ, HALF, 1]
     comptime SinSlot = Slot[F32, Replicated, MAX_SEQ, HALF, 1]
-    var cos_tab = arena.alloc[Float32](MAX_SEQ * HALF)
-    var sin_tab = arena.alloc[Float32](MAX_SEQ * HALF)
     init_rope_tables(Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)), Float64(100000.0))
-
-    var scratch = arena.alloc[UInt8](max_scratch)
 
     comptime QSlot = Slot[BF16, Replicated, 1, HIDDEN, 1]
 
-    var ctx_values = InlineArray[Int, 4](fill=0)
-    ctx_values[0] = 512
-    ctx_values[1] = 2048
-    ctx_values[2] = 4096
-    ctx_values[3] = 16384
+    # F32 reference: same pipeline as the kernel, in scalar
+    var inv_sqrt_hd = Float32(1.0) / sqrt[DType.float32, 1](Float32(HD))
+    var context = POS + 1
+    for h in range(NH):
+        var g = h // GQA
+        # Q: bf16 → f32 → RoPE → FWHT → fixed-scale i8
+        for d in range(HD):
+            q_head[d] = Float32(q_bf16[h * HD + d])
+        for j in range(HALF):
+            var x_lo = q_head[j]
+            var x_hi = q_head[HALF + j]
+            var cv = cos_tab[POS * HALF + j]
+            var sv = sin_tab[POS * HALF + j]
+            q_head[j] = x_lo * cv - x_hi * sv
+            q_head[HALF + j] = x_hi * cv + x_lo * sv
+        fwht_block[DType.float32, HD](q_head)
+        # Fixed-scale quantize Q
+        var qi_ref = corr_arena.alloc[Scalar[DType.int8]](HD)
+        var q_sum = Int(0)
+        for d in range(HD):
+            var qi = Int(max(min(Int(q_head[d] * q_quant_inv + 0.5), 127), -128))
+            if q_head[d] * q_quant_inv < 0:
+                qi = Int(max(min(Int(q_head[d] * q_quant_inv - 0.5), 127), -128))
+            qi_ref[d] = Scalar[DType.int8](qi)
+            q_sum += qi
+        var q_bias = Float32(128 * q_sum)
+        var score_scale = q_layer_scale * k_layer_scale * inv_sqrt_hd / (Float32(127.0) * Float32(127.0))
+
+        # Score against K cache
+        var scores_mark = corr_arena.mark()
+        var scores = corr_arena.alloc[Float32](context)
+        for t in range(context):
+            var k_data = k_cache.k_head(t, g)
+            var dot = Int32(0)
+            for d in range(HD):
+                dot += Int32(qi_ref[d]) * Int32(k_data[d])
+            scores[t] = (Float32(dot) - q_bias) * score_scale
+
+        # Softmax
+        var smax = scores[0]
+        for t in range(1, context):
+            if scores[t] > smax: smax = scores[t]
+        var exp_sum = Float32(0)
+        for t in range(context):
+            scores[t] = exp_f32[1](scores[t] - smax)
+            exp_sum += scores[t]
+        var vagg_scale = v_layer_scale / (Float32(255.0) * Float32(127.0))
+        for d in range(HD):
+            expected[h * HD + d] = Float32(0)
+        for t in range(context):
+            var w_u8 = UInt8(max(min(Int(scores[t] * 255.0 + 0.5), 255), 0))
+            var v_data = v_cache.v_head(t, g)
+            for d in range(HD):
+                var v_i8 = Int32(v_data[d])
+                expected[h * HD + d] += Float32(Int32(w_u8) * v_i8) * vagg_scale
+        for d in range(HD):
+            expected[h * HD + d] /= exp_sum
+
+        corr_arena.reset_to(scores_mark)
+
+    # Run kernel
+    decode[NH, NKV, HD](
+        DynView[QSlot](Int(q_bf16), 1),
+        k_cache, v_cache,
+        Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
+        Int(scratch), POS,
+        q_layer_scale, k_layer_scale, v_layer_scale,
+        pool_ptrs[0][],
+    ).join()
+
+    # Compare
+    var rf32 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(scratch))
+    var err_sum = Float64(0)
+    var count = 0
+    for d in range(HIDDEN):
+        var got = Float64(rf32[d])
+        var rv = Float64(expected[d])
+        var e = got - rv
+        if e < 0: e = -e
+        err_sum += e
+        count += 1
+    var avg_err = err_sum / Float64(count)
+    print("avg_err: " + String(avg_err))
+    if avg_err < 0.1:
+        print("PASS")
+    else:
+        print("FAIL")
 
     # =====================================================================
-    # Timing sweep: control vs chunked wpg=4,8
+    # Performance sweep
     # =====================================================================
-    print("\n=== Timing (hot mode, single node) ===")
-    print("  context | control | wpg=4 | wpg=8 | wpg=15")
-    print("  --------|---------|-------|-------|-------")
+    comptime HD2 = 128
+    comptime NH2 = 128
+    comptime NKV2 = 8
+    comptime HALF2 = HD2 // 2
+    comptime MAX_SEQ2 = 8192
 
-    for ci in range(4):
-        var ctx_pos = ctx_values[ci]
+    comptime LOCAL_KV2 = NKV2 // NUM_NODES
+    comptime LOCAL_NH2 = NH2 // NUM_NODES
+    comptime LOCAL_HIDDEN2 = LOCAL_NH2 * HD2
 
-        # Control
-        pool.begin_forward()
-        var best_ctrl = Int(1 << 60)
-        for trial in range(10):
+    comptime LOCAL_KVC = KVCache[MAX_SEQ2, HD2, LOCAL_KV2]
+    var local_scratch_bytes = scratch_bytes[LOCAL_NH2, LOCAL_KV2, HD2](LOCAL_KV2)
+
+    print("\n=== Performance: 128h/8kv, hd=128, " + String(NUM_NODES) + " NUMA nodes ===")
+    print("  Per node: " + String(LOCAL_NH2) + "h/" + String(LOCAL_KV2) + "kv, "
+          + String(pools[0].capacity) + " cores")
+
+    var perf_arenas = HeapMoveArray[NumaArena[]](NUM_NODES)
+    for i in range(NUM_NODES):
+        perf_arenas.push(NumaArena[](topo[i], 512 * 1024 * 1024))
+
+    var q_ptrs = InlineArray[Int, NUM_NODES](fill=0)
+    var k_bases = InlineArray[Int, NUM_NODES](fill=0)
+    var v_bases = InlineArray[Int, NUM_NODES](fill=0)
+    var cos_ptrs = InlineArray[Int, NUM_NODES](fill=0)
+    var sin_ptrs = InlineArray[Int, NUM_NODES](fill=0)
+    var scratch_ptrs = InlineArray[Int, NUM_NODES](fill=0)
+
+    comptime CS2 = Slot[F32, Replicated, MAX_SEQ2, HALF2, 1]
+    comptime SS2 = Slot[F32, Replicated, MAX_SEQ2, HALF2, 1]
+
+    var perf_q_scale = Float32(0.15)
+    var perf_k_scale = Float32(0.15)
+    var perf_v_scale = Float32(0.15)
+
+    for node in range(NUM_NODES):
+        var cos_node = perf_arenas[node].alloc[Float32](MAX_SEQ2 * HALF2)
+        var sin_node = perf_arenas[node].alloc[Float32](MAX_SEQ2 * HALF2)
+        init_rope_tables(Bound[CS2](Int(cos_node)), Bound[SS2](Int(sin_node)), Float64(100000.0))
+        cos_ptrs[node] = Int(cos_node)
+        sin_ptrs[node] = Int(sin_node)
+
+        var q_node = perf_arenas[node].alloc[Scalar[DType.bfloat16]](LOCAL_HIDDEN2)
+        for i in range(LOCAL_HIDDEN2):
+            q_node[i] = Scalar[DType.bfloat16](Float32(i % 256 - 128) / 128.0)
+        q_ptrs[node] = Int(q_node)
+
+        var kv_mem = perf_arenas[node].alloc[UInt8](2 * LOCAL_KVC.TOTAL_BYTES)
+        k_bases[node] = Int(kv_mem)
+        v_bases[node] = Int(kv_mem) + LOCAL_KVC.TOTAL_BYTES
+        var k_node = LOCAL_KVC(Int(kv_mem))
+        var v_node = LOCAL_KVC(Int(kv_mem) + LOCAL_KVC.TOTAL_BYTES)
+        var hb = perf_arenas[node].alloc[Scalar[DType.int8]](HD2)
+        for t in range(MAX_SEQ2):
+            for lg in range(LOCAL_KV2):
+                var global_g = node * LOCAL_KV2 + lg
+                for d in range(HD2):
+                    hb[d] = Scalar[DType.int8]((t * 7 + global_g * HD2 + d * 3) % 251 - 125)
+                k_node.write_k(t, lg, hb)
+                for d in range(HD2):
+                    hb[d] = Scalar[DType.int8]((t * 11 + global_g * HD2 + d * 5) % 251 - 125)
+                v_node.write_v(t, lg, hb)
+
+        scratch_ptrs[node] = Int(perf_arenas[node].alloc[UInt8](local_scratch_bytes))
+
+    comptime QS2 = Slot[BF16, Replicated, 1, LOCAL_HIDDEN2, 1]
+
+    print("\n  ctx  |  total us")
+    print("  -----|----------")
+
+    for ctx_idx in range(5):
+        var ctx_pos = 128
+        if ctx_idx == 1: ctx_pos = 512
+        if ctx_idx == 2: ctx_pos = 2048
+        if ctx_idx == 3: ctx_pos = 4096
+        if ctx_idx == 4: ctx_pos = 8000
+
+        for warmup in range(2):
+            @parameter
+            def wu[node: Int]() -> PoolFence:
+                return decode[LOCAL_NH2, LOCAL_KV2, HD2](
+                    DynView[QS2](q_ptrs[node], 1),
+                    LOCAL_KVC(k_bases[node]), LOCAL_KVC(v_bases[node]),
+                    Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
+                    scratch_ptrs[node], ctx_pos,
+                    perf_q_scale, perf_k_scale, perf_v_scale,
+                    pool_ptrs[node][],
+                )
+            parallel_for[NUM_NODES, wu]()
+
+        var best = Int(1 << 60)
+        for trial in range(5):
             var t0 = Int(perf_counter_ns())
-            decode_hot[NH, NKV, HD](
-                DynView[QSlot](Int(q_bf16), 1),
-                k_cache, v_cache,
-                Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
-                Int(scratch), ctx_pos,
-                q_scale, k_scale, v_scale, pool,
-            )
-            var e = Int(perf_counter_ns()) - t0
-            keep(scratch[0])
-            if e < best_ctrl: best_ctrl = e
-        pool.end_forward()
+            @parameter
+            def run[node: Int]() -> PoolFence:
+                return decode[LOCAL_NH2, LOCAL_KV2, HD2](
+                    DynView[QS2](q_ptrs[node], 1),
+                    LOCAL_KVC(k_bases[node]), LOCAL_KVC(v_bases[node]),
+                    Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
+                    scratch_ptrs[node], ctx_pos,
+                    perf_q_scale, perf_k_scale, perf_v_scale,
+                    pool_ptrs[node][],
+                )
+            parallel_for[NUM_NODES, run]()
+            var wall = Int(perf_counter_ns()) - t0
+            keep(UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=scratch_ptrs[0])[0])
+            if wall < best: best = wall
 
-        # wpg=4
-        pool.begin_forward()
-        var best_4 = Int(1 << 60)
-        for trial in range(10):
-            var t0 = Int(perf_counter_ns())
-            decode_chunked[NH, NKV, HD](
-                DynView[QSlot](Int(q_bf16), 1),
-                k_cache, v_cache,
-                Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
-                Int(scratch), ctx_pos,
-                q_scale, k_scale, v_scale, pool, 4,
-            ).join()
-            var e = Int(perf_counter_ns()) - t0
-            keep(scratch[0])
-            if e < best_4: best_4 = e
-        pool.end_forward()
-
-        # wpg=8
-        pool.begin_forward()
-        var best_8 = Int(1 << 60)
-        for trial in range(10):
-            var t0 = Int(perf_counter_ns())
-            decode_chunked[NH, NKV, HD](
-                DynView[QSlot](Int(q_bf16), 1),
-                k_cache, v_cache,
-                Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
-                Int(scratch), ctx_pos,
-                q_scale, k_scale, v_scale, pool, 8,
-            ).join()
-            var e = Int(perf_counter_ns()) - t0
-            keep(scratch[0])
-            if e < best_8: best_8 = e
-        pool.end_forward()
-
-        # wpg=15 (full pool utilization: 15 * 2 KV heads = 30 jobs)
-        pool.begin_forward()
-        var best_15 = Int(1 << 60)
-        for trial in range(10):
-            var t0 = Int(perf_counter_ns())
-            decode_chunked[NH, NKV, HD](
-                DynView[QSlot](Int(q_bf16), 1),
-                k_cache, v_cache,
-                Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
-                Int(scratch), ctx_pos,
-                q_scale, k_scale, v_scale, pool, 15,
-            ).join()
-            var e = Int(perf_counter_ns()) - t0
-            keep(scratch[0])
-            if e < best_15: best_15 = e
-        pool.end_forward()
-
-        print("  " + String(ctx_pos)
-              + " | " + String(best_ctrl // 1000)
-              + " | " + String(best_4 // 1000)
-              + " | " + String(best_8 // 1000)
-              + " | " + String(best_15 // 1000))
-
-    # =====================================================================
-    # Detailed profiles at 4k and 16k
-    # =====================================================================
-    for ci in range(2):
-        var ctx_pos = 4096
-        if ci == 1: ctx_pos = 16384
-
-        print("\n=== Profile at ctx=" + String(ctx_pos) + " ===")
-
-        # Control profile
-        pool.begin_forward()
-        decode_hot[NH, NKV, HD](
-            DynView[QSlot](Int(q_bf16), 1),
-            k_cache, v_cache,
-            Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
-            Int(scratch), ctx_pos,
-            q_scale, k_scale, v_scale, pool,
-        )
-        pool.end_forward()
-
-        print("control (wpg=1):")
-        var ctrl_agg = ProfileAggregator()
-        control_collect_profiles[NH, NKV, HD](Int(scratch), ctrl_agg)
-        ctrl_agg.print_summary()
-
-        # Chunked wpg=8 profile
-        pool.begin_forward()
-        decode_chunked[NH, NKV, HD](
-            DynView[QSlot](Int(q_bf16), 1),
-            k_cache, v_cache,
-            Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
-            Int(scratch), ctx_pos,
-            q_scale, k_scale, v_scale, pool, 8,
-        ).join()
-        pool.end_forward()
-
-        print("chunked wpg=8 caller:")
-        chunk_read_caller[NH, NKV, HD](Int(scratch), cap, 8).print_summary()
-        print("chunked wpg=8 workers:")
-        var chunk_agg8 = ProfileAggregator()
-        chunk_collect_profiles[NH, NKV, HD](Int(scratch), cap, chunk_agg8, 8)
-        chunk_agg8.print_summary()
-
-        # Chunked wpg=15 profile
-        pool.begin_forward()
-        decode_chunked[NH, NKV, HD](
-            DynView[QSlot](Int(q_bf16), 1),
-            k_cache, v_cache,
-            Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
-            Int(scratch), ctx_pos,
-            q_scale, k_scale, v_scale, pool, 15,
-        ).join()
-        pool.end_forward()
-
-        print("chunked wpg=15 caller:")
-        chunk_read_caller[NH, NKV, HD](Int(scratch), cap, 15).print_summary()
-        print("chunked wpg=15 workers:")
-        var chunk_agg15 = ProfileAggregator()
-        chunk_collect_profiles[NH, NKV, HD](Int(scratch), cap, chunk_agg15, 15)
-        chunk_agg15.print_summary()
+        var total_us = best // 1000
+        print("  " + String(ctx_pos) + " | " + String(total_us))
