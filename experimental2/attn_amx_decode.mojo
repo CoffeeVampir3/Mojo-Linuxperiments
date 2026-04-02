@@ -1,8 +1,11 @@
-"""AMX decode attention — 1-3-3 tile layout, specialized for SL=1.
+"""AMX decode attention — 1-3-3 tile layout, VNNI-primary K cache.
 
 Uses TMM0(A) × TMM1-3(B) → TMM4-6(C) for decode where gqa_factor ≤ 16
-fits exactly in one A tile. Processes 3 N-tiles per A load — 50% more
-throughput vs the 2-2-4 layout which wastes the second A tile.
+fits exactly in one A tile. Processes 3 N-tiles per A load.
+
+K cache is stored natively in VNNI tile format — no runtime transpose.
+V cache is row-major, packed into VNNI per-block (position-outer for
+cache locality).
 
 Score:  Q_i8 × K_u8_vnni → i32      (tdpbsud, signed Q × unsigned K)
 V-agg: W_u8 × V_i8_vnni → i32      (tdpbusd, unsigned W × signed V)
@@ -19,7 +22,6 @@ from modeling.model_spec import (
 )
 from kernels.kernel_ops import PoolFence
 from simd_math import sqrt
-from simd_math.matrixops import transpose_rows
 from experimental2.kv_cache import KVCache
 from experimental2.helpers import AttnCtx, pack_v_tile_vnni, amx_gemm_1x3, prep_q_row, softmax_row
 from experimental2.kernel_profile import KernelProfile, tap, ProfileAggregator
@@ -31,18 +33,18 @@ from experimental.amx import (
 
 
 comptime BLOCK_N = 512
-# Score buffer width padded to multiple of 3 tiles for 1-3-3 grouping
 comptime SCORE_N = ((BLOCK_N // TILE_N + 2) // 3) * 3 * TILE_N  # 528
 comptime N_STEP_133 = 3 * TILE_N  # 48
 
 
 # ============================================================================
-# Per-worker scratch — typed pointers produced by caller
+# Per-worker scratch
 # ============================================================================
 
 @fieldwise_init
 struct DecodeWorkerScratch:
     var group: Int
+    var k_vnni_head: UnsafePointer[UInt8, MutAnyOrigin]
     var qi_buf: UnsafePointer[Int8, MutAnyOrigin]
     var qi_biases: UnsafePointer[Float32, MutAnyOrigin]
     var running_o: UnsafePointer[Float32, MutAnyOrigin]
@@ -50,7 +52,6 @@ struct DecodeWorkerScratch:
     var running_l: UnsafePointer[Float32, MutAnyOrigin]
     var score_i32: UnsafePointer[Int32, MutAnyOrigin]
     var w_u8_buf: UnsafePointer[UInt8, MutAnyOrigin]
-    var k_vnni: UnsafePointer[UInt8, MutAnyOrigin]
     var v_vnni: UnsafePointer[Int8, MutAnyOrigin]
     var profile: UnsafePointer[KernelProfile, MutAnyOrigin]
 
@@ -62,8 +63,6 @@ struct DecodeWorkerScratch:
 def per_worker_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int]() -> Int:
     comptime gqa_factor = num_heads // num_kv_heads
     comptime padded_q = ((gqa_factor + TILE_M - 1) // TILE_M) * TILE_M
-    comptime k_slices = head_dim // K_STEP
-    comptime k_n_tiles_padded = ((BLOCK_N // TILE_N + 2) // 3) * 3
     comptime v_k_tiles = BLOCK_N // K_STEP
     comptime hd_n_padded = ((head_dim // TILE_N + 2) // 3) * 3
     return (
@@ -72,10 +71,9 @@ def per_worker_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int]() -> Int:
         + gqa_factor * size_of[Float32]()                # qi_biases
         + padded_q * head_dim * size_of[Float32]()       # running_o f32
         + padded_q * size_of[Float32]() * 2              # running_m, running_l
-        + padded_q * SCORE_N * size_of[Int32]()          # score_i32 (wider for 1-3-3)
+        + padded_q * SCORE_N * size_of[Int32]()          # score_i32
         + padded_q * BLOCK_N                             # w_u8_buf u8
-        + k_n_tiles_padded * k_slices * TILE_BYTES       # k_vnni (individual tiles)
-        + hd_n_padded * v_k_tiles * TILE_BYTES           # v_vnni (padded for triple groups)
+        + hd_n_padded * v_k_tiles * TILE_BYTES           # v_vnni
         + size_of[KernelProfile]()                       # profile
     )
 
@@ -89,7 +87,7 @@ def scratch_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int](
 
 
 # ============================================================================
-# Kernel — 1-3-3 tile layout, one worker per KV group
+# Kernel — 1-3-3 layout, VNNI-primary K, one worker per KV group
 # ============================================================================
 
 def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
@@ -108,7 +106,7 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
     comptime K_TILE_K_BYTES = k_slices * TILE_BYTES
     comptime padded_q = ((gqa_factor + TILE_M - 1) // TILE_M) * TILE_M
     comptime m_iters = padded_q // TILE_M
-    comptime HEAD_STRIDE = max_seq * head_dim
+    comptime V_HEAD_STRIDE = max_seq * head_dim
 
     var pos = ctx[].pos
     var score_scale = ctx[].score_scale
@@ -129,11 +127,10 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
     var running_l = ws[].running_l
     var score_i32 = ws[].score_i32
     var w_u8_buf = ws[].w_u8_buf
-    var k_vnni = ws[].k_vnni
+    var k_vnni_head = ws[].k_vnni_head
     var v_vnni = ws[].v_vnni
 
-    var k_base = ctx[].k_base + g * HEAD_STRIDE
-    var v_base = ctx[].v_base + g * HEAD_STRIDE
+    var v_base = ctx[].v_base + g * V_HEAD_STRIDE
 
     # =================================================================
     # Q prep — RoPE → FWHT → quantize (gqa_factor rows, all at pos)
@@ -172,7 +169,7 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
     var vagg_arr = InlineArray[Int32, TILE_M * N_STEP_133](fill=Int32(0))
     var vagg_i32 = UnsafePointer(to=vagg_arr).bitcast[Int32]()
 
-    var ns_k_pack = 0
+    var ns_k_read = 0
     var ns_v_pack = 0
     var ns_score = 0
     var ns_softmax = 0
@@ -187,59 +184,36 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
         var chunk_k_iters = padded_chunk // K_STEP
         var n_tiles = (block_len + TILE_N - 1) // TILE_N
         var n_groups = (n_tiles + 2) // 3
-        var n_padded = n_groups * 3
+        var block_tile_off = (block_start // TILE_N) * K_TILE_K_BYTES
 
         var tb0 = tap()
 
-        # --- Pack K (individual tiles for 1-3-3 grouping) ---
-        for nt in range(n_tiles):
-            var k_tile_base = k_vnni + nt * K_TILE_K_BYTES
-            var n_off = block_start + nt * TILE_N
-            var n_cols = max(0, min(TILE_N, block_len - nt * TILE_N))
-            for ki in range(k_slices):
-                var k_off = ki * K_STEP
-                var k_rows = InlineArray[SIMD[DType.uint32, TILE_N], TILE_N](
-                    fill=SIMD[DType.uint32, TILE_N](0))
-                for col in range(n_cols):
-                    k_rows[col] = (k_base + (n_off + col) * head_dim + k_off).bitcast[UInt32]().load[width=TILE_N]()
-                transpose_rows[DType.uint32, TILE_N](
-                    k_rows,
-                    (k_tile_base + ki * TILE_BYTES).bitcast[UInt32](),
-                    TILE_N)
-        # Zero padding K tiles for complete triple groups
-        comptime u8w = simd_width_of[DType.uint8]()
-        comptime u8zeros = SIMD[DType.uint8, u8w](0)
-        for nt in range(n_tiles, n_padded):
-            var p = (k_vnni + nt * K_TILE_K_BYTES).bitcast[UInt8]()
-            var bi = 0
-            while bi + u8w <= K_TILE_K_BYTES:
-                (p + bi).store(u8zeros)
-                bi += u8w
+        # --- K: read directly from VNNI-primary cache (no packing) ---
 
         var tb1 = tap()
 
-        # --- Pack V (with padding tile for triple groups) ---
-        for nt in range(hd_n_tiles):
-            for kt in range(chunk_k_iters):
+        # --- Pack V (K-outer for cache locality on position rows) ---
+        for kt in range(chunk_k_iters):
+            var kt_n_pos = min(K_STEP, block_len - kt * K_STEP)
+            var kt_pos_off = block_start + kt * K_STEP
+            for nt in range(hd_n_tiles):
                 pack_v_tile_vnni(v_base, head_dim,
-                    block_start + kt * K_STEP, nt * TILE_N,
-                    min(K_STEP, block_len - kt * K_STEP),
+                    kt_pos_off, nt * TILE_N,
+                    kt_n_pos,
                     v_vnni + (nt * chunk_k_iters + kt) * TILE_BYTES)
-        # Zero padding V tiles
-        for nt in range(hd_n_tiles, hd_n_padded):
-            for kt in range(chunk_k_iters):
+            for nt in range(hd_n_tiles, hd_n_padded):
                 pack_v_tile_vnni(v_base, head_dim,
-                    block_start + kt * K_STEP, 0, 0,
+                    kt_pos_off, 0, 0,
                     v_vnni + (nt * chunk_k_iters + kt) * TILE_BYTES)
 
         var tb2 = tap()
 
-        # --- Score GEMM: i8 Q × u8 K → i32 (1-3-3 triple groups) ---
+        # --- Score GEMM: i8 Q × u8 K_vnni → i32 (1-3-3 triple groups) ---
         for ng in range(n_groups):
             var nt_base = ng * 3
-            var b0 = k_vnni + nt_base * K_TILE_K_BYTES
-            var b1 = k_vnni + (nt_base + 1) * K_TILE_K_BYTES
-            var b2 = k_vnni + (nt_base + 2) * K_TILE_K_BYTES
+            var b0 = k_vnni_head + block_tile_off + nt_base * K_TILE_K_BYTES
+            var b1 = k_vnni_head + block_tile_off + (nt_base + 1) * K_TILE_K_BYTES
+            var b2 = k_vnni_head + block_tile_off + (nt_base + 2) * K_TILE_K_BYTES
             for mi in range(m_iters):
                 amx_gemm_1x3[DType.int8, DType.uint8, SCORE_N](
                     qi_buf + mi * TILE_M * head_dim,
@@ -291,7 +265,7 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
 
         var tb5 = tap()
 
-        ns_k_pack += tb1 - tb0
+        ns_k_read += tb1 - tb0
         ns_v_pack += tb2 - tb1
         ns_score += tb3 - tb2
         ns_softmax += tb4 - tb3
@@ -312,12 +286,11 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
             d += width
     var t_fn1 = tap()
 
-    # Write profile
     var prof = ws[].profile
     prof[].amx_config = t1 - t0
     prof[].q_prep = t2 - t1
     prof[].running_init = t3 - t2
-    prof[].k_pack = ns_k_pack
+    prof[].k_pack = ns_k_read
     prof[].v_pack = ns_v_pack
     prof[].score_gemm = ns_score
     prof[].softmax = ns_softmax
@@ -334,7 +307,6 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
 def collect_profiles[num_heads: Int, num_kv_heads: Int, head_dim: Int](
     scratch: Int,
 ) -> ProfileAggregator:
-    """Read per-worker profiles from scratch and aggregate."""
     comptime q_cols = num_heads * head_dim
     comptime pw = per_worker_bytes[num_heads, num_kv_heads, head_dim]()
     comptime WORKERS_OFF = q_cols * size_of[Float32]()
@@ -366,24 +338,26 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     v_layer_scale: Float32,
     mut pool: BurstPool[],
 ) -> PoolFence:
-    """Async AMX decode — 1-3-3 layout, SL=1, one worker per KV group."""
+    """Async AMX decode — 1-3-3 layout, VNNI-primary K, one worker per KV group."""
     comptime gqa_factor = num_heads // num_kv_heads
     comptime q_cols = QT.COLS
     comptime pw = per_worker_bytes[num_heads, num_kv_heads, head_dim]()
     comptime padded_q = ((gqa_factor + TILE_M - 1) // TILE_M) * TILE_M
     comptime WORKERS_OFF = q_cols * size_of[Float32]()
     comptime k_slices = head_dim // K_STEP
-    comptime k_n_tiles_padded = ((BLOCK_N // TILE_N + 2) // 3) * 3
-    comptime v_k_tiles = BLOCK_N // K_STEP
+    comptime tile_k_bytes = k_slices * TILE_BYTES
+    comptime max_tiles = (max_seq + TILE_N - 1) // TILE_N
+    comptime k_head_stride = max_tiles * tile_k_bytes
     comptime hd_n_padded = ((head_dim // TILE_N + 2) // 3) * 3
+    comptime v_k_tiles = BLOCK_N // K_STEP
     var inv_sqrt_hd = Float32(1.0 / Float64(sqrt[DType.float32, 1](Float32(head_dim))))
 
     var ctx = AttnCtx(
         UnsafePointer[BFloat16, MutAnyOrigin](unsafe_from_address=q.ptr),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cos_table.ptr),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=sin_table.ptr),
-        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=k_cache.data_base),
-        UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=v_cache.data_base),
+        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=k_cache.k_base),
+        UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=v_cache.v_base),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=scratch),
         Float32(127.0) / q_layer_scale,
         q_layer_scale * k_layer_scale * inv_sqrt_hd / (Float32(127.0) * Float32(127.0)),
@@ -399,6 +373,8 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
         var data = ws_base + size_of[DecodeWorkerScratch]()
         var off = 0
         ws[].group = g
+        ws[].k_vnni_head = UnsafePointer[UInt8, MutAnyOrigin](
+            unsafe_from_address=k_cache.k_base + g * k_head_stride)
         ws[].qi_buf = UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=data + off)
         off += padded_q * head_dim
         ws[].qi_biases = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
@@ -413,8 +389,6 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
         off += padded_q * SCORE_N * size_of[Int32]()
         ws[].w_u8_buf = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=data + off)
         off += padded_q * BLOCK_N
-        ws[].k_vnni = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=data + off)
-        off += k_n_tiles_padded * k_slices * TILE_BYTES
         ws[].v_vnni = UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=data + off)
         off += hd_n_padded * v_k_tiles * TILE_BYTES
         ws[].profile = UnsafePointer[KernelProfile, MutAnyOrigin](unsafe_from_address=data + off)

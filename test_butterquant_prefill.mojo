@@ -80,9 +80,8 @@ def main():
     var corr_scratch_bytes = scratch_bytes[NH, NKV, HD, SL](pools[0].capacity)
 
     var q_bf16 = corr_arena.alloc[Scalar[DType.bfloat16]](SL * HIDDEN)
-    var kv_mem = corr_arena.alloc[UInt8](2 * KVC.TOTAL_BYTES)
-    var k_cache = KVC(Int(kv_mem))
-    var v_cache = KVC(Int(kv_mem) + KVC.TOTAL_BYTES)
+    var kv_mem = corr_arena.alloc[UInt8](KVC.TOTAL_BYTES)
+    var kv_cache = KVC(Int(kv_mem))
     var qi_out = corr_arena.alloc[Scalar[DType.int8]](SL * HIDDEN)
     var sc_out = corr_arena.alloc[Float32](SL)
     var cos_tab = corr_arena.alloc[Float32](MAX_SEQ * HALF)
@@ -104,11 +103,11 @@ def main():
             for d in range(HD):
                 var val = Float32((t * 7 + g * 13 + d * 3) % 251 - 125) / 125.0
                 head_buf[d] = Scalar[DType.int8](Int8(max(min(Int(val * 127.0), 127), -128)))
-            k_cache.write_k(t, g, head_buf)
+            kv_cache.write_k(t, g, head_buf)
             for d in range(HD):
                 var val = Float32((t * 11 + g * 17 + d * 5) % 251 - 125) / 125.0
                 head_buf[d] = Scalar[DType.int8](Int8(max(min(Int(val * 127.0), 127), -128)))
-            v_cache.write_v(t, g, head_buf)
+            kv_cache.write_v(t, g, head_buf)
 
     comptime CosSlot = Slot[F32, Replicated, MAX_SEQ, HALF, 1]
     comptime SinSlot = Slot[F32, Replicated, MAX_SEQ, HALF, 1]
@@ -150,10 +149,12 @@ def main():
             var scores_mark = corr_arena.mark()
             var scores = corr_arena.alloc[Float32](context)
             for t in range(context):
-                var k_data = k_cache.k_head(t, g)
                 var dot = Int32(0)
                 for d in range(HD):
-                    dot += Int32(qi_ref[d]) * Int32(k_data[d])
+                    var val = Float32((t * 7 + g * 13 + d * 3) % 251 - 125) / 125.0
+                    var ki8 = Int8(max(min(Int(val * 127.0), 127), -128))
+                    var ku8 = UInt8(Int(ki8) + 128)
+                    dot += Int32(qi_ref[d]) * Int32(ku8)
                 scores[t] = (Float32(dot) - q_bias) * score_scale
 
             # Softmax
@@ -169,7 +170,7 @@ def main():
                 expected[m * HIDDEN + h * HD + d] = Float32(0)
             for t in range(context):
                 var w_u8 = UInt8(max(min(Int(scores[t] * 255.0 + 0.5), 255), 0))
-                var v_data = v_cache.v_head(t, g)
+                var v_data = kv_cache.v_head(t, g)
                 for d in range(HD):
                     var v_i8 = Int32(v_data[d])
                     expected[m * HIDDEN + h * HD + d] += Float32(Int32(w_u8) * v_i8) * vagg_scale
@@ -181,7 +182,7 @@ def main():
     # Run kernel
     prefill[NH, NKV, HD](
         DynView[QSlot](Int(q_bf16), SL),
-        k_cache, v_cache,
+        kv_cache, kv_cache,
         Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
         Int(scratch), POS,
         q_layer_scale, k_layer_scale, v_layer_scale,
@@ -258,11 +259,11 @@ def main():
             q_node[i] = Scalar[DType.bfloat16](Float32(i % 256 - 128) / 128.0)
         q_ptrs[node] = Int(q_node)
 
-        var kv_mem = perf_arenas[node].alloc[UInt8](2 * LOCAL_KVC.TOTAL_BYTES)
+        var kv_mem = perf_arenas[node].alloc[UInt8](LOCAL_KVC.TOTAL_BYTES)
         k_bases[node] = Int(kv_mem)
-        v_bases[node] = Int(kv_mem) + LOCAL_KVC.TOTAL_BYTES
+        v_bases[node] = Int(kv_mem)
         var k_node = LOCAL_KVC(Int(kv_mem))
-        var v_node = LOCAL_KVC(Int(kv_mem) + LOCAL_KVC.TOTAL_BYTES)
+        var v_node = LOCAL_KVC(Int(kv_mem))
         var hb = perf_arenas[node].alloc[Scalar[DType.int8]](HD2)
         for t in range(MAX_SEQ2):
             for lg in range(LOCAL_KV2):

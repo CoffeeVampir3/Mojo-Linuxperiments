@@ -77,9 +77,8 @@ def main():
     var corr_scratch_bytes = scratch_bytes[NH, NKV, HD](NKV)
 
     var q_bf16 = corr_arena.alloc[Scalar[DType.bfloat16]](HIDDEN)
-    var kv_mem = corr_arena.alloc[UInt8](2 * KVC.TOTAL_BYTES)
-    var k_cache = KVC(Int(kv_mem))
-    var v_cache = KVC(Int(kv_mem) + KVC.TOTAL_BYTES)
+    var kv_mem = corr_arena.alloc[UInt8](KVC.TOTAL_BYTES)
+    var kv_cache = KVC(Int(kv_mem))
     var cos_tab = corr_arena.alloc[Float32](MAX_SEQ * HALF)
     var sin_tab = corr_arena.alloc[Float32](MAX_SEQ * HALF)
     var scratch = corr_arena.alloc[UInt8](corr_scratch_bytes)
@@ -97,11 +96,11 @@ def main():
             for d in range(HD):
                 var val = Float32((t * 7 + g * 13 + d * 3) % 251 - 125) / 125.0
                 head_buf[d] = Scalar[DType.int8](Int8(max(min(Int(val * 127.0), 127), -128)))
-            k_cache.write_k(t, g, head_buf)
+            kv_cache.write_k(t, g, head_buf)
             for d in range(HD):
                 var val = Float32((t * 11 + g * 17 + d * 5) % 251 - 125) / 125.0
                 head_buf[d] = Scalar[DType.int8](Int8(max(min(Int(val * 127.0), 127), -128)))
-            v_cache.write_v(t, g, head_buf)
+            kv_cache.write_v(t, g, head_buf)
 
     comptime CosSlot = Slot[F32, Replicated, MAX_SEQ, HALF, 1]
     comptime SinSlot = Slot[F32, Replicated, MAX_SEQ, HALF, 1]
@@ -137,14 +136,16 @@ def main():
         var q_bias = Float32(128 * q_sum)
         var score_scale = q_layer_scale * k_layer_scale * inv_sqrt_hd / (Float32(127.0) * Float32(127.0))
 
-        # Score against K cache
+        # Score against K (recompute u8 from test data formula)
         var scores_mark = corr_arena.mark()
         var scores = corr_arena.alloc[Float32](context)
         for t in range(context):
-            var k_data = k_cache.k_head(t, g)
             var dot = Int32(0)
             for d in range(HD):
-                dot += Int32(qi_ref[d]) * Int32(k_data[d])
+                var val = Float32((t * 7 + g * 13 + d * 3) % 251 - 125) / 125.0
+                var ki8 = Int8(max(min(Int(val * 127.0), 127), -128))
+                var ku8 = UInt8(Int(ki8) + 128)  # XOR 0x80
+                dot += Int32(qi_ref[d]) * Int32(ku8)
             scores[t] = (Float32(dot) - q_bias) * score_scale
 
         # Softmax
@@ -160,7 +161,7 @@ def main():
             expected[h * HD + d] = Float32(0)
         for t in range(context):
             var w_u8 = UInt8(max(min(Int(scores[t] * 255.0 + 0.5), 255), 0))
-            var v_data = v_cache.v_head(t, g)
+            var v_data = kv_cache.v_head(t, g)
             for d in range(HD):
                 var v_i8 = Int32(v_data[d])
                 expected[h * HD + d] += Float32(Int32(w_u8) * v_i8) * vagg_scale
@@ -172,7 +173,7 @@ def main():
     # Run kernel
     decode[NH, NKV, HD](
         DynView[QSlot](Int(q_bf16), 1),
-        k_cache, v_cache,
+        kv_cache, kv_cache,
         Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
         Int(scratch), POS,
         q_layer_scale, k_layer_scale, v_layer_scale,
@@ -204,7 +205,7 @@ def main():
     comptime NH2 = 128
     comptime NKV2 = 8
     comptime HALF2 = HD2 // 2
-    comptime MAX_SEQ2 = 8192
+    comptime MAX_SEQ2 = 33000
 
     comptime LOCAL_KV2 = NKV2 // NUM_NODES
     comptime LOCAL_NH2 = NH2 // NUM_NODES
@@ -219,11 +220,10 @@ def main():
 
     var perf_arenas = HeapMoveArray[NumaArena[]](NUM_NODES)
     for i in range(NUM_NODES):
-        perf_arenas.push(NumaArena[](topo[i], 512 * 1024 * 1024))
+        perf_arenas.push(NumaArena[](topo[i], 1024 * 1024 * 1024))
 
     var q_ptrs = InlineArray[Int, NUM_NODES](fill=0)
-    var k_bases = InlineArray[Int, NUM_NODES](fill=0)
-    var v_bases = InlineArray[Int, NUM_NODES](fill=0)
+    var kv_bases = InlineArray[Int, NUM_NODES](fill=0)
     var cos_ptrs = InlineArray[Int, NUM_NODES](fill=0)
     var sin_ptrs = InlineArray[Int, NUM_NODES](fill=0)
     var scratch_ptrs = InlineArray[Int, NUM_NODES](fill=0)
@@ -247,21 +247,19 @@ def main():
             q_node[i] = Scalar[DType.bfloat16](Float32(i % 256 - 128) / 128.0)
         q_ptrs[node] = Int(q_node)
 
-        var kv_mem = perf_arenas[node].alloc[UInt8](2 * LOCAL_KVC.TOTAL_BYTES)
-        k_bases[node] = Int(kv_mem)
-        v_bases[node] = Int(kv_mem) + LOCAL_KVC.TOTAL_BYTES
-        var k_node = LOCAL_KVC(Int(kv_mem))
-        var v_node = LOCAL_KVC(Int(kv_mem) + LOCAL_KVC.TOTAL_BYTES)
+        var kv_mem = perf_arenas[node].alloc[UInt8](LOCAL_KVC.TOTAL_BYTES)
+        kv_bases[node] = Int(kv_mem)
+        var kv_node = LOCAL_KVC(Int(kv_mem))
         var hb = perf_arenas[node].alloc[Scalar[DType.int8]](HD2)
         for t in range(MAX_SEQ2):
             for lg in range(LOCAL_KV2):
                 var global_g = node * LOCAL_KV2 + lg
                 for d in range(HD2):
                     hb[d] = Scalar[DType.int8]((t * 7 + global_g * HD2 + d * 3) % 251 - 125)
-                k_node.write_k(t, lg, hb)
+                kv_node.write_k(t, lg, hb)
                 for d in range(HD2):
                     hb[d] = Scalar[DType.int8]((t * 11 + global_g * HD2 + d * 5) % 251 - 125)
-                v_node.write_v(t, lg, hb)
+                kv_node.write_v(t, lg, hb)
 
         scratch_ptrs[node] = Int(perf_arenas[node].alloc[UInt8](local_scratch_bytes))
 
@@ -276,7 +274,7 @@ def main():
     for warmup in range(5):
         decode[LOCAL_NH2, LOCAL_KV2, HD2](
             DynView[QS2](q_ptrs[0], 1),
-            LOCAL_KVC(k_bases[0]), LOCAL_KVC(v_bases[0]),
+            LOCAL_KVC(kv_bases[0]), LOCAL_KVC(kv_bases[0]),
             Bound[CS2](cos_ptrs[0]), Bound[SS2](sin_ptrs[0]),
             scratch_ptrs[0], 0,
             perf_q_scale, perf_k_scale, perf_v_scale,
@@ -288,7 +286,7 @@ def main():
         var t0 = Int(perf_counter_ns())
         decode[LOCAL_NH2, LOCAL_KV2, HD2](
             DynView[QS2](q_ptrs[0], 1),
-            LOCAL_KVC(k_bases[0]), LOCAL_KVC(v_bases[0]),
+            LOCAL_KVC(kv_bases[0]), LOCAL_KVC(kv_bases[0]),
             Bound[CS2](cos_ptrs[0]), Bound[SS2](sin_ptrs[0]),
             scratch_ptrs[0], 0,
             perf_q_scale, perf_k_scale, perf_v_scale,
@@ -306,7 +304,7 @@ def main():
         def wu_oh[node: Int]() -> PoolFence:
             return decode[LOCAL_NH2, LOCAL_KV2, HD2](
                 DynView[QS2](q_ptrs[node], 1),
-                LOCAL_KVC(k_bases[node]), LOCAL_KVC(v_bases[node]),
+                LOCAL_KVC(kv_bases[node]), LOCAL_KVC(kv_bases[node]),
                 Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
                 scratch_ptrs[node], 0,
                 perf_q_scale, perf_k_scale, perf_v_scale,
@@ -320,7 +318,7 @@ def main():
         def run_oh[node: Int]() -> PoolFence:
             return decode[LOCAL_NH2, LOCAL_KV2, HD2](
                 DynView[QS2](q_ptrs[node], 1),
-                LOCAL_KVC(k_bases[node]), LOCAL_KVC(v_bases[node]),
+                LOCAL_KVC(kv_bases[node]), LOCAL_KVC(kv_bases[node]),
                 Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
                 scratch_ptrs[node], 0,
                 perf_q_scale, perf_k_scale, perf_v_scale,
@@ -343,7 +341,7 @@ def main():
     var oh32_q = perf_arenas[0].alloc[Scalar[DType.bfloat16]](OH_HIDDEN)
     for i in range(OH_HIDDEN):
         oh32_q[i] = Scalar[DType.bfloat16](Float32(i % 256 - 128) / 128.0)
-    var oh32_kv = perf_arenas[0].alloc[UInt8](2 * OH_KVC.TOTAL_BYTES)
+    var oh32_kv = perf_arenas[0].alloc[UInt8](OH_KVC.TOTAL_BYTES)
     comptime OH_QS = Slot[BF16, Replicated, 1, OH_HIDDEN, 1]
     comptime OH_HALF = OH_HD // 2
     comptime OH_CS = Slot[F32, Replicated, MAX_SEQ2, OH_HALF, 1]
@@ -352,7 +350,7 @@ def main():
     for warmup in range(5):
         decode[OH_NH, OH_NKV, OH_HD](
             DynView[OH_QS](Int(oh32_q), 1),
-            OH_KVC(Int(oh32_kv)), OH_KVC(Int(oh32_kv) + OH_KVC.TOTAL_BYTES),
+            OH_KVC(Int(oh32_kv)), OH_KVC(Int(oh32_kv)),
             Bound[OH_CS](cos_ptrs[0]), Bound[OH_SS](sin_ptrs[0]),
             Int(oh32_scratch), 0,
             perf_q_scale, perf_k_scale, perf_v_scale,
@@ -363,7 +361,7 @@ def main():
         var t0 = Int(perf_counter_ns())
         decode[OH_NH, OH_NKV, OH_HD](
             DynView[OH_QS](Int(oh32_q), 1),
-            OH_KVC(Int(oh32_kv)), OH_KVC(Int(oh32_kv) + OH_KVC.TOTAL_BYTES),
+            OH_KVC(Int(oh32_kv)), OH_KVC(Int(oh32_kv)),
             Bound[OH_CS](cos_ptrs[0]), Bound[OH_SS](sin_ptrs[0]),
             Int(oh32_scratch), 0,
             perf_q_scale, perf_k_scale, perf_v_scale,
@@ -376,19 +374,21 @@ def main():
     # -----------------------------------------------------------------
     # Main performance sweep
     # -----------------------------------------------------------------
-    for ctx_idx in range(5):
+    for ctx_idx in range(7):
         var ctx_pos = 128
         if ctx_idx == 1: ctx_pos = 512
         if ctx_idx == 2: ctx_pos = 2048
         if ctx_idx == 3: ctx_pos = 4096
         if ctx_idx == 4: ctx_pos = 8000
+        if ctx_idx == 5: ctx_pos = 16000
+        if ctx_idx == 6: ctx_pos = 32000
 
         for warmup in range(2):
             @parameter
             def wu[node: Int]() -> PoolFence:
                 return decode[LOCAL_NH2, LOCAL_KV2, HD2](
                     DynView[QS2](q_ptrs[node], 1),
-                    LOCAL_KVC(k_bases[node]), LOCAL_KVC(v_bases[node]),
+                    LOCAL_KVC(kv_bases[node]), LOCAL_KVC(kv_bases[node]),
                     Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
                     scratch_ptrs[node], ctx_pos,
                     perf_q_scale, perf_k_scale, perf_v_scale,
@@ -403,7 +403,7 @@ def main():
             def run[node: Int]() -> PoolFence:
                 return decode[LOCAL_NH2, LOCAL_KV2, HD2](
                     DynView[QS2](q_ptrs[node], 1),
-                    LOCAL_KVC(k_bases[node]), LOCAL_KVC(v_bases[node]),
+                    LOCAL_KVC(kv_bases[node]), LOCAL_KVC(kv_bases[node]),
                     Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
                     scratch_ptrs[node], ctx_pos,
                     perf_q_scale, perf_k_scale, perf_v_scale,

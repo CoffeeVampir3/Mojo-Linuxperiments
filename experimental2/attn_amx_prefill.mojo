@@ -25,7 +25,6 @@ from modeling.model_spec import (
 )
 from kernels.kernel_ops import PoolFence
 from simd_math import sqrt
-from simd_math.matrixops import transpose_rows
 from experimental2.kv_cache import KVCache
 from experimental2.helpers import AttnCtx, pack_v_tile_vnni, amx_gemm_2x2, prep_q_row, softmax_row
 from experimental.amx import (
@@ -106,9 +105,10 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
     comptime q_cols = num_heads * head_dim
     comptime hd_n_tiles = head_dim // TILE_N
     comptime k_slices = head_dim // K_STEP
-    comptime K_PAIR_BYTES = k_slices * 2 * TILE_BYTES
-
-    comptime HEAD_STRIDE = max_seq * head_dim
+    comptime K_TILE_K_BYTES = k_slices * TILE_BYTES
+    comptime MAX_TILES = (max_seq + TILE_N - 1) // TILE_N
+    comptime K_HEAD_STRIDE = MAX_TILES * K_TILE_K_BYTES
+    comptime V_HEAD_STRIDE = max_seq * head_dim
 
     var seq_len = ctx[].seq_len
     var pos = ctx[].pos
@@ -135,8 +135,8 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
     var k_vnni = ws[].k_vnni
     var v_vnni = ws[].v_vnni
 
-    var k_base = ctx[].k_base + g * HEAD_STRIDE
-    var v_base = ctx[].v_base + g * HEAD_STRIDE
+    var k_vnni_head = ctx[].k_base + g * K_HEAD_STRIDE
+    var v_base = ctx[].v_base + g * V_HEAD_STRIDE
 
     # =================================================================
     # Q prep — fused RoPE → FWHT → quantize
@@ -184,22 +184,8 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
         var chunk_k_iters = padded_chunk // K_STEP
         var n_tiles = (block_len + TILE_N - 1) // TILE_N
 
-        # --- Pack K (all N-tile pairs) ---
-        for nt in range(0, n_tiles, 2):
-            var k_pair_base = k_vnni + (nt // 2) * K_PAIR_BYTES
-            var n_off = block_start + nt * TILE_N
-            for ki in range(k_slices):
-                var k_off = ki * K_STEP
-                for ti in range(2):
-                    var n_cols = max(0, min(TILE_N, block_len - (nt + ti) * TILE_N))
-                    var k_rows = InlineArray[SIMD[DType.uint32, TILE_N], TILE_N](
-                        fill=SIMD[DType.uint32, TILE_N](0))
-                    for col in range(n_cols):
-                        k_rows[col] = (k_base + (n_off + ti * TILE_N + col) * head_dim + k_off).bitcast[UInt32]().load[width=TILE_N]()
-                    transpose_rows[DType.uint32, TILE_N](
-                        k_rows,
-                        (k_pair_base + ki * 2 * TILE_BYTES + ti * TILE_BYTES).bitcast[UInt32](),
-                        TILE_N)
+        # --- K: read directly from VNNI-primary cache (no packing) ---
+        var block_tile_base = (block_start // TILE_N) * K_TILE_K_BYTES
 
         # --- Pack V (i8 → VNNI interleave) ---
         for nt in range(hd_n_tiles):
@@ -214,17 +200,18 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
             var qb_len = min(Q_BATCH, my_q_rows - qb_start)
             var qb_m_iters = (qb_len + M_STEP - 1) // M_STEP
 
-            # Score GEMM: i8 Q × u8 K → i32
+            # Score GEMM: i8 Q × u8 K_vnni → i32
             for nt in range(0, n_tiles, 2):
-                var k_nt_base = k_vnni + (nt // 2) * K_PAIR_BYTES
+                var b0 = k_vnni_head + block_tile_base + nt * K_TILE_K_BYTES
+                var b1 = k_vnni_head + block_tile_base + (nt + 1) * K_TILE_K_BYTES
                 for mi in range(qb_m_iters):
                     var m_off = qb_start + mi * M_STEP
                     amx_gemm_2x2[DType.int8, DType.uint8, BLOCK_N](
                         qi_buf + m_off * head_dim,
                         qi_buf + (m_off + TILE_M) * head_dim,
                         head_dim,
-                        k_nt_base, k_nt_base + TILE_BYTES,
-                        2 * TILE_BYTES, k_slices,
+                        b0, b1,
+                        TILE_BYTES, k_slices,
                         score_i32 + (mi * M_STEP) * BLOCK_N + nt * TILE_N,
                     )
 
@@ -314,8 +301,8 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
         UnsafePointer[BFloat16, MutAnyOrigin](unsafe_from_address=q.ptr),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cos_table.ptr),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=sin_table.ptr),
-        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=k_cache.data_base),
-        UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=v_cache.data_base),
+        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=k_cache.k_base),
+        UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=v_cache.v_base),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=scratch),
         Float32(127.0) / q_layer_scale,
         q_layer_scale * k_layer_scale * inv_sqrt_hd / (Float32(127.0) * Float32(127.0)),
