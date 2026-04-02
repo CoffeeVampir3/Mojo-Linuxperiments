@@ -61,7 +61,7 @@ struct DecodeWorkerScratch:
 
 def per_worker_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int]() -> Int:
     comptime gqa_factor = num_heads // num_kv_heads
-    comptime padded_m = ((gqa_factor + M_STEP - 1) // M_STEP) * M_STEP
+    comptime padded_m = ((gqa_factor + TILE_M - 1) // TILE_M) * TILE_M
     return (
         size_of[DecodeWorkerScratch]()
         + size_of[KernelProfile]()                       # profile
@@ -102,7 +102,9 @@ def attn_decode_worker[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
     comptime gqa_factor = num_heads // num_kv_heads
     comptime q_cols = num_heads * head_dim
     comptime k_slices = head_dim // K_STEP
-    comptime padded_m = ((gqa_factor + M_STEP - 1) // M_STEP) * M_STEP
+    comptime padded_m = ((gqa_factor + TILE_M - 1) // TILE_M) * TILE_M
+    comptime hd_n_tiles = head_dim // TILE_N
+    comptime VAGG_N = TILE_N * 3
 
     comptime HEAD_STRIDE = max_seq * head_dim
 
@@ -190,7 +192,7 @@ def attn_decode_worker[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
         prof[].total = tap() - t0
         return
 
-    var vagg_arr = InlineArray[Int32, M_STEP * N_STEP](fill=Int32(0))
+    var vagg_arr = InlineArray[Int32, TILE_M * VAGG_N](fill=Int32(0))
     var vagg_i32 = UnsafePointer(to=vagg_arr).bitcast[Int32]()
 
     # Stack buffer for fused VNNI packing (one tile, reused)
@@ -207,40 +209,43 @@ def attn_decode_worker[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
         var chunk_k_iters = padded_chunk // K_STEP
         var n_tiles = (block_len + TILE_N - 1) // TILE_N
 
-        # --- Score GEMM (fused K pack) ---
+        # --- Score GEMM (1-3-3 fused K pack) ---
         t1 = tap()
-        comptime m_iters = (padded_m + M_STEP - 1) // M_STEP
-        for nt in range(0, n_tiles, 2):
-            for mi in range(m_iters):
-                var m_off = mi * M_STEP
-                tilezero[4](); tilezero[5](); tilezero[6](); tilezero[7]()
-                for ki in range(k_slices):
-                    tileload[0](qi_buf + m_off * head_dim + ki * K_STEP, head_dim)
-                    tileload[1](qi_buf + (m_off + TILE_M) * head_dim + ki * K_STEP, head_dim)
-                    for ti in range(2):
-                        var n_cols = max(0, min(TILE_N, block_len - (nt + ti) * TILE_N))
-                        var k_rows = InlineArray[SIMD[DType.uint32, TILE_N], TILE_N](
-                            fill=SIMD[DType.uint32, TILE_N](0))
-                        for col in range(n_cols):
-                            k_rows[col] = (k_base + (block_start + (nt + ti) * TILE_N + col) * head_dim + ki * K_STEP).bitcast[UInt32]().load[width=TILE_N]()
-                        transpose_rows[DType.uint32, TILE_N](
-                            k_rows,
-                            UnsafePointer[UInt32, MutAnyOrigin](unsafe_from_address=tile_buf_addr),
-                            TILE_N)
-                        if ti == 0:
-                            tileload[2](UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=tile_buf_addr), TILE_N * VNNI_BLK)
-                        else:
-                            tileload[3](UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=tile_buf_addr), TILE_N * VNNI_BLK)
-                    tile_dp[4, 0, 2, DType.int8, DType.uint8]()
-                    tile_dp[5, 0, 3, DType.int8, DType.uint8]()
-                    tile_dp[6, 1, 2, DType.int8, DType.uint8]()
-                    tile_dp[7, 1, 3, DType.int8, DType.uint8]()
-                comptime score_stride = BLOCK_N * size_of[Int32]()
-                var s_dst = score_i32 + m_off * BLOCK_N + nt * TILE_N
-                tilestore[4](s_dst, score_stride)
+        for nt in range(0, n_tiles, 3):
+            var nt_count = min(3, n_tiles - nt)
+            tilezero[4](); tilezero[5](); tilezero[6]()
+            if nt_count < 3:
+                tilezero[3]()
+            if nt_count < 2:
+                tilezero[2]()
+            for ki in range(k_slices):
+                tileload[0](qi_buf + ki * K_STEP, head_dim)
+                for ti in range(nt_count):
+                    var n_cols = max(0, min(TILE_N, block_len - (nt + ti) * TILE_N))
+                    var k_rows = InlineArray[SIMD[DType.uint32, TILE_N], TILE_N](
+                        fill=SIMD[DType.uint32, TILE_N](0))
+                    for col in range(n_cols):
+                        k_rows[col] = (k_base + (block_start + (nt + ti) * TILE_N + col) * head_dim + ki * K_STEP).bitcast[UInt32]().load[width=TILE_N]()
+                    transpose_rows[DType.uint32, TILE_N](
+                        k_rows,
+                        UnsafePointer[UInt32, MutAnyOrigin](unsafe_from_address=tile_buf_addr),
+                        TILE_N)
+                    if ti == 0:
+                        tileload[1](UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=tile_buf_addr), TILE_N * VNNI_BLK)
+                    elif ti == 1:
+                        tileload[2](UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=tile_buf_addr), TILE_N * VNNI_BLK)
+                    else:
+                        tileload[3](UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=tile_buf_addr), TILE_N * VNNI_BLK)
+                tile_dp[4, 0, 1, DType.int8, DType.uint8]()
+                tile_dp[5, 0, 2, DType.int8, DType.uint8]()
+                tile_dp[6, 0, 3, DType.int8, DType.uint8]()
+            comptime score_stride = BLOCK_N * size_of[Int32]()
+            var s_dst = score_i32 + nt * TILE_N
+            tilestore[4](s_dst, score_stride)
+            if nt_count >= 2:
                 tilestore[5](s_dst + TILE_N, score_stride)
-                tilestore[6](s_dst + TILE_M * BLOCK_N, score_stride)
-                tilestore[7](s_dst + TILE_M * BLOCK_N + TILE_N, score_stride)
+            if nt_count >= 3:
+                tilestore[6](s_dst + 2 * TILE_N, score_stride)
 
         prof[].score_gemm += tap() - t1
 
@@ -300,43 +305,44 @@ def attn_decode_worker[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
 
         prof[].softmax += tap() - t1
 
-        # --- V-agg (fused V pack) ---
+        # --- V-agg (1-3-3 fused V pack) ---
         t1 = tap()
-        for ns in range(head_dim // N_STEP):
-            var d_off = ns * N_STEP
-            var nt_lo = d_off // TILE_N
-            for mi in range(m_iters):
-                tilezero[4](); tilezero[5](); tilezero[6](); tilezero[7]()
-                for kt in range(chunk_k_iters):
-                    tileload[0](w_u8_buf + (mi * M_STEP) * padded_chunk + kt * K_STEP, padded_chunk)
-                    tileload[1](w_u8_buf + (mi * M_STEP + TILE_M) * padded_chunk + kt * K_STEP, padded_chunk)
-                    var v_n_pos = min(K_STEP, block_len - kt * K_STEP)
+        comptime vagg_stride = VAGG_N * size_of[Int32]()
+        for ns in range(0, hd_n_tiles, 3):
+            var out_tiles = min(3, hd_n_tiles - ns)
+            tilezero[4](); tilezero[5](); tilezero[6]()
+            if out_tiles < 3:
+                tilezero[3]()
+            for kt in range(chunk_k_iters):
+                tileload[0](w_u8_buf + kt * K_STEP, padded_chunk)
+                var v_n_pos = min(K_STEP, block_len - kt * K_STEP)
+                for ti in range(out_tiles):
                     pack_v_tile_vnni(v_base, head_dim,
-                        block_start + kt * K_STEP, nt_lo * TILE_N,
+                        block_start + kt * K_STEP, (ns + ti) * TILE_N,
                         v_n_pos,
                         UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=tile_buf_addr))
-                    tileload[2](UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=tile_buf_addr), TILE_N * VNNI_BLK)
-                    pack_v_tile_vnni(v_base, head_dim,
-                        block_start + kt * K_STEP, (nt_lo + 1) * TILE_N,
-                        v_n_pos,
-                        UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=tile_buf_addr))
-                    tileload[3](UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=tile_buf_addr), TILE_N * VNNI_BLK)
-                    tile_dp[4, 0, 2, DType.uint8, DType.int8]()
-                    tile_dp[5, 0, 3, DType.uint8, DType.int8]()
-                    tile_dp[6, 1, 2, DType.uint8, DType.int8]()
-                    tile_dp[7, 1, 3, DType.uint8, DType.int8]()
-                comptime vagg_stride = N_STEP * size_of[Int32]()
-                tilestore[4](vagg_i32, vagg_stride)
-                tilestore[5](vagg_i32 + TILE_N, vagg_stride)
-                tilestore[6](vagg_i32 + TILE_M * N_STEP, vagg_stride)
-                tilestore[7](vagg_i32 + TILE_M * N_STEP + TILE_N, vagg_stride)
-                for r in range(min(M_STEP, gqa_factor - mi * M_STEP)):
-                    var ro_row = running_o + (mi * M_STEP + r) * head_dim + d_off
-                    var c = 0
-                    while c + width <= N_STEP:
-                        var raw = (vagg_i32 + r * N_STEP + c).load[width=width]().cast[DType.float32]()
-                        (ro_row + c).store((ro_row + c).load[width=width]() + raw)
-                        c += width
+                    if ti == 0:
+                        tileload[1](UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=tile_buf_addr), TILE_N * VNNI_BLK)
+                    elif ti == 1:
+                        tileload[2](UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=tile_buf_addr), TILE_N * VNNI_BLK)
+                    else:
+                        tileload[3](UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=tile_buf_addr), TILE_N * VNNI_BLK)
+                tile_dp[4, 0, 1, DType.uint8, DType.int8]()
+                tile_dp[5, 0, 2, DType.uint8, DType.int8]()
+                tile_dp[6, 0, 3, DType.uint8, DType.int8]()
+            tilestore[4](vagg_i32, vagg_stride)
+            tilestore[5](vagg_i32 + TILE_N, vagg_stride)
+            if out_tiles >= 3:
+                tilestore[6](vagg_i32 + 2 * TILE_N, vagg_stride)
+            var d_off = ns * TILE_N
+            var cols = out_tiles * TILE_N
+            for r in range(gqa_factor):
+                var ro_row = running_o + r * head_dim + d_off
+                var c = 0
+                while c + width <= cols:
+                    var raw = (vagg_i32 + r * VAGG_N + c).load[width=width]().cast[DType.float32]()
+                    (ro_row + c).store((ro_row + c).load[width=width]() + raw)
+                    c += width
         prof[].vagg += tap() - t1
 
     prof[].total = tap() - t0
@@ -368,7 +374,7 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     comptime q_cols = QT.COLS
     comptime pw = per_worker_bytes[num_heads, num_kv_heads, head_dim]()
     comptime WORKERS_OFF = q_cols * size_of[Float32]()
-    comptime padded_m = ((gqa_factor + M_STEP - 1) // M_STEP) * M_STEP
+    comptime padded_m = ((gqa_factor + TILE_M - 1) // TILE_M) * TILE_M
     comptime width = simd_width_of[DType.float32]()
     var inv_sqrt_hd = Float32(1.0 / Float64(sqrt[DType.float32, 1](Float32(head_dim))))
 
@@ -403,8 +409,6 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     # Build per-worker scratch and assign context ranges
     for g in range(num_kv_heads):
         var chunk_size = (context_len + workers_per_group - 1) // workers_per_group
-        # Align chunk boundaries to BLOCK_N for clean tiling
-        chunk_size = ((chunk_size + BLOCK_N - 1) // BLOCK_N) * BLOCK_N
 
         for w in range(workers_per_group):
             var job_idx = g * workers_per_group + w

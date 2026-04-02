@@ -63,15 +63,21 @@ struct WorkerMailbox:
     """Per-worker dispatch slot. Dispatcher writes, worker reads.
 
     job_ready: 0 = idle, 1 = job available. Worker spins on this.
+    sleeping:  Worker-published intent flag. Set to 1 by the worker
+               right before entering futex_wait, cleared on wake.
+               Dispatcher reads this to decide whether futex_wake is
+               needed (Dekker's pattern: both sides publish then check).
     func_ptr:  Kernel function pointer (set before job_ready=1).
     pack:      Arguments for this worker's job.
     """
     var job_ready: AtomicInt32
+    var sleeping: AtomicInt32
     var func_ptr: Int
     var pack: ArgPack
 
     def __init__(out self):
         self.job_ready = AtomicInt32(0)
+        self.sleeping = AtomicInt32(0)
         self.func_ptr = 0
         self.pack = ArgPack()
 
@@ -350,7 +356,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         return Self(cap, mask^, node)
 
     def begin_forward(mut self):
-        """Enter hot mode: wake all workers, keep them spinning.
+        """Enter hot mode: wake all sleeping workers, keep them spinning.
 
         Requires headroom (fewer workers than cores) to prevent scheduler
         deadlock. Use for_numa_node(headroom=2) or similar.
@@ -359,8 +365,10 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
             UnsafePointer(to=self.shared[].hot_mode.value), 1)
         var sys = linux.linux_sys()
         for i in range(self.capacity):
-            var ready_ptr = UnsafePointer(to=(self.mailboxes + i)[].job_ready.value)
-            _ = sys.sys_futex_wake(Int(ready_ptr), 1, self.futex_flags)
+            var sleeping_ptr = UnsafePointer(to=(self.mailboxes + i)[].sleeping.value)
+            if AtomicInt32.load[ordering=Consistency.ACQUIRE](sleeping_ptr) != 0:
+                var ready_ptr = UnsafePointer(to=(self.mailboxes + i)[].job_ready.value)
+                _ = sys.sys_futex_wake(Int(ready_ptr), 1, self.futex_flags)
 
     def end_forward(mut self):
         """Exit hot mode: workers drain back to futex_wait."""
@@ -393,14 +401,20 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         AtomicInt32.store[ordering=Consistency.MONOTONIC](done_ptr, Int32(jobs))
 
         var sys = linux.linux_sys()
-        var hot = self.shared[].hot_mode.load[ordering=Consistency.MONOTONIC]() != 0
         for i in range(jobs):
             var mb = self.mailboxes + i
             mb[].func_ptr = kernel_ptr
             mb[].pack = (packs + i)[]
+            # Publish work (RELEASE ensures func_ptr/pack visible before job_ready)
             AtomicInt32.store[ordering=Consistency.RELEASE](
                 UnsafePointer(to=mb[].job_ready.value), 1)
-            if not hot:
+            # Dekker check: we published ready=1, now check if worker is sleeping.
+            # If worker published sleeping=1 before our ready=1, we see it and wake.
+            # If worker sees our ready=1 before sleeping, it won't enter futex_wait.
+            # TSO guarantees at least one side sees the other's store.
+            if AtomicInt32.load[ordering=Consistency.ACQUIRE](
+                UnsafePointer(to=mb[].sleeping.value)
+            ) != 0:
                 _ = sys.sys_futex_wake(Int(UnsafePointer(to=mb[].job_ready.value)), 1, self.futex_flags)
 
     def join(mut self):
@@ -448,6 +462,11 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
 
             var result = sys.sys_clone3_with_entry(UnsafePointer(to=clone_args), size_of[linux.Clone3Args]())
             if result < 0:
+                # Some workers may already be alive — shrink capacity so
+                # __del__ shuts down only the ones that were spawned.
+                self.capacity = i
+                if i > 0:
+                    self.workers_alive = True
                 return
         self.workers_alive = True
 
@@ -486,7 +505,7 @@ def worker_main[mask_size: Int](stack_head_ptr: Int):
     ptr[Int](slot_base + SlotLayout.WORKER_MAGIC)[] = SlotLayout.WORKER_MAGIC_VALUE
 
     if head_ptr[].pinned != 0:
-        var ret = sys.sys_sched_setaffinity(0, mask_size, Int(head_ptr[].cpu_mask.ptr()))
+        var ret = sys.sys_sched_setaffinity(0, mask_size * 8, Int(head_ptr[].cpu_mask.ptr()))
         if ret != 0:
             print("sched_setaffinity failed:", ret)
 
@@ -526,7 +545,24 @@ def worker_main[mask_size: Int](stack_head_ptr: Int):
                     sys.arch_cpu_relax()
                     spins += 1
                 else:
+                    # Dekker sleep protocol: publish sleeping=1, then recheck
+                    # ready_ptr. Dispatcher publishes ready=1 then checks
+                    # sleeping. TSO guarantees one side sees the other's store.
+                    var sleeping_ptr = UnsafePointer(to=mailbox[].sleeping.value)
+                    AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 1)
+                    # Recheck after publishing — if work arrived or mode
+                    # changed, cancel sleep.
+                    if AtomicInt32.load[ordering=Consistency.ACQUIRE](ready_ptr) != 0:
+                        AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 0)
+                        break
+                    if shared[].shutdown.load[ordering=Consistency.ACQUIRE]() != 0:
+                        AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 0)
+                        break
+                    if shared[].hot_mode.load[ordering=Consistency.ACQUIRE]() != 0:
+                        AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 0)
+                        break
                     _ = sys.sys_futex_wait(Int(ready_ptr), 0, futex_flags)
+                    AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 0)
                     spins = 0
 
     # CHILD_CLEARTID handles clearing child_tid and futex wake automatically

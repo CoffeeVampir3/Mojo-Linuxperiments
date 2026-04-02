@@ -111,8 +111,8 @@ def main():
     # Timing sweep: control vs chunked wpg=4,8
     # =====================================================================
     print("\n=== Timing (hot mode, single node) ===")
-    print("  context | control | wpg=4 | wpg=8")
-    print("  --------|---------|-------|------")
+    print("  context | control | wpg=4 | wpg=8 | wpg=15")
+    print("  --------|---------|-------|-------|-------")
 
     for ci in range(4):
         var ctx_pos = ctx_values[ci]
@@ -168,10 +168,28 @@ def main():
             if e < best_8: best_8 = e
         pool.end_forward()
 
+        # wpg=15 (full pool utilization: 15 * 2 KV heads = 30 jobs)
+        pool.begin_forward()
+        var best_15 = Int(1 << 60)
+        for trial in range(10):
+            var t0 = Int(perf_counter_ns())
+            decode_chunked[NH, NKV, HD](
+                DynView[QSlot](Int(q_bf16), 1),
+                k_cache, v_cache,
+                Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
+                Int(scratch), ctx_pos,
+                q_scale, k_scale, v_scale, pool, 15,
+            ).join()
+            var e = Int(perf_counter_ns()) - t0
+            keep(scratch[0])
+            if e < best_15: best_15 = e
+        pool.end_forward()
+
         print("  " + String(ctx_pos)
               + " | " + String(best_ctrl // 1000)
               + " | " + String(best_4 // 1000)
-              + " | " + String(best_8 // 1000))
+              + " | " + String(best_8 // 1000)
+              + " | " + String(best_15 // 1000))
 
     # =====================================================================
     # Detailed profiles at 4k and 16k
@@ -212,6 +230,24 @@ def main():
         print("chunked wpg=8 caller:")
         chunk_read_caller[NH, NKV, HD](Int(scratch), cap, 8).print_summary()
         print("chunked wpg=8 workers:")
-        var chunk_agg = ProfileAggregator()
-        chunk_collect_profiles[NH, NKV, HD](Int(scratch), cap, chunk_agg, 8)
-        chunk_agg.print_summary()
+        var chunk_agg8 = ProfileAggregator()
+        chunk_collect_profiles[NH, NKV, HD](Int(scratch), cap, chunk_agg8, 8)
+        chunk_agg8.print_summary()
+
+        # Chunked wpg=15 profile
+        pool.begin_forward()
+        decode_chunked[NH, NKV, HD](
+            DynView[QSlot](Int(q_bf16), 1),
+            k_cache, v_cache,
+            Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
+            Int(scratch), ctx_pos,
+            q_scale, k_scale, v_scale, pool, 15,
+        ).join()
+        pool.end_forward()
+
+        print("chunked wpg=15 caller:")
+        chunk_read_caller[NH, NKV, HD](Int(scratch), cap, 15).print_summary()
+        print("chunked wpg=15 workers:")
+        var chunk_agg15 = ProfileAggregator()
+        chunk_collect_profiles[NH, NKV, HD](Int(scratch), cap, chunk_agg15, 15)
+        chunk_agg15.print_summary()
