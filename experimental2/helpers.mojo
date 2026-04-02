@@ -205,3 +205,38 @@ def amx_gemm_2x2[a_dtype: DType, b_dtype: DType, dst_n: Int](
     tilestore[5](dst + TILE_N, dst_stride)
     tilestore[6](dst + TILE_M * dst_n, dst_stride)
     tilestore[7](dst + TILE_M * dst_n + TILE_N, dst_stride)
+
+
+# ============================================================================
+# 1x3 AMX tile GEMM — optimized for decode (M=16, wide N)
+# ============================================================================
+
+@always_inline
+def amx_gemm_1x3[a_dtype: DType, b_dtype: DType, dst_n: Int](
+    a0: UnsafePointer[Scalar[a_dtype], MutAnyOrigin],
+    a_stride: Int,
+    b0: UnsafePointer[Scalar[b_dtype], MutAnyOrigin],
+    b1: UnsafePointer[Scalar[b_dtype], MutAnyOrigin],
+    b2: UnsafePointer[Scalar[b_dtype], MutAnyOrigin],
+    b_k_step: Int,
+    k_iters: Int,
+    dst: UnsafePointer[Int32, MutAnyOrigin],
+):
+    """Zero accumulators, K-reduce with 1x3 tile MACs, store.
+
+    Tile layout: A[0] x B[1,2,3] -> C[4,5,6].
+    One A tile reused across 3 B tiles — 50% more N per A load vs 2x2.
+    """
+    comptime dst_stride = dst_n * size_of[Int32]()
+    tilezero[4](); tilezero[5](); tilezero[6]()
+    for ki in range(k_iters):
+        tileload[0](a0 + ki * K_STEP, a_stride)
+        tileload[1](b0 + ki * b_k_step, TILE_N * VNNI_BLK)
+        tileload[2](b1 + ki * b_k_step, TILE_N * VNNI_BLK)
+        tileload[3](b2 + ki * b_k_step, TILE_N * VNNI_BLK)
+        tile_dp[4, 0, 1, a_dtype, b_dtype]()
+        tile_dp[5, 0, 2, a_dtype, b_dtype]()
+        tile_dp[6, 0, 3, a_dtype, b_dtype]()
+    tilestore[4](dst, dst_stride)
+    tilestore[5](dst + TILE_N, dst_stride)
+    tilestore[6](dst + 2 * TILE_N, dst_stride)

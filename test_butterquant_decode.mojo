@@ -12,7 +12,7 @@ from modeling.model_spec import (
     BF16, F32, I8, Replicated,
     Slot, Bound, DynView,
 )
-from experimental2.attn_amx_decode import decode, scratch_bytes
+from experimental2.attn_amx_decode import decode, scratch_bytes, collect_profiles
 from experimental.hadquant_impl import fwht_block
 from experimental2.kv_cache import KVCache
 from experimental.amx import init_intel_amx
@@ -267,9 +267,115 @@ def main():
 
     comptime QS2 = Slot[BF16, Replicated, 1, LOCAL_HIDDEN2, 1]
 
-    print("\n  ctx  |  total us")
-    print("  -----|----------")
+    # -----------------------------------------------------------------
+    # Dispatch/join overhead: decode at ctx=1 (near-zero kernel work)
+    # -----------------------------------------------------------------
+    print("\n--- Dispatch/join overhead ---")
 
+    # Single node, 2 workers
+    for warmup in range(5):
+        decode[LOCAL_NH2, LOCAL_KV2, HD2](
+            DynView[QS2](q_ptrs[0], 1),
+            LOCAL_KVC(k_bases[0]), LOCAL_KVC(v_bases[0]),
+            Bound[CS2](cos_ptrs[0]), Bound[SS2](sin_ptrs[0]),
+            scratch_ptrs[0], 0,
+            perf_q_scale, perf_k_scale, perf_v_scale,
+            pool_ptrs[0][],
+        ).join()
+
+    var best_1node = Int(1 << 60)
+    for trial in range(20):
+        var t0 = Int(perf_counter_ns())
+        decode[LOCAL_NH2, LOCAL_KV2, HD2](
+            DynView[QS2](q_ptrs[0], 1),
+            LOCAL_KVC(k_bases[0]), LOCAL_KVC(v_bases[0]),
+            Bound[CS2](cos_ptrs[0]), Bound[SS2](sin_ptrs[0]),
+            scratch_ptrs[0], 0,
+            perf_q_scale, perf_k_scale, perf_v_scale,
+            pool_ptrs[0][],
+        ).join()
+        var wall = Int(perf_counter_ns()) - t0
+        if wall < best_1node: best_1node = wall
+    print("  1 node, 2 workers, ctx=1: " + String(best_1node // 1000) + " us")
+    var oh_agg = collect_profiles[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[0])
+    oh_agg.print_summary()
+
+    # 4 nodes, 8 workers total
+    for warmup in range(5):
+        @parameter
+        def wu_oh[node: Int]() -> PoolFence:
+            return decode[LOCAL_NH2, LOCAL_KV2, HD2](
+                DynView[QS2](q_ptrs[node], 1),
+                LOCAL_KVC(k_bases[node]), LOCAL_KVC(v_bases[node]),
+                Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
+                scratch_ptrs[node], 0,
+                perf_q_scale, perf_k_scale, perf_v_scale,
+                pool_ptrs[node][],
+            )
+        parallel_for[NUM_NODES, wu_oh]()
+    var best_4node = Int(1 << 60)
+    for trial in range(20):
+        var t0 = Int(perf_counter_ns())
+        @parameter
+        def run_oh[node: Int]() -> PoolFence:
+            return decode[LOCAL_NH2, LOCAL_KV2, HD2](
+                DynView[QS2](q_ptrs[node], 1),
+                LOCAL_KVC(k_bases[node]), LOCAL_KVC(v_bases[node]),
+                Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
+                scratch_ptrs[node], 0,
+                perf_q_scale, perf_k_scale, perf_v_scale,
+                pool_ptrs[node][],
+            )
+        parallel_for[NUM_NODES, run_oh]()
+        var wall = Int(perf_counter_ns()) - t0
+        if wall < best_4node: best_4node = wall
+    print("  4 nodes, 8 workers, ctx=1: " + String(best_4node // 1000) + " us")
+
+    # Higher worker count test: use a config with more "KV heads" to dispatch more jobs
+    # 32h/32kv gives 32 workers per node (1 Q head per KV group)
+    comptime OH_NH = 32
+    comptime OH_NKV = 32
+    comptime OH_HD = HD2
+    comptime OH_HIDDEN = OH_NH * OH_HD
+    comptime OH_KVC = KVCache[MAX_SEQ2, OH_HD, OH_NKV]
+    var oh32_scratch_bytes = scratch_bytes[OH_NH, OH_NKV, OH_HD](OH_NKV)
+    var oh32_scratch = perf_arenas[0].alloc[UInt8](oh32_scratch_bytes)
+    var oh32_q = perf_arenas[0].alloc[Scalar[DType.bfloat16]](OH_HIDDEN)
+    for i in range(OH_HIDDEN):
+        oh32_q[i] = Scalar[DType.bfloat16](Float32(i % 256 - 128) / 128.0)
+    var oh32_kv = perf_arenas[0].alloc[UInt8](2 * OH_KVC.TOTAL_BYTES)
+    comptime OH_QS = Slot[BF16, Replicated, 1, OH_HIDDEN, 1]
+    comptime OH_HALF = OH_HD // 2
+    comptime OH_CS = Slot[F32, Replicated, MAX_SEQ2, OH_HALF, 1]
+    comptime OH_SS = Slot[F32, Replicated, MAX_SEQ2, OH_HALF, 1]
+
+    for warmup in range(5):
+        decode[OH_NH, OH_NKV, OH_HD](
+            DynView[OH_QS](Int(oh32_q), 1),
+            OH_KVC(Int(oh32_kv)), OH_KVC(Int(oh32_kv) + OH_KVC.TOTAL_BYTES),
+            Bound[OH_CS](cos_ptrs[0]), Bound[OH_SS](sin_ptrs[0]),
+            Int(oh32_scratch), 0,
+            perf_q_scale, perf_k_scale, perf_v_scale,
+            pool_ptrs[0][],
+        ).join()
+    var best_32w = Int(1 << 60)
+    for trial in range(20):
+        var t0 = Int(perf_counter_ns())
+        decode[OH_NH, OH_NKV, OH_HD](
+            DynView[OH_QS](Int(oh32_q), 1),
+            OH_KVC(Int(oh32_kv)), OH_KVC(Int(oh32_kv) + OH_KVC.TOTAL_BYTES),
+            Bound[OH_CS](cos_ptrs[0]), Bound[OH_SS](sin_ptrs[0]),
+            Int(oh32_scratch), 0,
+            perf_q_scale, perf_k_scale, perf_v_scale,
+            pool_ptrs[0][],
+        ).join()
+        var wall = Int(perf_counter_ns()) - t0
+        if wall < best_32w: best_32w = wall
+    print("  1 node, 32 workers, ctx=1: " + String(best_32w // 1000) + " us")
+
+    # -----------------------------------------------------------------
+    # Main performance sweep
+    # -----------------------------------------------------------------
     for ctx_idx in range(5):
         var ctx_pos = 128
         if ctx_idx == 1: ctx_pos = 512
@@ -309,4 +415,6 @@ def main():
             if wall < best: best = wall
 
         var total_us = best // 1000
-        print("  " + String(ctx_pos) + " | " + String(total_us))
+        print("\n--- ctx=" + String(ctx_pos) + "  wall=" + String(total_us) + " us ---")
+        var agg = collect_profiles[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[0])
+        agg.print_summary()

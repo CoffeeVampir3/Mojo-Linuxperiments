@@ -64,6 +64,17 @@ def make_224_i8_config() -> TileConfig:
     return cfg^
 
 
+def make_133_i8_config() -> TileConfig:
+    """1-3-3 int8 config for decode: TMM0 A, TMM1-3 B, TMM4-6 C.
+    All active tiles 16 rows x 64 col-bytes. TMM7 unused."""
+    var cfg = TileConfig()
+    cfg.palette_id = 1
+    for i in range(7):
+        cfg.rows[i] = 16
+        cfg.colsb[i] = 64
+    return cfg^
+
+
 # ============================================================================
 # AMX System Init (Linux)
 # ============================================================================

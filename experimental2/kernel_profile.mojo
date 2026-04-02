@@ -42,7 +42,7 @@ def tap() -> Int:
     return Int(perf_counter_ns())
 
 
-struct ProfileAggregator:
+struct ProfileAggregator(Movable, Copyable, ImplicitlyCopyable):
     """Collects profiles from N workers, prints per-phase breakdown."""
     var count: Int
     var sum_amx_config: Int
