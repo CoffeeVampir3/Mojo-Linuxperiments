@@ -63,6 +63,40 @@ def simd_interleave[T: DType, N: Int, stride: Int, high: Bool](
 
 
 @always_inline
+def transpose_rows[T: DType, N: Int](
+    mut rows: InlineArray[SIMD[T, N], N],
+    dst: UnsafePointer[Scalar[T], MutAnyOrigin], dst_stride: Int,
+):
+    """Butterfly transpose pre-loaded rows and store to dst.
+
+    Rows are modified in-place during the butterfly stages.
+    Caller loads rows (full or partial with zero padding).
+    """
+    comptime num_stages = log2[N]()
+    comptime for stage in range(num_stages):
+        comptime stride = 1 << stage
+        comptime groups = N // (2 * stride)
+        comptime for g in range(groups):
+            comptime for j in range(stride):
+                comptime idx0 = g * 2 * stride + j
+                comptime idx1 = idx0 + stride
+                var lo = simd_interleave[T, N, stride, False](rows[idx0], rows[idx1])
+                var hi = simd_interleave[T, N, stride, True](rows[idx0], rows[idx1])
+                rows[idx0] = lo
+                rows[idx1] = hi
+
+    comptime for i in range(N):
+        comptime j = bit_reverse[num_stages, i]()
+        comptime if i < j:
+            var tmp = rows[i]
+            rows[i] = rows[j]
+            rows[j] = tmp
+
+    comptime for i in range(N):
+        (dst + i * dst_stride).store(rows[i])
+
+
+@always_inline
 def transpose_generic[T: DType, N: Int](
     src: UnsafePointer[Scalar[T], _], src_stride: Int,
     dst: UnsafePointer[Scalar[T], MutAnyOrigin], dst_stride: Int,
@@ -76,29 +110,7 @@ def transpose_generic[T: DType, N: Int](
     """
     comptime for i in range(N):
         scratch[i] = (src + i * src_stride).load[width=N]()
-
-    comptime num_stages = log2[N]()
-    comptime for stage in range(num_stages):
-        comptime stride = 1 << stage
-        comptime groups = N // (2 * stride)
-        comptime for g in range(groups):
-            comptime for j in range(stride):
-                comptime idx0 = g * 2 * stride + j
-                comptime idx1 = idx0 + stride
-                var lo = simd_interleave[T, N, stride, False](scratch[idx0], scratch[idx1])
-                var hi = simd_interleave[T, N, stride, True](scratch[idx0], scratch[idx1])
-                scratch[idx0] = lo
-                scratch[idx1] = hi
-
-    comptime for i in range(N):
-        comptime j = bit_reverse[num_stages, i]()
-        comptime if i < j:
-            var tmp = scratch[i]
-            scratch[i] = scratch[j]
-            scratch[j] = tmp
-
-    comptime for i in range(N):
-        (dst + i * dst_stride).store(scratch[i])
+    transpose_rows[T, N](scratch, dst, dst_stride)
 
 
 

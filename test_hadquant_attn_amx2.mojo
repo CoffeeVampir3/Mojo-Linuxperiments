@@ -104,11 +104,11 @@ def main():
             for d in range(HD):
                 var val = Float32((t * 7 + g * 13 + d * 3) % 251 - 125) / 125.0
                 head_buf[d] = Scalar[DType.int8](Int8(max(min(Int(val * 127.0), 127), -128)))
-            k_cache.write_head(t, g, head_buf)
+            k_cache.write_k(t, g, head_buf)
             for d in range(HD):
                 var val = Float32((t * 11 + g * 17 + d * 5) % 251 - 125) / 125.0
                 head_buf[d] = Scalar[DType.int8](Int8(max(min(Int(val * 127.0), 127), -128)))
-            v_cache.write_head(t, g, head_buf)
+            v_cache.write_v(t, g, head_buf)
 
     comptime CosSlot = Slot[F32, Replicated, MAX_SEQ, HALF, 1]
     comptime SinSlot = Slot[F32, Replicated, MAX_SEQ, HALF, 1]
@@ -164,14 +164,14 @@ def main():
             for t in range(context):
                 scores[t] = exp_f32[1](scores[t] - smax)
                 exp_sum += scores[t]
-            var vagg_scale = v_layer_scale / Float32(255.0)
+            var vagg_scale = v_layer_scale / (Float32(255.0) * Float32(127.0))
             for d in range(HD):
                 expected[m * HIDDEN + h * HD + d] = Float32(0)
             for t in range(context):
                 var w_u8 = UInt8(max(min(Int(scores[t] * 255.0 + 0.5), 255), 0))
-                var v_data = v_cache.head_data(t, g)
+                var v_data = v_cache.head_data(t, g).bitcast[Scalar[DType.int8]]()
                 for d in range(HD):
-                    var v_i8 = Int32(v_data[d]) - 128
+                    var v_i8 = Int32(v_data[d])
                     expected[m * HIDDEN + h * HD + d] += Float32(Int32(w_u8) * v_i8) * vagg_scale
             for d in range(HD):
                 expected[m * HIDDEN + h * HD + d] /= exp_sum
@@ -269,10 +269,10 @@ def main():
                 var global_g = node * LOCAL_KV2 + lg
                 for d in range(HD2):
                     hb[d] = Scalar[DType.int8]((t * 7 + global_g * HD2 + d * 3) % 251 - 125)
-                k_node.write_head(t, lg, hb)
+                k_node.write_k(t, lg, hb)
                 for d in range(HD2):
                     hb[d] = Scalar[DType.int8]((t * 11 + global_g * HD2 + d * 5) % 251 - 125)
-                v_node.write_head(t, lg, hb)
+                v_node.write_v(t, lg, hb)
 
         scratch_ptrs[node] = Int(perf_arenas[node].alloc[UInt8](local_scratch_bytes))
 

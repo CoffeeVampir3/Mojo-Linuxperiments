@@ -1,8 +1,8 @@
 """AMX prefill attention — uniform integer pipeline, zero per-token scales.
 
-KV cache is flat u8 (i8 XOR 0x80). Per-layer fixed scales for K and V
-derived from weight norms and Hadamard concentration. No per-token
-metadata in the cache. No per-row adaptive scaling in softmax.
+K cache is u8 (i8 XOR 0x80) for tdpbsud. V cache is i8 directly for
+tdpbusd. Per-layer fixed scales derived from weight norms and Hadamard
+concentration. No per-token metadata. No per-row adaptive scaling.
 
 Score:  Q_i8 × K_u8_vnni → i32      (tdpbsud, signed Q × unsigned K)
 V-agg: W_u8 × V_i8_vnni → i32      (tdpbusd, unsigned W × signed V)
@@ -25,7 +25,7 @@ from modeling.model_spec import (
 )
 from kernels.kernel_ops import PoolFence
 from simd_math import sqrt, roundeven, exp_f32_fast, quantize_i8
-from simd_math.matrixops import transpose_generic
+from simd_math.matrixops import transpose_rows
 from experimental.hadquant_impl import fwht_block
 from experimental2.kv_cache import KVCache
 from experimental.amx import (
@@ -59,7 +59,7 @@ struct AttnCtx:
 
 
 # ============================================================================
-# V VNNI pack — XOR + interleave
+# V VNNI pack — interleave i8 rows to [K/4,N,4]
 # ============================================================================
 
 @always_inline
@@ -68,43 +68,19 @@ def pack_v_tile_vnni(
     pos_off: Int, dim_off: Int, n_pos: Int,
     dst: UnsafePointer[UInt8, MutAnyOrigin],
 ):
-    """Pack V[pos,dim] u8 → VNNI [K/4,N,4] i8 with XOR restore."""
-    comptime xor_mask = SIMD[DType.uint8, TILE_N](0x80)
+    """Pack V[pos,dim] i8 → VNNI [K/4,N,4] via SIMD interleave."""
+    comptime VNNI_GROUP_BYTES = TILE_N * VNNI_BLK
+    comptime zeros = SIMD[DType.uint8, VNNI_GROUP_BYTES](0)
     var full_groups = n_pos // VNNI_BLK
     for kg in range(full_groups):
         var p = pos_off + kg * VNNI_BLK
-        var r0 = (v_base + (p + 0) * head_dim + dim_off).load[width=TILE_N]() ^ xor_mask
-        var r1 = (v_base + (p + 1) * head_dim + dim_off).load[width=TILE_N]() ^ xor_mask
-        var r2 = (v_base + (p + 2) * head_dim + dim_off).load[width=TILE_N]() ^ xor_mask
-        var r3 = (v_base + (p + 3) * head_dim + dim_off).load[width=TILE_N]() ^ xor_mask
-        (dst + kg * 64).bitcast[Scalar[DType.uint32]]().store[width=TILE_N](
-            r0.cast[DType.uint32]()
-            | (r1.cast[DType.uint32]() << 8)
-            | (r2.cast[DType.uint32]() << 16)
-            | (r3.cast[DType.uint32]() << 24))
-    comptime zeros = SIMD[DType.uint32, TILE_N](0)
+        var r0 = (v_base + (p + 0) * head_dim + dim_off).load[width=TILE_N]()
+        var r1 = (v_base + (p + 1) * head_dim + dim_off).load[width=TILE_N]()
+        var r2 = (v_base + (p + 2) * head_dim + dim_off).load[width=TILE_N]()
+        var r3 = (v_base + (p + 3) * head_dim + dim_off).load[width=TILE_N]()
+        (dst + kg * VNNI_GROUP_BYTES).store(r0.interleave(r2).interleave(r1.interleave(r3)))
     for kg in range(full_groups, K_STEP // VNNI_BLK):
-        (dst + kg * 64).bitcast[Scalar[DType.uint32]]().store[width=TILE_N](zeros)
-
-
-# ============================================================================
-# K VNNI pack — transpose u8 to VNNI (no XOR, K stays unsigned)
-# ============================================================================
-
-@always_inline
-def pack_k_tile_vnni(
-    k_base: UnsafePointer[UInt8, MutAnyOrigin], head_dim: Int,
-    k_off: Int, n_off: Int, n_cols: Int,
-    dst: UnsafePointer[UInt8, MutAnyOrigin],
-):
-    for kg in range(K_STEP // VNNI_BLK):
-        for col in range(n_cols):
-            var src = k_base + (n_off + col) * head_dim + k_off + 4 * kg
-            var d = kg * 64 + col * 4
-            dst[d] = src[0]; dst[d+1] = src[1]; dst[d+2] = src[2]; dst[d+3] = src[3]
-        for col in range(n_cols, TILE_N):
-            var d = kg * 64 + col * 4
-            dst[d] = 0; dst[d+1] = 0; dst[d+2] = 0; dst[d+3] = 0
+        (dst + kg * VNNI_GROUP_BYTES).store(zeros)
 
 
 # ============================================================================
@@ -124,7 +100,7 @@ def per_worker_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int,
         + total_q_max * size_of[Float32]()                  # qi_biases (128*sum)
         + total_q_max * head_dim * size_of[Float32]()       # running_o f32
         + total_q_max * size_of[Float32]() * 2              # running_m, running_l
-        + Q_BATCH * BLOCK_N * size_of[Float32]()            # score_buf f32
+        + Q_BATCH * BLOCK_N * size_of[Int32]()              # score_i32 (GEMM output)
         + Q_BATCH * BLOCK_N                                 # w_u8_buf u8
         + k_nt_pairs * k_slices * 2 * TILE_BYTES            # k_vnni (all N-tile pairs)
         + v_k_tiles * v_n_tiles * TILE_BYTES                # v_vnni
@@ -181,9 +157,8 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
     off += padded_q_rows * size_of[Float32]()
     var running_l = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=worker_scratch + off)
     off += padded_q_rows * size_of[Float32]()
-    var score_buf = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=worker_scratch + off)
     var score_i32 = UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=worker_scratch + off)
-    off += Q_BATCH * BLOCK_N * size_of[Float32]()
+    off += Q_BATCH * BLOCK_N * size_of[Int32]()
     var w_u8_buf = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=worker_scratch + off)
     off += Q_BATCH * BLOCK_N
     var k_vnni = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=worker_scratch + off)
@@ -214,14 +189,10 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
         var q_head = InlineArray[Float32, head_dim](fill=Float32(0))
         var qp = UnsafePointer(to=q_head).bitcast[Float32]()
         var q_row = ctx[].q + m * q_cols + h * head_dim
-        var k = 0
-        while k + width <= head_dim:
-            (qp + k).store((q_row + k).load[width=width]().cast[DType.float32]())
-            k += width
         var j = 0
         while j + width <= half:
-            var x_lo = (qp + j).load[width=width]()
-            var x_hi = (qp + half + j).load[width=width]()
+            var x_lo = (q_row + j).load[width=width]().cast[DType.float32]()
+            var x_hi = (q_row + half + j).load[width=width]().cast[DType.float32]()
             var cv = (cos_row + j).load[width=width]()
             var sv = (sin_row + j).load[width=width]()
             (qp + j).store(x_lo * cv - x_hi * sv)
@@ -236,7 +207,7 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
             (qi_row + k).store(qi)
             q_sum_acc += qi.cast[DType.int32]()
             k += width
-        qi_biases[local_idx] = Float32(128 * Int(q_sum_acc.reduce_add()))
+        qi_biases[local_idx] = Float32(q_sum_acc.reduce_add()) * Float32(128)
 
     # =================================================================
     # Init running state
@@ -257,7 +228,6 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
     var vagg_arr = InlineArray[Int32, M_STEP * N_STEP](fill=Int32(0))
     var vagg_i32 = UnsafePointer(to=vagg_arr).bitcast[Int32]()
     comptime vagg_stride = N_STEP * size_of[Int32]()
-    var vvagg_scale = SIMD[DType.float32, width](vagg_scale)
 
     # =================================================================
     # KV-outer, query-inner
@@ -269,35 +239,33 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
         var n_tiles = (block_len + TILE_N - 1) // TILE_N
 
         # --- Pack K (all N-tile pairs) ---
-        var k_scratch_arr = InlineArray[SIMD[DType.uint32, TILE_N], TILE_N](
-            fill=SIMD[DType.uint32, TILE_N](0))
         for nt in range(0, n_tiles, 2):
             var k_pair_base = k_vnni + (nt // 2) * K_PAIR_BYTES
             var n_off = block_start + nt * TILE_N
             for ki in range(k_slices):
                 var k_off = ki * K_STEP
+                # Tile 0 of pair
                 var n0 = min(TILE_N, block_len - nt * TILE_N)
-                if n0 == TILE_N:
-                    transpose_generic[DType.uint32, TILE_N](
-                        (k_base + n_off * head_dim + k_off).bitcast[Scalar[DType.uint32]](),
-                        head_dim // 4,
-                        (k_pair_base + ki * 2 * TILE_BYTES).bitcast[Scalar[DType.uint32]](),
-                        TILE_N, k_scratch_arr)
-                else:
-                    pack_k_tile_vnni(k_base, head_dim, k_off, n_off, n0,
-                                     k_pair_base + ki * 2 * TILE_BYTES)
+                var k_rows0 = InlineArray[SIMD[DType.uint32, TILE_N], TILE_N](
+                    fill=SIMD[DType.uint32, TILE_N](0))
+                for col in range(n0):
+                    k_rows0[col] = (k_base + (n_off + col) * head_dim + k_off).bitcast[Scalar[DType.uint32]]().load[width=TILE_N]()
+                transpose_rows[DType.uint32, TILE_N](
+                    k_rows0,
+                    (k_pair_base + ki * 2 * TILE_BYTES).bitcast[Scalar[DType.uint32]](),
+                    TILE_N)
+                # Tile 1 of pair
                 var n1 = max(0, min(TILE_N, block_len - (nt + 1) * TILE_N))
-                if n1 == TILE_N:
-                    transpose_generic[DType.uint32, TILE_N](
-                        (k_base + (n_off + TILE_N) * head_dim + k_off).bitcast[Scalar[DType.uint32]](),
-                        head_dim // 4,
-                        (k_pair_base + ki * 2 * TILE_BYTES + TILE_BYTES).bitcast[Scalar[DType.uint32]](),
-                        TILE_N, k_scratch_arr)
-                else:
-                    pack_k_tile_vnni(k_base, head_dim, k_off, n_off + TILE_N, n1,
-                                     k_pair_base + ki * 2 * TILE_BYTES + TILE_BYTES)
+                var k_rows1 = InlineArray[SIMD[DType.uint32, TILE_N], TILE_N](
+                    fill=SIMD[DType.uint32, TILE_N](0))
+                for col in range(n1):
+                    k_rows1[col] = (k_base + (n_off + TILE_N + col) * head_dim + k_off).bitcast[Scalar[DType.uint32]]().load[width=TILE_N]()
+                transpose_rows[DType.uint32, TILE_N](
+                    k_rows1,
+                    (k_pair_base + ki * 2 * TILE_BYTES + TILE_BYTES).bitcast[Scalar[DType.uint32]](),
+                    TILE_N)
 
-        # --- Pack V (XOR → i8 VNNI) ---
+        # --- Pack V (i8 → VNNI interleave) ---
         for nt in range(hd_n_tiles):
             for kt in range(chunk_k_iters):
                 pack_v_tile_vnni(v_base, head_dim,
@@ -334,64 +302,59 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
                 var qi_row = qb_start + qi_local
                 var abs_row = q_row_start + qi_row
                 var m_pos = abs_row // gqa_factor
-                var causal_limit = pos + m_pos + 1 - block_start
+                var causal_limit = min(pos + m_pos + 1 - block_start, block_len)
                 var q_bi = qi_biases[qi_row]
-                var q_sc = score_scale  # per-layer constant
-                var vq_bi = SIMD[DType.float32, width](q_bi)
-                var vq_sc = SIMD[DType.float32, width](q_sc)
-
-                var s_row = score_buf + qi_local * BLOCK_N
+                var q_sc = score_scale
                 var si_row = score_i32 + qi_local * BLOCK_N
 
-                # Dequant + max
+                # Max pass (i32 → dequant inline, no f32 store)
                 var vmax = SIMD[DType.float32, width](Float32(-1e30))
                 var t = 0
-                while t + width <= min(causal_limit, block_len):
-                    var raw = (si_row + t).load[width=width]().cast[DType.float32]()
-                    var dq = (raw - vq_bi) * vq_sc
-                    (s_row + t).store(dq)
+                while t + width <= causal_limit:
+                    var dq = ((si_row + t).load[width=width]().cast[DType.float32]() - q_bi) * q_sc
                     vmax = max(vmax, dq)
                     t += width
-                while t < min(causal_limit, block_len):
-                    var dq = (Float32(si_row[t]) - q_bi) * q_sc
-                    s_row[t] = dq
-                    if dq > vmax.reduce_max(): vmax = SIMD[DType.float32, width](dq)
+                var scalar_max = Float32(-1e30)
+                while t < causal_limit:
+                    scalar_max = max(scalar_max, (Float32(si_row[t]) - q_bi) * q_sc)
                     t += 1
-                var row_max = vmax.reduce_max()
-                while t < block_len:
-                    s_row[t] = Float32(-1e30)
-                    t += 1
+                var row_max = max(vmax.reduce_max(), scalar_max)
 
                 # Correction
                 var m_old = running_m[qi_row]
                 var m_new = max(m_old, row_max)
-                var correction = exp_f32_fast[1](m_old - m_new)
                 running_m[qi_row] = m_new
-                running_l[qi_row] = running_l[qi_row] * correction
-                var ro = running_o + qi_row * head_dim
-                var vcorr = SIMD[DType.float32, width](correction)
-                var d = 0
-                while d + width <= head_dim:
-                    (ro + d).store((ro + d).load[width=width]() * vcorr)
-                    d += width
+                if m_new > m_old:
+                    var correction = exp_f32_fast[1](m_old - m_new)
+                    running_l[qi_row] = running_l[qi_row] * correction
+                    var ro = running_o + qi_row * head_dim
+                    var d = 0
+                    while d + width <= head_dim:
+                        (ro + d).store((ro + d).load[width=width]() * correction)
+                        d += width
 
-                # Exp → u8
-                var vm_new = SIMD[DType.float32, width](m_new)
+                # Fused dequant + exp → u8 (re-reads i32, no score_buf)
                 var l_acc = SIMD[DType.float32, width](0)
-                var v255 = SIMD[DType.float32, width](255.0)
                 var w_row = w_u8_buf + qi_local * padded_chunk
                 t = 0
-                while t + width <= block_len:
-                    var e = exp_f32_fast((s_row + t).load[width=width]() - vm_new)
-                    (w_row + t).store(roundeven(e * v255).cast[DType.uint8]())
+                while t + width <= causal_limit:
+                    var dq = ((si_row + t).load[width=width]().cast[DType.float32]() - q_bi) * q_sc
+                    var e = exp_f32_fast(dq - m_new)
+                    (w_row + t).store(roundeven(e * Float32(255)).cast[DType.uint8]())
                     l_acc += e
                     t += width
                 var l_contrib = l_acc.reduce_add()
-                while t < block_len:
-                    var e = exp_f32_fast[1](s_row[t] - m_new)
-                    w_row[t] = UInt8(roundeven[DType.float32, 1](e * Float32(255.0)))
+                while t < causal_limit:
+                    var dq = (Float32(si_row[t]) - q_bi) * q_sc
+                    var e = exp_f32_fast[1](dq - m_new)
+                    w_row[t] = roundeven[DType.float32, 1](e * Float32(255)).cast[DType.uint8]()
                     l_contrib += e
                     t += 1
+                comptime u8w = simd_width_of[DType.uint8]()
+                comptime u8zeros = SIMD[DType.uint8, u8w](0)
+                while t + u8w <= padded_chunk:
+                    (w_row + t).store(u8zeros)
+                    t += u8w
                 while t < padded_chunk:
                     w_row[t] = UInt8(0)
                     t += 1
@@ -415,13 +378,13 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
                     tilestore[5](vagg_i32 + TILE_N, vagg_stride)
                     tilestore[6](vagg_i32 + TILE_M * N_STEP, vagg_stride)
                     tilestore[7](vagg_i32 + TILE_M * N_STEP + TILE_N, vagg_stride)
-                    # Dequant + accumulate
+                    # Accumulate i32→f32 (vagg_scale deferred to final normalize)
                     for r in range(min(M_STEP, qb_len - mi * M_STEP)):
                         var ro_row = running_o + (qb_start + mi * M_STEP + r) * head_dim + d_off
                         var c = 0
                         while c + width <= N_STEP:
                             var raw = (vagg_i32 + r * N_STEP + c).load[width=width]().cast[DType.float32]()
-                            (ro_row + c).store((ro_row + c).load[width=width]() + raw * vvagg_scale)
+                            (ro_row + c).store((ro_row + c).load[width=width]() + raw)
                             c += width
 
     # =================================================================
@@ -432,13 +395,12 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
         var m = abs_row // gqa_factor
         var hi = abs_row % gqa_factor
         var h = g * gqa_factor + hi
-        var inv_l = Float32(1.0) / running_l[local_idx]
-        var vinv_l = SIMD[DType.float32, width](inv_l)
+        var final_scale = vagg_scale / running_l[local_idx]
         var ro = running_o + local_idx * head_dim
         var out = ctx[].row_f32 + m * q_cols + h * head_dim
         var d = 0
         while d + width <= head_dim:
-            (out + d).store((ro + d).load[width=width]() * vinv_l)
+            (out + d).store((ro + d).load[width=width]() * final_scale)
             d += width
 
 
@@ -478,7 +440,7 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=scratch),
         Float32(127.0) / q_layer_scale,
         q_layer_scale * k_layer_scale * inv_sqrt_hd / (Float32(127.0) * Float32(127.0)),
-        v_layer_scale / Float32(255.0),
+        v_layer_scale / (Float32(255.0) * Float32(127.0)),
         pos, q.seq_len,
     )
     var ctx_ptr = UnsafePointer(to=ctx)
