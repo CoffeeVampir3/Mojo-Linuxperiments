@@ -13,7 +13,9 @@ K/V packing is not redundant — each worker packs only its own context range.
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of, size_of
 from std.collections import InlineArray
+from std.os.atomic import Atomic, Consistency
 from threading import BurstPool
+import linux.sys as linux
 
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named,
@@ -40,11 +42,17 @@ comptime BLOCK_N = 512
 # Per-worker scratch — typed pointers produced by caller
 # ============================================================================
 
+comptime AtomicInt32 = Atomic[DType.int32]
+
+
 @fieldwise_init
 struct DecodeWorkerScratch:
     var group: Int
     var ctx_start: Int
     var ctx_end: Int
+    var worker_in_group: Int
+    var workers_per_group: Int
+    var group_state: Int           # raw address of per-group merge state
     var profile: UnsafePointer[KernelProfile, MutAnyOrigin]
     var qi_buf: UnsafePointer[Int8, MutAnyOrigin]
     var qi_biases: UnsafePointer[Float32, MutAnyOrigin]
@@ -53,6 +61,22 @@ struct DecodeWorkerScratch:
     var running_l: UnsafePointer[Float32, MutAnyOrigin]
     var score_i32: UnsafePointer[Int32, MutAnyOrigin]
     var w_u8_buf: UnsafePointer[UInt8, MutAnyOrigin]
+
+
+# Group merge state layout (per KV group, allocated in scratch):
+#   [0]:                          counter (Int32, atomic) — workers remaining
+#   [4]:                          merge_ready (Int32, atomic) — set by last worker
+#   [8]:                          corrections[wpg * gqa_factor] (Float32)
+#   [8 + wpg*gf*4]:              ro_ptrs[wpg] (Int) — running_o addresses
+#   [8 + wpg*gf*4 + wpg*8]:      rm_ptrs[wpg] (Int) — running_m addresses
+#   [8 + wpg*gf*4 + wpg*16]:     rl_ptrs[wpg] (Int) — running_l addresses
+comptime MERGE_COUNTER_OFF = 0
+comptime MERGE_READY_OFF = 4
+comptime MERGE_CORR_OFF = 8
+
+def group_state_bytes[num_heads: Int, num_kv_heads: Int](wpg: Int) -> Int:
+    comptime gqa_factor = num_heads // num_kv_heads
+    return 8 + wpg * gqa_factor * size_of[Float32]() + wpg * 3 * size_of[Int]()
 
 
 # ============================================================================
@@ -82,7 +106,8 @@ def scratch_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int](
     if max_workers_per_group > 0:
         wpg = min(wpg, max_workers_per_group)
     var total_workers = num_kv_heads * wpg
-    return q_cols * size_of[Float32]() + total_workers * pw + size_of[CallerProfile]()
+    var gs = group_state_bytes[num_heads, num_kv_heads](wpg)
+    return q_cols * size_of[Float32]() + total_workers * pw + num_kv_heads * gs + size_of[CallerProfile]()
 
 
 # ============================================================================
@@ -345,6 +370,87 @@ def attn_decode_worker[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq
                     c += width
         prof[].vagg += tap() - t1
 
+    # =================================================================
+    # Fused merge — workers self-coordinate via atomic counter
+    # =================================================================
+    var gs = ws[].group_state
+    var wpg = ws[].workers_per_group
+    var wid = ws[].worker_in_group
+
+    # Offsets into group state
+    var corr_base = UnsafePointer[Float32, MutAnyOrigin](
+        unsafe_from_address=gs + MERGE_CORR_OFF)
+    var ro_ptrs = UnsafePointer[Int, MutAnyOrigin](
+        unsafe_from_address=gs + MERGE_CORR_OFF + wpg * gqa_factor * size_of[Float32]())
+    var rm_ptrs = UnsafePointer[Int, MutAnyOrigin](
+        unsafe_from_address=Int(ro_ptrs) + wpg * size_of[Int]())
+    var rl_ptrs = UnsafePointer[Int, MutAnyOrigin](
+        unsafe_from_address=Int(rm_ptrs) + wpg * size_of[Int]())
+
+    var counter_p = UnsafePointer[Int32, MutAnyOrigin](
+        unsafe_from_address=gs + MERGE_COUNTER_OFF)
+    var ready_p = UnsafePointer[Int32, MutAnyOrigin](
+        unsafe_from_address=gs + MERGE_READY_OFF)
+
+    # Signal context phase complete
+    var old = AtomicInt32.fetch_add[ordering=Consistency.ACQUIRE_RELEASE](counter_p, -1)
+
+    if old == 1:
+        # Last worker: compute scalar merge + precompute corrections
+        var vagg_scale = ctx[].vagg_scale
+        for hi in range(gqa_factor):
+            # Find global max
+            var m = Float32(-1e30)
+            for wi in range(wpg):
+                var rm = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=rm_ptrs[wi])
+                m = max(m, rm[hi])
+
+            # Compute corrections and merged_l
+            var l = Float32(0)
+            for wi in range(wpg):
+                var rm = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=rm_ptrs[wi])
+                var rl = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=rl_ptrs[wi])
+                var c = exp_f32_fast[1](rm[hi] - m)
+                l += rl[hi] * c
+                corr_base[wi * gqa_factor + hi] = c
+
+            # Fold vagg_scale / merged_l into corrections
+            var inv_l = vagg_scale / l
+            for wi in range(wpg):
+                corr_base[wi * gqa_factor + hi] *= inv_l
+
+        # Signal merge ready
+        AtomicInt32.store[ordering=Consistency.RELEASE](ready_p, 1)
+    else:
+        # Spin until last worker signals
+        var sys = linux.linux_sys()
+        while AtomicInt32.load[ordering=Consistency.ACQUIRE](ready_p) == 0:
+            sys.arch_cpu_relax()
+
+    # All workers: pull-merge output for assigned heads
+    var out = ctx[].row_f32 + g * gqa_factor * head_dim
+    var total_out = gqa_factor * head_dim
+    var my_start = wid * total_out // wpg
+    var my_end = (wid + 1) * total_out // wpg
+    # Align to SIMD width for clean vectorization
+    my_start = (my_start // width) * width
+    if wid + 1 < wpg:
+        my_end = (my_end // width) * width
+
+    var idx = my_start
+    while idx + width <= my_end:
+        var hi = idx // head_dim
+        var d = idx % head_dim
+        var c0 = corr_base[hi]   # correction for worker 0
+        var ro0 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=ro_ptrs[0])
+        var acc = (ro0 + hi * head_dim + d).load[width=width]() * c0
+        for wi in range(1, wpg):
+            var c = corr_base[wi * gqa_factor + hi]
+            var ro = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=ro_ptrs[wi])
+            acc = acc + (ro + hi * head_dim + d).load[width=width]() * c
+        (out + idx).store(acc)
+        idx += width
+
     prof[].total = tap() - t0
 
 
@@ -382,8 +488,10 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     if max_workers_per_group > 0:
         workers_per_group_val = min(workers_per_group_val, max_workers_per_group)
     var total_jobs_val = num_kv_heads * workers_per_group_val
+    var gs_size = group_state_bytes[num_heads, num_kv_heads](workers_per_group_val)
+    var gs_base = scratch + WORKERS_OFF + total_jobs_val * pw
     var cp = UnsafePointer[CallerProfile, MutAnyOrigin](
-        unsafe_from_address=scratch + WORKERS_OFF + total_jobs_val * pw)
+        unsafe_from_address=gs_base + num_kv_heads * gs_size)
     cp[] = CallerProfile()
 
     var ctx = AttnCtx(
@@ -406,9 +514,26 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     var context_len = pos
     cp[].setup = tap() - tc0
 
-    # Build per-worker scratch and assign context ranges
+    # Build per-worker scratch, group merge state, and assign context ranges
     for g in range(num_kv_heads):
         var chunk_size = (context_len + workers_per_group - 1) // workers_per_group
+
+        # Initialize per-group merge state
+        var gs_addr = gs_base + g * gs_size
+        var gs_counter = UnsafePointer[Int32, MutAnyOrigin](
+            unsafe_from_address=gs_addr + MERGE_COUNTER_OFF)
+        var gs_ready = UnsafePointer[Int32, MutAnyOrigin](
+            unsafe_from_address=gs_addr + MERGE_READY_OFF)
+        AtomicInt32.store[ordering=Consistency.RELEASE](gs_counter, Int32(workers_per_group))
+        AtomicInt32.store[ordering=Consistency.RELEASE](gs_ready, 0)
+
+        # Pointer arrays within group state
+        var ro_ptrs_base = UnsafePointer[Int, MutAnyOrigin](
+            unsafe_from_address=gs_addr + MERGE_CORR_OFF + workers_per_group * gqa_factor * size_of[Float32]())
+        var rm_ptrs_base = UnsafePointer[Int, MutAnyOrigin](
+            unsafe_from_address=Int(ro_ptrs_base) + workers_per_group * size_of[Int]())
+        var rl_ptrs_base = UnsafePointer[Int, MutAnyOrigin](
+            unsafe_from_address=Int(rm_ptrs_base) + workers_per_group * size_of[Int]())
 
         for w in range(workers_per_group):
             var job_idx = g * workers_per_group + w
@@ -423,6 +548,9 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
             ws[].group = g
             ws[].ctx_start = c_start
             ws[].ctx_end = c_end
+            ws[].worker_in_group = w
+            ws[].workers_per_group = workers_per_group
+            ws[].group_state = gs_addr
             ws[].profile = UnsafePointer[KernelProfile, MutAnyOrigin](unsafe_from_address=data + off)
             ws[].profile[] = KernelProfile()
             off += size_of[KernelProfile]()
@@ -439,6 +567,11 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
             ws[].score_i32 = UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=data + off)
             off += padded_m * BLOCK_N * size_of[Int32]()
             ws[].w_u8_buf = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=data + off)
+
+            # Register this worker's pointers in group state
+            ro_ptrs_base[w] = Int(ws[].running_o)
+            rm_ptrs_base[w] = Int(ws[].running_m)
+            rl_ptrs_base[w] = Int(ws[].running_l)
 
             var pack = pool.args_base + job_idx
             pack[].arg0 = Int(ctx_ptr)
@@ -459,57 +592,8 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     pool.join()
     cp[].join = tap() - tc1
 
-    # =================================================================
-    # Merge partial results across workers per KV group
-    # =================================================================
-    tc1 = tap()
-    var out = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=scratch)
-
-    for g in range(num_kv_heads):
-        for hi in range(gqa_factor):
-            var h = g * gqa_factor + hi
-
-            # Start from worker 0's state
-            var ws0_base = scratch + WORKERS_OFF + g * workers_per_group * pw
-            var ws0 = UnsafePointer[DecodeWorkerScratch, MutAnyOrigin](
-                unsafe_from_address=ws0_base)
-            var merged_m = ws0[].running_m[hi]
-            var merged_l = ws0[].running_l[hi]
-            var merged_o = ws0[].running_o + hi * head_dim
-
-            # Merge remaining workers
-            for w in range(1, workers_per_group):
-                var wsw_base = scratch + WORKERS_OFF + (g * workers_per_group + w) * pw
-                var wsw = UnsafePointer[DecodeWorkerScratch, MutAnyOrigin](
-                    unsafe_from_address=wsw_base)
-                var w_m = wsw[].running_m[hi]
-                var w_l = wsw[].running_l[hi]
-                var w_o = wsw[].running_o + hi * head_dim
-
-                var new_m = max(merged_m, w_m)
-                var c_old = exp_f32_fast[1](merged_m - new_m)
-                var c_new = exp_f32_fast[1](w_m - new_m)
-
-                merged_l = merged_l * c_old + w_l * c_new
-                var vc_old = SIMD[DType.float32, width](c_old)
-                var vc_new = SIMD[DType.float32, width](c_new)
-                var d = 0
-                while d + width <= head_dim:
-                    var o_merged = (merged_o + d).load[width=width]() * vc_old
-                    var o_worker = (w_o + d).load[width=width]() * vc_new
-                    (merged_o + d).store(o_merged + o_worker)
-                    d += width
-                merged_m = new_m
-
-            # Final normalize and write output
-            var final_scale = vagg_scale / merged_l
-            var d = 0
-            while d + width <= head_dim:
-                (out + h * head_dim + d).store(
-                    (merged_o + d).load[width=width]() * final_scale)
-                d += width
-
-    cp[].merge = tap() - tc1
+    # Merge is fused into worker kernels — output is ready
+    cp[].merge = 0
     cp[].total = tap() - tc0
 
     return PoolFence(UnsafePointer[BurstPool[], MutAnyOrigin](
@@ -527,8 +611,9 @@ def read_caller_profile[num_heads: Int, num_kv_heads: Int, head_dim: Int](
     var wpg = max(1, num_workers // num_kv_heads)
     if max_wpg > 0: wpg = min(wpg, max_wpg)
     var total_workers = num_kv_heads * wpg
+    var gs = group_state_bytes[num_heads, num_kv_heads](wpg)
     var cp = UnsafePointer[CallerProfile, MutAnyOrigin](
-        unsafe_from_address=scratch + WORKERS_OFF + total_workers * pw)
+        unsafe_from_address=scratch + WORKERS_OFF + total_workers * pw + num_kv_heads * gs)
     return cp[]
 
 
