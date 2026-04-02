@@ -110,11 +110,13 @@ def install_burst_sigsegv_handler():
 struct DispatchLine:
     var work_available: AtomicInt32
     var shutdown: AtomicInt32
+    var hot_mode: AtomicInt32
     var func_ptr: Int
 
     def __init__(out self):
         self.work_available = AtomicInt32(0)
         self.shutdown = AtomicInt32(0)
+        self.hot_mode = AtomicInt32(0)
         self.func_ptr = 0
 
 @align(64)
@@ -156,6 +158,7 @@ struct WorkerStackHead[mask_size: Int]:
     var shared: UnsafePointer[SharedPoolState, MutAnyOrigin]
     var args_base: UnsafePointer[ArgPack, MutAnyOrigin]
     var futex_flags: Int
+    var spin_limit: Int
     var altstack_base: Int
     var altstack_size: Int
     var pinned: Int
@@ -165,7 +168,8 @@ struct WorkerStackHead[mask_size: Int]:
                 worker_id: Int,
                 shared: UnsafePointer[SharedPoolState, MutAnyOrigin],
                 args_base: UnsafePointer[ArgPack, MutAnyOrigin],
-                futex_flags: Int, altstack_base: Int, altstack_size: Int, pinned: Int, var cpu_mask: CpuMask[Self.mask_size]):
+                futex_flags: Int, spin_limit: Int,
+                altstack_base: Int, altstack_size: Int, pinned: Int, var cpu_mask: CpuMask[Self.mask_size]):
         self.entry = entry
         self.slot_base = slot_base
         self.worker_id = worker_id
@@ -173,12 +177,13 @@ struct WorkerStackHead[mask_size: Int]:
         self.shared = shared
         self.args_base = args_base
         self.futex_flags = futex_flags
+        self.spin_limit = spin_limit
         self.altstack_base = altstack_base
         self.altstack_size = altstack_size
         self.pinned = pinned
         self.cpu_mask = cpu_mask^
 
-struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 128](Movable):
+struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 128, spin_limit: Int = 1000](Movable):
     comptime slot_size = slot_size[Self.stack_size]()
     var slots: HeapMoveArray[WorkerSlot]
     var shared: UnsafePointer[SharedPoolState, MutAnyOrigin]
@@ -298,6 +303,46 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
             cap -= 1
         return Self(cap, mask^, node)
 
+    @staticmethod
+    def for_numa_node_hot(numa: NumaInfo, node: Int, headroom: Int = 2) -> Self:
+        """Create pool with headroom cores reserved for OS/caller.
+
+        Workers never exceed (cores - headroom), preventing scheduler
+        deadlock when using high spin_limit. The reserved cores guarantee
+        the OS and straggler workers can always be scheduled.
+        """
+        var mask = numa.get_node_mask[Self.mask_size](node)
+        var total = numa.cpus_on_node(node)
+        var cap = max(1, total - headroom)
+        # Remove the highest-numbered cores from the mask to create headroom
+        var removed = 0
+        var bit = Self.mask_size * 64 - 1
+        while removed < headroom and bit >= 0:
+            if mask.test(bit):
+                mask.clear(bit)
+                removed += 1
+            bit -= 1
+        return Self(cap, mask^, node)
+
+    def begin_forward(mut self):
+        """Enter hot mode: wake all workers and keep them spinning.
+
+        Workers pure-spin on work_available without futex_wait until
+        end_forward() is called. Requires headroom (fewer workers than
+        cores) to prevent scheduler deadlock. Use for_numa_node_hot().
+        spin_limit still applies as a safety ceiling in cold mode.
+        """
+        AtomicInt32.store[ordering=Consistency.RELEASE](
+            UnsafePointer(to=self.shared[].dispatch.hot_mode.value), 1)
+        var sys = linux.linux_sys()
+        var workPtr = UnsafePointer(to=self.shared[].dispatch.work_available.value)
+        _ = sys.sys_futex_wake(Int(workPtr), self.capacity, self.futex_flags)
+
+    def end_forward(mut self):
+        """Exit hot mode: workers drain back to spin_limit/futex_wait."""
+        AtomicInt32.store[ordering=Consistency.RELEASE](
+            UnsafePointer(to=self.shared[].dispatch.hot_mode.value), 0)
+
     def dispatch[F: TrivialRegisterPassable](mut self, kernel: F, packs: UnsafePointer[ArgPack, MutAnyOrigin], num_jobs: Int = -1):
         """Launch `num_jobs` packs to workers and return immediately.
 
@@ -370,6 +415,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
                 self.shared,
                 self.args_base,
                 self.futex_flags,
+                Self.spin_limit,
                 altstack_base,
                 SlotLayout.ALTSTACK_SIZE,
                 Int(self.pinned),
@@ -399,6 +445,7 @@ def worker_main[mask_size: Int](stack_head_ptr: Int):
     ss.ss_flags = 0
     _ = sys.sys_sigaltstack(UnsafePointer(to=ss))
     var futex_flags = head_ptr[].futex_flags
+    var spin_limit = head_ptr[].spin_limit
     var slot_base = head_ptr[].slot_base
     var worker_id = head_ptr[].worker_id
     var shared = head_ptr[].shared
@@ -427,7 +474,6 @@ def worker_main[mask_size: Int](stack_head_ptr: Int):
         if ret != 0:
             print("sched_setaffinity failed:", ret)
 
-    comptime SPIN_LIMIT = 1000  # Spin iterations before sleeping
     var workPtr = UnsafePointer(to=shared[].dispatch.work_available.value)
 
     while True:
@@ -462,30 +508,23 @@ def worker_main[mask_size: Int](stack_head_ptr: Int):
                 var expected = old - 1
                 _ = shared[].dispatch.work_available.compare_exchange(expected, 0)
 
-        # A note, because it wasn't obvious to me. If you do not futex wait the scheduler
-        # on linux can absolutely deadlock spinning threads by not scheduling
-        # other (wanting to work) threads, leading to no-work on spinning threads and
-        # never re-scheduling waiting threads, so the work effectively deadlocks.
-        # (The threads look busy because they spin on the atomic.)
-        # Basically, we could go faster but it runs into stochastic failure
-        # unless we set up the system to specifically account for this number
-        # of physical threads to be dispatched by us.
-        # There's about a 6x penalty in latency cost (worst case) doing this VS pure spin
-        # however it guarantees work will always attempt to complete (in bounded time)
-        # and this doesn't need complex user/system configuration. But it's not optimal.
-
-        # No work available - spin briefly then sleep
+        # Hot mode (begin_forward/end_forward): pure spin, never sleep.
+        # Requires core headroom to prevent scheduler deadlock.
+        #
+        # Cold mode (default): spin up to spin_limit then futex_wait.
+        # Safe on any core count but adds wake latency per dispatch.
         var spins = 0
         while shared[].dispatch.work_available.load[ordering=Consistency.MONOTONIC]() <= 0:
             if shared[].dispatch.shutdown.load[ordering=Consistency.MONOTONIC]() != 0:
                 break
-            if spins < SPIN_LIMIT:
+            if shared[].dispatch.hot_mode.load[ordering=Consistency.MONOTONIC]() != 0:
+                sys.arch_cpu_relax()
+            elif spins < spin_limit:
                 sys.arch_cpu_relax()
                 spins += 1
             else:
-                # Sleep on work_available address, expecting value == 0
                 _ = sys.sys_futex_wait(Int(workPtr), 0, futex_flags)
-                spins = 0  # Reset spin count after wake
+                spins = 0
 
     # CHILD_CLEARTID handles clearing child_tid and futex wake automatically
     sys.sys_exit()
