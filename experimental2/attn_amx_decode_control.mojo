@@ -14,7 +14,7 @@ No context splitting in this baseline — establishes the true bandwidth floor.
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of, size_of
 from std.collections import InlineArray
-from threading import BurstPool
+from threading import BurstPool, ArgPack
 
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named,
@@ -463,3 +463,87 @@ def collect_profiles[num_heads: Int, num_kv_heads: Int, head_dim: Int](
         var data = ws_base + size_of[DecodeWorkerScratch]()
         var prof = UnsafePointer[KernelProfile, MutAnyOrigin](unsafe_from_address=data)
         agg.add(prof[])
+
+
+def decode_hot[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
+    QT: Encoding & Shaped,
+    CosT: Encoding & Shaped, SinT: Encoding & Shaped](
+    q: DynView[QT],
+    k_cache: KVCache[max_seq, head_dim, num_kv_heads],
+    v_cache: KVCache[max_seq, head_dim, num_kv_heads],
+    cos_table: Bound[CosT],
+    sin_table: Bound[SinT],
+    scratch: Int,
+    pos: Int,
+    q_layer_scale: Float32,
+    k_layer_scale: Float32,
+    v_layer_scale: Float32,
+    mut pool: BurstPool[],
+):
+    """Synchronous AMX decode with hot mode — one worker per KV group, true GQA."""
+    comptime gqa_factor = num_heads // num_kv_heads
+    comptime q_cols = QT.COLS
+    comptime pw = per_worker_bytes[num_heads, num_kv_heads, head_dim]()
+    comptime WORKERS_OFF = q_cols * size_of[Float32]()
+    comptime padded_m = ((gqa_factor + M_STEP - 1) // M_STEP) * M_STEP
+    var inv_sqrt_hd = Float32(1.0 / Float64(sqrt[DType.float32, 1](Float32(head_dim))))
+
+    var ctx = AttnCtx(
+        UnsafePointer[BFloat16, MutAnyOrigin](unsafe_from_address=q.ptr),
+        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cos_table.ptr),
+        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=sin_table.ptr),
+        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=k_cache.data_base),
+        UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=v_cache.data_base),
+        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=scratch),
+        Float32(127.0) / q_layer_scale,
+        q_layer_scale * k_layer_scale * inv_sqrt_hd / (Float32(127.0) * Float32(127.0)),
+        v_layer_scale / (Float32(255.0) * Float32(127.0)),
+        pos, 1,
+    )
+    var ctx_ptr = UnsafePointer(to=ctx)
+
+    comptime K_NT_PAIRS = BLOCK_N // TILE_N // 2
+    comptime K_SLICES = head_dim // K_STEP
+    comptime V_K_TILES = BLOCK_N // K_STEP
+    comptime V_N_TILES = head_dim // TILE_N
+
+    for g in range(num_kv_heads):
+        var ws_base = scratch + WORKERS_OFF + g * pw
+        var ws = UnsafePointer[DecodeWorkerScratch, MutAnyOrigin](
+            unsafe_from_address=ws_base)
+        var data = ws_base + size_of[DecodeWorkerScratch]()
+        var off = 0
+        ws[].group = g
+        ws[].profile = UnsafePointer[KernelProfile, MutAnyOrigin](unsafe_from_address=data + off)
+        ws[].profile[] = KernelProfile()
+        off += size_of[KernelProfile]()
+        ws[].qi_buf = UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=data + off)
+        off += padded_m * head_dim
+        ws[].qi_biases = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
+        off += padded_m * size_of[Float32]()
+        ws[].running_o = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
+        off += padded_m * head_dim * size_of[Float32]()
+        ws[].running_m = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
+        off += padded_m * size_of[Float32]()
+        ws[].running_l = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
+        off += padded_m * size_of[Float32]()
+        ws[].score_i32 = UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=data + off)
+        off += padded_m * BLOCK_N * size_of[Int32]()
+        ws[].w_u8_buf = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=data + off)
+        off += padded_m * BLOCK_N
+        ws[].k_vnni = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=data + off)
+        off += K_NT_PAIRS * K_SLICES * 2 * TILE_BYTES
+        ws[].v_vnni = UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=data + off)
+
+    var packs_arr = InlineArray[ArgPack, 32](fill=ArgPack())
+    for g in range(num_kv_heads):
+        var ws_base = scratch + WORKERS_OFF + g * pw
+        packs_arr[g].arg0 = Int(ctx_ptr)
+        packs_arr[g].arg1 = ws_base
+
+    pool.dispatch(
+        attn_decode[num_heads, num_kv_heads, head_dim, max_seq],
+        UnsafePointer(to=packs_arr).bitcast[ArgPack](),
+        num_kv_heads,
+    )
+    pool.join()

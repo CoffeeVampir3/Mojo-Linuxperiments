@@ -1,13 +1,12 @@
-"""Dispatch/join overhead benchmark: BurstPool cold/hot vs HotPool.
+"""Dispatch/join overhead benchmark: BurstPool cold/hot vs BurstPool.
 
 Compares three configurations across noop and heavy (~200us) work:
   1. BurstPool cold (default spin_limit=1000)
   2. BurstPool hot (begin_forward/end_forward + headroom)
-  3. HotPool (per-worker mailbox + begin_forward/end_forward + headroom)
+  3. BurstPool (per-worker mailbox + begin_forward/end_forward + headroom)
 """
 
 from threading.burst_threading import BurstPool, ArgPack
-from threading.hot_pool import HotPool, ArgPack as HotArgPack
 from std.memory import UnsafePointer
 from std.time import perf_counter_ns
 from std.benchmark import keep
@@ -44,7 +43,7 @@ def main():
 
     var cold_pool = BurstPool[].for_numa_node(numa, node)
     var burst_hot = BurstPool[].for_numa_node_hot(numa, node, HEADROOM)
-    var hp = HotPool[].for_numa_node(numa, node, HEADROOM)
+    var hp = BurstPool[].for_numa_node(numa, node, HEADROOM)
 
     if not cold_pool:
         print("cold_pool creation failed")
@@ -53,12 +52,12 @@ def main():
         print("burst_hot creation failed")
         return
     if not hp:
-        print("HotPool creation failed")
+        print("BurstPool creation failed")
         return
 
     print("BurstPool cold: " + String(cold_pool.capacity) + " workers")
     print("BurstPool hot:  " + String(burst_hot.capacity) + " workers")
-    print("HotPool:        " + String(hp.capacity) + " workers")
+    print("BurstPool:        " + String(hp.capacity) + " workers")
 
     var max_cap = max(cold_pool.capacity, max(burst_hot.capacity, hp.capacity))
     var output = HeapMoveArray[Int](max_cap)
@@ -66,10 +65,10 @@ def main():
         output.push(0)
 
     var bp_packs = HeapMoveArray[ArgPack](max_cap)
-    var hp_packs = HeapMoveArray[HotArgPack](max_cap)
+    var hp_packs = HeapMoveArray[ArgPack](max_cap)
     for i in range(max_cap):
         bp_packs.push(ArgPack())
-        hp_packs.push(HotArgPack())
+        hp_packs.push(ArgPack())
 
     var job_counts = InlineArray[Int, 4](fill=0)
     job_counts[0] = 2
@@ -116,7 +115,7 @@ def main():
             keep(output[0])
             if e < best_bh: best_bh = e
 
-        # HotPool
+        # BurstPool
         var best_hp = Int(1 << 60)
         for trial in range(TRIALS):
             hp.begin_forward()
@@ -175,7 +174,7 @@ def main():
             keep(output[0])
             if e < best_bh: best_bh = e
 
-        # HotPool
+        # BurstPool
         var best_hp = Int(1 << 60)
         for trial in range(TRIALS):
             hp.begin_forward()
