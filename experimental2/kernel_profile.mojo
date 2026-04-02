@@ -1,0 +1,136 @@
+"""Per-worker kernel profiler — nanosecond tap points for each phase.
+
+Each worker gets its own KernelProfile. Caller collects after join
+and feeds to ProfileAggregator for min/max/avg breakdown.
+"""
+
+from std.time import perf_counter_ns
+
+
+@fieldwise_init
+struct KernelProfile:
+    """Cumulative nanoseconds per kernel phase. Zero-initialized."""
+    var amx_config: Int
+    var q_prep: Int
+    var running_init: Int
+    var k_pack: Int
+    var v_pack: Int
+    var score_gemm: Int
+    var softmax: Int
+    var vagg: Int
+    var total: Int
+
+    def __init__(out self):
+        self.amx_config = 0
+        self.q_prep = 0
+        self.running_init = 0
+        self.k_pack = 0
+        self.v_pack = 0
+        self.score_gemm = 0
+        self.softmax = 0
+        self.vagg = 0
+        self.total = 0
+
+
+@always_inline
+def tap() -> Int:
+    """Read the high-resolution timer."""
+    return Int(perf_counter_ns())
+
+
+struct ProfileAggregator:
+    """Collects profiles from N workers, prints per-phase breakdown."""
+    var count: Int
+    var sum_amx_config: Int
+    var sum_q_prep: Int
+    var sum_running_init: Int
+    var sum_k_pack: Int
+    var sum_v_pack: Int
+    var sum_score_gemm: Int
+    var sum_softmax: Int
+    var sum_vagg: Int
+    var sum_total: Int
+    var max_total: Int
+
+    def __init__(out self):
+        self.count = 0
+        self.sum_amx_config = 0
+        self.sum_q_prep = 0
+        self.sum_running_init = 0
+        self.sum_k_pack = 0
+        self.sum_v_pack = 0
+        self.sum_score_gemm = 0
+        self.sum_softmax = 0
+        self.sum_vagg = 0
+        self.sum_total = 0
+        self.max_total = 0
+
+    def add(mut self, p: KernelProfile):
+        self.count += 1
+        self.sum_amx_config += p.amx_config
+        self.sum_q_prep += p.q_prep
+        self.sum_running_init += p.running_init
+        self.sum_k_pack += p.k_pack
+        self.sum_v_pack += p.v_pack
+        self.sum_score_gemm += p.score_gemm
+        self.sum_softmax += p.softmax
+        self.sum_vagg += p.vagg
+        self.sum_total += p.total
+        if p.total > self.max_total:
+            self.max_total = p.total
+
+    def print_summary(self):
+        if self.count == 0:
+            print("  (no profiles)")
+            return
+        var n = self.count
+        var wall = self.max_total
+        print("  workers: " + String(n) + "  wall(max): " + String(wall // 1000) + " us")
+        _print_phase("amx_config", self.sum_amx_config, n, wall)
+        _print_phase("q_prep", self.sum_q_prep, n, wall)
+        _print_phase("running_init", self.sum_running_init, n, wall)
+        _print_phase("k_pack", self.sum_k_pack, n, wall)
+        _print_phase("v_pack", self.sum_v_pack, n, wall)
+        _print_phase("score_gemm", self.sum_score_gemm, n, wall)
+        _print_phase("softmax", self.sum_softmax, n, wall)
+        _print_phase("vagg", self.sum_vagg, n, wall)
+
+
+def _print_phase(name: String, total_ns: Int, count: Int, wall_ns: Int):
+    var avg_us = total_ns // count // 1000
+    var pct = 0
+    if wall_ns > 0:
+        pct = (total_ns // count) * 100 // wall_ns
+    print("    " + name + ": " + String(avg_us) + " us avg (" + String(pct) + "%)")
+
+
+@fieldwise_init
+struct CallerProfile(Copyable, ImplicitlyCopyable):
+    """Caller-side timing for setup, dispatch, join, merge."""
+    var setup: Int
+    var dispatch: Int
+    var join: Int
+    var merge: Int
+    var total: Int
+
+    def __init__(out self):
+        self.setup = 0
+        self.dispatch = 0
+        self.join = 0
+        self.merge = 0
+        self.total = 0
+
+    def print_summary(self):
+        print("  caller total: " + String(self.total // 1000) + " us")
+        _print_caller_phase("setup", self.setup, self.total)
+        _print_caller_phase("dispatch", self.dispatch, self.total)
+        _print_caller_phase("join", self.join, self.total)
+        _print_caller_phase("merge", self.merge, self.total)
+
+
+def _print_caller_phase(name: String, ns: Int, total_ns: Int):
+    var us = ns // 1000
+    var pct = 0
+    if total_ns > 0:
+        pct = ns * 100 // total_ns
+    print("    " + name + ": " + String(us) + " us (" + String(pct) + "%)")

@@ -152,3 +152,23 @@ def tdpbf16ps[dst: Int, src_a: Int, src_b: Int]():
     comptime assert dst >= 0 and dst < 8 and src_a >= 0 and src_a < 8 and src_b >= 0 and src_b < 8
     llvm_intrinsic["llvm.x86.tdpbf16ps", NoneType](
         Int8(dst), Int8(src_a), Int8(src_b))
+
+
+@always_inline
+def tile_dp[dst: Int, src_a: Int, src_b: Int, a_dtype: DType, b_dtype: DType]():
+    """Tile dot product — instruction auto-selected from A/B dtypes."""
+    comptime assert dst >= 0 and dst < 8 and src_a >= 0 and src_a < 8 and src_b >= 0 and src_b < 8
+    comptime if a_dtype == DType.int8 and b_dtype == DType.int8:
+        llvm_intrinsic["llvm.x86.tdpbssd", NoneType](Int8(dst), Int8(src_a), Int8(src_b))
+    elif a_dtype == DType.int8 and b_dtype == DType.uint8:
+        llvm_intrinsic["llvm.x86.tdpbsud", NoneType](Int8(dst), Int8(src_a), Int8(src_b))
+    elif a_dtype == DType.uint8 and b_dtype == DType.int8:
+        llvm_intrinsic["llvm.x86.tdpbusd", NoneType](Int8(dst), Int8(src_a), Int8(src_b))
+    elif a_dtype == DType.uint8 and b_dtype == DType.uint8:
+        llvm_intrinsic["llvm.x86.tdpbuud", NoneType](Int8(dst), Int8(src_a), Int8(src_b))
+    elif a_dtype == DType.bfloat16 and b_dtype == DType.bfloat16:
+        llvm_intrinsic["llvm.x86.tdpbf16ps", NoneType](Int8(dst), Int8(src_a), Int8(src_b))
+    elif a_dtype == DType.float16 and b_dtype == DType.float16:
+        llvm_intrinsic["llvm.x86.tdpfp16ps", NoneType](Int8(dst), Int8(src_a), Int8(src_b))
+    else:
+        comptime assert False, "unsupported dtype combination for tile_dp"

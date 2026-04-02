@@ -1,7 +1,7 @@
-"""Correctness + performance test for experimental2 AMX prefill kernel.
+"""Correctness + performance test for experimental2 AMX decode kernel.
 
-Zero per-token scales. KV cache is flat u8. Fixed layer-level scales
-for Q, K, V quantization.
+Single-token decode: sl=1, true GQA (one worker per KV group).
+Validates against scalar reference with identical quantization pipeline.
 """
 
 from std.sys.info import simd_width_of, size_of
@@ -12,7 +12,17 @@ from modeling.model_spec import (
     BF16, F32, I8, Replicated,
     Slot, Bound, DynView,
 )
-from experimental2.attn_amx_prefill import prefill, scratch_bytes
+from experimental2.attn_amx_decode_control import (
+    decode as decode_control,
+    scratch_bytes as control_scratch_bytes,
+    collect_profiles as control_collect_profiles,
+)
+from experimental2.attn_amx_decode import (
+    decode, scratch_bytes as decode_scratch_bytes,
+    collect_profiles as chunk_collect_profiles,
+    read_caller_profile as chunk_read_caller,
+)
+from experimental2.kernel_profile import ProfileAggregator
 from experimental.hadquant_impl import fwht_block
 from experimental2.kv_cache import KVCache
 from experimental.amx import init_intel_amx
@@ -61,45 +71,39 @@ def main():
     comptime HIDDEN = NH * HD
     comptime HALF = HD // 2
     comptime MAX_SEQ = 1024
-    comptime SL = 16
-    comptime POS = 48
+    comptime POS = 64  # decode at position 64, attending to 0..63
 
-    # Fixed per-layer scales (simulating what model loading would provide)
     var q_layer_scale = Float32(0.15)
     var k_layer_scale = Float32(0.15)
     var v_layer_scale = Float32(0.15)
     var q_quant_inv = Float32(127.0) / q_layer_scale
 
     print("\n=== Correctness: " + String(NH) + "h/" + String(NKV)
-          + "kv, hd=" + String(HD) + ", sl=" + String(SL)
-          + ", pos=" + String(POS) + " ===")
+          + "kv, hd=" + String(HD) + ", pos=" + String(POS) + " (decode) ===")
 
     var corr_arena = NumaArena[](topo[0], 256 * 1024 * 1024)
 
     comptime KVC = KVCache[MAX_SEQ, HD, NKV]
-    var corr_scratch_bytes = scratch_bytes[NH, NKV, HD, SL](pools[0].capacity)
+    var corr_scratch = control_scratch_bytes[NH, NKV, HD]()
 
-    var q_bf16 = corr_arena.alloc[Scalar[DType.bfloat16]](SL * HIDDEN)
+    var q_bf16 = corr_arena.alloc[Scalar[DType.bfloat16]](HIDDEN)
     var kv_mem = corr_arena.alloc[UInt8](2 * KVC.TOTAL_BYTES)
     var k_cache = KVC(Int(kv_mem))
     var v_cache = KVC(Int(kv_mem) + KVC.TOTAL_BYTES)
-    var qi_out = corr_arena.alloc[Scalar[DType.int8]](SL * HIDDEN)
-    var sc_out = corr_arena.alloc[Float32](SL)
     var cos_tab = corr_arena.alloc[Float32](MAX_SEQ * HALF)
     var sin_tab = corr_arena.alloc[Float32](MAX_SEQ * HALF)
-    var scratch = corr_arena.alloc[UInt8](corr_scratch_bytes)
-    var expected = corr_arena.alloc[Float32](SL * HIDDEN)
+    var scratch = corr_arena.alloc[UInt8](corr_scratch)
+    var expected = corr_arena.alloc[Float32](HIDDEN)
     var q_head = corr_arena.alloc[Float32](HD)
     var head_buf = corr_arena.alloc[Scalar[DType.int8]](HD)
 
-    # Fill Q
-    for m in range(SL):
-        for k in range(HIDDEN):
-            q_bf16[m * HIDDEN + k] = Scalar[DType.bfloat16](
-                Float32(m * HIDDEN + k + 1) / Float32(SL * HIDDEN) - 0.5)
+    # Fill Q (single token, all heads)
+    for k in range(HIDDEN):
+        q_bf16[k] = Scalar[DType.bfloat16](
+            Float32(k + 1) / Float32(HIDDEN) - 0.5)
 
-    # Fill KV cache with fixed-scale quantized data (no per-token scales)
-    for t in range(POS + SL):
+    # Fill KV cache for positions 0..POS-1
+    for t in range(POS):
         for g in range(NKV):
             for d in range(HD):
                 var val = Float32((t * 7 + g * 13 + d * 3) % 251 - 125) / 125.0
@@ -118,69 +122,67 @@ def main():
 
     # F32 reference: same pipeline as the kernel, in scalar
     var inv_sqrt_hd = Float32(1.0) / sqrt[DType.float32, 1](Float32(HD))
-    for m in range(SL):
-        var actual_pos = POS + m
-        var context = actual_pos + 1
-        for h in range(NH):
-            var g = h // GQA
-            # Q: bf16 → f32 → RoPE → FWHT → fixed-scale i8
-            for d in range(HD):
-                q_head[d] = Float32(q_bf16[m * HIDDEN + h * HD + d])
-            for j in range(HALF):
-                var x_lo = q_head[j]
-                var x_hi = q_head[HALF + j]
-                var cv = cos_tab[actual_pos * HALF + j]
-                var sv = sin_tab[actual_pos * HALF + j]
-                q_head[j] = x_lo * cv - x_hi * sv
-                q_head[HALF + j] = x_hi * cv + x_lo * sv
-            fwht_block[DType.float32, HD](q_head)
-            # Fixed-scale quantize Q
-            var qi_ref = corr_arena.alloc[Scalar[DType.int8]](HD)
-            var q_sum = Int(0)
-            for d in range(HD):
-                var qi = Int(max(min(Int(q_head[d] * q_quant_inv + 0.5), 127), -128))
-                if q_head[d] * q_quant_inv < 0:
-                    qi = Int(max(min(Int(q_head[d] * q_quant_inv - 0.5), 127), -128))
-                qi_ref[d] = Scalar[DType.int8](qi)
-                q_sum += qi
-            var q_bias = Float32(128 * q_sum)
-            var score_scale = q_layer_scale * k_layer_scale * inv_sqrt_hd / (Float32(127.0) * Float32(127.0))
+    var context = POS  # decode attends to 0..POS-1
+    for h in range(NH):
+        var g = h // GQA
+        # Q: bf16 -> f32 -> RoPE -> FWHT -> fixed-scale i8
+        for d in range(HD):
+            q_head[d] = Float32(q_bf16[h * HD + d])
+        for j in range(HALF):
+            var x_lo = q_head[j]
+            var x_hi = q_head[HALF + j]
+            var cv = cos_tab[POS * HALF + j]
+            var sv = sin_tab[POS * HALF + j]
+            q_head[j] = x_lo * cv - x_hi * sv
+            q_head[HALF + j] = x_hi * cv + x_lo * sv
+        fwht_block[DType.float32, HD](q_head)
+        # Fixed-scale quantize Q
+        var qi_ref = corr_arena.alloc[Scalar[DType.int8]](HD)
+        var q_sum = Int(0)
+        for d in range(HD):
+            var qi = Int(max(min(Int(q_head[d] * q_quant_inv + 0.5), 127), -128))
+            if q_head[d] * q_quant_inv < 0:
+                qi = Int(max(min(Int(q_head[d] * q_quant_inv - 0.5), 127), -128))
+            qi_ref[d] = Scalar[DType.int8](qi)
+            q_sum += qi
+        var q_bias = Float32(128 * q_sum)
+        var score_scale = q_layer_scale * k_layer_scale * inv_sqrt_hd / (Float32(127.0) * Float32(127.0))
 
-            # Score against K cache
-            var scores_mark = corr_arena.mark()
-            var scores = corr_arena.alloc[Float32](context)
-            for t in range(context):
-                var k_data = k_cache.k_head(t, g)
-                var dot = Int32(0)
-                for d in range(HD):
-                    dot += Int32(qi_ref[d]) * Int32(k_data[d])
-                scores[t] = (Float32(dot) - q_bias) * score_scale
-
-            # Softmax
-            var smax = scores[0]
-            for t in range(1, context):
-                if scores[t] > smax: smax = scores[t]
-            var exp_sum = Float32(0)
-            for t in range(context):
-                scores[t] = exp_f32[1](scores[t] - smax)
-                exp_sum += scores[t]
-            var vagg_scale = v_layer_scale / (Float32(255.0) * Float32(127.0))
+        # Score against K cache (all positions 0..POS-1)
+        var scores_mark = corr_arena.mark()
+        var scores = corr_arena.alloc[Float32](context)
+        for t in range(context):
+            var k_data = k_cache.k_head(t, g)
+            var dot = Int32(0)
             for d in range(HD):
-                expected[m * HIDDEN + h * HD + d] = Float32(0)
-            for t in range(context):
-                var w_u8 = UInt8(max(min(Int(scores[t] * 255.0 + 0.5), 255), 0))
-                var v_data = v_cache.v_head(t, g)
-                for d in range(HD):
-                    var v_i8 = Int32(v_data[d])
-                    expected[m * HIDDEN + h * HD + d] += Float32(Int32(w_u8) * v_i8) * vagg_scale
+                dot += Int32(qi_ref[d]) * Int32(k_data[d])
+            scores[t] = (Float32(dot) - q_bias) * score_scale
+
+        # Softmax (no causal mask — all positions valid)
+        var smax = scores[0]
+        for t in range(1, context):
+            if scores[t] > smax: smax = scores[t]
+        var exp_sum = Float32(0)
+        for t in range(context):
+            scores[t] = exp_f32[1](scores[t] - smax)
+            exp_sum += scores[t]
+        var vagg_scale = v_layer_scale / (Float32(255.0) * Float32(127.0))
+        for d in range(HD):
+            expected[h * HD + d] = Float32(0)
+        for t in range(context):
+            var w_u8 = UInt8(max(min(Int(scores[t] * 255.0 + 0.5), 255), 0))
+            var v_data = v_cache.v_head(t, g)
             for d in range(HD):
-                expected[m * HIDDEN + h * HD + d] /= exp_sum
+                var v_i8 = Int32(v_data[d])
+                expected[h * HD + d] += Float32(Int32(w_u8) * v_i8) * vagg_scale
+        for d in range(HD):
+            expected[h * HD + d] /= exp_sum
 
-            corr_arena.reset_to(scores_mark)
+        corr_arena.reset_to(scores_mark)
 
-    # Run kernel
-    prefill[NH, NKV, HD](
-        DynView[QSlot](Int(q_bf16), SL),
+    # Run control kernel
+    decode_control[NH, NKV, HD](
+        DynView[QSlot](Int(q_bf16), 1),
         k_cache, v_cache,
         Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
         Int(scratch), POS,
@@ -188,49 +190,77 @@ def main():
         pool_ptrs[0][],
     ).join()
 
-    # Compare
     var rf32 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(scratch))
     var err_sum = Float64(0)
     var count = 0
-    for m in range(SL):
-        for d in range(HIDDEN):
-            var got = Float64(rf32[m * HIDDEN + d])
-            var rv = Float64(expected[m * HIDDEN + d])
-            var e = got - rv
-            if e < 0: e = -e
-            err_sum += e
-            count += 1
+    for d in range(HIDDEN):
+        var got = Float64(rf32[d])
+        var rv = Float64(expected[d])
+        var e = got - rv
+        if e < 0: e = -e
+        err_sum += e
+        count += 1
     var avg_err = err_sum / Float64(count)
-    print("avg_err: " + String(avg_err))
+    print("control avg_err: " + String(avg_err))
     if avg_err < 0.1:
-        print("PASS")
+        print("control PASS")
     else:
-        print("FAIL")
+        print("control FAIL")
+
+    # Run chunked kernel
+    var corr_chunk_sz = decode_scratch_bytes[NH, NKV, HD](pools[0].capacity)
+    var chunk_scratch = corr_arena.alloc[UInt8](corr_chunk_sz)
+    decode[NH, NKV, HD](
+        DynView[QSlot](Int(q_bf16), 1),
+        k_cache, v_cache,
+        Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
+        Int(chunk_scratch), POS,
+        q_layer_scale, k_layer_scale, v_layer_scale,
+        pool_ptrs[0][],
+    ).join()
+
+    var cf32 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(chunk_scratch))
+    err_sum = Float64(0)
+    count = 0
+    for d in range(HIDDEN):
+        var got = Float64(cf32[d])
+        var rv = Float64(expected[d])
+        var e = got - rv
+        if e < 0: e = -e
+        err_sum += e
+        count += 1
+    avg_err = err_sum / Float64(count)
+    print("chunked avg_err: " + String(avg_err))
+    if avg_err < 0.1:
+        print("chunked PASS")
+    else:
+        print("chunked FAIL")
 
     # =====================================================================
-    # Performance sweep
+    # Performance sweep — decode at various context lengths
     # =====================================================================
     comptime HD2 = 128
     comptime NH2 = 128
     comptime NKV2 = 8
     comptime HALF2 = HD2 // 2
-    comptime MAX_SEQ2 = 8192
-    comptime MAX_SL = 64
+    comptime MAX_SEQ2 = 16384
 
     comptime LOCAL_KV2 = NKV2 // NUM_NODES
     comptime LOCAL_NH2 = NH2 // NUM_NODES
     comptime LOCAL_HIDDEN2 = LOCAL_NH2 * HD2
 
     comptime LOCAL_KVC = KVCache[MAX_SEQ2, HD2, LOCAL_KV2]
-    var local_scratch_bytes = scratch_bytes[LOCAL_NH2, LOCAL_KV2, HD2, MAX_SL](pools[0].capacity)
+    var ctrl_scratch_sz = control_scratch_bytes[LOCAL_NH2, LOCAL_KV2, HD2]()
+    var chunk_scratch_sz = decode_scratch_bytes[LOCAL_NH2, LOCAL_KV2, HD2](pools[0].capacity)
+    var max_scratch = max(ctrl_scratch_sz, chunk_scratch_sz)
 
-    print("\n=== Performance: 128h/8kv, hd=128, " + String(NUM_NODES) + " NUMA nodes ===")
+    print("\n=== Performance: 128h/8kv, hd=128, " + String(NUM_NODES) + " NUMA nodes (decode) ===")
     print("  Per node: " + String(LOCAL_NH2) + "h/" + String(LOCAL_KV2) + "kv, "
           + String(pools[0].capacity) + " cores")
 
     var perf_arenas = HeapMoveArray[NumaArena[]](NUM_NODES)
     for i in range(NUM_NODES):
-        perf_arenas.push(NumaArena[](topo[i], 512 * 1024 * 1024))
+        perf_arenas.push(NumaArena[](topo[i], 1024 * 1024 * 1024))
 
     var q_ptrs = InlineArray[Int, NUM_NODES](fill=0)
     var k_bases = InlineArray[Int, NUM_NODES](fill=0)
@@ -253,8 +283,8 @@ def main():
         cos_ptrs[node] = Int(cos_node)
         sin_ptrs[node] = Int(sin_node)
 
-        var q_node = perf_arenas[node].alloc[Scalar[DType.bfloat16]](MAX_SL * LOCAL_HIDDEN2)
-        for i in range(MAX_SL * LOCAL_HIDDEN2):
+        var q_node = perf_arenas[node].alloc[Scalar[DType.bfloat16]](LOCAL_HIDDEN2)
+        for i in range(LOCAL_HIDDEN2):
             q_node[i] = Scalar[DType.bfloat16](Float32(i % 256 - 128) / 128.0)
         q_ptrs[node] = Int(q_node)
 
@@ -274,56 +304,73 @@ def main():
                     hb[d] = Scalar[DType.int8]((t * 11 + global_g * HD2 + d * 5) % 251 - 125)
                 v_node.write_v(t, lg, hb)
 
-        scratch_ptrs[node] = Int(perf_arenas[node].alloc[UInt8](local_scratch_bytes))
+        scratch_ptrs[node] = Int(perf_arenas[node].alloc[UInt8](max_scratch))
 
     comptime QS2 = Slot[BF16, Replicated, 1, LOCAL_HIDDEN2, 1]
 
-    print("\n  ctx  |  sl |  total us | us/pos")
-    print("  -----|-----|-----------|-------")
+    # Sweep: context lengths x workers_per_group
+    var wpg_values = InlineArray[Int, 5](fill=0)
+    wpg_values[0] = 1   # = control baseline
+    wpg_values[1] = 2
+    wpg_values[2] = 4
+    wpg_values[3] = 8
+    wpg_values[4] = 16
 
-    for ctx_idx in range(3):
-        var ctx_pos = 128
-        if ctx_idx == 1: ctx_pos = 2048
-        if ctx_idx == 2: ctx_pos = 4096
+    var ctx_values = InlineArray[Int, 4](fill=0)
+    ctx_values[0] = 512
+    ctx_values[1] = 2048
+    ctx_values[2] = 4096
+    ctx_values[3] = 16384
 
-        for sl_idx in range(3):
-            var sl = 1
-            if sl_idx == 1: sl = 16
-            if sl_idx == 2: sl = 64
+    # Header
+    print("\n  context | wpg=1  | wpg=2  | wpg=4  | wpg=8  | wpg=16")
+    print("  --------|--------|--------|--------|--------|-------")
 
+    for ci in range(4):
+        var ctx_pos = ctx_values[ci]
+        var results = InlineArray[Int, 5](fill=0)
+
+        for wi in range(5):
+            var wpg = wpg_values[wi]
+
+            # Warmup
             for warmup in range(2):
                 @parameter
                 def wu[node: Int]() -> PoolFence:
-                    return prefill[LOCAL_NH2, LOCAL_KV2, HD2](
-                        DynView[QS2](q_ptrs[node], sl),
+                    return decode[LOCAL_NH2, LOCAL_KV2, HD2](
+                        DynView[QS2](q_ptrs[node], 1),
                         LOCAL_KVC(k_bases[node]), LOCAL_KVC(v_bases[node]),
                         Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
                         scratch_ptrs[node], ctx_pos,
                         perf_q_scale, perf_k_scale, perf_v_scale,
-                        pool_ptrs[node][],
+                        pool_ptrs[node][], wpg,
                     )
                 parallel_for[NUM_NODES, wu]()
 
             var best = Int(1 << 60)
-            for trial in range(5):
+            for trial in range(10):
                 var t0 = Int(perf_counter_ns())
                 @parameter
                 def run[node: Int]() -> PoolFence:
-                    return prefill[LOCAL_NH2, LOCAL_KV2, HD2](
-                        DynView[QS2](q_ptrs[node], sl),
+                    return decode[LOCAL_NH2, LOCAL_KV2, HD2](
+                        DynView[QS2](q_ptrs[node], 1),
                         LOCAL_KVC(k_bases[node]), LOCAL_KVC(v_bases[node]),
                         Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
                         scratch_ptrs[node], ctx_pos,
                         perf_q_scale, perf_k_scale, perf_v_scale,
-                        pool_ptrs[node][],
+                        pool_ptrs[node][], wpg,
                     )
                 parallel_for[NUM_NODES, run]()
                 var wall = Int(perf_counter_ns()) - t0
                 keep(UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=scratch_ptrs[0])[0])
                 if wall < best: best = wall
+            results[wi] = best // 1000
 
-            var total_us = best // 1000
-            var per_pos = total_us // sl if sl > 0 else 0
-            print("  " + String(ctx_pos) + " | " + String(sl)
-                  + " | " + String(total_us)
-                  + " | " + String(per_pos))
+        print("  " + String(ctx_pos)
+              + " | " + String(results[0])
+              + " | " + String(results[1])
+              + " | " + String(results[2])
+              + " | " + String(results[3])
+              + " | " + String(results[4]))
+
+    print("\nDone.")

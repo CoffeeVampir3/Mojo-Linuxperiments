@@ -20,7 +20,7 @@ struct KVCache[max_seq: Int, head_dim: Int, num_heads: Int]:
         self.data_base = base
 
     def write_k(self, pos: Int, head: Int,
-        data_i8: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+        data_i8: UnsafePointer[Int8, MutAnyOrigin],
     ):
         """Write K head: i8 → u8 (XOR 0x80) for tdpbsud unsigned operand."""
         comptime w = simd_width_of[DType.uint8]()
@@ -34,21 +34,33 @@ struct KVCache[max_seq: Int, head_dim: Int, num_heads: Int]:
             i += w
 
     def write_v(self, pos: Int, head: Int,
-        data_i8: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+        data_i8: UnsafePointer[Int8, MutAnyOrigin],
     ):
         """Write V head: i8 stored directly for tdpbusd signed operand."""
         comptime w = simd_width_of[DType.int8]()
-        var dst = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](
+        var dst = UnsafePointer[Int8, MutAnyOrigin](
             unsafe_from_address=self.data_base + head * Self.HEAD_STRIDE + pos * Self.head_dim)
         var i = 0
         while i + w <= Self.head_dim:
             (dst + i).store(data_i8.load[width=w](offset=i))
             i += w
 
-    def head_data(self, pos: Int, head: Int) -> UnsafePointer[UInt8, MutAnyOrigin]:
+    def k_head(self, pos: Int, head: Int) -> UnsafePointer[UInt8, MutAnyOrigin]:
+        """K data pointer: u8 (XOR'd i8) at [head][pos]."""
         return UnsafePointer[UInt8, MutAnyOrigin](
             unsafe_from_address=self.data_base + head * Self.HEAD_STRIDE + pos * Self.head_dim)
 
-    def head_data_base(self, head: Int) -> UnsafePointer[UInt8, MutAnyOrigin]:
+    def k_head_base(self, head: Int) -> UnsafePointer[UInt8, MutAnyOrigin]:
+        """K data pointer: u8 at [head][0]."""
         return UnsafePointer[UInt8, MutAnyOrigin](
+            unsafe_from_address=self.data_base + head * Self.HEAD_STRIDE)
+
+    def v_head(self, pos: Int, head: Int) -> UnsafePointer[Int8, MutAnyOrigin]:
+        """V data pointer: i8 at [head][pos]."""
+        return UnsafePointer[Int8, MutAnyOrigin](
+            unsafe_from_address=self.data_base + head * Self.HEAD_STRIDE + pos * Self.head_dim)
+
+    def v_head_base(self, head: Int) -> UnsafePointer[Int8, MutAnyOrigin]:
+        """V data pointer: i8 at [head][0]."""
+        return UnsafePointer[Int8, MutAnyOrigin](
             unsafe_from_address=self.data_base + head * Self.HEAD_STRIDE)

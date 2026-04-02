@@ -90,26 +90,18 @@ def fwht_width[T: DType, block: Int]() -> Int:
 
 
 @always_inline
-def fwht_block[T: DType, block: Int](
-    buf: UnsafePointer[Scalar[T], MutAnyOrigin],
+def fwht_apply[T: DType, block: Int](
+    mut r: InlineArray[SIMD[T, fwht_width[T, block]()], block // fwht_width[T, block]()],
 ):
-    """In-register FWHT on one block of `block` elements.
+    """Butterfly stages + normalize on pre-loaded registers.
 
-    Parameterized on DType (f32, f64) and block size (power of 2).
-    Fully comptime-unrolled butterfly network with SIMD shuffles for
-    in-register stages and plain add/sub for cross-register stages.
-
-    For block=64 on AVX-512 f32: 4 ZMM registers, 6 stages
-    (4 shuffle+FMA + 2 cross-register add/sub), final 1/sqrt(64) scale.
+    Caller loads data into r (full or partial, e.g. from RoPE output).
+    Fully comptime-unrolled: SIMD shuffles for in-register stages,
+    plain add/sub for cross-register stages.
     """
     comptime width = fwht_width[T, block]()
     comptime regs = block // width
     comptime stages = log2[block]()
-
-    # Load block into registers
-    var r = InlineArray[SIMD[T, width], regs](fill=SIMD[T, width](0))
-    comptime for i in range(regs):
-        r[i] = (buf + i * width).load[width=width]()
 
     # Butterfly stages
     comptime for stage in range(stages):
@@ -147,7 +139,26 @@ def fwht_block[T: DType, block: Int](
     comptime for i in range(regs):
         r[i] = r[i] * sc
 
-    # Store
+
+@always_inline
+def fwht_block[T: DType, block: Int](
+    buf: UnsafePointer[Scalar[T], MutAnyOrigin],
+):
+    """In-register FWHT on one block of `block` elements.
+
+    Loads from buf, applies butterfly stages, stores back to buf.
+    For block=64 on AVX-512 f32: 4 ZMM registers, 6 stages
+    (4 shuffle+FMA + 2 cross-register add/sub), final 1/sqrt(64) scale.
+    """
+    comptime width = fwht_width[T, block]()
+    comptime regs = block // width
+
+    var r = InlineArray[SIMD[T, width], regs](fill=SIMD[T, width](0))
+    comptime for i in range(regs):
+        r[i] = (buf + i * width).load[width=width]()
+
+    fwht_apply[T, block](r)
+
     comptime for i in range(regs):
         (buf + i * width).store(r[i])
 
