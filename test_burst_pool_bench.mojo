@@ -1,6 +1,6 @@
-"""Dispatch/join overhead benchmark: BurstPool cold/hot vs BurstPool.
+"""BurstPool dispatch/join overhead benchmark.
 
-Compares three configurations across noop and heavy (~200us) work:
+Compares cold vs hot mode across noop and heavy (~200us) work:
   1. BurstPool cold (default spin_limit=1000)
   2. BurstPool hot (begin_forward/end_forward + headroom)
   3. BurstPool (per-worker mailbox + begin_forward/end_forward + headroom)

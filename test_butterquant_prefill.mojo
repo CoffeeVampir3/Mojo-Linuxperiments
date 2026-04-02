@@ -1,4 +1,4 @@
-"""Correctness + performance test for experimental2 AMX prefill kernel.
+"""ButterQuant AMX prefill attention — correctness + performance.
 
 Zero per-token scales. KV cache is flat u8. Fixed layer-level scales
 for Q, K, V quantization.

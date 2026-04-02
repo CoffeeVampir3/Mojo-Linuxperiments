@@ -21,4 +21,4 @@ rsync -av \
 
 echo "✓ Synced to $REMOTE_HOST:$REMOTE_PATH"
 
-ssh $REMOTE_USER@$REMOTE_HOST "cd $REMOTE_PATH && pixi run mojo build test_hadquant_attn_amx_decode.mojo && ./test_hadquant_attn_amx_decode"
+ssh $REMOTE_USER@$REMOTE_HOST "cd $REMOTE_PATH && pixi run mojo build test_butterquant_decode.mojo && ./test_butterquant_decode"
