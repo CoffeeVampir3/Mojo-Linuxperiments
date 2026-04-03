@@ -17,7 +17,7 @@ from experimental.hadquant_impl import fwht_block
 from experimental2.kv_cache import KVCache
 from experimental.amx import init_intel_amx
 from simd_math import sqrt, exp_f32, quantize_i8
-from threading import BurstPool
+from threading import BurstPool, make_node_pools
 from numa import NumaInfo, get_current_cpu_and_node
 from numa.arena import NumaArena
 from notstdcollections import HeapMoveArray
@@ -39,17 +39,14 @@ def main():
     var topo = numa.plan_topology(NUM_NODES)
 
     print("NUMA: " + String(NUM_NODES) + " nodes")
+    var pools = make_node_pools(numa)
     for i in range(NUM_NODES):
-        print("  node " + String(topo[i]) + ": " + String(numa.cpus_on_node(topo[i])) + " cpus")
-
-    var pools = HeapMoveArray[BurstPool[]](NUM_NODES)
-    for i in range(NUM_NODES):
-        pools.push(BurstPool[].for_numa_node(numa, topo[i]))
+        print("  node " + String(topo[i]) + ": " + String(pools[topo[i]].capacity) + " workers")
     var pool_ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], NUM_NODES](
         fill=UnsafePointer[BurstPool[], MutAnyOrigin]())
     for i in range(NUM_NODES):
         pool_ptrs[i] = UnsafePointer[BurstPool[], MutAnyOrigin](
-            unsafe_from_address=Int(UnsafePointer(to=pools[i])))
+            unsafe_from_address=Int(UnsafePointer(to=pools[topo[i]])))
 
     # =====================================================================
     # Correctness test
@@ -77,7 +74,7 @@ def main():
     var corr_arena = NumaArena[](topo[0], 256 * 1024 * 1024)
 
     comptime KVC = KVCache[MAX_SEQ, HD, NKV]
-    var corr_scratch_bytes = scratch_bytes[NH, NKV, HD, SL](pools[0].capacity)
+    var corr_scratch_bytes = scratch_bytes[NH, NKV, HD, SL](pools[topo[0]].capacity)
 
     var q_bf16 = corr_arena.alloc[Scalar[DType.bfloat16]](SL * HIDDEN)
     var kv_mem = corr_arena.alloc[UInt8](KVC.TOTAL_BYTES)
@@ -223,11 +220,11 @@ def main():
     comptime LOCAL_HIDDEN2 = LOCAL_NH2 * HD2
 
     comptime LOCAL_KVC = KVCache[MAX_SEQ2, HD2, LOCAL_KV2]
-    var local_scratch_bytes = scratch_bytes[LOCAL_NH2, LOCAL_KV2, HD2, MAX_SL](pools[0].capacity)
+    var local_scratch_bytes = scratch_bytes[LOCAL_NH2, LOCAL_KV2, HD2, MAX_SL](pools[topo[0]].capacity)
 
     print("\n=== Performance: 128h/8kv, hd=128, " + String(NUM_NODES) + " NUMA nodes ===")
     print("  Per node: " + String(LOCAL_NH2) + "h/" + String(LOCAL_KV2) + "kv, "
-          + String(pools[0].capacity) + " cores")
+          + String(pools[topo[0]].capacity) + " cores")
 
     var perf_arenas = HeapMoveArray[NumaArena[]](NUM_NODES)
     for i in range(NUM_NODES):

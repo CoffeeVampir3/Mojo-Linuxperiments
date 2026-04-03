@@ -17,7 +17,7 @@ from experimental.hadquant_impl import fwht_block
 from experimental2.kv_cache import KVCache
 from experimental.amx import init_intel_amx
 from simd_math import sqrt, exp_f32, quantize_i8
-from threading import BurstPool
+from threading import BurstPool, make_node_pools
 from numa import NumaInfo, get_current_cpu_and_node
 from numa.arena import NumaArena
 from notstdcollections import HeapMoveArray
@@ -39,17 +39,15 @@ def main():
     var topo = numa.plan_topology(NUM_NODES)
 
     print("NUMA: " + String(NUM_NODES) + " nodes")
+    var pools = make_node_pools(numa)
     for i in range(NUM_NODES):
-        print("  node " + String(topo[i]) + ": " + String(numa.cpus_on_node(topo[i])) + " cpus")
+        print("  node " + String(topo[i]) + ": " + String(pools[topo[i]].capacity) + " workers")
 
-    var pools = HeapMoveArray[BurstPool[]](NUM_NODES)
-    for i in range(NUM_NODES):
-        pools.push(BurstPool[].for_numa_node(numa, topo[i]))
     var pool_ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], NUM_NODES](
         fill=UnsafePointer[BurstPool[], MutAnyOrigin]())
     for i in range(NUM_NODES):
         pool_ptrs[i] = UnsafePointer[BurstPool[], MutAnyOrigin](
-            unsafe_from_address=Int(UnsafePointer(to=pools[i])))
+            unsafe_from_address=Int(UnsafePointer(to=pools[topo[i]])))
 
     # =====================================================================
     # Correctness test
@@ -221,7 +219,7 @@ def main():
 
     print("\n=== Performance: 128h/8kv, hd=128, " + String(NUM_NODES) + " NUMA nodes ===")
     print("  Per node: " + String(LOCAL_NH2) + "h/" + String(LOCAL_KV2) + "kv, "
-          + String(pools[0].capacity) + " cores")
+          + String(pools[topo[0]].capacity) + " cores")
 
     var perf_arenas = HeapMoveArray[NumaArena[]](NUM_NODES)
     for i in range(NUM_NODES):
