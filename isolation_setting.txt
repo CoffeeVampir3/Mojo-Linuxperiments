@@ -1,0 +1,1 @@
+isolcpus=managed_irq,domain,2-127 nohz_full=2-127 rcu_nocbs=2-127 kthread_cpus=0-1 irqaffinity=0-1

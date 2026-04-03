@@ -6,7 +6,8 @@ the gap between the last worker finishing and the main thread returning
 from join.
 """
 
-from threading.isolated_burst_pool import IsolatedBurstPool, ArgPack
+from threading.burst_threading import BurstPool
+from threading.isolated_burst_pool import ArgPack
 from std.memory import UnsafePointer
 from std.time import perf_counter_ns
 from std.benchmark import keep
@@ -30,9 +31,6 @@ comptime TRIALS = 50
 
 def main():
     var numa = NumaInfo()
-    if not numa.has_isolation():
-        print("SKIP: no CPU isolation")
-        return
     if numa.num_nodes < 2:
         print("SKIP: need multiple NUMA nodes")
         return
@@ -43,9 +41,9 @@ def main():
     print(String(num_nodes) + " NUMA nodes, "
         + String(len(numa.isolated_cpus)) + " isolated cpus")
 
-    var pools = HeapMoveArray[IsolatedBurstPool[]](num_nodes)
+    var pools = HeapMoveArray[BurstPool[]](num_nodes)
     for i in range(num_nodes):
-        pools.push(IsolatedBurstPool[].for_topology(numa, topo[i]))
+        pools.push(BurstPool[].for_topology(numa, topo[i]))
         print("  node " + String(topo[i]) + ": " + String(pools[i].capacity) + " workers")
 
     var node_packs = HeapMoveArray[HeapMoveArray[ArgPack]](num_nodes)
