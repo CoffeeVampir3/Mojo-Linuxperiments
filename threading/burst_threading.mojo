@@ -4,15 +4,18 @@ Each worker spins on its own cache-line-aligned slot. The dispatcher
 writes job info directly to each slot. No shared atomic counter,
 no thundering herd, no CAS storms.
 
-Hot mode (begin_forward/end_forward): workers pure-spin, never sleep.
-Requires core headroom to prevent scheduler deadlock under sustained spin.
+Two threading models, chosen at compile time via the Model parameter:
 
-Cold mode (default): workers spin briefly then futex_wait on their mailbox.
-Safe on any core count but adds wake latency per dispatch.
+  ColdModel (default): workers spin briefly then futex_wait.
+    Safe on any machine, any core count. Adds wake latency per dispatch.
+
+  IsolatedModel: workers pure-spin, never sleep.
+    Requires CPU isolation (isolcpus + nohz_full + rcu_nocbs).
+    Zero-syscall dispatch path. Workers are never preempted.
 
 Dispatch: O(N) sequential stores to N worker mailboxes.
 Claim:    Each worker reads its own mailbox — zero cross-core traffic.
-Join:     Spin on shared work_done counter (staggered decrements, no storm).
+Join:     Scan per-worker done flags (no shared counter, no atomic RMW).
 """
 
 from std.sys.info import size_of
@@ -55,31 +58,52 @@ def ptr[T: AnyType](addr: Int) -> UnsafePointer[T, MutAnyOrigin]:
 
 
 # ============================================================================
-# Per-worker mailbox — one cache line per worker
+# Per-worker mailbox
 # ============================================================================
 
 @align(64)
 struct WorkerMailbox:
-    """Per-worker dispatch slot. Dispatcher writes, worker reads.
+    """Per-worker dispatch slot.
 
-    job_ready: 0 = idle, 1 = job available. Worker spins on this.
-    sleeping:  Worker-published intent flag. Set to 1 by the worker
-               right before entering futex_wait, cleared on wake.
-               Dispatcher reads this to decide whether futex_wake is
-               needed (Dekker's pattern: both sides publish then check).
-    func_ptr:  Kernel function pointer (set before job_ready=1).
-    pack:      Arguments for this worker's job.
+    Cache line 1 (offset 0-63): dispatch path.
+      job_ready, sleeping, func_ptr, pack args — written by dispatcher,
+      read by worker.
+
+    Cache line 2 (offset 64-127): padding.
+      ArgPack tail (pad0/pad1) + explicit padding isolates dispatch
+      data from the completion flag.
+
+    Cache line 3 (offset 128+): completion path.
+      done flag — written by worker, read by dispatcher during join.
+      Fully isolated: no false sharing with dispatch or sleep paths.
     """
+    # --- cache line 1: dispatch data ---
     var job_ready: AtomicInt32
-    var sleeping: AtomicInt32
+    var sleeping: AtomicInt32  # used by ColdModel; padding for IsolatedModel
     var func_ptr: Int
     var pack: ArgPack
+    # --- cache line 2: padding (isolates dispatch from completion) ---
+    var line_pad0: Int
+    var line_pad1: Int
+    var line_pad2: Int
+    var line_pad3: Int
+    var line_pad4: Int
+    var line_pad5: Int
+    # --- cache line 3: completion flag ---
+    var done: AtomicInt32
 
     def __init__(out self):
         self.job_ready = AtomicInt32(0)
         self.sleeping = AtomicInt32(0)
         self.func_ptr = 0
         self.pack = ArgPack()
+        self.line_pad0 = 0
+        self.line_pad1 = 0
+        self.line_pad2 = 0
+        self.line_pad3 = 0
+        self.line_pad4 = 0
+        self.line_pad5 = 0
+        self.done = AtomicInt32(0)
 
 
 # ============================================================================
@@ -88,14 +112,12 @@ struct WorkerMailbox:
 
 @align(64)
 struct SharedPoolState:
-    var work_done: AtomicInt32
     var shutdown: AtomicInt32
-    var hot_mode: AtomicInt32
+    var parked: AtomicInt32  # 0=spinning, 1=parked. Doubles as futex guard value.
 
     def __init__(out self):
-        self.work_done = AtomicInt32(0)
         self.shutdown = AtomicInt32(0)
-        self.hot_mode = AtomicInt32(0)
+        self.parked = AtomicInt32(0)
 
 
 # ============================================================================
@@ -214,10 +236,248 @@ struct WorkerStackHead[mask_size: Int]:
 
 
 # ============================================================================
-# BurstPool
+# ThreadingModel trait
 # ============================================================================
 
-struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 128](Movable):
+trait ThreadingModel(ImplicitlyDestructible):
+    """Defines how workers wait for work and how the dispatcher wakes them.
+
+    ColdModel:     spin briefly → Dekker → futex_wait. Safe everywhere.
+    IsolatedModel: pure PAUSE spin. Requires CPU isolation.
+    """
+    comptime PER_CORE_PIN: Bool
+
+    def __init__(out self): ...
+
+    def worker_loop(self,
+        mailbox: UnsafePointer[WorkerMailbox, MutAnyOrigin],
+        shared: UnsafePointer[SharedPoolState, MutAnyOrigin],
+        futex_flags: Int,
+    ): ...
+
+    def on_dispatch(self,
+        mailboxes: UnsafePointer[WorkerMailbox, MutAnyOrigin],
+        jobs: Int,
+        futex_flags: Int,
+    ): ...
+
+    def on_shutdown(self,
+        mailboxes: UnsafePointer[WorkerMailbox, MutAnyOrigin],
+        shared: UnsafePointer[SharedPoolState, MutAnyOrigin],
+        capacity: Int,
+        futex_flags: Int,
+    ): ...
+
+    def wake(self,
+        shared: UnsafePointer[SharedPoolState, MutAnyOrigin],
+        capacity: Int,
+        futex_flags: Int,
+    ): ...
+
+    def sleep(self,
+        shared: UnsafePointer[SharedPoolState, MutAnyOrigin],
+    ): ...
+
+
+# ============================================================================
+# ColdModel — safe on any machine
+# ============================================================================
+
+struct ColdModel(ThreadingModel):
+    """Workers spin for COLD_SPIN_LIMIT iterations, then Dekker-sleep via futex.
+
+    Dispatch wakes sleeping workers with per-worker futex_wake (Dekker protocol
+    ensures no missed wakes). Safe on any core count, any machine.
+    """
+    comptime PER_CORE_PIN = False
+    comptime COLD_SPIN_LIMIT = 1000
+
+    def __init__(out self):
+        pass
+
+    def worker_loop(self,
+        mailbox: UnsafePointer[WorkerMailbox, MutAnyOrigin],
+        shared: UnsafePointer[SharedPoolState, MutAnyOrigin],
+        futex_flags: Int,
+    ):
+        var sys = linux.linux_sys()
+        var ready_ptr = UnsafePointer(to=mailbox[].job_ready.value)
+
+        while True:
+            if shared[].shutdown.load[ordering=Consistency.ACQUIRE]() != 0:
+                break
+
+            if AtomicInt32.load[ordering=Consistency.ACQUIRE](ready_ptr) != 0:
+                var func_addr = mailbox[].func_ptr
+                var p = mailbox[].pack
+                AtomicInt32.store[ordering=Consistency.RELEASE](ready_ptr, 0)
+                UnsafePointer(to=func_addr).bitcast[KernelFn]()[](
+                    p.arg0, p.arg1, p.arg2, p.arg3, p.arg4, p.arg5,
+                )
+                AtomicInt32.store[ordering=Consistency.RELEASE](
+                    UnsafePointer(to=mailbox[].done.value), 1)
+                continue
+
+            var spins = 0
+            while AtomicInt32.load[ordering=Consistency.MONOTONIC](ready_ptr) == 0:
+                if shared[].shutdown.load[ordering=Consistency.MONOTONIC]() != 0:
+                    break
+                if spins < Self.COLD_SPIN_LIMIT:
+                    sys.arch_cpu_relax()
+                    spins += 1
+                else:
+                    # Dekker sleep: publish sleeping=1, recheck ready_ptr.
+                    # Dispatcher publishes ready=1 then checks sleeping.
+                    # TSO guarantees at least one side sees the other's store.
+                    var sleeping_ptr = UnsafePointer(to=mailbox[].sleeping.value)
+                    AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 1)
+                    if AtomicInt32.load[ordering=Consistency.ACQUIRE](ready_ptr) != 0:
+                        AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 0)
+                        break
+                    if shared[].shutdown.load[ordering=Consistency.ACQUIRE]() != 0:
+                        AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 0)
+                        break
+                    _ = sys.sys_futex_wait(Int(ready_ptr), 0, futex_flags)
+                    AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 0)
+                    spins = 0
+
+    def on_dispatch(self,
+        mailboxes: UnsafePointer[WorkerMailbox, MutAnyOrigin],
+        jobs: Int,
+        futex_flags: Int,
+    ):
+        """Dekker wake: check sleeping flag, futex_wake if needed."""
+        var sys = linux.linux_sys()
+        for i in range(jobs):
+            var mb = mailboxes + i
+            if AtomicInt32.load[ordering=Consistency.ACQUIRE](
+                UnsafePointer(to=mb[].sleeping.value)
+            ) != 0:
+                _ = sys.sys_futex_wake(
+                    Int(UnsafePointer(to=mb[].job_ready.value)), 1, futex_flags)
+
+    def on_shutdown(self,
+        mailboxes: UnsafePointer[WorkerMailbox, MutAnyOrigin],
+        shared: UnsafePointer[SharedPoolState, MutAnyOrigin],
+        capacity: Int,
+        futex_flags: Int,
+    ):
+        """Wake all sleeping workers so they see the shutdown flag."""
+        var sys = linux.linux_sys()
+        for i in range(capacity):
+            var ready_ptr = UnsafePointer(to=(mailboxes + i)[].job_ready.value)
+            AtomicInt32.store[ordering=Consistency.RELEASE](ready_ptr, 1)
+            _ = sys.sys_futex_wake(Int(ready_ptr), 1, futex_flags)
+
+    def wake(self,
+        shared: UnsafePointer[SharedPoolState, MutAnyOrigin],
+        capacity: Int,
+        futex_flags: Int,
+    ):
+        """No-op: ColdModel workers manage their own sleep/wake."""
+        pass
+
+    def sleep(self,
+        shared: UnsafePointer[SharedPoolState, MutAnyOrigin],
+    ):
+        """No-op: ColdModel workers manage their own sleep/wake."""
+        pass
+
+
+# ============================================================================
+# IsolatedModel — zero-syscall dispatch on isolated cores
+# ============================================================================
+
+struct IsolatedModel(ThreadingModel):
+    """Workers pure-spin on job_ready. No sleeping, no futex, no Dekker.
+
+    Requires CPU isolation: isolcpus + nohz_full + rcu_nocbs on worker cores.
+    Workers are never preempted, so spinning is safe and dispatch is
+    zero-syscall (just RELEASE stores to mailboxes).
+
+    Workers burn CPU while awake. Use wake()/sleep() to control when
+    isolated cores are active. Between sleep() and wake(), workers park
+    via futex_wait and consume no CPU.
+    """
+    comptime PER_CORE_PIN = True
+
+    def __init__(out self):
+        pass
+
+    def worker_loop(self,
+        mailbox: UnsafePointer[WorkerMailbox, MutAnyOrigin],
+        shared: UnsafePointer[SharedPoolState, MutAnyOrigin],
+        futex_flags: Int,
+    ):
+        var sys = linux.linux_sys()
+        var ready_ptr = UnsafePointer(to=mailbox[].job_ready.value)
+
+        while True:
+            if AtomicInt32.load[ordering=Consistency.ACQUIRE](ready_ptr) != 0:
+                var func_addr = mailbox[].func_ptr
+                var p = mailbox[].pack
+                AtomicInt32.store[ordering=Consistency.RELEASE](ready_ptr, 0)
+                UnsafePointer(to=func_addr).bitcast[KernelFn]()[](
+                    p.arg0, p.arg1, p.arg2, p.arg3, p.arg4, p.arg5,
+                )
+                AtomicInt32.store[ordering=Consistency.RELEASE](
+                    UnsafePointer(to=mailbox[].done.value), 1)
+            else:
+                if shared[].shutdown.load[ordering=Consistency.MONOTONIC]() != 0:
+                    break
+                if shared[].parked.load[ordering=Consistency.ACQUIRE]() != 0:
+                    # Park via futex_wait on parked with expected=1.
+                    # If wake() already set parked=0, futex_wait sees 0!=1 → EAGAIN.
+                    var parked_ptr = UnsafePointer(to=shared[].parked.value)
+                    _ = sys.sys_futex_wait(Int(parked_ptr), 1, futex_flags)
+                else:
+                    sys.arch_cpu_relax()
+
+    def on_dispatch(self,
+        mailboxes: UnsafePointer[WorkerMailbox, MutAnyOrigin],
+        jobs: Int,
+        futex_flags: Int,
+    ):
+        """No-op: workers are spinning on isolated cores."""
+        pass
+
+    def on_shutdown(self,
+        mailboxes: UnsafePointer[WorkerMailbox, MutAnyOrigin],
+        shared: UnsafePointer[SharedPoolState, MutAnyOrigin],
+        capacity: Int,
+        futex_flags: Int,
+    ):
+        """Unpark workers so they see the shutdown flag."""
+        var parked_ptr = UnsafePointer(to=shared[].parked.value)
+        AtomicInt32.store[ordering=Consistency.RELEASE](parked_ptr, 0)
+        var sys = linux.linux_sys()
+        _ = sys.sys_futex_wake(Int(parked_ptr), capacity, futex_flags)
+
+    def wake(self,
+        shared: UnsafePointer[SharedPoolState, MutAnyOrigin],
+        capacity: Int,
+        futex_flags: Int,
+    ):
+        """Unpark workers. Sets parked=0, futex_wake unblocks sleepers.
+        Late arrivals see parked=0!=1 via futex expected-value check → EAGAIN."""
+        var parked_ptr = UnsafePointer(to=shared[].parked.value)
+        AtomicInt32.store[ordering=Consistency.RELEASE](parked_ptr, 0)
+        var sys = linux.linux_sys()
+        _ = sys.sys_futex_wake(Int(parked_ptr), capacity, futex_flags)
+
+    def sleep(self,
+        shared: UnsafePointer[SharedPoolState, MutAnyOrigin],
+    ):
+        """Park workers. They see parked=1 and futex_wait(parked, 1) blocks."""
+        AtomicInt32.store[ordering=Consistency.RELEASE](
+            UnsafePointer(to=shared[].parked.value), 1)
+
+
+# ============================================================================
+# BurstPool[Model]
+# ============================================================================
+
+struct BurstPool[Model: ThreadingModel = ColdModel, stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 128](Movable):
     comptime slot_size = slot_size[Self.stack_size]()
     var slots: HeapMoveArray[WorkerSlot]
     var shared: UnsafePointer[SharedPoolState, MutAnyOrigin]
@@ -225,6 +485,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
     var args_base: UnsafePointer[ArgPack, MutAnyOrigin]
     var arena_base: Int
     var capacity: Int
+    var active_jobs: Int
     var cpu_mask: CpuMask[Self.mask_size]
     var numa_node: Optional[Int]
     var futex_flags: Int
@@ -233,6 +494,7 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
 
     def __init__(out self, capacity: Int, var cpu_mask: CpuMask[Self.mask_size] = CpuMask[Self.mask_size](), numa_node: Optional[Int] = None):
         self.capacity = capacity
+        self.active_jobs = 0
         self.slots = HeapMoveArray[WorkerSlot](capacity)
         self.arena_base = 0
         self.shared = UnsafePointer[SharedPoolState, MutAnyOrigin]()
@@ -303,10 +565,8 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         if self.workers_alive:
             AtomicInt32.store[ordering=Consistency.RELEASE](
                 UnsafePointer(to=self.shared[].shutdown.value), 1)
-            for i in range(self.capacity):
-                var ready_ptr = UnsafePointer(to=(self.mailboxes + i)[].job_ready.value)
-                AtomicInt32.store[ordering=Consistency.RELEASE](ready_ptr, 1)
-                _ = sys.sys_futex_wake(Int(ready_ptr), 1, self.futex_flags)
+            var model = Self.Model()
+            model.on_shutdown(self.mailboxes, self.shared, self.capacity, self.futex_flags)
 
             # Spin-wait for workers to exit.  Workers are already shutting
             # down so this completes in microseconds.  We avoid futex_wait
@@ -330,6 +590,16 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
     def __len__(self) -> Int:
         return self.capacity
 
+    def wake(mut self):
+        """Unpark workers. IsolatedModel: resumes spinning. ColdModel: no-op."""
+        var model = Self.Model()
+        model.wake(self.shared, self.capacity, self.futex_flags)
+
+    def sleep(mut self):
+        """Park workers. IsolatedModel: futex_wait, zero CPU burn. ColdModel: no-op."""
+        var model = Self.Model()
+        model.sleep(self.shared)
+
     @staticmethod
     def for_numa_node(numa: NumaInfo, node: Int, headroom: Int = 0) -> Self:
         """Create pool for a NUMA node. headroom reserves cores for OS/caller."""
@@ -347,6 +617,17 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         return Self(cap, mask^, node)
 
     @staticmethod
+    def for_topology(numa: NumaInfo, node: Int) -> Self:
+        """Create pool from topology discovery. Uses isolated cores on the node
+        if isolation is configured, otherwise all cores on the node."""
+        var mask = numa.get_worker_mask[Self.mask_size](node)
+        var cap = mask.count()
+        if cap == 0:
+            cap = 1
+            mask = numa.get_node_mask[Self.mask_size](node)
+        return Self(cap, mask^, node)
+
+    @staticmethod
     def for_numa_node_excluding(numa: NumaInfo, node: Int, exclude_cpu: Int) -> Self:
         var mask = numa.get_node_mask[Self.mask_size](node)
         var cap = numa.cpus_on_node(node)
@@ -354,26 +635,6 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
             mask.clear(exclude_cpu)
             cap -= 1
         return Self(cap, mask^, node)
-
-    def begin_forward(mut self):
-        """Enter hot mode: wake all sleeping workers, keep them spinning.
-
-        Requires headroom (fewer workers than cores) to prevent scheduler
-        deadlock. Use for_numa_node(headroom=2) or similar.
-        """
-        AtomicInt32.store[ordering=Consistency.RELEASE](
-            UnsafePointer(to=self.shared[].hot_mode.value), 1)
-        var sys = linux.linux_sys()
-        for i in range(self.capacity):
-            var sleeping_ptr = UnsafePointer(to=(self.mailboxes + i)[].sleeping.value)
-            if AtomicInt32.load[ordering=Consistency.ACQUIRE](sleeping_ptr) != 0:
-                var ready_ptr = UnsafePointer(to=(self.mailboxes + i)[].job_ready.value)
-                _ = sys.sys_futex_wake(Int(ready_ptr), 1, self.futex_flags)
-
-    def end_forward(mut self):
-        """Exit hot mode: workers drain back to futex_wait."""
-        AtomicInt32.store[ordering=Consistency.RELEASE](
-            UnsafePointer(to=self.shared[].hot_mode.value), 0)
 
     def dispatch[F: TrivialRegisterPassable](mut self, kernel: F, packs: UnsafePointer[ArgPack, MutAnyOrigin], num_jobs: Int = -1):
         """Dispatch jobs to workers via per-worker mailboxes.
@@ -389,52 +650,62 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         comptime KernelType = type_of(kernel)
         comptime assert size_of[KernelType]() == 8, "kernel must be an 8-byte function pointer"
 
-        var done_ptr = UnsafePointer(to=self.shared[].work_done.value)
-        debug_assert(
-            AtomicInt32.load[ordering=Consistency.ACQUIRE](done_ptr) == 0,
-            "previous dispatch still in flight; call join() first",
-        )
+        debug_assert(self.active_jobs == 0,
+            "previous dispatch still in flight; call join() first")
 
         var kernel_copy = kernel
         var kernel_ptr = UnsafePointer(to=kernel_copy).bitcast[Int]()[]
 
-        AtomicInt32.store[ordering=Consistency.MONOTONIC](done_ptr, Int32(jobs))
+        self.active_jobs = jobs
 
-        var sys = linux.linux_sys()
         for i in range(jobs):
             var mb = self.mailboxes + i
             mb[].func_ptr = kernel_ptr
             mb[].pack = (packs + i)[]
-            # Publish work (RELEASE ensures func_ptr/pack visible before job_ready)
             AtomicInt32.store[ordering=Consistency.RELEASE](
                 UnsafePointer(to=mb[].job_ready.value), 1)
-            # Dekker check: we published ready=1, now check if worker is sleeping.
-            # If worker published sleeping=1 before our ready=1, we see it and wake.
-            # If worker sees our ready=1 before sleeping, it won't enter futex_wait.
-            # TSO guarantees at least one side sees the other's store.
-            if AtomicInt32.load[ordering=Consistency.ACQUIRE](
-                UnsafePointer(to=mb[].sleeping.value)
-            ) != 0:
-                _ = sys.sys_futex_wake(Int(UnsafePointer(to=mb[].job_ready.value)), 1, self.futex_flags)
+
+        # Model-specific wake strategy (after all mailboxes written)
+        var model = Self.Model()
+        model.on_dispatch(self.mailboxes, jobs, self.futex_flags)
 
     def join(mut self):
         """Wait for all dispatched jobs to complete."""
-        var done_ptr = UnsafePointer(to=self.shared[].work_done.value)
         var sys = linux.linux_sys()
-        while AtomicInt32.load[ordering=Consistency.ACQUIRE](done_ptr) > 0:
-            sys.arch_cpu_relax()
+        for i in range(self.active_jobs):
+            var done_ptr = UnsafePointer(to=(self.mailboxes + i)[].done.value)
+            while AtomicInt32.load[ordering=Consistency.ACQUIRE](done_ptr) == 0:
+                sys.arch_cpu_relax()
+            # Reset for next round — cache line is already loaded from the read
+            AtomicInt32.store[ordering=Consistency.MONOTONIC](done_ptr, 0)
+        self.active_jobs = 0
 
     def spawn_workers(mut self):
         var sys = linux.linux_sys()
         var parent_fs = sys.arch_thread_pointer()
 
         for i in range(self.capacity):
-            var worker_mask = self.cpu_mask.copy() if self.pinned else CpuMask[Self.mask_size]()
+            var worker_mask = CpuMask[Self.mask_size]()
+            if self.pinned:
+                comptime
+                if Self.Model.PER_CORE_PIN:
+                    # Per-worker pinning: worker i → the i-th set bit.
+                    # Required on isolated cores where the load balancer is disabled.
+                    var bit_count = 0
+                    for bit in range(Self.mask_size * 8):
+                        if self.cpu_mask.test(bit):
+                            if bit_count == i:
+                                worker_mask.set(bit)
+                                break
+                            bit_count += 1
+                else:
+                    # Shared mask: let the kernel load balancer spread workers.
+                    worker_mask = self.cpu_mask.copy()
 
             var stack_top_addr = Int(self.slots[i].stack_top) + Self.stack_size
             var stack_head_addr = (stack_top_addr - size_of[WorkerStackHead[Self.mask_size]]()) & ~15
             var head = ptr[WorkerStackHead[Self.mask_size]](stack_head_addr)
-            var worker_main_copy = worker_main[Self.mask_size]
+            var worker_main_copy = worker_main[Self.Model, Self.mask_size]
             var slot_base = Int(self.slots[i].base)
             var altstack_base = (
                 slot_base + SlotLayout.HEADER + SlotLayout.GUARD + Self.stack_size + SlotLayout.ALT_GUARD
@@ -471,11 +742,21 @@ struct BurstPool[stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 12
         self.workers_alive = True
 
 
+def make_node_pools[Model: ThreadingModel = ColdModel, stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 128](
+    numa: NumaInfo,
+) -> HeapMoveArray[BurstPool[Model, stack_size, mask_size]]:
+    """Create one BurstPool per NUMA node, sized from isolation topology."""
+    var pools = HeapMoveArray[BurstPool[Model, stack_size, mask_size]](numa.num_nodes)
+    for i in range(numa.num_nodes):
+        pools.push(BurstPool[Model, stack_size, mask_size].for_topology(numa, numa.nodes[i].id))
+    return pools^
+
+
 # ============================================================================
-# Worker main loop
+# Worker entry point — parameterized on Model
 # ============================================================================
 
-def worker_main[mask_size: Int](stack_head_ptr: Int):
+def worker_main[Model: ThreadingModel, mask_size: Int](stack_head_ptr: Int):
     var head_ptr = ptr[WorkerStackHead[mask_size]](stack_head_ptr)
     var sys = linux.linux_sys()
 
@@ -509,61 +790,9 @@ def worker_main[mask_size: Int](stack_head_ptr: Int):
         if ret != 0:
             print("sched_setaffinity failed:", ret)
 
-    var ready_ptr = UnsafePointer(to=mailbox[].job_ready.value)
-    comptime COLD_SPIN_LIMIT = 1000
-
-    while True:
-        if shared[].shutdown.load[ordering=Consistency.ACQUIRE]() != 0:
-            break
-
-        # Check own mailbox
-        if AtomicInt32.load[ordering=Consistency.ACQUIRE](ready_ptr) != 0:
-            var func_addr = mailbox[].func_ptr
-            var p = mailbox[].pack
-
-            AtomicInt32.store[ordering=Consistency.RELEASE](ready_ptr, 0)
-
-            UnsafePointer(to=func_addr).bitcast[KernelFn]()[](
-                p.arg0, p.arg1, p.arg2, p.arg3, p.arg4, p.arg5,
-            )
-
-            _ = shared[].work_done.fetch_sub[ordering=Consistency.ACQUIRE_RELEASE](1)
-            continue
-
-        # No work — hot mode: pure spin; cold mode: spin then futex_wait
-        var hot = shared[].hot_mode.load[ordering=Consistency.MONOTONIC]() != 0
-        if hot:
-            sys.arch_cpu_relax()
-        else:
-            var spins = 0
-            while AtomicInt32.load[ordering=Consistency.MONOTONIC](ready_ptr) == 0:
-                if shared[].shutdown.load[ordering=Consistency.MONOTONIC]() != 0:
-                    break
-                if shared[].hot_mode.load[ordering=Consistency.MONOTONIC]() != 0:
-                    break
-                if spins < COLD_SPIN_LIMIT:
-                    sys.arch_cpu_relax()
-                    spins += 1
-                else:
-                    # Dekker sleep protocol: publish sleeping=1, then recheck
-                    # ready_ptr. Dispatcher publishes ready=1 then checks
-                    # sleeping. TSO guarantees one side sees the other's store.
-                    var sleeping_ptr = UnsafePointer(to=mailbox[].sleeping.value)
-                    AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 1)
-                    # Recheck after publishing — if work arrived or mode
-                    # changed, cancel sleep.
-                    if AtomicInt32.load[ordering=Consistency.ACQUIRE](ready_ptr) != 0:
-                        AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 0)
-                        break
-                    if shared[].shutdown.load[ordering=Consistency.ACQUIRE]() != 0:
-                        AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 0)
-                        break
-                    if shared[].hot_mode.load[ordering=Consistency.ACQUIRE]() != 0:
-                        AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 0)
-                        break
-                    _ = sys.sys_futex_wait(Int(ready_ptr), 0, futex_flags)
-                    AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 0)
-                    spins = 0
+    # Delegate to model-specific loop
+    var model = Model()
+    model.worker_loop(mailbox, shared, futex_flags)
 
     # CHILD_CLEARTID handles clearing child_tid and futex wake automatically
     sys.sys_exit()

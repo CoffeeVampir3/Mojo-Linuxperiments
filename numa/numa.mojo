@@ -109,11 +109,15 @@ struct NumaTopology(Movable):
 struct NumaInfo:
     var nodes: List[NumaNode]
     var num_nodes: Int
+    var isolated_cpus: List[Int]  # from /sys/devices/system/cpu/isolated
 
     def __init__(out self):
         self.num_nodes = 0
         self.nodes = List[NumaNode]()
+        self.isolated_cpus = List[Int]()
         try:
+            self.isolated_cpus = parse_cpulist(
+                read_sysfs("/sys/devices/system/cpu/isolated"))
             var online_str = read_sysfs("/sys/devices/system/node/online")
             if len(online_str) == 0:
                 return
@@ -129,6 +133,35 @@ struct NumaInfo:
                 self.num_nodes += 1
         except:
             print("NumaInfo failed to read system numa information or it was not present on the system.")
+
+    def has_isolation(self) -> Bool:
+        """True if CPU isolation is configured (isolcpus boot param)."""
+        return len(self.isolated_cpus) > 0
+
+    def get_worker_cpus(self, node_id: Int) -> List[Int]:
+        """Get worker CPUs for a node: node ∩ isolated, or all node if no isolation."""
+        var node_cpus = self.get_node_cpus(node_id)
+        if not self.has_isolation():
+            return node_cpus^
+        var workers = List[Int]()
+        for cpu in node_cpus:
+            for iso in self.isolated_cpus:
+                if cpu == iso:
+                    workers.append(cpu)
+                    break
+        return workers^
+
+    def get_worker_mask[mask_size: Int = 128](self, node_id: Int) -> CpuMask[mask_size]:
+        """CPU mask for worker cores on a node (isolated ∩ node, or all node)."""
+        var mask = CpuMask[mask_size]()
+        var cpus = self.get_worker_cpus(node_id)
+        for cpu in cpus:
+            mask.set(cpu)
+        return mask^
+
+    def worker_count(self, node_id: Int) -> Int:
+        """Number of worker CPUs on a node (respects isolation)."""
+        return len(self.get_worker_cpus(node_id))
 
     def get_node_cpus(self, node_id: Int) -> List[Int]:
         """Get the list of CPU IDs belonging to the specified NUMA node."""
