@@ -1,7 +1,7 @@
 """BurstPool — spin-backoff pool with dual-mailbox NUMA-aware dispatch.
 
 Workers spin briefly on local mailboxes, then Dekker-sleep via futex.
-Safe on any machine, any core count.
+Backoff sleep after-spin, typical thread style.
 
 Memory layout — dual arena for NUMA-optimal access:
 
@@ -21,14 +21,14 @@ from std.sys.info import size_of
 from std.memory import UnsafePointer, memcpy
 from std.time import perf_counter_ns
 import linux.sys as linux
-from std.os.atomic import Atomic, Consistency
+from std.os.atomic import Consistency
 from numa import NumaInfo, CpuMask
 from notstdcollections import HeapMoveArray
-from .isolated_burst_pool import ArgPack
 from .threading_traits import BurstThreadPool
-
-comptime AtomicInt32 = Atomic[DType.int32]
-comptime KernelFn = def (Int, Int, Int, Int, Int, Int) -> None
+from .threading_shared import (
+    AtomicInt32, KernelFn, ArgPack, JoinFlag, SlotLayout,
+    compute_slot_size, ptr,
+)
 
 
 # ============================================================================
@@ -55,22 +55,6 @@ struct WorkerMailbox:
 
 
 # ============================================================================
-# Join flag — lives on the main thread's NUMA node
-# ============================================================================
-
-@align(64)
-struct JoinFlag:
-    """Completion flag on the main thread's NUMA node.
-    Main thread reads locally. Worker writes remotely once."""
-    var done: AtomicInt32  # 0=running, 1=complete
-    var timestamp: Int     # worker writes perf_counter_ns() before setting done
-
-    def __init__(out self):
-        self.done = AtomicInt32(0)
-        self.timestamp = 0
-
-
-# ============================================================================
 # Shared state — lives on worker's NUMA node
 # ============================================================================
 
@@ -80,41 +64,6 @@ struct SharedState:
 
     def __init__(out self):
         self.shutdown = AtomicInt32(0)
-
-
-# ============================================================================
-# Stack / slot layout
-# ============================================================================
-
-struct SlotLayout(TrivialRegisterPassable):
-    comptime TLS_SIZE = 256
-    comptime TCB_SIZE = 64
-    comptime TCB_SELF_OFFSET = 0x10
-    comptime TCB = Self.TLS_SIZE
-    comptime CHILD_TID = Self.TCB + Self.TCB_SIZE
-    comptime WORKER_ID = Self.CHILD_TID + 8
-    comptime WORKER_MAGIC = Self.WORKER_ID + 8
-    comptime WORKER_MAGIC_VALUE = Int(0x4255525354574B52)  # "BURSTWKR"
-    comptime WORKER_ID_FROM_FS = Self.WORKER_ID - Self.TCB
-    comptime WORKER_MAGIC_FROM_FS = Self.WORKER_MAGIC - Self.TCB
-    comptime HEADER = ((Self.WORKER_MAGIC + 8 + 4095) // 4096) * 4096
-    comptime GUARD = 4096
-    comptime ALTSTACK_SIZE = 64 * 1024
-    comptime ALT_GUARD = Self.GUARD
-    comptime DEFAULT_STACK = 64 * 1024
-
-
-def compute_slot_size(stack_size: Int) -> Int:
-    debug_assert(stack_size >= SlotLayout.GUARD and stack_size % SlotLayout.GUARD == 0,
-        "stack_size must be a multiple of 4096 (>= 4096)")
-    var raw = (SlotLayout.HEADER + SlotLayout.GUARD + stack_size
-             + SlotLayout.ALT_GUARD + SlotLayout.ALTSTACK_SIZE)
-    return ((raw + SlotLayout.GUARD - 1) // SlotLayout.GUARD) * SlotLayout.GUARD
-
-
-@always_inline
-def ptr[T: AnyType](addr: Int) -> UnsafePointer[T, MutAnyOrigin]:
-    return UnsafePointer[T, MutAnyOrigin](unsafe_from_address=addr)
 
 
 # ============================================================================

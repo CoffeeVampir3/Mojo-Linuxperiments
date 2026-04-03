@@ -8,12 +8,13 @@ Left-right design: each side reads only local memory.
   Join:     workers write done=1 to join flags on the main thread's NUMA node
             (remote write, once per worker). Main thread polls locally.
 
-No atomics, no syscalls on the hot path. Ordering is TSO (x86 store-store
-and load-load ordering). The flags are plain stores/loads with compiler
-barriers (RELEASE/ACQUIRE compile to zero hardware instructions on x86).
+No atomics, no syscalls on the hot path. Ordering is TSO.
 
 Requires CPU isolation: isolcpus + nohz_full + rcu_nocbs on worker cores.
-Workers are pinned one-per-core and never preempted.
+Workers are pinned one-per-core and never preempted. 
+
+Expected speedup directly equal to the number of distinct numa domains plus a small fixed 
+cost reduction.
 """
 
 from std.sys.info import size_of
@@ -24,32 +25,10 @@ from std.os.atomic import Atomic, Consistency
 from numa import NumaInfo, CpuMask
 from notstdcollections import HeapMoveArray
 from .threading_traits import BurstThreadPool, SleepableThreadPool
-
-comptime AtomicInt32 = Atomic[DType.int32]
-
-
-# ============================================================================
-# Kernel call ABI — same as BurstPool for kernel compatibility
-# ============================================================================
-
-comptime KernelFn = def (Int, Int, Int, Int, Int, Int) -> None
-
-@fieldwise_init
-struct ArgPack(Copyable, ImplicitlyCopyable):
-    var arg0: Int
-    var arg1: Int
-    var arg2: Int
-    var arg3: Int
-    var arg4: Int
-    var arg5: Int
-
-    def __init__(out self):
-        self.arg0 = 0
-        self.arg1 = 0
-        self.arg2 = 0
-        self.arg3 = 0
-        self.arg4 = 0
-        self.arg5 = 0
+from .threading_shared import (
+    AtomicInt32, KernelFn, ArgPack, JoinFlag, SlotLayout,
+    compute_slot_size, ptr,
+)
 
 
 # ============================================================================
@@ -58,11 +37,7 @@ struct ArgPack(Copyable, ImplicitlyCopyable):
 
 @align(64)
 struct WorkerMailbox:
-    """Dispatch slot on the worker's NUMA node. Worker reads locally.
-
-    Cache line 1: dispatch data (main writes remotely, worker reads locally)
-    Cache line 2: padding
-    """
+    """Dispatch slot on the worker's NUMA node. Worker reads locally."""
     var job_ready: AtomicInt32  # 0=idle, 1=work available
     var func_ptr: Int
     var pack: ArgPack
@@ -71,22 +46,6 @@ struct WorkerMailbox:
         self.job_ready = AtomicInt32(0)
         self.func_ptr = 0
         self.pack = ArgPack()
-
-
-# ============================================================================
-# Join flag — lives on the main thread's NUMA node
-# ============================================================================
-
-@align(64)
-struct JoinFlag:
-    """Completion flag on the main thread's NUMA node.
-    Main thread reads locally. Worker writes remotely once."""
-    var done: AtomicInt32  # 0=running, 1=complete
-    var timestamp: Int     # worker writes perf_counter_ns() before setting done
-
-    def __init__(out self):
-        self.done = AtomicInt32(0)
-        self.timestamp = 0
 
 
 # ============================================================================
@@ -101,32 +60,6 @@ struct SharedState:
     def __init__(out self):
         self.shutdown = AtomicInt32(0)
         self.parked = AtomicInt32(0)
-
-
-# ============================================================================
-# Stack layout — same proven layout as BurstPool
-# ============================================================================
-
-struct SlotLayout(TrivialRegisterPassable):
-    comptime TLS_SIZE = 256
-    comptime TCB_SIZE = 64
-    comptime TCB_SELF_OFFSET = 0x10
-    comptime TCB = Self.TLS_SIZE
-    comptime CHILD_TID = Self.TCB + Self.TCB_SIZE
-    comptime WORKER_ID = Self.CHILD_TID + 8
-    comptime WORKER_MAGIC = Self.WORKER_ID + 8
-    comptime WORKER_MAGIC_VALUE = Int(0x4255525354574B52)  # "BURSTWKR"
-    comptime HEADER = ((Self.WORKER_MAGIC + 8 + 4095) // 4096) * 4096
-    comptime GUARD = 4096
-    comptime ALTSTACK_SIZE = 64 * 1024
-    comptime ALT_GUARD = Self.GUARD
-    comptime DEFAULT_STACK = 2 * 1024 * 1024
-
-
-def compute_slot_size(stack_size: Int) -> Int:
-    var raw = (SlotLayout.HEADER + SlotLayout.GUARD + stack_size
-             + SlotLayout.ALT_GUARD + SlotLayout.ALTSTACK_SIZE)
-    return ((raw + SlotLayout.GUARD - 1) // SlotLayout.GUARD) * SlotLayout.GUARD
 
 
 # ============================================================================
@@ -162,15 +95,6 @@ struct WorkerSlot(Movable):
             unsafe_from_address=slot_base + SlotLayout.CHILD_TID)
         self.stack_top = UnsafePointer[UInt8, MutAnyOrigin](
             unsafe_from_address=slot_base + SlotLayout.HEADER + SlotLayout.GUARD)
-
-
-# ============================================================================
-# Helpers
-# ============================================================================
-
-@always_inline
-def ptr[T: AnyType](addr: Int) -> UnsafePointer[T, MutAnyOrigin]:
-    return UnsafePointer[T, MutAnyOrigin](unsafe_from_address=addr)
 
 
 # ============================================================================

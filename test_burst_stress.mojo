@@ -1,4 +1,7 @@
-from threading.burst_threading import BurstPool, ArgPack
+"""BurstPool stress test — correctness + timing comparison with jthread."""
+
+from threading.burst_threading import BurstPool
+from threading.threading_shared import ArgPack
 from notstdcollections import HeapMoveArray
 from std.memory import UnsafePointer
 from std.collections import InlineArray
@@ -6,7 +9,6 @@ from std.time import perf_counter_ns
 
 
 def mix64(x: Int) -> Int:
-    # SplitMix64
     var z = x + (-7046029254386353131)
     z = (z ^ (z >> 30)) * (-4658895280553007687)
     z = (z ^ (z >> 27)) * (-7723592293110705685)
@@ -15,7 +17,6 @@ def mix64(x: Int) -> Int:
 
 def calc_result(iter: Int, job_idx: Int) -> Int:
     var x = mix64(iter ^ job_idx)
-    # Variable work to allow scheduler preemption/deschedule.
     var spins = Int(x & 0xFF)
     for _ in range(spins):
         x = mix64(x)
@@ -23,13 +24,12 @@ def calc_result(iter: Int, job_idx: Int) -> Int:
 
 
 def calc_scratch_sum(iter: Int, job_idx: Int) -> Int:
-    # Sum_{i=0..127} (iter + job_idx + i)
     return (iter + job_idx) * 128 + 8128
 
 
-def stress_kernel(out_ptr: UnsafePointer[Int, MutAnyOrigin], iter: Int, job_idx: Int):
-    # Heavy-ish stack usage to stress small worker stacks.
-    var scratch = InlineArray[Int, 128](uninitialized=True)  # 1KB
+def stress_kernel(out_addr: Int, iter: Int, job_idx: Int,
+                  unused1: Int, unused2: Int, unused3: Int):
+    var scratch = InlineArray[Int, 128](uninitialized=True)
     for i in range(128):
         scratch[i] = iter + job_idx + i
 
@@ -39,22 +39,17 @@ def stress_kernel(out_ptr: UnsafePointer[Int, MutAnyOrigin], iter: Int, job_idx:
     for i in range(128):
         scratch_sum += scratch[i]
 
-    out_ptr[] = x + scratch_sum
+    UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=out_addr)[] = x + scratch_sum
 
 
 def main():
     comptime CAPACITY = 15
     comptime ITERATIONS = 5000
-    comptime STACK_BYTES = 4096  # small, page-aligned stack to stress guard/reset behavior
 
-    print("mew")
-
-    var pool = BurstPool[STACK_BYTES](CAPACITY)
+    var pool = BurstPool[](CAPACITY)
     if not pool:
         print("BurstPool creation failed")
         return
-
-    print("mew")
 
     var output = HeapMoveArray[Int](CAPACITY)
     for _ in range(CAPACITY):
@@ -64,14 +59,14 @@ def main():
     for _ in range(CAPACITY):
         packs.push(ArgPack())
 
+    var total_dispatch_ns = 0
+    var total_join_ns = 0
     var max_dispatch_ns = 0
     var max_join_ns = 0
-
-    print("mew")
+    var total_dispatches = 0
 
     var bench_start_ns = Int(perf_counter_ns())
     for iter_i in range(ITERATIONS):
-        # Vary job count to hit partial bursts.
         var jobs = CAPACITY
         if iter_i % 5 == 1:
             jobs = CAPACITY // 2
@@ -94,6 +89,9 @@ def main():
 
         var dispatch_ns = t1 - t0
         var join_ns = t2 - t1
+        total_dispatch_ns += dispatch_ns
+        total_join_ns += join_ns
+        total_dispatches += 1
         if dispatch_ns > max_dispatch_ns:
             max_dispatch_ns = dispatch_ns
         if join_ns > max_join_ns:
@@ -111,11 +109,11 @@ def main():
 
     var bench_end_ns = Int(perf_counter_ns())
     var total_ns = bench_end_ns - bench_start_ns
-    var total_s = total_ns // 1_000_000_000
-    var rem_ms = (total_ns % 1_000_000_000) // 1_000_000
 
     print("Stress test passed.")
-    print("max dispatch ns:", max_dispatch_ns)
-    print("max join ns:", max_join_ns)
-    print("total benchmark ns:", total_ns)
-    print("total benchmark:", total_s, "s", rem_ms, "ms")
+    print("  iterations:", ITERATIONS, " workers:", CAPACITY)
+    print("  avg dispatch:", total_dispatch_ns // total_dispatches, "ns")
+    print("  avg join:    ", total_join_ns // total_dispatches, "ns")
+    print("  max dispatch:", max_dispatch_ns, "ns")
+    print("  max join:    ", max_join_ns, "ns")
+    print("  total:       ", total_ns // 1_000_000, "ms")

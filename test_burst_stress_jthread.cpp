@@ -1,3 +1,6 @@
+// jthread stress test — same workload as test_burst_stress.mojo for comparison.
+// Each iteration spawns N jthreads, joins all. Measures dispatch+join cost.
+
 #include <array>
 #include <chrono>
 #include <cstdint>
@@ -22,12 +25,24 @@ static inline uint64_t calc_result(uint64_t iter, uint64_t job_idx) {
     return x;
 }
 
+static inline uint64_t calc_scratch_sum(uint64_t iter, uint64_t job_idx) {
+    return (iter + job_idx) * 128 + 8128;
+}
+
 static inline void stress_kernel(uint64_t *dst, uint64_t iter, uint64_t job_idx) {
     array<uint64_t, 128> scratch;
     for (size_t i = 0; i < scratch.size(); ++i) {
         scratch[i] = iter + job_idx + i;
     }
-    *dst = calc_result(iter, job_idx);
+
+    uint64_t x = calc_result(iter, job_idx);
+
+    uint64_t scratch_sum = 0;
+    for (size_t i = 0; i < scratch.size(); ++i) {
+        scratch_sum += scratch[i];
+    }
+
+    *dst = x + scratch_sum;
 }
 
 int main() {
@@ -36,8 +51,11 @@ int main() {
 
     vector<uint64_t> output(CAPACITY, 0);
 
+    int64_t total_dispatch_ns = 0;
+    int64_t total_join_ns = 0;
     int64_t max_dispatch_ns = 0;
     int64_t max_join_ns = 0;
+    int64_t total_dispatches = 0;
 
     auto bench_start = chrono::steady_clock::now();
     for (int64_t iter_i = 0; iter_i < ITERATIONS; ++iter_i) {
@@ -72,6 +90,9 @@ int main() {
 
         auto dispatch_ns = chrono::duration_cast<chrono::nanoseconds>(t1 - t0).count();
         auto join_ns = chrono::duration_cast<chrono::nanoseconds>(t2 - t1).count();
+        total_dispatch_ns += dispatch_ns;
+        total_join_ns += join_ns;
+        total_dispatches++;
         if (dispatch_ns > max_dispatch_ns) {
             max_dispatch_ns = static_cast<int64_t>(dispatch_ns);
         }
@@ -81,7 +102,10 @@ int main() {
 
         for (int64_t j = 0; j < jobs; ++j) {
             uint64_t got = output[static_cast<size_t>(j)];
-            uint64_t exp = calc_result(static_cast<uint64_t>(iter_i), static_cast<uint64_t>(j));
+            uint64_t exp = calc_result(static_cast<uint64_t>(iter_i),
+                                       static_cast<uint64_t>(j))
+                         + calc_scratch_sum(static_cast<uint64_t>(iter_i),
+                                            static_cast<uint64_t>(j));
             if (got != exp) {
                 cerr << "Mismatch at iter " << iter_i << " job " << j
                      << " got " << got << " expected " << exp << "\n";
@@ -97,11 +121,11 @@ int main() {
     auto total_ns = chrono::duration_cast<chrono::nanoseconds>(bench_end - bench_start).count();
 
     cout << "Stress test passed.\n";
-    cout << "max dispatch ns: " << max_dispatch_ns << "\n";
-    cout << "max join ns: " << max_join_ns << "\n";
-    cout << "total benchmark ns: " << total_ns << "\n";
-    cout << "total benchmark: " << (total_ns / 1'000'000'000) << " s "
-         << ((total_ns % 1'000'000'000) / 1'000'000) << " ms\n";
+    cout << "  iterations: " << ITERATIONS << "  workers: " << CAPACITY << "\n";
+    cout << "  avg dispatch: " << total_dispatch_ns / total_dispatches << " ns\n";
+    cout << "  avg join:     " << total_join_ns / total_dispatches << " ns\n";
+    cout << "  max dispatch: " << max_dispatch_ns << " ns\n";
+    cout << "  max join:     " << max_join_ns << " ns\n";
+    cout << "  total:        " << (total_ns / 1'000'000) << " ms\n";
     return 0;
 }
-
