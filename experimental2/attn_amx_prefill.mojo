@@ -44,49 +44,28 @@ comptime Q_BATCH = 32
 
 @fieldwise_init
 struct WorkerScratch:
+    """Per-worker dispatch config. All buffers are stack-allocated in the kernel."""
     var group: Int
     var q_row_start: Int
     var q_row_end: Int
-    var qi_buf: UnsafePointer[Int8, MutAnyOrigin]
-    var qi_biases: UnsafePointer[Float32, MutAnyOrigin]
-    var running_o: UnsafePointer[Float32, MutAnyOrigin]
-    var running_m: UnsafePointer[Float32, MutAnyOrigin]
-    var running_l: UnsafePointer[Float32, MutAnyOrigin]
-    var score_i32: UnsafePointer[Int32, MutAnyOrigin]
-    var w_u8_buf: UnsafePointer[UInt8, MutAnyOrigin]
-    var k_vnni: UnsafePointer[UInt8, MutAnyOrigin]
-    var v_vnni: UnsafePointer[Int8, MutAnyOrigin]
+    var pos: Int
+    var seq_len: Int
+    var q_quant_inv: Float32
+    var score_scale: Float32
+    var vagg_scale: Float32
 
 
 # ============================================================================
 # Scratch sizing
 # ============================================================================
 
-def per_worker_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int,
-                     prefill_chunk: Int = 512]() -> Int:
-    comptime gqa_factor = num_heads // num_kv_heads
-    comptime chunk_q_max = ((prefill_chunk * gqa_factor + M_STEP - 1) // M_STEP) * M_STEP
-    comptime k_nt_pairs = BLOCK_N // TILE_N // 2
-    comptime k_slices = head_dim // K_STEP
-    comptime v_k_tiles = BLOCK_N // K_STEP
-    comptime v_n_tiles = head_dim // TILE_N
-    return (
-        size_of[WorkerScratch]()                            # worker args at front
-        + chunk_q_max * head_dim                            # qi_buf i8
-        + chunk_q_max * size_of[Float32]()                  # qi_biases (128*sum)
-        + chunk_q_max * head_dim * size_of[Float32]()       # running_o f32
-        + chunk_q_max * size_of[Float32]() * 2              # running_m, running_l
-        + Q_BATCH * BLOCK_N * size_of[Int32]()              # score_i32 (GEMM output)
-        + Q_BATCH * BLOCK_N                                 # w_u8_buf u8
-        + k_nt_pairs * k_slices * 2 * TILE_BYTES            # k_vnni (all N-tile pairs)
-        + v_k_tiles * v_n_tiles * TILE_BYTES                # v_vnni
-    )
-
 def scratch_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int,
                   max_seq_len: Int, prefill_chunk: Int = 512](num_workers: Int) -> Int:
+    """Output buffer + AttnCtx + worker configs. All working memory is stack-allocated."""
     comptime q_cols = num_heads * head_dim
-    comptime pw = per_worker_bytes[num_heads, num_kv_heads, head_dim, prefill_chunk]()
-    return max_seq_len * q_cols * size_of[Float32]() + num_workers * pw
+    return (max_seq_len * q_cols * size_of[Float32]()
+          + size_of[AttnCtx]()
+          + num_workers * size_of[WorkerScratch]())
 
 
 # ============================================================================
@@ -110,34 +89,43 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
     comptime MAX_TILES = (max_seq + TILE_N - 1) // TILE_N
     comptime K_HEAD_STRIDE = MAX_TILES * K_TILE_K_BYTES
     comptime V_HEAD_STRIDE = max_seq * head_dim
-    comptime chunk_q_max = prefill_chunk * gqa_factor
+    comptime chunk_q_max = ((prefill_chunk * gqa_factor + M_STEP - 1) // M_STEP) * M_STEP
+    comptime v_k_tiles = BLOCK_N // K_STEP
 
-    var seq_len = ctx[].seq_len
-    var pos = ctx[].pos
-    var score_scale = ctx[].score_scale
-    var vagg_scale = ctx[].vagg_scale
     var g = ws[].group
     var q_row_start = ws[].q_row_start
     var my_q_rows = ws[].q_row_end - q_row_start
+    var pos = ws[].pos
+    var seq_len = ws[].seq_len
+    var score_scale = ws[].score_scale
+    var vagg_scale = ws[].vagg_scale
+    var q_quant_inv = ws[].q_quant_inv
     if my_q_rows <= 0:
         return
 
     var cfg = make_224_i8_config()
     ldtilecfg(UnsafePointer(to=cfg))
 
-    var qi_buf = ws[].qi_buf
-    var qi_biases = ws[].qi_biases
-    var running_o = ws[].running_o
-    var running_m = ws[].running_m
-    var running_l = ws[].running_l
-    var score_i32 = ws[].score_i32
-    var w_u8_buf = ws[].w_u8_buf
-    var k_vnni = ws[].k_vnni
-    var v_vnni = ws[].v_vnni
-
+    var output = ctx[].output
     var k_vnni_head = ctx[].k_base + g * K_HEAD_STRIDE
     var v_base = ctx[].v_base + g * V_HEAD_STRIDE
-    var q_quant_inv = ctx[].q_quant_inv
+
+    var qi_arr = InlineArray[Int8, chunk_q_max * head_dim](uninitialized=True)
+    var qi_buf = UnsafePointer(to=qi_arr).bitcast[Int8]()
+    var bias_arr = InlineArray[Float32, chunk_q_max](uninitialized=True)
+    var qi_biases = UnsafePointer(to=bias_arr).bitcast[Float32]()
+    var rm_arr = InlineArray[Float32, chunk_q_max](uninitialized=True)
+    var running_m = UnsafePointer(to=rm_arr).bitcast[Float32]()
+    var rl_arr = InlineArray[Float32, chunk_q_max](uninitialized=True)
+    var running_l = UnsafePointer(to=rl_arr).bitcast[Float32]()
+    var off_arr = InlineArray[Int, chunk_q_max](uninitialized=True)
+    var output_offsets = UnsafePointer(to=off_arr).bitcast[Int]()
+    var score_arr = InlineArray[Int32, Q_BATCH * BLOCK_N](uninitialized=True)
+    var score_i32 = UnsafePointer(to=score_arr).bitcast[Int32]()
+    var wu8_arr = InlineArray[UInt8, Q_BATCH * BLOCK_N](uninitialized=True)
+    var w_u8_buf = UnsafePointer(to=wu8_arr).bitcast[UInt8]()
+    var vv_arr = InlineArray[Int8, hd_n_tiles * v_k_tiles * TILE_BYTES](uninitialized=True)
+    var v_vnni = UnsafePointer(to=vv_arr).bitcast[Int8]()
 
     var vzero = SIMD[DType.float32, width](0)
     var vinf = SIMD[DType.float32, width](Float32(-1e30))
@@ -151,13 +139,21 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
         var chunk_rows = min(chunk_q_max, my_q_rows - chunk_start)
         var padded_chunk_rows = ((chunk_rows + M_STEP - 1) // M_STEP) * M_STEP
 
-        # --- Q prep for this chunk ---
+        # --- Compute output offsets + zero output + Q prep ---
         for local_idx in range(chunk_rows):
             var abs_row = q_row_start + chunk_start + local_idx
             var m = abs_row // gqa_factor
             var hi = abs_row % gqa_factor
             var h = g * gqa_factor + hi
             var actual_pos = pos + m
+            output_offsets[local_idx] = m * q_cols + h * head_dim
+            # Zero output for this row
+            var out_row = output + output_offsets[local_idx]
+            var d = 0
+            while d + width <= head_dim:
+                (out_row + d).store(vzero)
+                d += width
+            # Q prep
             qi_biases[local_idx] = prep_q_row[head_dim](
                 ctx[].q + m * q_cols + h * head_dim,
                 ctx[].cos + actual_pos * half,
@@ -166,12 +162,8 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
                 qi_buf + local_idx * head_dim,
             )
 
-        # --- Init running state for this chunk ---
+        # --- Init running_m/l for this chunk ---
         var i = 0
-        while i + width <= padded_chunk_rows * head_dim:
-            (running_o + i).store(vzero)
-            i += width
-        i = 0
         while i + width <= padded_chunk_rows:
             (running_m + i).store(vinf)
             (running_l + i).store(vzero)
@@ -215,7 +207,7 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
                             score_i32 + (mi * M_STEP) * BLOCK_N + nt * TILE_N,
                         )
 
-                # Softmax
+                # Softmax — accumulates directly into output
                 for qi_local in range(qb_len):
                     var qi_row = qb_start + qi_local
                     var abs_row = q_row_start + chunk_start + qi_row
@@ -226,11 +218,11 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
                         qi_biases[qi_row], score_scale,
                         causal_limit, padded_chunk,
                         running_m + qi_row, running_l + qi_row,
-                        running_o + qi_row * head_dim,
+                        output + output_offsets[qi_row],
                         w_u8_buf + qi_local * padded_chunk,
                     )
 
-                # V-agg
+                # V-agg — accumulates directly into output
                 for ns in range(head_dim // N_STEP):
                     var d_off = ns * N_STEP
                     var nt_lo = d_off // TILE_N
@@ -245,25 +237,20 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
                             vagg_i32,
                         )
                         for r in range(min(M_STEP, qb_len - mi * M_STEP)):
-                            var ro_row = running_o + (qb_start + mi * M_STEP + r) * head_dim + d_off
+                            var ro_row = output + output_offsets[qb_start + mi * M_STEP + r] + d_off
                             var c = 0
                             while c + width <= N_STEP:
                                 var raw = (vagg_i32 + r * N_STEP + c).load[width=width]().cast[DType.float32]()
                                 (ro_row + c).store((ro_row + c).load[width=width]() + raw)
                                 c += width
 
-        # --- Final normalize for this chunk ---
+        # --- Final normalize (in-place on output) ---
         for local_idx in range(chunk_rows):
-            var abs_row = q_row_start + chunk_start + local_idx
-            var m = abs_row // gqa_factor
-            var hi = abs_row % gqa_factor
-            var h = g * gqa_factor + hi
             var final_scale = vagg_scale / running_l[local_idx]
-            var ro = running_o + local_idx * head_dim
-            var out = ctx[].row_f32 + m * q_cols + h * head_dim
+            var out_row = output + output_offsets[local_idx]
             var d = 0
             while d + width <= head_dim:
-                (out + d).store((ro + d).load[width=width]() * final_scale)
+                (out_row + d).store((out_row + d).load[width=width]() * final_scale)
                 d += width
 
 
@@ -294,34 +281,31 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     """
     comptime gqa_factor = num_heads // num_kv_heads
     comptime q_cols = QT.COLS
-    comptime pw = per_worker_bytes[num_heads, num_kv_heads, head_dim, prefill_chunk]()
-    comptime chunk_q_max = prefill_chunk * gqa_factor
-    var WORKERS_OFF = q.seq_len * q_cols * size_of[Float32]()
     var inv_sqrt_hd = Float32(1.0 / Float64(sqrt[DType.float32, 1](Float32(head_dim))))
 
-    var ctx = AttnCtx(
+    # Derived per-layer constants
+    var q_quant_inv = Float32(127.0) / q_layer_scale
+    var score_scale = q_layer_scale * k_layer_scale * inv_sqrt_hd / (Float32(127.0) * Float32(127.0))
+    var vagg_scale = v_layer_scale / (Float32(255.0) * Float32(127.0))
+
+    # Write AttnCtx into scratch (after output buffer, before workers)
+    var output_bytes = q.seq_len * q_cols * size_of[Float32]()
+    var ctx_ptr = UnsafePointer[AttnCtx, MutAnyOrigin](
+        unsafe_from_address=scratch + output_bytes)
+    ctx_ptr[] = AttnCtx(
         UnsafePointer[BFloat16, MutAnyOrigin](unsafe_from_address=q.ptr),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cos_table.ptr),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=sin_table.ptr),
         UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=k_cache.k_base),
         UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=v_cache.v_base),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=scratch),
-        Float32(127.0) / q_layer_scale,
-        q_layer_scale * k_layer_scale * inv_sqrt_hd / (Float32(127.0) * Float32(127.0)),
-        v_layer_scale / (Float32(255.0) * Float32(127.0)),
-        pos, q.seq_len,
     )
-    var ctx_ptr = UnsafePointer(to=ctx)
+    var workers_off = output_bytes + size_of[AttnCtx]()
 
     var workers_per_group = max(1, pool.capacity // num_kv_heads)
     var total_q_rows = q.seq_len * gqa_factor
     var rows_per_worker = (total_q_rows + workers_per_group - 1) // workers_per_group
     var total_jobs = num_kv_heads * workers_per_group
-
-    comptime K_NT_PAIRS = BLOCK_N // TILE_N // 2
-    comptime K_SLICES = head_dim // K_STEP
-    comptime V_K_TILES = BLOCK_N // K_STEP
-    comptime V_N_TILES = head_dim // TILE_N
 
     for g in range(num_kv_heads):
         for w in range(workers_per_group):
@@ -329,32 +313,17 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
             var q_start = w * rows_per_worker
             var q_end = min(q_start + rows_per_worker, total_q_rows)
 
-            # Scratch sized for prefill_chunk rows, reused by kernel chunk loop
-            var ws_base = scratch + WORKERS_OFF + job_idx * pw
+            var ws_base = scratch + workers_off + job_idx * size_of[WorkerScratch]()
             var ws = UnsafePointer[WorkerScratch, MutAnyOrigin](
                 unsafe_from_address=ws_base)
-            var data = ws_base + size_of[WorkerScratch]()
-            var off = 0
             ws[].group = g
             ws[].q_row_start = q_start
             ws[].q_row_end = q_end
-            ws[].qi_buf = UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=data + off)
-            off += chunk_q_max * head_dim
-            ws[].qi_biases = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
-            off += chunk_q_max * size_of[Float32]()
-            ws[].running_o = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
-            off += chunk_q_max * head_dim * size_of[Float32]()
-            ws[].running_m = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
-            off += chunk_q_max * size_of[Float32]()
-            ws[].running_l = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
-            off += chunk_q_max * size_of[Float32]()
-            ws[].score_i32 = UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=data + off)
-            off += Q_BATCH * BLOCK_N * size_of[Int32]()
-            ws[].w_u8_buf = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=data + off)
-            off += Q_BATCH * BLOCK_N
-            ws[].k_vnni = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=data + off)
-            off += K_NT_PAIRS * K_SLICES * 2 * TILE_BYTES
-            ws[].v_vnni = UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=data + off)
+            ws[].pos = pos
+            ws[].seq_len = q.seq_len
+            ws[].q_quant_inv = q_quant_inv
+            ws[].score_scale = score_scale
+            ws[].vagg_scale = vagg_scale
 
             var pack = pool.args_base + job_idx
             pack[].arg0 = Int(ctx_ptr)

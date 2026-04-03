@@ -141,8 +141,9 @@ struct SlotLayout(TrivialRegisterPassable):
     comptime ALT_GUARD = Self.GUARD
     comptime DEFAULT_STACK = 64 * 1024
 
-def slot_size[stack_size: Int]() -> Int:
-    comptime assert stack_size >= SlotLayout.GUARD and stack_size % SlotLayout.GUARD == 0, "stack_size must be a multiple of 4096 (>= 4096)"
+def compute_slot_size(stack_size: Int) -> Int:
+    debug_assert(stack_size >= SlotLayout.GUARD and stack_size % SlotLayout.GUARD == 0,
+        "stack_size must be a multiple of 4096 (>= 4096)")
     var raw = SlotLayout.HEADER + SlotLayout.GUARD + stack_size + SlotLayout.ALT_GUARD + SlotLayout.ALTSTACK_SIZE
     return ((raw + SlotLayout.GUARD - 1) // SlotLayout.GUARD) * SlotLayout.GUARD
 
@@ -477,8 +478,9 @@ struct IsolatedModel(ThreadingModel):
 # BurstPool[Model]
 # ============================================================================
 
-struct BurstPool[Model: ThreadingModel = ColdModel, stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 128](Movable):
-    comptime slot_size = slot_size[Self.stack_size]()
+struct BurstPool[Model: ThreadingModel = ColdModel, mask_size: Int = 128](Movable):
+    var slot_size: Int
+    var stack_size: Int
     var slots: HeapMoveArray[WorkerSlot]
     var shared: UnsafePointer[SharedPoolState, MutAnyOrigin]
     var mailboxes: UnsafePointer[WorkerMailbox, MutAnyOrigin]
@@ -492,7 +494,9 @@ struct BurstPool[Model: ThreadingModel = ColdModel, stack_size: Int = SlotLayout
     var pinned: Bool
     var workers_alive: Bool
 
-    def __init__(out self, capacity: Int, var cpu_mask: CpuMask[Self.mask_size] = CpuMask[Self.mask_size](), numa_node: Optional[Int] = None):
+    def __init__(out self, capacity: Int, var cpu_mask: CpuMask[Self.mask_size] = CpuMask[Self.mask_size](), numa_node: Optional[Int] = None, stack_size: Int = SlotLayout.DEFAULT_STACK):
+        self.stack_size = stack_size
+        self.slot_size = compute_slot_size(stack_size)
         self.capacity = capacity
         self.active_jobs = 0
         self.slots = HeapMoveArray[WorkerSlot](capacity)
@@ -511,7 +515,7 @@ struct BurstPool[Model: ThreadingModel = ColdModel, stack_size: Int = SlotLayout
         var sys = linux.linux_sys()
         var mailbox_bytes = capacity * size_of[WorkerMailbox]()
         var args_bytes = capacity * size_of[ArgPack]()
-        var arena_size = Self.slot_size * capacity + size_of[SharedPoolState]() + mailbox_bytes + args_bytes
+        var arena_size = self.slot_size * capacity + size_of[SharedPoolState]() + mailbox_bytes + args_bytes
         self.arena_base = sys.sys_mmap[
             prot=linux.Prot.RW,
             flags=linux.MapFlag.PRIVATE | linux.MapFlag.ANONYMOUS | linux.MapFlag.NORESERVE | linux.MapFlag.POPULATE
@@ -526,7 +530,7 @@ struct BurstPool[Model: ThreadingModel = ColdModel, stack_size: Int = SlotLayout
                 self.arena_base = 0
                 return
 
-        var shared_addr = self.arena_base + Self.slot_size * capacity
+        var shared_addr = self.arena_base + self.slot_size * capacity
         self.shared = UnsafePointer[SharedPoolState, MutAnyOrigin](unsafe_from_address=shared_addr)
         self.shared[] = SharedPoolState()
 
@@ -539,13 +543,13 @@ struct BurstPool[Model: ThreadingModel = ColdModel, stack_size: Int = SlotLayout
             unsafe_from_address=mailbox_addr + mailbox_bytes)
 
         for i in range(capacity):
-            var slot_base = self.arena_base + i * Self.slot_size
+            var slot_base = self.arena_base + i * self.slot_size
             if sys.sys_mprotect(slot_base + SlotLayout.HEADER, SlotLayout.GUARD, linux.Prot.NONE) != 0:
                 _ = sys.sys_munmap(self.arena_base, arena_size)
                 self.arena_base = 0
                 return
             if sys.sys_mprotect(
-                slot_base + SlotLayout.HEADER + SlotLayout.GUARD + Self.stack_size,
+                slot_base + SlotLayout.HEADER + SlotLayout.GUARD + self.stack_size,
                 SlotLayout.ALT_GUARD, linux.Prot.NONE,
             ) != 0:
                 _ = sys.sys_munmap(self.arena_base, arena_size)
@@ -582,7 +586,7 @@ struct BurstPool[Model: ThreadingModel = ColdModel, stack_size: Int = SlotLayout
         var args_bytes = self.capacity * size_of[ArgPack]()
         _ = sys.sys_munmap(
             self.arena_base,
-            Self.slot_size * self.capacity + size_of[SharedPoolState]() + mailbox_bytes + args_bytes)
+            self.slot_size * self.capacity + size_of[SharedPoolState]() + mailbox_bytes + args_bytes)
 
     def __bool__(self) -> Bool:
         return self.arena_base != 0 and self.workers_alive
@@ -601,7 +605,7 @@ struct BurstPool[Model: ThreadingModel = ColdModel, stack_size: Int = SlotLayout
         model.sleep(self.shared)
 
     @staticmethod
-    def for_numa_node(numa: NumaInfo, node: Int, headroom: Int = 0) -> Self:
+    def for_numa_node(numa: NumaInfo, node: Int, headroom: Int = 0, stack_size: Int = SlotLayout.DEFAULT_STACK) -> Self:
         """Create pool for a NUMA node. headroom reserves cores for OS/caller."""
         var mask = numa.get_node_mask[Self.mask_size](node)
         var total = numa.cpus_on_node(node)
@@ -614,10 +618,10 @@ struct BurstPool[Model: ThreadingModel = ColdModel, stack_size: Int = SlotLayout
                     mask.clear(bit)
                     removed += 1
                 bit -= 1
-        return Self(cap, mask^, node)
+        return Self(cap, mask^, node, stack_size)
 
     @staticmethod
-    def for_topology(numa: NumaInfo, node: Int) -> Self:
+    def for_topology(numa: NumaInfo, node: Int, stack_size: Int = SlotLayout.DEFAULT_STACK) -> Self:
         """Create pool from topology discovery. Uses isolated cores on the node
         if isolation is configured, otherwise all cores on the node."""
         var mask = numa.get_worker_mask[Self.mask_size](node)
@@ -625,16 +629,16 @@ struct BurstPool[Model: ThreadingModel = ColdModel, stack_size: Int = SlotLayout
         if cap == 0:
             cap = 1
             mask = numa.get_node_mask[Self.mask_size](node)
-        return Self(cap, mask^, node)
+        return Self(cap, mask^, node, stack_size)
 
     @staticmethod
-    def for_numa_node_excluding(numa: NumaInfo, node: Int, exclude_cpu: Int) -> Self:
+    def for_numa_node_excluding(numa: NumaInfo, node: Int, exclude_cpu: Int, stack_size: Int = SlotLayout.DEFAULT_STACK) -> Self:
         var mask = numa.get_node_mask[Self.mask_size](node)
         var cap = numa.cpus_on_node(node)
         if mask.test(exclude_cpu):
             mask.clear(exclude_cpu)
             cap -= 1
-        return Self(cap, mask^, node)
+        return Self(cap, mask^, node, stack_size)
 
     def dispatch[F: TrivialRegisterPassable](mut self, kernel: F, packs: UnsafePointer[ArgPack, MutAnyOrigin], num_jobs: Int = -1):
         """Dispatch jobs to workers via per-worker mailboxes.
@@ -702,13 +706,13 @@ struct BurstPool[Model: ThreadingModel = ColdModel, stack_size: Int = SlotLayout
                     # Shared mask: let the kernel load balancer spread workers.
                     worker_mask = self.cpu_mask.copy()
 
-            var stack_top_addr = Int(self.slots[i].stack_top) + Self.stack_size
+            var stack_top_addr = Int(self.slots[i].stack_top) + self.stack_size
             var stack_head_addr = (stack_top_addr - size_of[WorkerStackHead[Self.mask_size]]()) & ~15
             var head = ptr[WorkerStackHead[Self.mask_size]](stack_head_addr)
             var worker_main_copy = worker_main[Self.Model, Self.mask_size]
             var slot_base = Int(self.slots[i].base)
             var altstack_base = (
-                slot_base + SlotLayout.HEADER + SlotLayout.GUARD + Self.stack_size + SlotLayout.ALT_GUARD
+                slot_base + SlotLayout.HEADER + SlotLayout.GUARD + self.stack_size + SlotLayout.ALT_GUARD
             )
             head[] = WorkerStackHead[Self.mask_size](
                 UnsafePointer(to=worker_main_copy).bitcast[Int]()[],
@@ -742,13 +746,14 @@ struct BurstPool[Model: ThreadingModel = ColdModel, stack_size: Int = SlotLayout
         self.workers_alive = True
 
 
-def make_node_pools[Model: ThreadingModel = ColdModel, stack_size: Int = SlotLayout.DEFAULT_STACK, mask_size: Int = 128](
+def make_node_pools[Model: ThreadingModel = ColdModel, mask_size: Int = 128](
     numa: NumaInfo,
-) -> HeapMoveArray[BurstPool[Model, stack_size, mask_size]]:
+    stack_size: Int = SlotLayout.DEFAULT_STACK,
+) -> HeapMoveArray[BurstPool[Model, mask_size]]:
     """Create one BurstPool per NUMA node, sized from isolation topology."""
-    var pools = HeapMoveArray[BurstPool[Model, stack_size, mask_size]](numa.num_nodes)
+    var pools = HeapMoveArray[BurstPool[Model, mask_size]](numa.num_nodes)
     for i in range(numa.num_nodes):
-        pools.push(BurstPool[Model, stack_size, mask_size].for_topology(numa, numa.nodes[i].id))
+        pools.push(BurstPool[Model, mask_size].for_topology(numa, numa.nodes[i].id, stack_size))
     return pools^
 
 

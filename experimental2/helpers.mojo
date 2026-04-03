@@ -23,17 +23,14 @@ from experimental.amx import (
 
 @fieldwise_init
 struct AttnCtx:
+    """Pointers to long-lived allocations shared across all workers.
+    Lives in scratch buffer — no per-dispatch temporaries."""
     var q: UnsafePointer[BFloat16, MutAnyOrigin]
     var cos: UnsafePointer[Float32, MutAnyOrigin]
     var sin: UnsafePointer[Float32, MutAnyOrigin]
     var k_base: UnsafePointer[UInt8, MutAnyOrigin]
     var v_base: UnsafePointer[Int8, MutAnyOrigin]
-    var row_f32: UnsafePointer[Float32, MutAnyOrigin]
-    var q_quant_inv: Float32
-    var score_scale: Float32
-    var vagg_scale: Float32
-    var pos: Int
-    var seq_len: Int
+    var output: UnsafePointer[Float32, MutAnyOrigin]
 
 
 # ============================================================================
@@ -87,12 +84,12 @@ def softmax_row[head_dim: Int](
     score_scale: Float32,
     causal_limit: Int,
     padded_chunk: Int,
-    running_m_ptr: UnsafePointer[Float32, MutAnyOrigin],
-    running_l_ptr: UnsafePointer[Float32, MutAnyOrigin],
-    running_o: UnsafePointer[Float32, MutAnyOrigin],
+    running_m: UnsafePointer[Float32, MutAnyOrigin],
+    running_l: UnsafePointer[Float32, MutAnyOrigin],
+    accum: UnsafePointer[Float32, MutAnyOrigin],
     w_row: UnsafePointer[UInt8, MutAnyOrigin],
 ):
-    """Online softmax for one Q row: max, correct running state, exp→u8."""
+    """Online softmax for one Q row: max, correct accum, exp→u8."""
     comptime width = simd_width_of[DType.float32]()
 
     # Max pass
@@ -109,15 +106,15 @@ def softmax_row[head_dim: Int](
     var row_max = max(vmax.reduce_max(), scalar_max)
 
     # Correction
-    var m_old = running_m_ptr[]
+    var m_old = running_m[]
     var m_new = max(m_old, row_max)
-    running_m_ptr[] = m_new
+    running_m[] = m_new
     if m_new > m_old:
         var correction = exp_f32_fast[1](m_old - m_new)
-        running_l_ptr[] = running_l_ptr[] * correction
+        running_l[] = running_l[] * correction
         var d = 0
         while d + width <= head_dim:
-            (running_o + d).store((running_o + d).load[width=width]() * correction)
+            (accum + d).store((accum + d).load[width=width]() * correction)
             d += width
 
     # Fused dequant + exp → u8
@@ -142,7 +139,7 @@ def softmax_row[head_dim: Int](
     while t + u8w <= padded_chunk:
         (w_row + t).store(u8zeros)
         t += u8w
-    running_l_ptr[] += l_contrib
+    running_l[] += l_contrib
 
 
 # ============================================================================

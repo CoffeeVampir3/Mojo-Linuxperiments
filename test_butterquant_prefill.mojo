@@ -39,7 +39,7 @@ def main():
     var topo = numa.plan_topology(NUM_NODES)
 
     print("NUMA: " + String(NUM_NODES) + " nodes")
-    var pools = make_node_pools(numa)
+    var pools = make_node_pools(numa, stack_size=2 * 1024 * 1024)
     for i in range(NUM_NODES):
         print("  node " + String(topo[i]) + ": " + String(pools[topo[i]].capacity) + " workers")
 
