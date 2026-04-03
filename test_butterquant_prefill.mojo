@@ -17,8 +17,8 @@ from experimental.hadquant_impl import fwht_block
 from experimental2.kv_cache import KVCache
 from experimental.amx import init_intel_amx
 from simd_math import sqrt, exp_f32, quantize_i8
-from threading import BurstPool, make_node_pools
-from numa import NumaInfo, get_current_cpu_and_node
+from threading import make_node_pools
+from numa import NumaInfo
 from numa.arena import NumaArena
 from notstdcollections import HeapMoveArray
 from kernels.kernel_ops import init_rope_tables, parallel_for, PoolFence
@@ -42,11 +42,6 @@ def main():
     var pools = make_node_pools(numa)
     for i in range(NUM_NODES):
         print("  node " + String(topo[i]) + ": " + String(pools[topo[i]].capacity) + " workers")
-    var pool_ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], NUM_NODES](
-        fill=UnsafePointer[BurstPool[], MutAnyOrigin]())
-    for i in range(NUM_NODES):
-        pool_ptrs[i] = UnsafePointer[BurstPool[], MutAnyOrigin](
-            unsafe_from_address=Int(UnsafePointer(to=pools[topo[i]])))
 
     # =====================================================================
     # Correctness test
@@ -176,14 +171,14 @@ def main():
 
             corr_arena.reset_to(scores_mark)
 
-    # Run kernel
+    # Run kernel (unchunked — SL=16 fits in default prefill_chunk=512)
     prefill[NH, NKV, HD](
         DynView[QSlot](Int(q_bf16), SL),
         kv_cache, kv_cache,
         Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
         Int(scratch), POS,
         q_layer_scale, k_layer_scale, v_layer_scale,
-        pool_ptrs[0][],
+        pools[topo[0]],
     ).join()
 
     # Compare
@@ -201,9 +196,40 @@ def main():
     var avg_err = err_sum / Float64(count)
     print("avg_err: " + String(avg_err))
     if avg_err < 0.1:
-        print("PASS")
+        print("PASS (unchunked)")
     else:
-        print("FAIL")
+        print("FAIL (unchunked)")
+
+    # Run kernel again with prefill_chunk=4 — forces 4 chunks for SL=16
+    comptime CHUNK = 4
+    var chunked_scratch_bytes = scratch_bytes[NH, NKV, HD, SL, CHUNK](pools[topo[0]].capacity)
+    var chunked_scratch = corr_arena.alloc[UInt8](chunked_scratch_bytes)
+    prefill[NH, NKV, HD, MAX_SEQ, prefill_chunk=CHUNK](
+        DynView[QSlot](Int(q_bf16), SL),
+        kv_cache, kv_cache,
+        Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
+        Int(chunked_scratch), POS,
+        q_layer_scale, k_layer_scale, v_layer_scale,
+        pools[topo[0]],
+    ).join()
+
+    var rf32_c = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(chunked_scratch))
+    var err_sum_c = Float64(0)
+    var count_c = 0
+    for m in range(SL):
+        for d in range(HIDDEN):
+            var got = Float64(rf32_c[m * HIDDEN + d])
+            var rv = Float64(expected[m * HIDDEN + d])
+            var e = got - rv
+            if e < 0: e = -e
+            err_sum_c += e
+            count_c += 1
+    var avg_err_c = err_sum_c / Float64(count_c)
+    print("avg_err (chunked): " + String(avg_err_c))
+    if avg_err_c < 0.1:
+        print("PASS (chunked, prefill_chunk=4)")
+    else:
+        print("FAIL (chunked, prefill_chunk=4)")
 
     # =====================================================================
     # Performance sweep
@@ -289,7 +315,7 @@ def main():
             if sl_idx == 1: sl = 16
             if sl_idx == 2: sl = 64
 
-            for warmup in range(2):
+            for _ in range(2):
                 @parameter
                 def wu[node: Int]() -> PoolFence:
                     return prefill[LOCAL_NH2, LOCAL_KV2, HD2](
@@ -298,7 +324,7 @@ def main():
                         Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
                         scratch_ptrs[node], ctx_pos,
                         perf_q_scale, perf_k_scale, perf_v_scale,
-                        pool_ptrs[node][],
+                        pools[topo[node]],
                     )
                 parallel_for[NUM_NODES, wu]()
 
@@ -313,7 +339,7 @@ def main():
                         Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
                         scratch_ptrs[node], ctx_pos,
                         perf_q_scale, perf_k_scale, perf_v_scale,
-                        pool_ptrs[node][],
+                        pools[topo[node]],
                     )
                 parallel_for[NUM_NODES, run]()
                 var wall = Int(perf_counter_ns()) - t0

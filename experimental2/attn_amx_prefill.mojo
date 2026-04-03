@@ -63,19 +63,19 @@ struct WorkerScratch:
 # ============================================================================
 
 def per_worker_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int,
-                     max_prefill: Int = 512]() -> Int:
+                     prefill_chunk: Int = 512]() -> Int:
     comptime gqa_factor = num_heads // num_kv_heads
-    comptime total_q_max = ((max_prefill * gqa_factor + M_STEP - 1) // M_STEP) * M_STEP
+    comptime chunk_q_max = ((prefill_chunk * gqa_factor + M_STEP - 1) // M_STEP) * M_STEP
     comptime k_nt_pairs = BLOCK_N // TILE_N // 2
     comptime k_slices = head_dim // K_STEP
     comptime v_k_tiles = BLOCK_N // K_STEP
     comptime v_n_tiles = head_dim // TILE_N
     return (
         size_of[WorkerScratch]()                            # worker args at front
-        + total_q_max * head_dim                            # qi_buf i8
-        + total_q_max * size_of[Float32]()                  # qi_biases (128*sum)
-        + total_q_max * head_dim * size_of[Float32]()       # running_o f32
-        + total_q_max * size_of[Float32]() * 2              # running_m, running_l
+        + chunk_q_max * head_dim                            # qi_buf i8
+        + chunk_q_max * size_of[Float32]()                  # qi_biases (128*sum)
+        + chunk_q_max * head_dim * size_of[Float32]()       # running_o f32
+        + chunk_q_max * size_of[Float32]() * 2              # running_m, running_l
         + Q_BATCH * BLOCK_N * size_of[Int32]()              # score_i32 (GEMM output)
         + Q_BATCH * BLOCK_N                                 # w_u8_buf u8
         + k_nt_pairs * k_slices * 2 * TILE_BYTES            # k_vnni (all N-tile pairs)
@@ -83,17 +83,18 @@ def per_worker_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int,
     )
 
 def scratch_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int,
-                  max_prefill: Int = 512](num_workers: Int) -> Int:
+                  max_seq_len: Int, prefill_chunk: Int = 512](num_workers: Int) -> Int:
     comptime q_cols = num_heads * head_dim
-    comptime pw = per_worker_bytes[num_heads, num_kv_heads, head_dim, max_prefill]()
-    return max_prefill * q_cols * size_of[Float32]() + num_workers * pw
+    comptime pw = per_worker_bytes[num_heads, num_kv_heads, head_dim, prefill_chunk]()
+    return max_seq_len * q_cols * size_of[Float32]() + num_workers * pw
 
 
 # ============================================================================
 # Kernel
 # ============================================================================
 
-def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
+def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
+                 max_seq: Int, prefill_chunk: Int = 512](
     ctx_addr: Int, ws_addr: Int, unused0: Int, unused1: Int,
     unused2: Int, unused3: Int,
 ):
@@ -109,6 +110,7 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
     comptime MAX_TILES = (max_seq + TILE_N - 1) // TILE_N
     comptime K_HEAD_STRIDE = MAX_TILES * K_TILE_K_BYTES
     comptime V_HEAD_STRIDE = max_seq * head_dim
+    comptime chunk_q_max = prefill_chunk * gqa_factor
 
     var seq_len = ctx[].seq_len
     var pos = ctx[].pos
@@ -119,12 +121,10 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
     var my_q_rows = ws[].q_row_end - q_row_start
     if my_q_rows <= 0:
         return
-    var padded_q_rows = ((my_q_rows + M_STEP - 1) // M_STEP) * M_STEP
 
     var cfg = make_224_i8_config()
     ldtilecfg(UnsafePointer(to=cfg))
 
-    # --- Per-worker scratch (typed pointers from caller) ---
     var qi_buf = ws[].qi_buf
     var qi_biases = ws[].qi_biases
     var running_o = ws[].running_o
@@ -137,137 +137,134 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
 
     var k_vnni_head = ctx[].k_base + g * K_HEAD_STRIDE
     var v_base = ctx[].v_base + g * V_HEAD_STRIDE
-
-    # =================================================================
-    # Q prep — fused RoPE → FWHT → quantize
-    # =================================================================
     var q_quant_inv = ctx[].q_quant_inv
-    for local_idx in range(my_q_rows):
-        var abs_row = q_row_start + local_idx
-        var m = abs_row // gqa_factor
-        var hi = abs_row % gqa_factor
-        var h = g * gqa_factor + hi
-        var actual_pos = pos + m
-        qi_biases[local_idx] = prep_q_row[head_dim](
-            ctx[].q + m * q_cols + h * head_dim,
-            ctx[].cos + actual_pos * half,
-            ctx[].sin + actual_pos * half,
-            q_quant_inv,
-            qi_buf + local_idx * head_dim,
-        )
 
-    # =================================================================
-    # Init running state
-    # =================================================================
     var vzero = SIMD[DType.float32, width](0)
     var vinf = SIMD[DType.float32, width](Float32(-1e30))
-    var i = 0
-    while i + width <= padded_q_rows * head_dim:
-        (running_o + i).store(vzero)
-        i += width
-    i = 0
-    while i + width <= padded_q_rows:
-        (running_m + i).store(vinf)
-        (running_l + i).store(vzero)
-        i += width
-
-    var max_context = pos + seq_len
     var vagg_arr = InlineArray[Int32, M_STEP * N_STEP](fill=Int32(0))
     var vagg_i32 = UnsafePointer(to=vagg_arr).bitcast[Int32]()
 
     # =================================================================
-    # KV-outer, query-inner
+    # Outer chunk loop — process Q rows in prefill_chunk-sized pieces
     # =================================================================
-    for block_start in range(0, max_context, BLOCK_N):
-        var block_len = min(BLOCK_N, max_context - block_start)
-        var padded_chunk = ((block_len + K_STEP - 1) // K_STEP) * K_STEP
-        var chunk_k_iters = padded_chunk // K_STEP
-        var n_tiles = (block_len + TILE_N - 1) // TILE_N
+    for chunk_start in range(0, my_q_rows, chunk_q_max):
+        var chunk_rows = min(chunk_q_max, my_q_rows - chunk_start)
+        var padded_chunk_rows = ((chunk_rows + M_STEP - 1) // M_STEP) * M_STEP
 
-        # --- K: read directly from VNNI-primary cache (no packing) ---
-        var block_tile_base = (block_start // TILE_N) * K_TILE_K_BYTES
+        # --- Q prep for this chunk ---
+        for local_idx in range(chunk_rows):
+            var abs_row = q_row_start + chunk_start + local_idx
+            var m = abs_row // gqa_factor
+            var hi = abs_row % gqa_factor
+            var h = g * gqa_factor + hi
+            var actual_pos = pos + m
+            qi_biases[local_idx] = prep_q_row[head_dim](
+                ctx[].q + m * q_cols + h * head_dim,
+                ctx[].cos + actual_pos * half,
+                ctx[].sin + actual_pos * half,
+                q_quant_inv,
+                qi_buf + local_idx * head_dim,
+            )
 
-        # --- Pack V (i8 → VNNI interleave) ---
-        for nt in range(hd_n_tiles):
-            for kt in range(chunk_k_iters):
-                pack_v_tile_vnni(v_base, head_dim,
-                    block_start + kt * K_STEP, nt * TILE_N,
-                    min(K_STEP, block_len - kt * K_STEP),
-                    v_vnni + (nt * chunk_k_iters + kt) * TILE_BYTES)
+        # --- Init running state for this chunk ---
+        var i = 0
+        while i + width <= padded_chunk_rows * head_dim:
+            (running_o + i).store(vzero)
+            i += width
+        i = 0
+        while i + width <= padded_chunk_rows:
+            (running_m + i).store(vinf)
+            (running_l + i).store(vzero)
+            i += width
 
-        # --- Query-inner ---
-        for qb_start in range(0, my_q_rows, Q_BATCH):
-            var qb_len = min(Q_BATCH, my_q_rows - qb_start)
-            var qb_m_iters = (qb_len + M_STEP - 1) // M_STEP
+        # --- KV-outer, query-inner ---
+        var max_context = pos + seq_len
+        for block_start in range(0, max_context, BLOCK_N):
+            var block_len = min(BLOCK_N, max_context - block_start)
+            var padded_chunk = ((block_len + K_STEP - 1) // K_STEP) * K_STEP
+            var chunk_k_iters = padded_chunk // K_STEP
+            var n_tiles = (block_len + TILE_N - 1) // TILE_N
 
-            # Score GEMM: i8 Q × u8 K_vnni → i32
-            for nt in range(0, n_tiles, 2):
-                var b0 = k_vnni_head + block_tile_base + nt * K_TILE_K_BYTES
-                var b1 = k_vnni_head + block_tile_base + (nt + 1) * K_TILE_K_BYTES
-                for mi in range(qb_m_iters):
-                    var m_off = qb_start + mi * M_STEP
-                    amx_gemm_2x2[DType.int8, DType.uint8, BLOCK_N](
-                        qi_buf + m_off * head_dim,
-                        qi_buf + (m_off + TILE_M) * head_dim,
-                        head_dim,
-                        b0, b1,
-                        TILE_BYTES, k_slices,
-                        score_i32 + (mi * M_STEP) * BLOCK_N + nt * TILE_N,
+            var block_tile_base = (block_start // TILE_N) * K_TILE_K_BYTES
+
+            # Pack V
+            for nt in range(hd_n_tiles):
+                for kt in range(chunk_k_iters):
+                    pack_v_tile_vnni(v_base, head_dim,
+                        block_start + kt * K_STEP, nt * TILE_N,
+                        min(K_STEP, block_len - kt * K_STEP),
+                        v_vnni + (nt * chunk_k_iters + kt) * TILE_BYTES)
+
+            # Query-inner
+            for qb_start in range(0, chunk_rows, Q_BATCH):
+                var qb_len = min(Q_BATCH, chunk_rows - qb_start)
+                var qb_m_iters = (qb_len + M_STEP - 1) // M_STEP
+
+                # Score GEMM
+                for nt in range(0, n_tiles, 2):
+                    var b0 = k_vnni_head + block_tile_base + nt * K_TILE_K_BYTES
+                    var b1 = k_vnni_head + block_tile_base + (nt + 1) * K_TILE_K_BYTES
+                    for mi in range(qb_m_iters):
+                        var m_off = qb_start + mi * M_STEP
+                        amx_gemm_2x2[DType.int8, DType.uint8, BLOCK_N](
+                            qi_buf + m_off * head_dim,
+                            qi_buf + (m_off + TILE_M) * head_dim,
+                            head_dim,
+                            b0, b1,
+                            TILE_BYTES, k_slices,
+                            score_i32 + (mi * M_STEP) * BLOCK_N + nt * TILE_N,
+                        )
+
+                # Softmax
+                for qi_local in range(qb_len):
+                    var qi_row = qb_start + qi_local
+                    var abs_row = q_row_start + chunk_start + qi_row
+                    var m_pos = abs_row // gqa_factor
+                    var causal_limit = min(pos + m_pos + 1 - block_start, block_len)
+                    softmax_row[head_dim](
+                        score_i32 + qi_local * BLOCK_N,
+                        qi_biases[qi_row], score_scale,
+                        causal_limit, padded_chunk,
+                        running_m + qi_row, running_l + qi_row,
+                        running_o + qi_row * head_dim,
+                        w_u8_buf + qi_local * padded_chunk,
                     )
 
-            # Softmax
-            for qi_local in range(qb_len):
-                var qi_row = qb_start + qi_local
-                var abs_row = q_row_start + qi_row
-                var m_pos = abs_row // gqa_factor
-                var causal_limit = min(pos + m_pos + 1 - block_start, block_len)
-                softmax_row[head_dim](
-                    score_i32 + qi_local * BLOCK_N,
-                    qi_biases[qi_row], score_scale,
-                    causal_limit, padded_chunk,
-                    running_m + qi_row, running_l + qi_row,
-                    running_o + qi_row * head_dim,
-                    w_u8_buf + qi_local * padded_chunk,
-                )
+                # V-agg
+                for ns in range(head_dim // N_STEP):
+                    var d_off = ns * N_STEP
+                    var nt_lo = d_off // TILE_N
+                    for mi in range(qb_m_iters):
+                        amx_gemm_2x2[DType.uint8, DType.int8, N_STEP](
+                            w_u8_buf + (mi * M_STEP) * padded_chunk,
+                            w_u8_buf + (mi * M_STEP + TILE_M) * padded_chunk,
+                            padded_chunk,
+                            v_vnni + nt_lo * chunk_k_iters * TILE_BYTES,
+                            v_vnni + (nt_lo + 1) * chunk_k_iters * TILE_BYTES,
+                            TILE_BYTES, chunk_k_iters,
+                            vagg_i32,
+                        )
+                        for r in range(min(M_STEP, qb_len - mi * M_STEP)):
+                            var ro_row = running_o + (qb_start + mi * M_STEP + r) * head_dim + d_off
+                            var c = 0
+                            while c + width <= N_STEP:
+                                var raw = (vagg_i32 + r * N_STEP + c).load[width=width]().cast[DType.float32]()
+                                (ro_row + c).store((ro_row + c).load[width=width]() + raw)
+                                c += width
 
-            # V-agg: u8 W × i8 V → i32
-            for ns in range(head_dim // N_STEP):
-                var d_off = ns * N_STEP
-                var nt_lo = d_off // TILE_N
-                for mi in range(qb_m_iters):
-                    amx_gemm_2x2[DType.uint8, DType.int8, N_STEP](
-                        w_u8_buf + (mi * M_STEP) * padded_chunk,
-                        w_u8_buf + (mi * M_STEP + TILE_M) * padded_chunk,
-                        padded_chunk,
-                        v_vnni + nt_lo * chunk_k_iters * TILE_BYTES,
-                        v_vnni + (nt_lo + 1) * chunk_k_iters * TILE_BYTES,
-                        TILE_BYTES, chunk_k_iters,
-                        vagg_i32,
-                    )
-                    # Accumulate i32→f32 (vagg_scale deferred to final normalize)
-                    for r in range(min(M_STEP, qb_len - mi * M_STEP)):
-                        var ro_row = running_o + (qb_start + mi * M_STEP + r) * head_dim + d_off
-                        var c = 0
-                        while c + width <= N_STEP:
-                            var raw = (vagg_i32 + r * N_STEP + c).load[width=width]().cast[DType.float32]()
-                            (ro_row + c).store((ro_row + c).load[width=width]() + raw)
-                            c += width
-
-    # =================================================================
-    # Final normalize
-    # =================================================================
-    for local_idx in range(my_q_rows):
-        var abs_row = q_row_start + local_idx
-        var m = abs_row // gqa_factor
-        var hi = abs_row % gqa_factor
-        var h = g * gqa_factor + hi
-        var final_scale = vagg_scale / running_l[local_idx]
-        var ro = running_o + local_idx * head_dim
-        var out = ctx[].row_f32 + m * q_cols + h * head_dim
-        var d = 0
-        while d + width <= head_dim:
-            (out + d).store((ro + d).load[width=width]() * final_scale)
-            d += width
+        # --- Final normalize for this chunk ---
+        for local_idx in range(chunk_rows):
+            var abs_row = q_row_start + chunk_start + local_idx
+            var m = abs_row // gqa_factor
+            var hi = abs_row % gqa_factor
+            var h = g * gqa_factor + hi
+            var final_scale = vagg_scale / running_l[local_idx]
+            var ro = running_o + local_idx * head_dim
+            var out = ctx[].row_f32 + m * q_cols + h * head_dim
+            var d = 0
+            while d + width <= head_dim:
+                (out + d).store((ro + d).load[width=width]() * final_scale)
+                d += width
 
 
 # ============================================================================
@@ -276,7 +273,8 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int]
 
 def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     QT: Encoding & Shaped,
-    CosT: Encoding & Shaped, SinT: Encoding & Shaped](
+    CosT: Encoding & Shaped, SinT: Encoding & Shaped,
+    prefill_chunk: Int = 512](
     q: DynView[QT],
     k_cache: KVCache[max_seq, head_dim, num_kv_heads],
     v_cache: KVCache[max_seq, head_dim, num_kv_heads],
@@ -289,12 +287,16 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     v_layer_scale: Float32,
     mut pool: BurstPool[],
 ) -> PoolFence:
-    """Async AMX prefill — zero per-token scales, uniform integer pipeline."""
+    """Async AMX prefill — chunked Q processing, zero per-token scales.
+
+    seq_len can exceed prefill_chunk: the kernel internally processes Q rows
+    in chunks, reusing scratch buffers each iteration. Single dispatch.
+    """
     comptime gqa_factor = num_heads // num_kv_heads
     comptime q_cols = QT.COLS
-    comptime max_prefill = 512
-    comptime pw = per_worker_bytes[num_heads, num_kv_heads, head_dim, max_prefill]()
-    comptime WORKERS_OFF = max_prefill * q_cols * size_of[Float32]()
+    comptime pw = per_worker_bytes[num_heads, num_kv_heads, head_dim, prefill_chunk]()
+    comptime chunk_q_max = prefill_chunk * gqa_factor
+    var WORKERS_OFF = q.seq_len * q_cols * size_of[Float32]()
     var inv_sqrt_hd = Float32(1.0 / Float64(sqrt[DType.float32, 1](Float32(head_dim))))
 
     var ctx = AttnCtx(
@@ -326,10 +328,8 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
             var job_idx = g * workers_per_group + w
             var q_start = w * rows_per_worker
             var q_end = min(q_start + rows_per_worker, total_q_rows)
-            var q_rows = q_end - q_start
-            var padded = ((q_rows + M_STEP - 1) // M_STEP) * M_STEP
 
-            # Build WorkerScratch at front of this worker's region
+            # Scratch sized for prefill_chunk rows, reused by kernel chunk loop
             var ws_base = scratch + WORKERS_OFF + job_idx * pw
             var ws = UnsafePointer[WorkerScratch, MutAnyOrigin](
                 unsafe_from_address=ws_base)
@@ -339,15 +339,15 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
             ws[].q_row_start = q_start
             ws[].q_row_end = q_end
             ws[].qi_buf = UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=data + off)
-            off += q_rows * head_dim
+            off += chunk_q_max * head_dim
             ws[].qi_biases = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
-            off += q_rows * size_of[Float32]()
+            off += chunk_q_max * size_of[Float32]()
             ws[].running_o = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
-            off += padded * head_dim * size_of[Float32]()
+            off += chunk_q_max * head_dim * size_of[Float32]()
             ws[].running_m = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
-            off += padded * size_of[Float32]()
+            off += chunk_q_max * size_of[Float32]()
             ws[].running_l = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
-            off += padded * size_of[Float32]()
+            off += chunk_q_max * size_of[Float32]()
             ws[].score_i32 = UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=data + off)
             off += Q_BATCH * BLOCK_N * size_of[Int32]()
             ws[].w_u8_buf = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=data + off)
@@ -365,7 +365,7 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
             pack[].arg5 = 0
 
     pool.dispatch(
-        attn_prefill[num_heads, num_kv_heads, head_dim, max_seq],
+        attn_prefill[num_heads, num_kv_heads, head_dim, max_seq, prefill_chunk],
         pool.args_base, total_jobs,
     )
     return PoolFence(UnsafePointer[BurstPool[], MutAnyOrigin](

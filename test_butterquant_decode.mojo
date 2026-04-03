@@ -17,8 +17,8 @@ from experimental.hadquant_impl import fwht_block
 from experimental2.kv_cache import KVCache
 from experimental.amx import init_intel_amx
 from simd_math import sqrt, exp_f32, quantize_i8
-from threading import BurstPool, make_node_pools
-from numa import NumaInfo, get_current_cpu_and_node
+from threading import make_node_pools
+from numa import NumaInfo
 from numa.arena import NumaArena
 from notstdcollections import HeapMoveArray
 from kernels.kernel_ops import init_rope_tables, parallel_for, PoolFence
@@ -43,11 +43,6 @@ def main():
     for i in range(NUM_NODES):
         print("  node " + String(topo[i]) + ": " + String(pools[topo[i]].capacity) + " workers")
 
-    var pool_ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], NUM_NODES](
-        fill=UnsafePointer[BurstPool[], MutAnyOrigin]())
-    for i in range(NUM_NODES):
-        pool_ptrs[i] = UnsafePointer[BurstPool[], MutAnyOrigin](
-            unsafe_from_address=Int(UnsafePointer(to=pools[topo[i]])))
 
     # =====================================================================
     # Correctness test
@@ -176,7 +171,7 @@ def main():
         Int(scratch), POS,
         q_layer_scale, k_layer_scale, v_layer_scale,
         1,
-        pool_ptrs[0][],
+        pools[topo[0]],
     ).join()
     var corr_vagg_scale = v_layer_scale / (Float32(255.0) * Float32(127.0))
     decode_merge[NH, NKV, HD](Int(scratch), 1, corr_vagg_scale)
@@ -293,7 +288,7 @@ def main():
                     scratch_ptrs[node], ctx_pos_scale,
                     perf_q_scale, perf_k_scale, perf_v_scale,
                     wpg,
-                    pool_ptrs[node][],
+                    pools[topo[node]],
                 )
             parallel_for[NUM_NODES, wu_s]()
             decode_merge[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[0], wpg, perf_vagg_scale)
@@ -310,7 +305,7 @@ def main():
                     scratch_ptrs[node], ctx_pos_scale,
                     perf_q_scale, perf_k_scale, perf_v_scale,
                     wpg,
-                    pool_ptrs[node][],
+                    pools[topo[node]],
                 )
             parallel_for[NUM_NODES, run_s]()
             for node in range(NUM_NODES):
@@ -348,7 +343,7 @@ def main():
                     scratch_ptrs[node], ctx_pos,
                     perf_q_scale, perf_k_scale, perf_v_scale,
                     MAX_WPG,
-                    pool_ptrs[node][],
+                    pools[topo[node]],
                 )
             parallel_for[NUM_NODES, wu]()
             decode_merge[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[0], MAX_WPG, perf_vagg_scale)
@@ -365,7 +360,7 @@ def main():
                     scratch_ptrs[node], ctx_pos,
                     perf_q_scale, perf_k_scale, perf_v_scale,
                     MAX_WPG,
-                    pool_ptrs[node][],
+                    pools[topo[node]],
                 )
             parallel_for[NUM_NODES, run]()
             for node in range(NUM_NODES):
