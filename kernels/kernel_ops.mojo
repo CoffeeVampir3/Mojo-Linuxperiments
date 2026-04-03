@@ -10,7 +10,8 @@ TP=N: parallel_for dispatches body[rank]() for each rank, then joins all
 from std.math import sqrt
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
-from threading import BurstPool
+from std.time import perf_counter_ns
+from threading.isolated_burst_pool import IsolatedBurstPool
 import linux.sys as linux
 
 from modeling.model_spec import (
@@ -40,18 +41,18 @@ struct PoolFence(Movable):
         .join()  — wait immediately (TP=1)
         .take()  — extract raw pool ptr for deferred batch join (parametric TP)
     """
-    var pool: UnsafePointer[BurstPool[], MutAnyOrigin]
+    var pool: UnsafePointer[IsolatedBurstPool[], MutAnyOrigin]
 
     @staticmethod
     def completed() -> Self:
-        return Self(UnsafePointer[BurstPool[], MutAnyOrigin]())
+        return Self(UnsafePointer[IsolatedBurstPool[], MutAnyOrigin]())
 
     def join(deinit self):
         """Consume fence, wait for work to complete."""
         if self.pool:
             self.pool[].join()
 
-    def take(deinit self) -> UnsafePointer[BurstPool[], MutAnyOrigin]:
+    def take(deinit self) -> UnsafePointer[IsolatedBurstPool[], MutAnyOrigin]:
         """Consume fence, return raw pool pointer for deferred join."""
         return self.pool
 
@@ -59,14 +60,37 @@ struct PoolFence(Movable):
 def parallel_for[tp: Int, body: def[rank: Int] () capturing -> PoolFence]():
     """Parametric barrier: dispatch body[rank]() for each rank, then join all.
     Works for any TP degree. body returns PoolFence — consumed internally via .take()."""
-    var ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp](
-        fill=UnsafePointer[BurstPool[], MutAnyOrigin]()
+    var ptrs = InlineArray[UnsafePointer[IsolatedBurstPool[], MutAnyOrigin], tp](
+        fill=UnsafePointer[IsolatedBurstPool[], MutAnyOrigin]()
     )
     comptime for rank in range(tp):
         ptrs[rank] = body[rank]().take()
     for i in range(tp):
         if ptrs[i]:
             ptrs[i][].join()
+
+
+@fieldwise_init
+struct ParallelTiming:
+    var dispatch_ns: Int
+    var join_ns: Int
+    var total_ns: Int
+
+
+def timed_parallel_for[tp: Int, body: def[rank: Int] () capturing -> PoolFence]() -> ParallelTiming:
+    """Like parallel_for but returns dispatch/join/total timing."""
+    var ptrs = InlineArray[UnsafePointer[IsolatedBurstPool[], MutAnyOrigin], tp](
+        fill=UnsafePointer[IsolatedBurstPool[], MutAnyOrigin]()
+    )
+    var t0 = Int(perf_counter_ns())
+    comptime for rank in range(tp):
+        ptrs[rank] = body[rank]().take()
+    var t1 = Int(perf_counter_ns())
+    for i in range(tp):
+        if ptrs[i]:
+            ptrs[i][].join()
+    var t2 = Int(perf_counter_ns())
+    return ParallelTiming(t1 - t0, t2 - t1, t2 - t0)
 
 
 # ================================================================
@@ -277,7 +301,7 @@ def gqa_kernel[
 
 def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped](
     input: DynView[InT], weight: Bound[W], output: DynView[OutT],
-    mut pool: BurstPool[],
+    mut pool: IsolatedBurstPool[],
 ) -> PoolFence where W.DTYPE == DType.bfloat16:
     """dst[M,N] = input[M,K] × weight[N,K]^T. M is runtime, via BurstPool.
     For small M (decode), partitions output columns across workers.
@@ -292,7 +316,7 @@ def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped](
     if seq_len == 0:
         return PoolFence.completed()
 
-    var fence = PoolFence(UnsafePointer[BurstPool[], MutAnyOrigin](
+    var fence = PoolFence(UnsafePointer[IsolatedBurstPool[], MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))
 
@@ -337,7 +361,7 @@ def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped](
 
 def rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped](
     input: DynView[InT], weight: Bound[W], output: DynView[OutT],
-    mut pool: BurstPool[],
+    mut pool: IsolatedBurstPool[],
     eps: Float32 = 1e-5,
 ) -> PoolFence where W.DTYPE == DType.bfloat16:
     """RMSNorm via BurstPool: output = (input / RMS(input)) * weight.
@@ -369,14 +393,14 @@ def rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shape
         pack[].arg5 = eps_int
 
     pool.dispatch(rmsnorm_kernel[InT.COLS], pool.args_base, num_jobs)
-    return PoolFence(UnsafePointer[BurstPool[], MutAnyOrigin](
+    return PoolFence(UnsafePointer[IsolatedBurstPool[], MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))
 
 
 def embed_lookup[W: Encoding & Shaped, OutT: Encoding & Shaped](
     table: Bound[W], tokens: Int, output: DynView[OutT],
-    mut pool: BurstPool[],
+    mut pool: IsolatedBurstPool[],
 ) -> PoolFence where W.DTYPE == DType.bfloat16:
     """Gather: for each token ID, copy table[id] → output row."""
     comptime assert OutT.DTYPE == DType.bfloat16, "embed: output must be bf16"
@@ -401,7 +425,7 @@ def embed_lookup[W: Encoding & Shaped, OutT: Encoding & Shaped](
         pack[].arg5 = 0
 
     pool.dispatch(embed_lookup_kernel[W.COLS], pool.args_base, num_jobs)
-    return PoolFence(UnsafePointer[BurstPool[], MutAnyOrigin](
+    return PoolFence(UnsafePointer[IsolatedBurstPool[], MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))
 
@@ -588,7 +612,7 @@ def attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
     OutT: Encoding & Shaped](
     q: DynView[QT], k_cache: CacheView[KCT], v_cache: CacheView[VCT],
     output: DynView[OutT], pos: Int,
-    mut pool: BurstPool[],
+    mut pool: IsolatedBurstPool[],
 ) -> PoolFence where KCT.DTYPE == DType.bfloat16:
     """GQA attention: Q[M, H*D] attends over KV cache[0..pos+M, Hkv*D].
     Causal masked, online softmax (single-pass, no score buffer).
@@ -628,6 +652,6 @@ def attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
         gqa_kernel[num_heads, num_kv_heads, head_dim, KCT.COLS],
         pool.args_base, num_jobs,
     )
-    return PoolFence(UnsafePointer[BurstPool[], MutAnyOrigin](
+    return PoolFence(UnsafePointer[IsolatedBurstPool[], MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))

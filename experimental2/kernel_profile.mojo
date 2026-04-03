@@ -21,6 +21,8 @@ struct KernelProfile:
     var merge_wait: Int
     var merge_work: Int
     var total: Int
+    var overhead: Int
+    var done_timestamp: Int
 
     def __init__(out self):
         self.amx_config = 0
@@ -34,6 +36,8 @@ struct KernelProfile:
         self.merge_wait = 0
         self.merge_work = 0
         self.total = 0
+        self.overhead = 0
+        self.done_timestamp = 0
 
 
 @always_inline
@@ -58,6 +62,9 @@ struct ProfileAggregator(Movable, Copyable, ImplicitlyCopyable):
     var sum_total: Int
     var max_total: Int
     var max_merge_wait: Int
+    var sum_overhead: Int
+    var max_overhead: Int
+    var max_done_timestamp: Int
 
     def __init__(out self):
         self.count = 0
@@ -74,6 +81,9 @@ struct ProfileAggregator(Movable, Copyable, ImplicitlyCopyable):
         self.sum_total = 0
         self.max_total = 0
         self.max_merge_wait = 0
+        self.sum_overhead = 0
+        self.max_overhead = 0
+        self.max_done_timestamp = 0
 
     def add(mut self, p: KernelProfile):
         self.count += 1
@@ -88,10 +98,15 @@ struct ProfileAggregator(Movable, Copyable, ImplicitlyCopyable):
         self.sum_merge_wait += p.merge_wait
         self.sum_merge_work += p.merge_work
         self.sum_total += p.total
+        self.sum_overhead += p.overhead
         if p.total > self.max_total:
             self.max_total = p.total
         if p.merge_wait > self.max_merge_wait:
             self.max_merge_wait = p.merge_wait
+        if p.overhead > self.max_overhead:
+            self.max_overhead = p.overhead
+        if p.done_timestamp > self.max_done_timestamp:
+            self.max_done_timestamp = p.done_timestamp
 
     def print_summary(self):
         if self.count == 0:
@@ -111,6 +126,8 @@ struct ProfileAggregator(Movable, Copyable, ImplicitlyCopyable):
         _print_phase("merge_wait", self.sum_merge_wait, n, wall)
         print("    merge_wait(max): " + String(self.max_merge_wait // 1000) + " us")
         _print_phase("merge_work", self.sum_merge_work, n, wall)
+        _print_phase("overhead", self.sum_overhead, n, wall)
+        print("    overhead(max): " + String(self.max_overhead // 1000) + " us")
 
 
 def _print_phase(name: String, total_ns: Int, count: Int, wall_ns: Int):

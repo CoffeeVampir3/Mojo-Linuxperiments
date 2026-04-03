@@ -17,11 +17,11 @@ from experimental.hadquant_impl import fwht_block
 from experimental2.kv_cache import KVCache
 from experimental.amx import init_intel_amx
 from simd_math import sqrt, exp_f32, quantize_i8
-from threading import make_node_pools
+from threading.isolated_burst_pool import IsolatedBurstPool
 from numa import NumaInfo
 from numa.arena import NumaArena
 from notstdcollections import HeapMoveArray
-from kernels.kernel_ops import init_rope_tables, parallel_for, PoolFence
+from kernels.kernel_ops import init_rope_tables, parallel_for, timed_parallel_for, ParallelTiming, PoolFence
 
 
 comptime NUM_NODES = 4
@@ -39,9 +39,10 @@ def main():
     var topo = numa.plan_topology(NUM_NODES)
 
     print("NUMA: " + String(NUM_NODES) + " nodes")
-    var pools = make_node_pools(numa, stack_size=2 * 1024 * 1024)
+    var pools = HeapMoveArray[IsolatedBurstPool[]](NUM_NODES)
     for i in range(NUM_NODES):
-        print("  node " + String(topo[i]) + ": " + String(pools[topo[i]].capacity) + " workers")
+        pools.push(IsolatedBurstPool[].for_topology(numa, topo[i]))
+        print("  node " + String(topo[i]) + ": " + String(pools[i].capacity) + " workers")
 
 
     # =====================================================================
@@ -171,7 +172,7 @@ def main():
         Int(scratch), POS,
         q_layer_scale, k_layer_scale, v_layer_scale,
         1,
-        pools[topo[0]],
+        pools[0],
     ).join()
     var corr_vagg_scale = v_layer_scale / (Float32(255.0) * Float32(127.0))
     decode_merge[NH, NKV, HD](Int(scratch), 1, corr_vagg_scale)
@@ -214,7 +215,7 @@ def main():
 
     print("\n=== Performance: 128h/8kv, hd=128, " + String(NUM_NODES) + " NUMA nodes ===")
     print("  Per node: " + String(LOCAL_NH2) + "h/" + String(LOCAL_KV2) + "kv, "
-          + String(pools[topo[0]].capacity) + " cores")
+          + String(pools[0].capacity) + " cores")
 
     var perf_arenas = HeapMoveArray[NumaArena[]](NUM_NODES)
     for i in range(NUM_NODES):
@@ -265,18 +266,33 @@ def main():
 
     var perf_vagg_scale = perf_v_scale / (Float32(255.0) * Float32(127.0))
 
+    # Max workers per group across all nodes (limited by smallest pool)
+    var max_wpg = pools[0].capacity // LOCAL_KV2
+    for i in range(1, NUM_NODES):
+        var nw = pools[i].capacity // LOCAL_KV2
+        if nw < max_wpg:
+            max_wpg = nw
+
     # -----------------------------------------------------------------
     # Worker scaling sweep at ctx=32000
     # -----------------------------------------------------------------
     print("\n--- Worker scaling at ctx=32000 ---")
     var ctx_pos_scale = 32000
 
-    for wpg_idx in range(5):
-        var wpg = 1
-        if wpg_idx == 1: wpg = 2
-        if wpg_idx == 2: wpg = 4
-        if wpg_idx == 3: wpg = 8
-        if wpg_idx == 4: wpg = 16
+    var worker_counts = InlineArray[Int, 6](fill=0)
+    worker_counts[0] = 2
+    worker_counts[1] = 4
+    worker_counts[2] = 8
+    worker_counts[3] = 16
+    worker_counts[4] = max_wpg * LOCAL_KV2
+    # Deduplicate last entry if it matches
+    var num_counts = 5
+    if worker_counts[4] == worker_counts[3]:
+        num_counts = 4
+
+    for wi in range(num_counts):
+        var total_workers = worker_counts[wi]
+        var wpg = total_workers // LOCAL_KV2
 
         for _ in range(2):
             @parameter
@@ -288,14 +304,20 @@ def main():
                     scratch_ptrs[node], ctx_pos_scale,
                     perf_q_scale, perf_k_scale, perf_v_scale,
                     wpg,
-                    pools[topo[node]],
+                    pools[node],
                 )
             parallel_for[NUM_NODES, wu_s]()
             decode_merge[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[0], wpg, perf_vagg_scale)
 
         var best = Int(1 << 60)
+        var best_disp = 0
+        var best_join = 0
+        var best_join_oh = 0
+        var best_merge = 0
+        var best_kernel_max = 0
+        var best_done_spread = 0
+        var best_per_node = InlineArray[Int, NUM_NODES](fill=0)
         for trial in range(5):
-            var t0 = Int(perf_counter_ns())
             @parameter
             def run_s[node: Int]() -> PoolFence:
                 return decode[LOCAL_NH2, LOCAL_KV2, HD2](
@@ -305,25 +327,65 @@ def main():
                     scratch_ptrs[node], ctx_pos_scale,
                     perf_q_scale, perf_k_scale, perf_v_scale,
                     wpg,
-                    pools[topo[node]],
+                    pools[node],
                 )
-            parallel_for[NUM_NODES, run_s]()
+            var timing = timed_parallel_for[NUM_NODES, run_s]()
+            var join_end = Int(perf_counter_ns())
+            # True join overhead: time from last worker finishing to join returning
+            var max_done_ts = 0
+            var min_done_ts = Int(1 << 60)
+            var global_kernel_max = 0
+            var per_node_max = InlineArray[Int, NUM_NODES](fill=0)
+            for node in range(NUM_NODES):
+                var node_agg = collect_profiles[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[node], wpg)
+                if node_agg.max_done_timestamp > max_done_ts:
+                    max_done_ts = node_agg.max_done_timestamp
+                if node_agg.max_done_timestamp < min_done_ts:
+                    min_done_ts = node_agg.max_done_timestamp
+                if node_agg.max_total > global_kernel_max:
+                    global_kernel_max = node_agg.max_total
+                per_node_max[node] = node_agg.max_total
+            var join_oh = join_end - max_done_ts
+            var done_spread = max_done_ts - min_done_ts
+            var tm0 = Int(perf_counter_ns())
             for node in range(NUM_NODES):
                 decode_merge[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[node], wpg, perf_vagg_scale)
-            var wall = Int(perf_counter_ns()) - t0
+            var merge_ns = Int(perf_counter_ns()) - tm0
+            var wall = timing.total_ns + merge_ns
             keep(UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=scratch_ptrs[0])[0])
-            if wall < best: best = wall
+            if wall < best:
+                best = wall
+                best_disp = timing.dispatch_ns
+                best_join = timing.join_ns
+                best_join_oh = join_oh
+                best_merge = merge_ns
+                best_kernel_max = global_kernel_max
+                best_done_spread = done_spread
+                for node in range(NUM_NODES):
+                    best_per_node[node] = per_node_max[node]
 
-        var total_us = best // 1000
-        var total_workers = LOCAL_KV2 * wpg
-        print("  wpg=" + String(wpg) + " (" + String(total_workers) + "w/node)  wall=" + String(total_us) + " us")
+        print("  " + String(total_workers) + "w/node"
+            + "  wall=" + String(best // 1000) + " us"
+            + "  disp=" + String(best_disp // 1000) + " us"
+            + "  kernel=" + String(best_kernel_max // 1000) + " us"
+            + "  join_oh=" + String(best_join_oh) + " ns"
+            + "  merge=" + String(best_merge // 1000) + " us"
+            + "  done_spread=" + String(best_done_spread // 1000) + " us")
+        print("    per-node kernel(max): n0=" + String(best_per_node[0] // 1000)
+            + " n1=" + String(best_per_node[1] // 1000)
+            + " n2=" + String(best_per_node[2] // 1000)
+            + " n3=" + String(best_per_node[3] // 1000) + " us")
+        var unaccounted = best_join - best_kernel_max
+        print("    unaccounted: " + String(unaccounted // 1000)
+            + " us (join - global_kernel_max)")
         var agg = collect_profiles[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[0], wpg)
         agg.print_summary()
 
     # -----------------------------------------------------------------
     # Context sweep at max workers (wpg=16)
     # -----------------------------------------------------------------
-    print("\n--- Context sweep (wpg=16) ---")
+    var sweep_workers = max_wpg * LOCAL_KV2
+    print("\n--- Context sweep (" + String(sweep_workers) + "w/node) ---")
     for ctx_idx in range(7):
         var ctx_pos = 128
         if ctx_idx == 1: ctx_pos = 512
@@ -342,15 +404,17 @@ def main():
                     Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
                     scratch_ptrs[node], ctx_pos,
                     perf_q_scale, perf_k_scale, perf_v_scale,
-                    MAX_WPG,
-                    pools[topo[node]],
+                    max_wpg,
+                    pools[node],
                 )
             parallel_for[NUM_NODES, wu]()
-            decode_merge[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[0], MAX_WPG, perf_vagg_scale)
+            decode_merge[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[0], max_wpg, perf_vagg_scale)
 
         var best = Int(1 << 60)
+        var best_join_oh = 0
+        var best_kernel_max = 0
+        var best_unaccounted = 0
         for trial in range(5):
-            var t0 = Int(perf_counter_ns())
             @parameter
             def run[node: Int]() -> PoolFence:
                 return decode[LOCAL_NH2, LOCAL_KV2, HD2](
@@ -359,15 +423,33 @@ def main():
                     Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
                     scratch_ptrs[node], ctx_pos,
                     perf_q_scale, perf_k_scale, perf_v_scale,
-                    MAX_WPG,
-                    pools[topo[node]],
+                    max_wpg,
+                    pools[node],
                 )
-            parallel_for[NUM_NODES, run]()
+            var timing = timed_parallel_for[NUM_NODES, run]()
+            var join_end = Int(perf_counter_ns())
+            var max_done_ts = 0
+            var global_km = 0
             for node in range(NUM_NODES):
-                decode_merge[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[node], MAX_WPG, perf_vagg_scale)
-            var wall = Int(perf_counter_ns()) - t0
+                var node_agg = collect_profiles[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[node], max_wpg)
+                if node_agg.max_done_timestamp > max_done_ts:
+                    max_done_ts = node_agg.max_done_timestamp
+                if node_agg.max_total > global_km:
+                    global_km = node_agg.max_total
+            var join_oh = join_end - max_done_ts
+            var tm0 = Int(perf_counter_ns())
+            for node in range(NUM_NODES):
+                decode_merge[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[node], max_wpg, perf_vagg_scale)
+            var merge_ns = Int(perf_counter_ns()) - tm0
+            var wall = timing.total_ns + merge_ns
             keep(UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=scratch_ptrs[0])[0])
-            if wall < best: best = wall
+            if wall < best:
+                best = wall
+                best_join_oh = join_oh
+                best_kernel_max = global_km
+                best_unaccounted = timing.join_ns - global_km
 
-        var total_us = best // 1000
-        print("  ctx=" + String(ctx_pos) + "  wall=" + String(total_us) + " us")
+        print("  ctx=" + String(ctx_pos) + "  wall=" + String(best // 1000) + " us"
+            + "  kernel=" + String(best_kernel_max // 1000) + " us"
+            + "  join_oh=" + String(best_join_oh) + " ns"
+            + "  unaccounted=" + String(best_unaccounted // 1000) + " us")

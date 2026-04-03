@@ -11,7 +11,7 @@ V-agg: W_u8 × V_i8_vnni → i32      (tdpbusd, unsigned W × signed V)
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of, size_of
 from std.collections import InlineArray
-from threading import BurstPool
+from threading.isolated_burst_pool import IsolatedBurstPool
 
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named,
@@ -90,6 +90,7 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
     ctx_addr: Int, ws_addr: Int, unused0: Int, unused1: Int,
     unused2: Int, unused3: Int,
 ):
+    var t_entry = tap()
     var ctx = UnsafePointer[AttnCtx, MutAnyOrigin](unsafe_from_address=ctx_addr)
     var ws = UnsafePointer[DecodeWorkerScratch, MutAnyOrigin](unsafe_from_address=ws_addr)
     comptime width = simd_width_of[DType.float32]()
@@ -285,6 +286,9 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
     prof[].merge_wait = 0
     prof[].merge_work = 0
     prof[].total = t_end - t0
+    var t_final = tap()
+    prof[].overhead = (t0 - t_entry) + (t_final - t_end)
+    prof[].done_timestamp = t_final
 
 
 # ============================================================================
@@ -384,7 +388,7 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     k_layer_scale: Float32,
     v_layer_scale: Float32,
     workers_per_group: Int,
-    mut pool: BurstPool[],
+    mut pool: IsolatedBurstPool[],
 ) -> PoolFence:
     """Async AMX decode — multi-worker context split within each KV group."""
     comptime gqa_factor = num_heads // num_kv_heads
@@ -419,7 +423,8 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
 
     var context = pos + 1
     var max_blocks = (context + BLOCK_N - 1) // BLOCK_N
-    var wpg = min(workers_per_group, max_blocks)
+    var max_wpg = pool.capacity // num_kv_heads
+    var wpg = min(min(workers_per_group, max_blocks), max_wpg)
     var blocks_per_worker = (max_blocks + wpg - 1) // wpg
     var total_jobs = num_kv_heads * wpg
 
@@ -466,6 +471,6 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
         attn_decode[num_heads, num_kv_heads, head_dim, max_seq],
         pool.args_base, total_jobs,
     )
-    return PoolFence(UnsafePointer[BurstPool[], MutAnyOrigin](
+    return PoolFence(UnsafePointer[IsolatedBurstPool[], MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))

@@ -1,246 +1,125 @@
-"""BurstPool dispatch/join overhead benchmark.
+"""IsolatedBurstPool multi-node dispatch/join benchmark.
 
-Automatically detects CPU isolation and runs the appropriate model:
-  Isolated cores: BurstPool[IsolatedModel] — zero-syscall dispatch.
-  No isolation:   BurstPool[ColdModel] — futex-based sleep/wake.
-
-Reports min / median / p99 in nanoseconds per layer.
+Dispatches to all NUMA nodes, then joins all.
+Workers write completion timestamps. Join overhead is measured as
+the gap between the last worker finishing and the main thread returning
+from join.
 """
 
-from threading.burst_threading import BurstPool, ColdModel, IsolatedModel, ThreadingModel, ArgPack, make_node_pools
+from threading.isolated_burst_pool import IsolatedBurstPool, ArgPack
 from std.memory import UnsafePointer
 from std.time import perf_counter_ns
 from std.benchmark import keep
 from numa import NumaInfo
 from notstdcollections import HeapMoveArray
+import linux.sys as linux
 
 
-def noop_kernel(out_addr: Int, job_id: Int, unused0: Int,
-                unused1: Int, unused2: Int, unused3: Int):
-    UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=out_addr)[] = job_id + 1
-
-
-def heavy_kernel(out_addr: Int, job_id: Int, iters: Int,
+def delay_kernel(out_addr: Int, job_id: Int, pauses: Int,
                  unused1: Int, unused2: Int, unused3: Int):
-    var x = job_id
-    for _ in range(iters):
-        x = x ^ (x >> 17)
-        x = x * 0xBF58476D1CE4E5B9
-        x = x ^ (x >> 31)
-    UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=out_addr)[] = x
+    var sys = linux.linux_sys()
+    for _ in range(pauses):
+        sys.arch_cpu_relax()
+    UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=out_addr)[] = job_id + 1
 
 
 comptime LAYERS = 40
 comptime WARMUP = 5
 comptime TRIALS = 50
-comptime HEAVY_ITERS = 50000
-
-
-def sort_ints(p: UnsafePointer[Int, MutAnyOrigin], n: Int):
-    for i in range(1, n):
-        var key = (p + i)[]
-        var j = i - 1
-        while j >= 0 and (p + j)[] > key:
-            (p + j + 1)[] = (p + j)[]
-            j -= 1
-        (p + j + 1)[] = key
-
-
-def rjust(val: Int, width: Int) -> String:
-    var s = String(val)
-    while len(s) < width:
-        s = " " + s
-    return s
-
-
-def fmt_stats(p: UnsafePointer[Int, MutAnyOrigin]) -> String:
-    return (rjust(p[], 7) + " /"
-          + rjust((p + TRIALS // 2)[], 7) + " /"
-          + rjust((p + TRIALS * 99 // 100)[], 7))
-
-
-def bench_pool[Model: ThreadingModel, F: TrivialRegisterPassable](
-    mut pool: BurstPool[Model],
-    kernel: F,
-    label: String,
-    packs: UnsafePointer[ArgPack, MutAnyOrigin],
-    output: UnsafePointer[Int, MutAnyOrigin],
-    dispatch_t: UnsafePointer[Int, MutAnyOrigin],
-    join_t: UnsafePointer[Int, MutAnyOrigin],
-    total_t: UnsafePointer[Int, MutAnyOrigin],
-    job_counts: InlineArray[Int, 8],
-    n_counts: Int,
-):
-    """Run benchmark for one pool across all job counts."""
-    var cap = pool.capacity
-
-    for ji in range(n_counts):
-        var jobs = job_counts[ji]
-        if jobs > cap:
-            continue
-
-        for _ in range(WARMUP):
-            for _ in range(LAYERS):
-                pool.dispatch(kernel, packs, jobs)
-                pool.join()
-
-        for trial in range(TRIALS):
-            var disp_accum = 0
-            var join_accum = 0
-            var t_start = Int(perf_counter_ns())
-            for _ in range(LAYERS):
-                var td0 = Int(perf_counter_ns())
-                pool.dispatch(kernel, packs, jobs)
-                var td1 = Int(perf_counter_ns())
-                pool.join()
-                var td2 = Int(perf_counter_ns())
-                disp_accum += td1 - td0
-                join_accum += td2 - td1
-            var t_total = Int(perf_counter_ns()) - t_start
-            keep(output[])
-            (dispatch_t + trial)[] = disp_accum // LAYERS
-            (join_t + trial)[] = join_accum // LAYERS
-            (total_t + trial)[] = t_total // LAYERS
-
-        sort_ints(dispatch_t, TRIALS)
-        sort_ints(join_t, TRIALS)
-        sort_ints(total_t, TRIALS)
-        print(rjust(jobs, 4) + " " + label
-            + "  disp " + fmt_stats(dispatch_t)
-            + "  join " + fmt_stats(join_t)
-            + "  total " + fmt_stats(total_t))
 
 
 def main():
     var numa = NumaInfo()
-    var node = numa.plan_topology(1)[0]
-    var ncpus = numa.cpus_on_node(node)
-    var isolated = numa.has_isolation()
-    print("Node " + String(node) + ": " + String(ncpus) + " cpus"
-        + (", isolation active" if isolated else ", no isolation"))
+    if not numa.has_isolation():
+        print("SKIP: no CPU isolation")
+        return
+    if numa.num_nodes < 2:
+        print("SKIP: need multiple NUMA nodes")
+        return
 
-    # Calibrate heavy kernel
-    var cal_out = 0
-    var cal_t0 = Int(perf_counter_ns())
-    heavy_kernel(Int(UnsafePointer(to=cal_out)), 42, HEAVY_ITERS, 0, 0, 0)
-    var cal_dur = Int(perf_counter_ns()) - cal_t0
-    print("Heavy kernel: ~" + String(cal_dur // 1000) + " us ("
-        + String(HEAVY_ITERS) + " iters)")
-    print(String(TRIALS) + " trials, " + String(WARMUP) + " warmup, "
-        + String(LAYERS) + " layers")
+    var topo = numa.plan_topology(numa.num_nodes)
+    var num_nodes = numa.num_nodes
 
-    if isolated:
-        var pool = BurstPool[IsolatedModel].for_topology(numa, node)
-        if not pool:
-            print("pool creation failed")
-            return
-        print("IsolatedModel: " + String(pool.capacity) + " workers")
+    print(String(num_nodes) + " NUMA nodes, "
+        + String(len(numa.isolated_cpus)) + " isolated cpus")
 
-        var cap = pool.capacity
-        var job_counts = InlineArray[Int, 8](fill=0)
-        var n_counts = 0
-        if cap >= 2:
-            job_counts[n_counts] = 2
-            n_counts += 1
-        if cap >= 4:
-            job_counts[n_counts] = 4
-            n_counts += 1
-        if cap >= 8:
-            job_counts[n_counts] = 8
-            n_counts += 1
-        if cap >= 16:
-            job_counts[n_counts] = 16
-            n_counts += 1
-        if cap > 16:
-            job_counts[n_counts] = cap
-            n_counts += 1
+    var pools = HeapMoveArray[IsolatedBurstPool[]](num_nodes)
+    for i in range(num_nodes):
+        pools.push(IsolatedBurstPool[].for_topology(numa, topo[i]))
+        print("  node " + String(topo[i]) + ": " + String(pools[i].capacity) + " workers")
 
-        var output = HeapMoveArray[Int](cap)
-        for _ in range(cap):
-            output.push(0)
-        var packs = HeapMoveArray[ArgPack](cap)
-        for _ in range(cap):
-            packs.push(ArgPack())
-        var dispatch_t = HeapMoveArray[Int](TRIALS)
-        var join_t = HeapMoveArray[Int](TRIALS)
-        var total_t = HeapMoveArray[Int](TRIALS)
+    var node_packs = HeapMoveArray[HeapMoveArray[ArgPack]](num_nodes)
+    var node_outputs = HeapMoveArray[HeapMoveArray[Int]](num_nodes)
+    for i in range(num_nodes):
+        var nc = pools[i].capacity
+        var np = HeapMoveArray[ArgPack](nc)
+        var no = HeapMoveArray[Int](nc)
+        for _ in range(nc):
+            np.push(ArgPack())
+            no.push(0)
+        for j in range(nc):
+            (np.ptr + j)[].arg0 = Int(no.ptr + j)
+            (np.ptr + j)[].arg1 = j
+        node_packs.push(np^)
+        node_outputs.push(no^)
+
+    print("\nwork       dispatch    join      join_overhead")
+
+    for wi in range(7):
+        var pauses = 0
+        var label = "noop"
+        if wi == 1: pauses = 1000;   label = "~10us"
+        if wi == 2: pauses = 5000;   label = "~50us"
+        if wi == 3: pauses = 20000;  label = "~200us"
+        if wi == 4: pauses = 50000;  label = "~500us"
+        if wi == 5: pauses = 100000; label = "~1ms"
+        if wi == 6: pauses = 200000; label = "~2ms"
+
+        for i in range(num_nodes):
+            for j in range(pools[i].capacity):
+                (node_packs[i].ptr + j)[].arg2 = pauses
+
+        for _ in range(WARMUP):
+            for _ in range(LAYERS):
+                for i in range(num_nodes):
+                    pools[i].dispatch(delay_kernel, node_packs[i].ptr, pools[i].capacity)
+                for i in range(num_nodes):
+                    pools[i].join()
+
+        var best_d = Int(1 << 60)
+        var best_j = Int(1 << 60)
+        var best_overhead = Int(1 << 60)
         for _ in range(TRIALS):
-            dispatch_t.push(0)
-            join_t.push(0)
-            total_t.push(0)
+            var da = 0
+            var ja = 0
+            var oa = 0
+            for _ in range(LAYERS):
+                var t0 = Int(perf_counter_ns())
+                for i in range(num_nodes):
+                    pools[i].dispatch(delay_kernel, node_packs[i].ptr, pools[i].capacity)
+                var t1 = Int(perf_counter_ns())
+                for i in range(num_nodes):
+                    pools[i].join()
+                var t2 = Int(perf_counter_ns())
+                # Max worker timestamp across all nodes
+                var max_ts = 0
+                for i in range(num_nodes):
+                    var ts = pools[i].last_worker_timestamp()
+                    if ts > max_ts:
+                        max_ts = ts
+                da += t1 - t0
+                ja += t2 - t1
+                oa += t2 - max_ts
+            keep(node_outputs[0].ptr[])
+            var d = da // LAYERS
+            var j = ja // LAYERS
+            var o = oa // LAYERS
+            if d + j < best_d + best_j:
+                best_d = d
+                best_j = j
+                best_overhead = o
 
-        print("\n=== noop kernel, ns/layer (min / med / p99) ===")
-        for j in range(cap):
-            (packs.ptr + j)[].arg0 = Int(output.ptr + j)
-            (packs.ptr + j)[].arg1 = j
-        bench_pool(pool, noop_kernel, "iso  ", packs.ptr, output.ptr,
-            dispatch_t.ptr, join_t.ptr, total_t.ptr,
-            job_counts, n_counts)
-
-        print("\n=== heavy kernel ~" + String(cal_dur // 1000)
-            + "us, ns/layer (min / med / p99) ===")
-        for j in range(cap):
-            (packs.ptr + j)[].arg0 = Int(output.ptr + j)
-            (packs.ptr + j)[].arg1 = j
-            (packs.ptr + j)[].arg2 = HEAVY_ITERS
-        bench_pool(pool, heavy_kernel, "iso  ", packs.ptr, output.ptr,
-            dispatch_t.ptr, join_t.ptr, total_t.ptr,
-            job_counts, n_counts)
-
-    else:
-        var pool = BurstPool[ColdModel].for_topology(numa, node)
-        if not pool:
-            print("pool creation failed")
-            return
-        print("ColdModel: " + String(pool.capacity) + " workers")
-
-        var cap = pool.capacity
-        var job_counts = InlineArray[Int, 8](fill=0)
-        var n_counts = 0
-        if cap >= 2:
-            job_counts[n_counts] = 2
-            n_counts += 1
-        if cap >= 4:
-            job_counts[n_counts] = 4
-            n_counts += 1
-        if cap >= 8:
-            job_counts[n_counts] = 8
-            n_counts += 1
-        if cap >= 16:
-            job_counts[n_counts] = 16
-            n_counts += 1
-        if cap > 16:
-            job_counts[n_counts] = cap
-            n_counts += 1
-
-        var output = HeapMoveArray[Int](cap)
-        for _ in range(cap):
-            output.push(0)
-        var packs = HeapMoveArray[ArgPack](cap)
-        for _ in range(cap):
-            packs.push(ArgPack())
-        var dispatch_t = HeapMoveArray[Int](TRIALS)
-        var join_t = HeapMoveArray[Int](TRIALS)
-        var total_t = HeapMoveArray[Int](TRIALS)
-        for _ in range(TRIALS):
-            dispatch_t.push(0)
-            join_t.push(0)
-            total_t.push(0)
-
-        print("\n=== noop kernel, ns/layer (min / med / p99) ===")
-        for j in range(cap):
-            (packs.ptr + j)[].arg0 = Int(output.ptr + j)
-            (packs.ptr + j)[].arg1 = j
-        bench_pool(pool, noop_kernel, "cold ", packs.ptr, output.ptr,
-            dispatch_t.ptr, join_t.ptr, total_t.ptr,
-            job_counts, n_counts)
-
-        print("\n=== heavy kernel ~" + String(cal_dur // 1000)
-            + "us, ns/layer (min / med / p99) ===")
-        for j in range(cap):
-            (packs.ptr + j)[].arg0 = Int(output.ptr + j)
-            (packs.ptr + j)[].arg1 = j
-            (packs.ptr + j)[].arg2 = HEAVY_ITERS
-        bench_pool(pool, heavy_kernel, "cold ", packs.ptr, output.ptr,
-            dispatch_t.ptr, join_t.ptr, total_t.ptr,
-            job_counts, n_counts)
+        print("  " + label + "\t   "
+            + String(best_d // 1000) + " us\t   "
+            + String(best_j // 1000) + " us\t   "
+            + String(best_overhead) + " ns")
