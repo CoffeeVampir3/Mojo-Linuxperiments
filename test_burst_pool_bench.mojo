@@ -1,13 +1,16 @@
-"""IsolatedBurstPool multi-node dispatch/join benchmark.
+"""Multi-node dispatch/join benchmark.
 
 Dispatches to all NUMA nodes, then joins all.
 Workers write completion timestamps. Join overhead is measured as
 the gap between the last worker finishing and the main thread returning
 from join.
+
+Uses IsolatedBurstPool when CPU isolation is configured, BurstPool otherwise.
 """
 
+from threading.threading_traits import BurstThreadPool
 from threading.burst_threading import BurstPool
-from threading.isolated_burst_pool import ArgPack
+from threading.isolated_burst_pool import IsolatedBurstPool, ArgPack
 from std.memory import UnsafePointer
 from std.time import perf_counter_ns
 from std.benchmark import keep
@@ -29,27 +32,11 @@ comptime WARMUP = 5
 comptime TRIALS = 50
 
 
-def main():
-    var numa = NumaInfo()
-    if numa.num_nodes < 2:
-        print("SKIP: need multiple NUMA nodes")
-        return
-
-    var topo = numa.plan_topology(numa.num_nodes)
-    var num_nodes = numa.num_nodes
-
-    print(String(num_nodes) + " NUMA nodes, "
-        + String(len(numa.isolated_cpus)) + " isolated cpus")
-
-    var pools = HeapMoveArray[BurstPool[]](num_nodes)
-    for i in range(num_nodes):
-        pools.push(BurstPool[].for_topology(numa, topo[i]))
-        print("  node " + String(topo[i]) + ": " + String(pools[i].capacity) + " workers")
-
+def run_bench[P: BurstThreadPool](mut pools: HeapMoveArray[P], num_nodes: Int):
     var node_packs = HeapMoveArray[HeapMoveArray[ArgPack]](num_nodes)
     var node_outputs = HeapMoveArray[HeapMoveArray[Int]](num_nodes)
     for i in range(num_nodes):
-        var nc = pools[i].capacity
+        var nc = pools[i].get_capacity()
         var np = HeapMoveArray[ArgPack](nc)
         var no = HeapMoveArray[Int](nc)
         for _ in range(nc):
@@ -74,13 +61,13 @@ def main():
         if wi == 6: pauses = 200000; label = "~2ms"
 
         for i in range(num_nodes):
-            for j in range(pools[i].capacity):
+            for j in range(pools[i].get_capacity()):
                 (node_packs[i].ptr + j)[].arg2 = pauses
 
         for _ in range(WARMUP):
             for _ in range(LAYERS):
                 for i in range(num_nodes):
-                    pools[i].dispatch(delay_kernel, node_packs[i].ptr, pools[i].capacity)
+                    pools[i].dispatch(delay_kernel, node_packs[i].ptr, pools[i].get_capacity())
                 for i in range(num_nodes):
                     pools[i].join()
 
@@ -94,12 +81,11 @@ def main():
             for _ in range(LAYERS):
                 var t0 = Int(perf_counter_ns())
                 for i in range(num_nodes):
-                    pools[i].dispatch(delay_kernel, node_packs[i].ptr, pools[i].capacity)
+                    pools[i].dispatch(delay_kernel, node_packs[i].ptr, pools[i].get_capacity())
                 var t1 = Int(perf_counter_ns())
                 for i in range(num_nodes):
                     pools[i].join()
                 var t2 = Int(perf_counter_ns())
-                # Max worker timestamp across all nodes
                 var max_ts = 0
                 for i in range(num_nodes):
                     var ts = pools[i].last_worker_timestamp()
@@ -121,3 +107,27 @@ def main():
             + String(best_d // 1000) + " us\t   "
             + String(best_j // 1000) + " us\t   "
             + String(best_overhead) + " ns")
+
+
+def main():
+    var numa = NumaInfo()
+    var topo = numa.plan_topology(numa.num_nodes)
+    var num_nodes = numa.num_nodes
+
+    print(String(num_nodes) + " NUMA nodes, "
+        + String(len(numa.isolated_cpus)) + " isolated cpus")
+
+    if numa.has_isolation():
+        print("mode: isolated (spin-only)")
+        var pools = HeapMoveArray[IsolatedBurstPool[]](num_nodes)
+        for i in range(num_nodes):
+            pools.push(IsolatedBurstPool[].for_topology(numa, topo[i]))
+            print("  node " + String(topo[i]) + ": " + String(pools[i].get_capacity()) + " workers")
+        run_bench(pools, num_nodes)
+    else:
+        print("mode: cold (spin-backoff)")
+        var pools = HeapMoveArray[BurstPool[]](num_nodes)
+        for i in range(num_nodes):
+            pools.push(BurstPool[].for_topology(numa, topo[i]))
+            print("  node " + String(topo[i]) + ": " + String(pools[i].get_capacity()) + " workers")
+        run_bench(pools, num_nodes)

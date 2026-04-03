@@ -11,7 +11,7 @@ from std.math import sqrt
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 from std.time import perf_counter_ns
-from threading.isolated_burst_pool import IsolatedBurstPool
+from threading.threading_traits import BurstThreadPool
 import linux.sys as linux
 
 from modeling.model_spec import (
@@ -34,34 +34,34 @@ def bf16_f32[width: Int](ptr: PtrBF16, offset: Int) -> SIMD[DType.float32, width
 
 @explicit_destroy
 @fieldwise_init
-struct PoolFence(Movable):
+struct PoolFence[P: BurstThreadPool](Movable):
     """Linear token for in-flight pool work. Unconsumed fences are a compile error.
 
     Two consumption paths:
         .join()  — wait immediately (TP=1)
         .take()  — extract raw pool ptr for deferred batch join (parametric TP)
     """
-    var pool: UnsafePointer[IsolatedBurstPool[], MutAnyOrigin]
+    var pool: UnsafePointer[Self.P, MutAnyOrigin]
 
     @staticmethod
     def completed() -> Self:
-        return Self(UnsafePointer[IsolatedBurstPool[], MutAnyOrigin]())
+        return Self(UnsafePointer[Self.P, MutAnyOrigin]())
 
     def join(deinit self):
         """Consume fence, wait for work to complete."""
         if self.pool:
             self.pool[].join()
 
-    def take(deinit self) -> UnsafePointer[IsolatedBurstPool[], MutAnyOrigin]:
+    def take(deinit self) -> UnsafePointer[Self.P, MutAnyOrigin]:
         """Consume fence, return raw pool pointer for deferred join."""
         return self.pool
 
 
-def parallel_for[tp: Int, body: def[rank: Int] () capturing -> PoolFence]():
-    """Parametric barrier: dispatch body[rank]() for each rank, then join all.
-    Works for any TP degree. body returns PoolFence — consumed internally via .take()."""
-    var ptrs = InlineArray[UnsafePointer[IsolatedBurstPool[], MutAnyOrigin], tp](
-        fill=UnsafePointer[IsolatedBurstPool[], MutAnyOrigin]()
+def parallel_for[P: BurstThreadPool, tp: Int,
+    body: def[rank: Int] () capturing -> PoolFence[P]]():
+    """Parametric barrier: dispatch body[rank]() for each rank, then join all."""
+    var ptrs = InlineArray[UnsafePointer[P, MutAnyOrigin], tp](
+        fill=UnsafePointer[P, MutAnyOrigin]()
     )
     comptime for rank in range(tp):
         ptrs[rank] = body[rank]().take()
@@ -77,10 +77,11 @@ struct ParallelTiming:
     var total_ns: Int
 
 
-def timed_parallel_for[tp: Int, body: def[rank: Int] () capturing -> PoolFence]() -> ParallelTiming:
+def timed_parallel_for[P: BurstThreadPool, tp: Int,
+    body: def[rank: Int] () capturing -> PoolFence[P]]() -> ParallelTiming:
     """Like parallel_for but returns dispatch/join/total timing."""
-    var ptrs = InlineArray[UnsafePointer[IsolatedBurstPool[], MutAnyOrigin], tp](
-        fill=UnsafePointer[IsolatedBurstPool[], MutAnyOrigin]()
+    var ptrs = InlineArray[UnsafePointer[P, MutAnyOrigin], tp](
+        fill=UnsafePointer[P, MutAnyOrigin]()
     )
     var t0 = Int(perf_counter_ns())
     comptime for rank in range(tp):
@@ -299,10 +300,11 @@ def gqa_kernel[
 # ================================================================
 
 
-def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped](
+def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped,
+    P: BurstThreadPool](
     input: DynView[InT], weight: Bound[W], output: DynView[OutT],
-    mut pool: IsolatedBurstPool[],
-) -> PoolFence where W.DTYPE == DType.bfloat16:
+    mut pool: P,
+) -> PoolFence[P] where W.DTYPE == DType.bfloat16:
     """dst[M,N] = input[M,K] × weight[N,K]^T. M is runtime, via BurstPool.
     For small M (decode), partitions output columns across workers.
     For large M (prefill), partitions input rows."""
@@ -314,22 +316,22 @@ def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped](
 
     var seq_len = input.seq_len
     if seq_len == 0:
-        return PoolFence.completed()
+        return PoolFence[P].completed()
 
-    var fence = PoolFence(UnsafePointer[IsolatedBurstPool[], MutAnyOrigin](
+    var fence = PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))
 
-    if seq_len < pool.capacity:
+    if seq_len < pool.get_capacity():
         # Decode path: partition N (output columns) across workers
         comptime N = W.ROWS
-        var num_jobs = pool.capacity
+        var num_jobs = pool.get_capacity()
         var cols_per_job = (N + num_jobs - 1) // num_jobs
 
         for i in range(num_jobs):
             var start = i * cols_per_job
             var end = min(start + cols_per_job, N)
-            var pack = pool.args_base + i
+            var pack = pool.get_args_base() + i
             pack[].arg0 = input.ptr
             pack[].arg1 = weight.ptr
             pack[].arg2 = output.ptr
@@ -337,16 +339,16 @@ def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped](
             pack[].arg4 = end
             pack[].arg5 = seq_len
 
-        pool.dispatch(gemv_kernel[InT.COLS, N], pool.args_base, num_jobs)
+        pool.dispatch(gemv_kernel[InT.COLS, N], pool.get_args_base(), num_jobs)
     else:
         # Prefill path: partition M (input rows) across workers
-        var num_jobs = min(seq_len, pool.capacity)
+        var num_jobs = min(seq_len, pool.get_capacity())
         var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
         for i in range(num_jobs):
             var start = i * rows_per_job
             var end = min(start + rows_per_job, seq_len)
-            var pack = pool.args_base + i
+            var pack = pool.get_args_base() + i
             pack[].arg0 = input.ptr
             pack[].arg1 = weight.ptr
             pack[].arg2 = output.ptr
@@ -354,16 +356,17 @@ def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped](
             pack[].arg4 = end
             pack[].arg5 = 0
 
-        pool.dispatch(gemm_kernel[InT.COLS, W.ROWS], pool.args_base, num_jobs)
+        pool.dispatch(gemm_kernel[InT.COLS, W.ROWS], pool.get_args_base(), num_jobs)
 
     return fence^
 
 
-def rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped](
+def rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped,
+    P: BurstThreadPool](
     input: DynView[InT], weight: Bound[W], output: DynView[OutT],
-    mut pool: IsolatedBurstPool[],
+    mut pool: P,
     eps: Float32 = 1e-5,
-) -> PoolFence where W.DTYPE == DType.bfloat16:
+) -> PoolFence[P] where W.DTYPE == DType.bfloat16:
     """RMSNorm via BurstPool: output = (input / RMS(input)) * weight.
     F32 accumulation in registers, bf16 I/O."""
     comptime assert InT.DTYPE == DType.bfloat16, "rmsnorm: input must be bf16"
@@ -373,18 +376,18 @@ def rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shape
 
     var seq_len = input.seq_len
     if seq_len == 0:
-        return PoolFence.completed()
+        return PoolFence[P].completed()
 
     var eps_copy = eps
     var eps_int = Int(UnsafePointer(to=eps_copy).bitcast[Int32]()[])
 
-    var num_jobs = min(seq_len, pool.capacity)
+    var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
     for i in range(num_jobs):
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
-        var pack = pool.args_base + i
+        var pack = pool.get_args_base() + i
         pack[].arg0 = input.ptr
         pack[].arg1 = weight.ptr
         pack[].arg2 = output.ptr
@@ -392,31 +395,32 @@ def rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shape
         pack[].arg4 = end
         pack[].arg5 = eps_int
 
-    pool.dispatch(rmsnorm_kernel[InT.COLS], pool.args_base, num_jobs)
-    return PoolFence(UnsafePointer[IsolatedBurstPool[], MutAnyOrigin](
+    pool.dispatch(rmsnorm_kernel[InT.COLS], pool.get_args_base(), num_jobs)
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))
 
 
-def embed_lookup[W: Encoding & Shaped, OutT: Encoding & Shaped](
+def embed_lookup[W: Encoding & Shaped, OutT: Encoding & Shaped,
+    P: BurstThreadPool](
     table: Bound[W], tokens: Int, output: DynView[OutT],
-    mut pool: IsolatedBurstPool[],
-) -> PoolFence where W.DTYPE == DType.bfloat16:
+    mut pool: P,
+) -> PoolFence[P] where W.DTYPE == DType.bfloat16:
     """Gather: for each token ID, copy table[id] → output row."""
     comptime assert OutT.DTYPE == DType.bfloat16, "embed: output must be bf16"
     comptime assert W.COLS == OutT.COLS, "embed: table hidden != output hidden"
 
     var seq_len = output.seq_len
     if seq_len == 0:
-        return PoolFence.completed()
+        return PoolFence[P].completed()
 
-    var num_jobs = min(seq_len, pool.capacity)
+    var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
     for i in range(num_jobs):
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
-        var pack = pool.args_base + i
+        var pack = pool.get_args_base() + i
         pack[].arg0 = table.ptr
         pack[].arg1 = tokens
         pack[].arg2 = output.ptr
@@ -424,8 +428,8 @@ def embed_lookup[W: Encoding & Shaped, OutT: Encoding & Shaped](
         pack[].arg4 = end
         pack[].arg5 = 0
 
-    pool.dispatch(embed_lookup_kernel[W.COLS], pool.args_base, num_jobs)
-    return PoolFence(UnsafePointer[IsolatedBurstPool[], MutAnyOrigin](
+    pool.dispatch(embed_lookup_kernel[W.COLS], pool.get_args_base(), num_jobs)
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))
 
@@ -609,11 +613,11 @@ def kv_cache_write[SrcT: Encoding & Shaped, CT: Encoding & Shaped](
 
 def attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
     QT: Encoding & Shaped, KCT: Encoding & Shaped, VCT: Encoding & Shaped,
-    OutT: Encoding & Shaped](
+    OutT: Encoding & Shaped, P: BurstThreadPool](
     q: DynView[QT], k_cache: CacheView[KCT], v_cache: CacheView[VCT],
     output: DynView[OutT], pos: Int,
-    mut pool: IsolatedBurstPool[],
-) -> PoolFence where KCT.DTYPE == DType.bfloat16:
+    mut pool: P,
+) -> PoolFence[P] where KCT.DTYPE == DType.bfloat16:
     """GQA attention: Q[M, H*D] attends over KV cache[0..pos+M, Hkv*D].
     Causal masked, online softmax (single-pass, no score buffer).
     Work partitioned by KV head group via BurstPool."""
@@ -630,17 +634,17 @@ def attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
 
     var seq_len = q.seq_len
     if seq_len == 0:
-        return PoolFence.completed()
+        return PoolFence[P].completed()
 
     var pos_seq = (pos << 32) | seq_len
 
-    var num_jobs = min(num_kv_heads, pool.capacity)
+    var num_jobs = min(num_kv_heads, pool.get_capacity())
     var groups_per_job = (num_kv_heads + num_jobs - 1) // num_jobs
 
     for i in range(num_jobs):
         var start = i * groups_per_job
         var end = min(start + groups_per_job, num_kv_heads)
-        var pack = pool.args_base + i
+        var pack = pool.get_args_base() + i
         pack[].arg0 = q.ptr
         pack[].arg1 = output.ptr
         pack[].arg2 = k_cache.ptr
@@ -650,8 +654,8 @@ def attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
 
     pool.dispatch(
         gqa_kernel[num_heads, num_kv_heads, head_dim, KCT.COLS],
-        pool.args_base, num_jobs,
+        pool.get_args_base(), num_jobs,
     )
-    return PoolFence(UnsafePointer[IsolatedBurstPool[], MutAnyOrigin](
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))

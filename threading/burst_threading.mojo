@@ -25,6 +25,7 @@ from std.os.atomic import Atomic, Consistency
 from numa import NumaInfo, CpuMask
 from notstdcollections import HeapMoveArray
 from .isolated_burst_pool import ArgPack
+from .threading_traits import BurstThreadPool
 
 comptime AtomicInt32 = Atomic[DType.int32]
 comptime KernelFn = def (Int, Int, Int, Int, Int, Int) -> None
@@ -213,7 +214,7 @@ struct WorkerStackHead[mask_size: Int]:
 
 comptime SPIN_LIMIT = 1000
 
-struct BurstPool[mask_size: Int = 128](Movable):
+struct BurstPool[mask_size: Int = 128](BurstThreadPool):
     """Spin-backoff pool with dual-mailbox NUMA-aware dispatch.
 
     Workers spin on local mailboxes, then Dekker-sleep via futex.
@@ -414,6 +415,12 @@ struct BurstPool[mask_size: Int = 128](Movable):
                 sys.arch_cpu_relax()
             AtomicInt32.store[ordering=Consistency.MONOTONIC](done_ptr, 0)
         self.active_jobs = 0
+
+    def get_capacity(self) -> Int:
+        return self.capacity
+
+    def get_args_base(self) -> UnsafePointer[ArgPack, MutAnyOrigin]:
+        return self.args_base
 
     def last_worker_timestamp(self) -> Int:
         """Max completion timestamp across workers from the last dispatch.

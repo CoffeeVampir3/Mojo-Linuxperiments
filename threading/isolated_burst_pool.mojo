@@ -23,6 +23,7 @@ import linux.sys as linux
 from std.os.atomic import Atomic, Consistency
 from numa import NumaInfo, CpuMask
 from notstdcollections import HeapMoveArray
+from .threading_traits import BurstThreadPool, SleepableThreadPool
 
 comptime AtomicInt32 = Atomic[DType.int32]
 
@@ -176,7 +177,7 @@ def ptr[T: AnyType](addr: Int) -> UnsafePointer[T, MutAnyOrigin]:
 # IsolatedBurstPool
 # ============================================================================
 
-struct IsolatedBurstPool[mask_size: Int = 128](Movable):
+struct IsolatedBurstPool[mask_size: Int = 128](BurstThreadPool, SleepableThreadPool):
     """Dual-mailbox burst pool for isolated cores.
 
     Workers spin on local mailboxes. Join polls local flags.
@@ -408,6 +409,12 @@ struct IsolatedBurstPool[mask_size: Int = 128](Movable):
                 sys.arch_cpu_relax()
             AtomicInt32.store[ordering=Consistency.MONOTONIC](done_ptr, 0)
         self.active_jobs = 0
+
+    def get_capacity(self) -> Int:
+        return self.capacity
+
+    def get_args_base(self) -> UnsafePointer[ArgPack, MutAnyOrigin]:
+        return self.args_base
 
     def last_worker_timestamp(self) -> Int:
         """Max completion timestamp across all workers from the last dispatch.

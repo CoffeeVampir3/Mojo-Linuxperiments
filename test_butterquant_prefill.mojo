@@ -17,8 +17,10 @@ from experimental.hadquant_impl import fwht_block
 from experimental2.kv_cache import KVCache
 from experimental.amx import init_intel_amx
 from simd_math import sqrt, exp_f32, quantize_i8
-from threading import make_node_pools
-from numa import NumaInfo
+from threading.threading_traits import BurstThreadPool
+from threading.burst_threading import BurstPool
+from threading.isolated_burst_pool import IsolatedBurstPool
+from numa import NumaInfo, NumaTopology
 from numa.arena import NumaArena
 from notstdcollections import HeapMoveArray
 from kernels.kernel_ops import init_rope_tables, parallel_for, PoolFence
@@ -39,9 +41,25 @@ def main():
     var topo = numa.plan_topology(NUM_NODES)
 
     print("NUMA: " + String(NUM_NODES) + " nodes")
-    var pools = make_node_pools(numa, stack_size=2 * 1024 * 1024)
-    for i in range(NUM_NODES):
-        print("  node " + String(topo[i]) + ": " + String(pools[topo[i]].capacity) + " workers")
+    if numa.has_isolation():
+        print("mode: isolated")
+        var pools = HeapMoveArray[IsolatedBurstPool[]](NUM_NODES)
+        for i in range(NUM_NODES):
+            pools.push(IsolatedBurstPool[].for_topology(numa, topo[i], stack_size=2 * 1024 * 1024))
+            print("  node " + String(topo[i]) + ": " + String(pools[i].capacity) + " workers")
+        run_test(numa, topo, pools)
+    else:
+        print("mode: cold")
+        var pools = HeapMoveArray[BurstPool[]](NUM_NODES)
+        for i in range(NUM_NODES):
+            pools.push(BurstPool[].for_topology(numa, topo[i], stack_size=2 * 1024 * 1024))
+            print("  node " + String(topo[i]) + ": " + String(pools[i].capacity) + " workers")
+        run_test(numa, topo, pools)
+
+
+def run_test[P: BurstThreadPool](numa: NumaInfo,
+    topo: NumaTopology,
+    mut pools: HeapMoveArray[P]):
 
     # =====================================================================
     # Correctness test
@@ -69,7 +87,7 @@ def main():
     var corr_arena = NumaArena[](topo[0], 256 * 1024 * 1024)
 
     comptime KVC = KVCache[MAX_SEQ, HD, NKV]
-    var corr_scratch_bytes = scratch_bytes[NH, NKV, HD, SL](pools[topo[0]].capacity)
+    var corr_scratch_bytes = scratch_bytes[NH, NKV, HD, SL](pools[0].get_capacity())
 
     var q_bf16 = corr_arena.alloc[Scalar[DType.bfloat16]](SL * HIDDEN)
     var kv_mem = corr_arena.alloc[UInt8](KVC.TOTAL_BYTES)
@@ -178,7 +196,7 @@ def main():
         Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
         Int(scratch), POS,
         q_layer_scale, k_layer_scale, v_layer_scale,
-        pools[topo[0]],
+        pools[0],
     ).join()
 
     # Compare
@@ -202,7 +220,7 @@ def main():
 
     # Run kernel again with prefill_chunk=4 — forces 4 chunks for SL=16
     comptime CHUNK = 4
-    var chunked_scratch_bytes = scratch_bytes[NH, NKV, HD, SL, CHUNK](pools[topo[0]].capacity)
+    var chunked_scratch_bytes = scratch_bytes[NH, NKV, HD, SL, CHUNK](pools[0].get_capacity())
     var chunked_scratch = corr_arena.alloc[UInt8](chunked_scratch_bytes)
     prefill[NH, NKV, HD, MAX_SEQ, prefill_chunk=CHUNK](
         DynView[QSlot](Int(q_bf16), SL),
@@ -210,7 +228,7 @@ def main():
         Bound[CosSlot](Int(cos_tab)), Bound[SinSlot](Int(sin_tab)),
         Int(chunked_scratch), POS,
         q_layer_scale, k_layer_scale, v_layer_scale,
-        pools[topo[0]],
+        pools[0],
     ).join()
 
     var rf32_c = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(chunked_scratch))
@@ -246,11 +264,11 @@ def main():
     comptime LOCAL_HIDDEN2 = LOCAL_NH2 * HD2
 
     comptime LOCAL_KVC = KVCache[MAX_SEQ2, HD2, LOCAL_KV2]
-    var local_scratch_bytes = scratch_bytes[LOCAL_NH2, LOCAL_KV2, HD2, MAX_SL](pools[topo[0]].capacity)
+    var local_scratch_bytes = scratch_bytes[LOCAL_NH2, LOCAL_KV2, HD2, MAX_SL](pools[0].get_capacity())
 
     print("\n=== Performance: 128h/8kv, hd=128, " + String(NUM_NODES) + " NUMA nodes ===")
     print("  Per node: " + String(LOCAL_NH2) + "h/" + String(LOCAL_KV2) + "kv, "
-          + String(pools[topo[0]].capacity) + " cores")
+          + String(pools[0].get_capacity()) + " cores")
 
     var perf_arenas = HeapMoveArray[NumaArena[]](NUM_NODES)
     for i in range(NUM_NODES):
@@ -317,31 +335,31 @@ def main():
 
             for _ in range(2):
                 @parameter
-                def wu[node: Int]() -> PoolFence:
+                def wu[node: Int]() -> PoolFence[P]:
                     return prefill[LOCAL_NH2, LOCAL_KV2, HD2](
                         DynView[QS2](q_ptrs[node], sl),
                         LOCAL_KVC(k_bases[node]), LOCAL_KVC(v_bases[node]),
                         Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
                         scratch_ptrs[node], ctx_pos,
                         perf_q_scale, perf_k_scale, perf_v_scale,
-                        pools[topo[node]],
+                        pools[node],
                     )
-                parallel_for[NUM_NODES, wu]()
+                parallel_for[P, NUM_NODES, wu]()
 
             var best = Int(1 << 60)
             for trial in range(5):
                 var t0 = Int(perf_counter_ns())
                 @parameter
-                def run[node: Int]() -> PoolFence:
+                def run[node: Int]() -> PoolFence[P]:
                     return prefill[LOCAL_NH2, LOCAL_KV2, HD2](
                         DynView[QS2](q_ptrs[node], sl),
                         LOCAL_KVC(k_bases[node]), LOCAL_KVC(v_bases[node]),
                         Bound[CS2](cos_ptrs[node]), Bound[SS2](sin_ptrs[node]),
                         scratch_ptrs[node], ctx_pos,
                         perf_q_scale, perf_k_scale, perf_v_scale,
-                        pools[topo[node]],
+                        pools[node],
                     )
-                parallel_for[NUM_NODES, run]()
+                parallel_for[P, NUM_NODES, run]()
                 var wall = Int(perf_counter_ns()) - t0
                 keep(UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=scratch_ptrs[0])[0])
                 if wall < best: best = wall

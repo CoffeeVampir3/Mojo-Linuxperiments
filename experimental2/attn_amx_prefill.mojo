@@ -17,7 +17,7 @@ redundantly packs K/V (all cores active, no barriers).
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of, size_of
 from std.collections import InlineArray
-from threading import BurstPool
+from threading.threading_traits import BurstThreadPool
 
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named,
@@ -261,7 +261,7 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
 def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     QT: Encoding & Shaped,
     CosT: Encoding & Shaped, SinT: Encoding & Shaped,
-    prefill_chunk: Int = 512](
+    P: BurstThreadPool, prefill_chunk: Int = 512](
     q: DynView[QT],
     k_cache: KVCache[max_seq, head_dim, num_kv_heads],
     v_cache: KVCache[max_seq, head_dim, num_kv_heads],
@@ -272,8 +272,8 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     q_layer_scale: Float32,
     k_layer_scale: Float32,
     v_layer_scale: Float32,
-    mut pool: BurstPool[],
-) -> PoolFence:
+    mut pool: P,
+) -> PoolFence[P]:
     """Async AMX prefill — chunked Q processing, zero per-token scales.
 
     seq_len can exceed prefill_chunk: the kernel internally processes Q rows
@@ -302,7 +302,7 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     )
     var workers_off = output_bytes + size_of[AttnCtx]()
 
-    var workers_per_group = max(1, pool.capacity // num_kv_heads)
+    var workers_per_group = max(1, pool.get_capacity() // num_kv_heads)
     var total_q_rows = q.seq_len * gqa_factor
     var rows_per_worker = (total_q_rows + workers_per_group - 1) // workers_per_group
     var total_jobs = num_kv_heads * workers_per_group
@@ -325,7 +325,7 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
             ws[].score_scale = score_scale
             ws[].vagg_scale = vagg_scale
 
-            var pack = pool.args_base + job_idx
+            var pack = pool.get_args_base() + job_idx
             pack[].arg0 = Int(ctx_ptr)
             pack[].arg1 = ws_base
             pack[].arg2 = 0
@@ -335,8 +335,8 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
 
     pool.dispatch(
         attn_prefill[num_heads, num_kv_heads, head_dim, max_seq, prefill_chunk],
-        pool.args_base, total_jobs,
+        pool.get_args_base(), total_jobs,
     )
-    return PoolFence(UnsafePointer[BurstPool[], MutAnyOrigin](
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))

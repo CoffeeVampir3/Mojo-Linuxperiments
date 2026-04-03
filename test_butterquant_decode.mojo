@@ -17,8 +17,10 @@ from experimental.hadquant_impl import fwht_block
 from experimental2.kv_cache import KVCache
 from experimental.amx import init_intel_amx
 from simd_math import sqrt, exp_f32, quantize_i8
+from threading.threading_traits import BurstThreadPool
+from threading.burst_threading import BurstPool
 from threading.isolated_burst_pool import IsolatedBurstPool
-from numa import NumaInfo
+from numa import NumaInfo, NumaTopology
 from numa.arena import NumaArena
 from notstdcollections import HeapMoveArray
 from kernels.kernel_ops import init_rope_tables, parallel_for, timed_parallel_for, ParallelTiming, PoolFence
@@ -39,10 +41,25 @@ def main():
     var topo = numa.plan_topology(NUM_NODES)
 
     print("NUMA: " + String(NUM_NODES) + " nodes")
-    var pools = HeapMoveArray[IsolatedBurstPool[]](NUM_NODES)
-    for i in range(NUM_NODES):
-        pools.push(IsolatedBurstPool[].for_topology(numa, topo[i]))
-        print("  node " + String(topo[i]) + ": " + String(pools[i].capacity) + " workers")
+    if numa.has_isolation():
+        print("mode: isolated")
+        var pools = HeapMoveArray[IsolatedBurstPool[]](NUM_NODES)
+        for i in range(NUM_NODES):
+            pools.push(IsolatedBurstPool[].for_topology(numa, topo[i]))
+            print("  node " + String(topo[i]) + ": " + String(pools[i].get_capacity()) + " workers")
+        run_test(numa, topo, pools)
+    else:
+        print("mode: cold")
+        var pools = HeapMoveArray[BurstPool[]](NUM_NODES)
+        for i in range(NUM_NODES):
+            pools.push(BurstPool[].for_topology(numa, topo[i], stack_size=2 * 1024 * 1024))
+            print("  node " + String(topo[i]) + ": " + String(pools[i].get_capacity()) + " workers")
+        run_test(numa, topo, pools)
+
+
+def run_test[P: BurstThreadPool](numa: NumaInfo,
+    topo: NumaTopology,
+    mut pools: HeapMoveArray[P]):
 
 
     # =====================================================================
@@ -215,7 +232,7 @@ def main():
 
     print("\n=== Performance: 128h/8kv, hd=128, " + String(NUM_NODES) + " NUMA nodes ===")
     print("  Per node: " + String(LOCAL_NH2) + "h/" + String(LOCAL_KV2) + "kv, "
-          + String(pools[0].capacity) + " cores")
+          + String(pools[0].get_capacity()) + " cores")
 
     var perf_arenas = HeapMoveArray[NumaArena[]](NUM_NODES)
     for i in range(NUM_NODES):
@@ -267,9 +284,9 @@ def main():
     var perf_vagg_scale = perf_v_scale / (Float32(255.0) * Float32(127.0))
 
     # Max workers per group across all nodes (limited by smallest pool)
-    var max_wpg = pools[0].capacity // LOCAL_KV2
+    var max_wpg = pools[0].get_capacity() // LOCAL_KV2
     for i in range(1, NUM_NODES):
-        var nw = pools[i].capacity // LOCAL_KV2
+        var nw = pools[i].get_capacity() // LOCAL_KV2
         if nw < max_wpg:
             max_wpg = nw
 
@@ -296,7 +313,7 @@ def main():
 
         for _ in range(2):
             @parameter
-            def wu_s[node: Int]() -> PoolFence:
+            def wu_s[node: Int]() -> PoolFence[P]:
                 return decode[LOCAL_NH2, LOCAL_KV2, HD2](
                     DynView[QS2](q_ptrs[node], 1),
                     LOCAL_KVC(kv_bases[node]), LOCAL_KVC(kv_bases[node]),
@@ -306,7 +323,7 @@ def main():
                     wpg,
                     pools[node],
                 )
-            parallel_for[NUM_NODES, wu_s]()
+            parallel_for[P, NUM_NODES, wu_s]()
             decode_merge[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[0], wpg, perf_vagg_scale)
 
         var best = Int(1 << 60)
@@ -319,7 +336,7 @@ def main():
         var best_per_node = InlineArray[Int, NUM_NODES](fill=0)
         for trial in range(5):
             @parameter
-            def run_s[node: Int]() -> PoolFence:
+            def run_s[node: Int]() -> PoolFence[P]:
                 return decode[LOCAL_NH2, LOCAL_KV2, HD2](
                     DynView[QS2](q_ptrs[node], 1),
                     LOCAL_KVC(kv_bases[node]), LOCAL_KVC(kv_bases[node]),
@@ -329,7 +346,7 @@ def main():
                     wpg,
                     pools[node],
                 )
-            var timing = timed_parallel_for[NUM_NODES, run_s]()
+            var timing = timed_parallel_for[P, NUM_NODES, run_s]()
             var join_end = Int(perf_counter_ns())
             # True join overhead: time from last worker finishing to join returning
             var max_done_ts = 0
@@ -397,7 +414,7 @@ def main():
 
         for _ in range(2):
             @parameter
-            def wu[node: Int]() -> PoolFence:
+            def wu[node: Int]() -> PoolFence[P]:
                 return decode[LOCAL_NH2, LOCAL_KV2, HD2](
                     DynView[QS2](q_ptrs[node], 1),
                     LOCAL_KVC(kv_bases[node]), LOCAL_KVC(kv_bases[node]),
@@ -407,7 +424,7 @@ def main():
                     max_wpg,
                     pools[node],
                 )
-            parallel_for[NUM_NODES, wu]()
+            parallel_for[P, NUM_NODES, wu]()
             decode_merge[LOCAL_NH2, LOCAL_KV2, HD2](scratch_ptrs[0], max_wpg, perf_vagg_scale)
 
         var best = Int(1 << 60)
@@ -416,7 +433,7 @@ def main():
         var best_unaccounted = 0
         for trial in range(5):
             @parameter
-            def run[node: Int]() -> PoolFence:
+            def run[node: Int]() -> PoolFence[P]:
                 return decode[LOCAL_NH2, LOCAL_KV2, HD2](
                     DynView[QS2](q_ptrs[node], 1),
                     LOCAL_KVC(kv_bases[node]), LOCAL_KVC(kv_bases[node]),
@@ -426,7 +443,7 @@ def main():
                     max_wpg,
                     pools[node],
                 )
-            var timing = timed_parallel_for[NUM_NODES, run]()
+            var timing = timed_parallel_for[P, NUM_NODES, run]()
             var join_end = Int(perf_counter_ns())
             var max_done_ts = 0
             var global_km = 0

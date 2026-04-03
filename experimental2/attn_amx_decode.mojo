@@ -11,7 +11,7 @@ V-agg: W_u8 × V_i8_vnni → i32      (tdpbusd, unsigned W × signed V)
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of, size_of
 from std.collections import InlineArray
-from threading.isolated_burst_pool import IsolatedBurstPool
+from threading.threading_traits import BurstThreadPool
 
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named,
@@ -376,7 +376,8 @@ def collect_profiles[num_heads: Int, num_kv_heads: Int, head_dim: Int](
 
 def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     QT: Encoding & Shaped,
-    CosT: Encoding & Shaped, SinT: Encoding & Shaped](
+    CosT: Encoding & Shaped, SinT: Encoding & Shaped,
+    P: BurstThreadPool](
     q: DynView[QT],
     k_cache: KVCache[max_seq, head_dim, num_kv_heads],
     v_cache: KVCache[max_seq, head_dim, num_kv_heads],
@@ -388,8 +389,8 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     k_layer_scale: Float32,
     v_layer_scale: Float32,
     workers_per_group: Int,
-    mut pool: IsolatedBurstPool[],
-) -> PoolFence:
+    mut pool: P,
+) -> PoolFence[P]:
     """Async AMX decode — multi-worker context split within each KV group."""
     comptime gqa_factor = num_heads // num_kv_heads
     comptime q_cols = QT.COLS
@@ -423,7 +424,7 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
 
     var context = pos + 1
     var max_blocks = (context + BLOCK_N - 1) // BLOCK_N
-    var max_wpg = pool.capacity // num_kv_heads
+    var max_wpg = pool.get_capacity() // num_kv_heads
     var wpg = min(min(workers_per_group, max_blocks), max_wpg)
     var blocks_per_worker = (max_blocks + wpg - 1) // wpg
     var total_jobs = num_kv_heads * wpg
@@ -459,7 +460,7 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
             ws[].profile = UnsafePointer[KernelProfile, MutAnyOrigin](unsafe_from_address=data + off)
             ws[].profile[] = KernelProfile()
 
-            var pack = pool.args_base + job_idx
+            var pack = pool.get_args_base() + job_idx
             pack[].arg0 = Int(ctx_ptr)
             pack[].arg1 = ws_base
             pack[].arg2 = 0
@@ -469,8 +470,8 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
 
     pool.dispatch(
         attn_decode[num_heads, num_kv_heads, head_dim, max_seq],
-        pool.args_base, total_jobs,
+        pool.get_args_base(), total_jobs,
     )
-    return PoolFence(UnsafePointer[IsolatedBurstPool[], MutAnyOrigin](
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))
