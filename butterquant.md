@@ -62,17 +62,7 @@ repeat until confidence interval width < epsilon:
 C(n) = total / samples
 ```
 
-**Reference values** (computed to 3 significant figures):
-
-| $n$ | $C(n)$ |
-|-----|--------|
-| 32  | 3.18 |
-| 64  | 3.53 |
-| 128 | 3.85 |
-| 256 | 4.15 |
-| 512 | 4.42 |
-
-$C(n)$ grows as $O(\sqrt{\log n})$. For practical block sizes (64–512), it ranges from approximately 3.5 to 4.5.
+$C(n)$ grows as $O(\sqrt{\log n})$ and is bounded above by $\sqrt{2 \ln n}$ (the independent-normal limit). Since $H_n$ is orthonormal, $C(n) = \sqrt{n} \cdot \mathbb{E}[\max_i |u_i|]$ for $u \sim \text{Uniform}(S^{n-1})$ — it depends only on the sphere geometry, not on the specific orthogonal matrix. Computed via Monte Carlo (10000 samples, deterministic seed) at compile time by `concentration_constant[]` in the model file.
 
 **Usage.** For a vector $x$ with $\|x\| = r$ partitioned into blocks of size $n$, the expected absmax of $\mathcal{H} x$ within each block is:
 

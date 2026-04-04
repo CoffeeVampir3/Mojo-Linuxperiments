@@ -3,6 +3,7 @@ pixi.lock
 test_models/
 validation/
 checkpoints/
+quantized_models/
 
 # Compiled executables
 test_linux_threading
