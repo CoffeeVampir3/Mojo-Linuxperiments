@@ -43,10 +43,11 @@ from modeling.model_spec import (
 )
 from kernels.vnni import VnniPacked
 from kernels.kernel_ops import (
-    gemm, embed_lookup, elem_add,
+    embed_lookup, elem_add,
     init_rope_tables,
     PoolFence, parallel_for,
 )
+from experimental2.kernels.float_kernels.float_gemv import float_gemv
 from kernels.reductions import ring_allreduce, ring_broadcast
 from modeling.loader import load_safetensors
 from quant import quantize as butterquant_quantize
@@ -493,6 +494,70 @@ def init_column_sums[tp: Int](arena_base: Int):
 
 
 # =============================================================================
+# GEMM epilogue table precomputation
+# =============================================================================
+
+
+def precompute_gemm_bias[CS: Encoding & Shaped & Placed & Named](
+    arena_base: Int, layer_base: Int,
+):
+    """Transform colsum[n] → 128 * colsum[n] in place."""
+    var p = UnsafePointer[Float32, MutAnyOrigin](
+        unsafe_from_address=arena_base + layer_base + CS.OFFSET)
+    for n in range(CS.ROWS):
+        p[n] = Float32(128) * p[n]
+
+
+def precompute_gemm_scale[RS: Encoding & Shaped & Placed & Named](
+    arena_base: Int, layer_base: Int, act_dequant: Float32,
+):
+    """Transform row_scale[n] → row_scale[n] * act_dequant in place."""
+    var p = UnsafePointer[Float32, MutAnyOrigin](
+        unsafe_from_address=arena_base + layer_base + RS.OFFSET)
+    for n in range(RS.ROWS):
+        p[n] = p[n] * act_dequant
+
+
+def precompute_gemm_tables[tp: Int](
+    arena_base: Int,
+    layer_scales: InlineArray[LayerScales, C.NUM_LAYERS],
+):
+    """Transform colsum → bias and row_scale → combined_scale in place.
+
+    After this, the GEMM epilogue is: (raw_i32 - bias[n]) * scale[n].
+    """
+    comptime L = ButterQuantTPLayer[tp]
+    comptime M = ButterQuantTPModel[tp]
+    var s_act_dequant = Float32(concentration_constant[FWHT_BLOCK]()) / Float32(127)
+
+    for layer in range(C.NUM_LAYERS):
+        var lb = M.LAYERS_OFF + layer * M.LAYER_STRIDE
+        var s_v_dequant = layer_scales[layer].v_layer_scale / Float32(127)
+        var s_post_dequant = layer_scales[layer].post_layer_scale / Float32(127)
+
+        # Bias: colsum → 128 * colsum
+        precompute_gemm_bias[L.Q_COLSUM](arena_base, lb)
+        precompute_gemm_bias[L.K_COLSUM](arena_base, lb)
+        precompute_gemm_bias[L.V_COLSUM](arena_base, lb)
+        precompute_gemm_bias[L.O_COLSUM](arena_base, lb)
+        precompute_gemm_bias[L.GATE_COLSUM](arena_base, lb)
+        precompute_gemm_bias[L.UP_COLSUM](arena_base, lb)
+        precompute_gemm_bias[L.DOWN_COLSUM](arena_base, lb)
+
+        # Scale: row_scale → row_scale * (activation_scale / 127)
+        # Q/K/V/gate/up: activated with S_act
+        precompute_gemm_scale[L.Q_ROW_SCALE](arena_base, lb, s_act_dequant)
+        precompute_gemm_scale[L.K_ROW_SCALE](arena_base, lb, s_act_dequant)
+        precompute_gemm_scale[L.V_ROW_SCALE](arena_base, lb, s_act_dequant)
+        precompute_gemm_scale[L.GATE_ROW_SCALE](arena_base, lb, s_act_dequant)
+        precompute_gemm_scale[L.UP_ROW_SCALE](arena_base, lb, s_act_dequant)
+        # O: activated with S_V (attention output quantized with S_V)
+        precompute_gemm_scale[L.O_ROW_SCALE](arena_base, lb, s_v_dequant)
+        # Down: activated with S_post (silu output quantized with S_post)
+        precompute_gemm_scale[L.DOWN_ROW_SCALE](arena_base, lb, s_post_dequant)
+
+
+# =============================================================================
 # Per-layer scale derivation
 # =============================================================================
 
@@ -657,6 +722,12 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
             )
             pack_weights[Self.M](base, scratch_ptr)
 
+        # Precompute GEMM epilogue tables in place:
+        #   colsum[n] → 128 * colsum[n]           (VNNI bias)
+        #   row_scale[n] → row_scale[n] * s/127   (combined dequant scale)
+        for rank in range(Self.tp):
+            precompute_gemm_tables[Self.tp](Int(arenas[rank].base), layer_scales)
+
         # Create BurstPools per NUMA node.
         var pools = HeapMoveArray[BurstPool[]](Self.tp)
         for rank in range(Self.tp):
@@ -800,7 +871,7 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
         var last_hidden = DynView[M.X_MAIN](host.x_main(seq_len).ptr + last_row_off, 1)
         var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
         var logit_view = host.scratch_view[M.LOGITS](logit_lease, 1)
-        gemm(last_hidden, host.weight[M.EMBED](), logit_view, self.pools[0]).join()
+        float_gemv(last_hidden, host.weight[M.EMBED](), logit_view, self.pools[0]).join()
 
         return LogitsView[C.VOCAB_SIZE](
             host.scratch_ptr[Scalar[DType.bfloat16]](logit_lease), logit_lease^,
