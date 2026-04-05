@@ -41,7 +41,7 @@ from modeling.model_spec import (
     Kernel3DTiling,
     LogitsView,
 )
-from kernels.vnni import VnniPacked
+from kernels.vnni import VnniPacked, pack_vnni
 from kernels.kernel_ops import (
     embed_lookup, elem_add,
     init_rope_tables,
@@ -214,6 +214,15 @@ struct ButterQuantTPLayer[tp: Int]:
     comptime DOWN_COLSUM = PlacedSlot[F32, Replicated, C.HIDDEN, 1, Self.tp, next_offset[Self.UP_COLSUM](), "mlp.down_proj.weight_colsum"]
 
     comptime STRIDE = next_offset[Self.DOWN_COLSUM]()
+
+    # Combined dimensions for fused GEMV dispatch.
+    # The PlacedSlot chain places Q, K, V weights (and their row_scale and
+    # colsum arrays) contiguously in memory with no gaps. This lets us
+    # VNNI-pack Q+K+V as a single [QKV_N, K] matrix and run one GEMV that
+    # produces all three outputs contiguously. The caller slices Q, K, V
+    # by known row counts. Same principle applies to gate+up.
+    comptime QKV_N = Self.Q_PROJ.ROWS + Self.K_PROJ.ROWS + Self.V_PROJ.ROWS
+    comptime GATE_UP_N = Self.GATE_PROJ.ROWS + Self.UP_PROJ.ROWS
 
     # KV cache: flat u8/i8, zero per-token metadata.
     # One KVCache instance per layer holds both K (VNNI) and V (row-major i8).
@@ -462,21 +471,73 @@ struct Ranks[tp: Int]:
 # =============================================================================
 
 
-def pack_weights[M: WeightIterable](
-    arena_base: Int,
+def pack_combined[S1: Encoding & Shaped & Placed & Named,
+                   S2: Encoding & Shaped & Placed & Named](
+    arena_base: Int, layer_base: Int,
     scratch: UnsafePointer[UInt8, MutAnyOrigin],
 ):
-    @parameter
-    def pack_if_needed[T: Encoding & Shaped & Placed & Named](prefix: String, base: Int):
-        comptime if conforms_to(T, Quantizable):
-            comptime weight_bytes = T.ROWS * T.COLS * T.ELEMENT_BYTES
-            var arena_slot = UnsafePointer[UInt8, MutAnyOrigin](
-                unsafe_from_address=arena_base + base + T.OFFSET
-            )
-            memcpy(dest=scratch, src=arena_slot, count=weight_bytes)
-            T.PACK_FN(scratch, arena_slot, T.ROWS, T.COLS)
+    """VNNI-pack two contiguous weight matrices as one combined [N1+N2, K] block."""
+    comptime combined_n = S1.ROWS + S2.ROWS
+    comptime k = S1.COLS
+    comptime assert S2.COLS == k, "pack_combined: K mismatch"
+    comptime combined_bytes = combined_n * k
+    var src = UnsafePointer[UInt8, MutAnyOrigin](
+        unsafe_from_address=arena_base + layer_base + S1.OFFSET)
+    memcpy(dest=scratch, src=src, count=combined_bytes)
+    pack_vnni(scratch, src, combined_n, k)
 
-    M.for_each_weight[pack_if_needed]()
+
+def pack_combined3[S1: Encoding & Shaped & Placed & Named,
+                    S2: Encoding & Shaped & Placed & Named,
+                    S3: Encoding & Shaped & Placed & Named](
+    arena_base: Int, layer_base: Int,
+    scratch: UnsafePointer[UInt8, MutAnyOrigin],
+):
+    """VNNI-pack three contiguous weight matrices as one combined [N1+N2+N3, K] block."""
+    comptime combined_n = S1.ROWS + S2.ROWS + S3.ROWS
+    comptime k = S1.COLS
+    comptime assert S2.COLS == k, "pack_combined3: K mismatch (S2)"
+    comptime assert S3.COLS == k, "pack_combined3: K mismatch (S3)"
+    comptime combined_bytes = combined_n * k
+    var src = UnsafePointer[UInt8, MutAnyOrigin](
+        unsafe_from_address=arena_base + layer_base + S1.OFFSET)
+    memcpy(dest=scratch, src=src, count=combined_bytes)
+    pack_vnni(scratch, src, combined_n, k)
+
+
+def pack_single[S: Encoding & Shaped & Placed & Named](
+    arena_base: Int, layer_base: Int,
+    scratch: UnsafePointer[UInt8, MutAnyOrigin],
+):
+    """VNNI-pack a single weight matrix."""
+    comptime weight_bytes = S.ROWS * S.COLS
+    var src = UnsafePointer[UInt8, MutAnyOrigin](
+        unsafe_from_address=arena_base + layer_base + S.OFFSET)
+    memcpy(dest=scratch, src=src, count=weight_bytes)
+    pack_vnni(scratch, src, S.ROWS, S.COLS)
+
+
+def pack_weights[tp: Int](arena_base: Int, scratch: UnsafePointer[UInt8, MutAnyOrigin]):
+    """VNNI-pack all projection weights per layer.
+
+    Because the PlacedSlot chain places weights contiguously (Q then K then V,
+    gate then up), we can pack multiple matrices as a single combined block.
+    This produces one VNNI tiling across the full combined N dimension, so a
+    single linear scan at runtime covers all sub-matrices. No extra memory —
+    the packed output occupies the same bytes as the original row-major data.
+
+    Q+K+V packed as one [QKV_N, K] block.
+    Gate+Up packed as one [GateUp_N, K] block.
+    O and Down packed individually.
+    """
+    comptime L = ButterQuantTPLayer[tp]
+    comptime M = ButterQuantTPModel[tp]
+    for layer in range(C.NUM_LAYERS):
+        var lb = M.LAYERS_OFF + layer * M.LAYER_STRIDE
+        pack_combined3[L.Q_PROJ, L.K_PROJ, L.V_PROJ](arena_base, lb, scratch)
+        pack_single[L.O_PROJ](arena_base, lb, scratch)
+        pack_combined[L.GATE_PROJ, L.UP_PROJ](arena_base, lb, scratch)
+        pack_single[L.DOWN_PROJ](arena_base, lb, scratch)
 
 
 def init_column_sums[tp: Int](arena_base: Int):
@@ -720,13 +781,7 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
             var scratch_ptr = UnsafePointer[UInt8, MutAnyOrigin](
                 unsafe_from_address=base + Self.M.DISTRIBUTED_BYTES + Self.M.SCRATCH_OFF
             )
-            pack_weights[Self.M](base, scratch_ptr)
-
-        # Precompute GEMM epilogue tables in place:
-        #   colsum[n] → 128 * colsum[n]           (VNNI bias)
-        #   row_scale[n] → row_scale[n] * s/127   (combined dequant scale)
-        for rank in range(Self.tp):
-            precompute_gemm_tables[Self.tp](Int(arenas[rank].base), layer_scales)
+            pack_weights[Self.tp](base, scratch_ptr)
 
         # Create BurstPools per NUMA node.
         var pools = HeapMoveArray[BurstPool[]](Self.tp)
@@ -769,6 +824,10 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
             var ls = self.layer_scales[layer_idx]
             print("layer " + String(layer_idx))
 
+            comptime s_act_dequant = s_act / Float32(127)
+            var s_v_dequant = ls.v_layer_scale / Float32(127)
+            var s_post_dequant = ls.post_layer_scale / Float32(127)
+
             # =============================================================
             # Attention block
             # =============================================================
@@ -776,91 +835,82 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
             # Step 1-2: RMSNorm + FWHT + quantize → act_i8 (S_act)
             var act_i8 = self.scratch.borrow[Scalar[DType.int8], C.MAX_SEQ_LEN * C.HIDDEN]()
             print("  ranks.parallel(1w): rmsnorm_fwht_quantize → act_i8")
-            # ranks.parallel(1w): rmsnorm_fwht_quantize(x_main, s_act) → act_i8
 
-            # Steps 3-5: Batched Q+K+V int8_gemm (single dispatch, full pool)
-            var q = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * M.Q_VIEW.COLS]()
-            var k = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * M.KV_VIEW.COLS]()
-            var v = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * M.KV_VIEW.COLS]()
-            print("  ranks.parallel(pool): batched int8_gemm Q+K+V")
-            # ranks.parallel(pool): batched_int8_gemm(act_i8, W_Q/W_K/W_V, scales, colsums, s_act) → q, k, v bf16
+            # Steps 3-5: Combined QKV int8_gemv (one [QKV_N, HIDDEN] GEMV)
+            # Output is contiguous bf16 [seq_len, QKV_N]; caller slices Q|K|V.
+            comptime QKV_N = L.QKV_N
+            var qkv = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * QKV_N]()
+            print("  ranks.parallel(pool): int8_gemv QKV [" + String(QKV_N) + "x" + String(C.HIDDEN) + "]")
+            # int8_gemv[QKV_N, HIDDEN](act_i8, W_QKV @ Q_PROJ.OFFSET,
+            #     colsum @ Q_COLSUM.OFFSET, scale @ Q_ROW_SCALE.OFFSET,
+            #     qkv, seq_len, s_act_dequant, pool)
 
             act_i8^.release()
 
-            # Step 6-7: KV cache write (RoPE+FWHT+quantize for K, FWHT+quantize for V)
-            print("  ranks.parallel(1w): kv_cache_write_k (RoPE+FWHT+quant) + kv_cache_write_v (FWHT+quant)")
-            # ranks.parallel(1w): kv_cache_write_k(k_bf16, kv_cache, rope, S_K, pos)
-            #                     kv_cache_write_v(v_bf16, kv_cache, S_V, pos)
+            # Step 6-7: KV cache write from K/V slices of qkv output
+            # Q = qkv[:, 0:Q_N], K = qkv[:, Q_N:Q_N+KV_N], V = qkv[:, Q_N+KV_N:QKV_N]
+            print("  ranks.parallel(1w): kv_cache_write_k + kv_cache_write_v")
 
-            v^.release()
-            k^.release()
-
-            # Steps 8-12: Attention (Q prep + score + softmax + V-agg + merge)
-            # Attention kernel uses its own scratch (sized via experimental2.attn_*::scratch_bytes)
-            # For the stub, borrow a placeholder for the f32 output
+            # Steps 8-12: Attention (Q prep from Q slice, K/V from cache)
             comptime ATTN_OUT_ELEMS = C.MAX_SEQ_LEN * M.LOCAL_HEADS * C.HEAD_DIM
             var attn_scratch = self.scratch.borrow[Float32, ATTN_OUT_ELEMS]()
-            print("  ranks.parallel(pool): attention (decode or prefill)")
-            # ranks.parallel(pool): attention(q_bf16, kv_cache, rope, S_Q, S_K, S_V, scratch, pos)
+            print("  ranks.parallel(pool): attention")
 
-            q^.release()
+            qkv^.release()
 
-            # Step 13: Quantize attention output → i8 (S_V = S_attn_out)
+            # Step 13: Quantize attention output → i8 (S_V)
             comptime ATTN_I8_ELEMS = C.MAX_SEQ_LEN * M.LOCAL_HEADS * C.HEAD_DIM
             var attn_i8 = self.scratch.borrow[Scalar[DType.int8], ATTN_I8_ELEMS]()
-            print("  ranks.parallel(1w): quantize_fixed attn_out → attn_i8 (S_V)")
-            # ranks.parallel(1w): quantize_fixed(attn_scratch_f32, S_V) → attn_i8
+            print("  ranks.parallel(1w): quantize_fixed attn_out → attn_i8")
 
             attn_scratch^.release()
 
-            # Step 14: O projection int8_gemm (ColShard → needs allreduce)
-            print("  ranks.parallel(pool): int8_gemm O_PROJ → x_residual")
-            # ranks.parallel(pool): int8_gemm(attn_i8, W_O, scales, colsums, S_V) → x_residual
+            # Step 14: O projection (ColShard → allreduce after)
+            print("  ranks.parallel(pool): int8_gemv O_PROJ → x_residual")
+            # int8_gemv[O_N, LOCAL_HIDDEN](attn_i8, W_O, colsum_O, scale_O,
+            #     x_residual, seq_len, s_v_dequant, pool)
 
             attn_i8^.release()
 
             # Step 15: Allreduce + residual add
-            print("  ring_allreduce x_residual")
+            print("  ring_allreduce + elem_add")
             ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
-            print("  ranks.parallel(1w): elem_add x_main += x_residual")
-            # ranks.parallel(1w): elem_add(x_main, x_residual) → x_main
 
             # =============================================================
             # MLP block
             # =============================================================
 
-            # Steps 16-17: RMSNorm + FWHT + quantize → act_i8 (S_act)
+            # Steps 16-17: RMSNorm + FWHT + quantize → mlp_i8 (S_act)
             var mlp_i8 = self.scratch.borrow[Scalar[DType.int8], C.MAX_SEQ_LEN * C.HIDDEN]()
             print("  ranks.parallel(1w): rmsnorm_fwht_quantize → mlp_i8")
-            # ranks.parallel(1w): rmsnorm_fwht_quantize(x_main, s_act) → mlp_i8
 
-            # Steps 18-19: Batched gate+up int8_gemm (single dispatch, full pool)
-            var gate = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * M.MLP_VIEW.COLS]()
-            var up = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * M.MLP_VIEW.COLS]()
-            print("  ranks.parallel(pool): batched int8_gemm gate+up")
-            # ranks.parallel(pool): batched_int8_gemm(mlp_i8, W_gate/W_up, scales, colsums, s_act) → gate, up
+            # Steps 18-19: Combined gate+up int8_gemv
+            comptime GATE_UP_N = L.GATE_UP_N
+            var gate_up = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * GATE_UP_N]()
+            print("  ranks.parallel(pool): int8_gemv gate+up [" + String(GATE_UP_N) + "x" + String(C.HIDDEN) + "]")
+            # int8_gemv[GATE_UP_N, HIDDEN](mlp_i8, W_gate_up @ GATE_PROJ.OFFSET,
+            #     colsum @ GATE_COLSUM.OFFSET, scale @ GATE_ROW_SCALE.OFFSET,
+            #     gate_up, seq_len, s_act_dequant, pool)
 
             mlp_i8^.release()
 
             # Steps 20-21: SiLU + FWHT + quantize → post_i8 (S_post)
+            # gate = gate_up[:, 0:GATE_PROJ.ROWS], up = gate_up[:, GATE_PROJ.ROWS:]
             var post_i8 = self.scratch.borrow[Scalar[DType.int8], C.MAX_SEQ_LEN * C.INTERMEDIATE]()
-            print("  ranks.parallel(1w): silu_fwht_quantize(gate, up) → post_i8 (S_post)")
-            # ranks.parallel(1w): silu_fwht_quantize(gate, up, S_post) → post_i8
+            print("  ranks.parallel(1w): silu_fwht_quantize → post_i8")
 
-            gate^.release()
-            up^.release()
+            gate_up^.release()
 
-            # Step 22: Down projection int8_gemm (ColShard → needs allreduce)
-            print("  ranks.parallel(pool): int8_gemm DOWN_PROJ → x_residual")
-            # ranks.parallel(pool): int8_gemm(post_i8, W_down, scales, colsums, S_post) → x_residual
+            # Step 22: Down projection (ColShard → allreduce after)
+            print("  ranks.parallel(pool): int8_gemv DOWN_PROJ → x_residual")
+            # int8_gemv[DOWN_N, INTERMEDIATE](post_i8, W_down, colsum_down, scale_down,
+            #     x_residual, seq_len, s_post_dequant, pool)
 
             post_i8^.release()
 
             # Step 23: Allreduce + residual add
-            print("  ring_allreduce x_residual")
+            print("  ring_allreduce + elem_add")
             ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
-            print("  ranks.parallel(1w): elem_add x_main += x_residual")
-            # ranks.parallel(1w): elem_add(x_main, x_residual) → x_main
 
             _ = layer_idx
 

@@ -1,269 +1,211 @@
-"""Int8 GEMV — VNNI-packed weights, precomputed bias/scale epilogue.
-
-dst[m, n] = (dot_i32(act_u8[m], weight_i8[n]) - bias[n]) * scale[n]
-
-Where bias and scale are precomputed at load time from colsum + row_scale.
-Activation is i8, XOR'd to u8 in the VNNI dot product.
-Weight is i8, VNNI-packed at load time.
-Output is bf16.
-
-Dispatch modes:
-  int8_gemv:         single matrix, workers split N columns
-  int8_gemv_batched: multiple matrices in one dispatch
-"""
-
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of, size_of, CompilationTarget
+from std.sys import llvm_intrinsic
 from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
 
 from kernels.kernel_ops import PoolFence
 from kernels.vnni import VNNI_N_STEP, VNNI_K_STEP, VNNI_TILE_N, VNNI_BLK, compute_n_block
-from experimental.hadquant_impl import int8_gemm_dot
 
 
 # ============================================================================
-# Row kernel — one activation row × VNNI weight → bf16 for [start_n, end_n)
+# VNNI dot product primitives
 # ============================================================================
 
 
 @always_inline
-def int8_gemv_row(
+def vpdpbusd[width: Int](
+    acc: SIMD[DType.int32, width],
+    a: SIMD[DType.uint8, width * 4],
+    b: SIMD[DType.int8, width * 4],
+) -> SIMD[DType.int32, width]:
+    """AVX-512 VNNI: u8 x i8 -> i32 dot product accumulate.
+    Per dword lane i: acc[i] += sum_{j=0..3} u8(a[i].byte[j]) * i8(b[i].byte[j])
+    """
+    return llvm_intrinsic[
+        "llvm.x86.avx512.vpdpbusd." + String(width * 32),
+        SIMD[DType.int32, width],
+    ](acc, a, b)
+
+
+@always_inline
+def dot_vnni[width: Int](
+    acc: SIMD[DType.int32, width],
     act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     wpacked: UnsafePointer[UInt8, MutAnyOrigin],
-    bias: UnsafePointer[Float32, MutAnyOrigin],
-    scale: UnsafePointer[Float32, MutAnyOrigin],
-    dst: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    n_total: Int,
-    k_total: Int,
-    start_n: Int,
-    end_n: Int,
+    k_pos: Int,
+) -> SIMD[DType.int32, width]:
+    """VNNI dot: width channels x 4 K values via vpdpbusd."""
+    var w = wpacked.bitcast[Scalar[DType.int8]]().load[width = width * 4]()
+    var dword = (act_row + k_pos).bitcast[Scalar[DType.uint32]]()[0] ^ UInt32(0x80808080)
+    var dwords = SIMD[DType.uint32, width](dword)
+    var tmp = InlineArray[SIMD[DType.uint32, width], 1](fill=dwords)
+    var a = UnsafePointer(to=tmp).bitcast[UInt8]().load[width = width * 4]()
+    return vpdpbusd[width](acc, a, w)
+
+
+@always_inline
+def dot_simd[width: Int](
+    acc: SIMD[DType.int32, width],
+    act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    wpacked: UnsafePointer[UInt8, MutAnyOrigin],
+    k_pos: Int,
+) -> SIMD[DType.int32, width]:
+    """Fallback dot: width channels x 4 K values via widen-to-i32 multiply."""
+    var wdw = wpacked.bitcast[Scalar[DType.int32]]().load[width=width]()
+    var result = acc
+    result += SIMD[DType.int32, width](Int32(act_row[k_pos]) + 128) * ((wdw << 24) >> 24)
+    result += SIMD[DType.int32, width](Int32(act_row[k_pos + 1]) + 128) * ((wdw << 16) >> 24)
+    result += SIMD[DType.int32, width](Int32(act_row[k_pos + 2]) + 128) * ((wdw << 8) >> 24)
+    result += SIMD[DType.int32, width](Int32(act_row[k_pos + 3]) + 128) * (wdw >> 24)
+    return result
+
+
+@always_inline
+def dot[width: Int](
+    acc: SIMD[DType.int32, width],
+    act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    wpacked: UnsafePointer[UInt8, MutAnyOrigin],
+    k_pos: Int,
+) -> SIMD[DType.int32, width]:
+    comptime if CompilationTarget.has_vnni():
+        return dot_vnni[width](acc, act_row, wpacked, k_pos)
+    else:
+        return dot_simd[width](acc, act_row, wpacked, k_pos)
+
+
+# ============================================================================
+# GEMV row — one activation row x VNNI-packed weight -> N output elements
+# ============================================================================
+
+
+def gemv_row[N: Int, K: Int, OutDType: DType](
+    act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    wpacked: UnsafePointer[UInt8, MutAnyOrigin],
+    act_sc: Float32,
+    wsc: UnsafePointer[Float32, MutAnyOrigin],
+    wcs: UnsafePointer[Float32, MutAnyOrigin],
+    dst: UnsafePointer[Scalar[OutDType], MutAnyOrigin],
 ):
+    """One activation row x VNNI-packed weight -> N output elements.
+
+    Epilogue: (raw_i32 - 128*colsum[n]) * act_sc * weight_scale[n] -> OutDType.
+    """
     comptime width = simd_width_of[DType.int32]()
     comptime passes_per_subtile = VNNI_TILE_N // width
     comptime bytes_per_pass = width * VNNI_BLK
     comptime acc_count = VNNI_N_STEP // width
 
-    var n_block = compute_n_block(n_total, k_total)
+    var n_block = compute_n_block(N, K)
     var packed_off = 0
 
-    for nb in range(0, n_total, n_block):
-        var nb_size = min(n_block, n_total - nb)
+    for nb in range(0, N, n_block):
+        var nb_size = min(n_block, N - nb)
 
         for ns in range(0, nb_size, VNNI_N_STEP):
-            var n_base = nb + ns
-
-            # Skip tile groups outside our assigned range
-            if n_base + VNNI_N_STEP <= start_n or n_base >= end_n:
-                # Advance packed_off past this N_STEP's K iterations
-                packed_off += (k_total // VNNI_BLK) * VNNI_TILE_N * VNNI_BLK * 2
-                continue
-
             var acc_buf = InlineArray[SIMD[DType.int32, width], acc_count](
                 fill=SIMD[DType.int32, width](0)
             )
             var acc = UnsafePointer(to=acc_buf).bitcast[SIMD[DType.int32, width]]()
-            var local_off = packed_off
 
-            for ks in range(0, k_total, VNNI_K_STEP):
-                # First subtile (lower VNNI_TILE_N channels)
+            for ks in range(0, K, VNNI_K_STEP):
                 for dc in range(VNNI_K_STEP // VNNI_BLK):
                     var k_pos = ks + dc * VNNI_BLK
                     for p in range(passes_per_subtile):
-                        acc[p] = int8_gemm_dot[width](
+                        acc[p] = dot[width](
                             acc[p], act_row,
-                            wpacked + local_off + p * bytes_per_pass,
+                            wpacked + packed_off + p * bytes_per_pass,
                             k_pos,
                         )
-                    local_off += VNNI_TILE_N * VNNI_BLK
+                    packed_off += VNNI_TILE_N * VNNI_BLK
 
-                # Second subtile (upper VNNI_TILE_N channels)
                 for dc in range(VNNI_K_STEP // VNNI_BLK):
                     var k_pos = ks + dc * VNNI_BLK
                     for p in range(passes_per_subtile):
-                        acc[passes_per_subtile + p] = int8_gemm_dot[width](
+                        acc[passes_per_subtile + p] = dot[width](
                             acc[passes_per_subtile + p], act_row,
-                            wpacked + local_off + p * bytes_per_pass,
+                            wpacked + packed_off + p * bytes_per_pass,
                             k_pos,
                         )
-                    local_off += VNNI_TILE_N * VNNI_BLK
+                    packed_off += VNNI_TILE_N * VNNI_BLK
 
-            packed_off = local_off
-
-            # Epilogue: (raw_i32 - bias[n]) * scale[n] → bf16
             for a in range(acc_count):
-                var nc = n_base + a * width
-                if nc >= start_n and nc + width <= end_n:
-                    var raw = acc[a].cast[DType.float32]()
-                    var result = (raw - (bias + nc).load[width=width]()) * (scale + nc).load[width=width]()
-                    (dst + nc).store(result.cast[DType.bfloat16]())
+                var n_base = nb + ns + a * width
+                var corrected = acc[a].cast[DType.float32]() - Float32(128) * (wcs + n_base).load[width=width]()
+                var result = corrected * act_sc * (wsc + n_base).load[width=width]()
+                (dst + n_base).store(result.cast[OutDType]())
 
 
 # ============================================================================
-# Shared context — lives on caller stack, workers read via pointer
+# Worker config — caller-owned, passed by pointer
 # ============================================================================
 
 
 @fieldwise_init
-struct GemvCtx:
-    var act_ptr: Int
-    var dst_ptr: Int
-    var n_total: Int
-    var k_total: Int
-    var seq_len: Int
-
-
-@fieldwise_init
-struct BatchedGemvEntry(Copyable, ImplicitlyCopyable):
-    var weight_ptr: Int
-    var bias_ptr: Int
-    var scale_ptr: Int
-    var dst_ptr: Int
-    var n_total: Int
-
-    def __init__(out self):
-        self.weight_ptr = 0
-        self.bias_ptr = 0
-        self.scale_ptr = 0
-        self.dst_ptr = 0
-        self.n_total = 0
-
-
-@fieldwise_init
-struct BatchedGemvCtx:
-    var act_ptr: Int
-    var k_total: Int
-    var seq_len: Int
-    var entries: InlineArray[BatchedGemvEntry, 3]
-    var count: Int
-
-    def __init__(out self):
-        self.act_ptr = 0
-        self.k_total = 0
-        self.seq_len = 0
-        self.entries = InlineArray[BatchedGemvEntry, 3](fill=BatchedGemvEntry())
-        self.count = 0
+struct WorkerConfig(Copyable, ImplicitlyCopyable):
+    var act_dequant: Float32
+    var row_count: Int
 
 
 # ============================================================================
-# Worker kernels (BurstPool ABI: 6 Int args)
+# Worker kernel (BurstPool ABI: 6 Int args)
 # ============================================================================
 
 
-def single_gemv_worker(
-    ctx_addr: Int, weight_ptr: Int, bias_ptr: Int,
-    scale_ptr: Int, start_n: Int, end_n: Int,
+def int8_gemv_worker[N: Int, K: Int](
+    act_ptr: Int, wpacked_ptr: Int, colsum_ptr: Int,
+    weight_scale_ptr: Int, dst_ptr: Int, config_ptr: Int,
 ):
-    var ctx = UnsafePointer[GemvCtx, MutAnyOrigin](unsafe_from_address=ctx_addr)
-    var act = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=ctx[].act_ptr)
-    var wpacked = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=weight_ptr)
-    var bias = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=bias_ptr)
-    var scale = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=scale_ptr)
-    var dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=ctx[].dst_ptr)
-    var n_total = ctx[].n_total
-    var k_total = ctx[].k_total
+    var cfg = UnsafePointer[WorkerConfig, MutAnyOrigin](unsafe_from_address=config_ptr)
+    var act = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=act_ptr)
+    var wpacked = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=wpacked_ptr)
+    var colsum = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=colsum_ptr)
+    var wscale = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=weight_scale_ptr)
+    var dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=dst_ptr)
 
-    for m in range(ctx[].seq_len):
-        int8_gemv_row(
-            act + m * k_total, wpacked, bias, scale,
-            dst + m * n_total,
-            n_total, k_total, start_n, end_n,
-        )
-
-
-def batched_gemv_worker(
-    ctx_addr: Int, start_n: Int, end_n: Int,
-    which: Int, unused0: Int, unused1: Int,
-):
-    var ctx = UnsafePointer[BatchedGemvCtx, MutAnyOrigin](unsafe_from_address=ctx_addr)
-    var entry = ctx[].entries[which]
-    var act = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=ctx[].act_ptr)
-    var wpacked = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=entry.weight_ptr)
-    var bias = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=entry.bias_ptr)
-    var scale = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=entry.scale_ptr)
-    var dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=entry.dst_ptr)
-    var n_total = entry.n_total
-    var k_total = ctx[].k_total
-
-    for m in range(ctx[].seq_len):
-        int8_gemv_row(
-            act + m * k_total, wpacked, bias, scale,
-            dst + m * n_total,
-            n_total, k_total, start_n, end_n,
+    for m in range(cfg[].row_count):
+        gemv_row[N, K, DType.bfloat16](
+            act + m * K, wpacked, cfg[].act_dequant, wscale, colsum, dst + m * N,
         )
 
 
 # ============================================================================
-# Single dispatch — one matrix, workers split N
+# Dispatch
 # ============================================================================
 
 
-def int8_gemv[P: BurstThreadPool](
-    mut ctx: GemvCtx,
-    weight_ptr: Int, bias_ptr: Int, scale_ptr: Int,
+def int8_gemv[N: Int, K: Int, P: BurstThreadPool](
+    act_ptr: Int, wpacked_ptr: Int,
+    colsum_ptr: Int, weight_scale_ptr: Int, dst_ptr: Int,
+    seq_len: Int,
+    act_dequant: Float32,
+    mut configs: InlineArray[WorkerConfig, 128],
     mut pool: P,
 ) -> PoolFence[P]:
-    if ctx.seq_len == 0:
+    """Dispatch int8 GEMV: [seq_len, K] x [N, K]^T -> [seq_len, N] bf16.
+
+    Caller provides configs array. Workers split M rows.
+    """
+    if seq_len == 0:
         return PoolFence[P].completed()
 
-    var ctx_addr = Int(UnsafePointer(to=ctx))
-    var num_jobs = pool.get_capacity()
-    var cols_per_job = (ctx.n_total + num_jobs - 1) // num_jobs
+    var cfg_base = Int(UnsafePointer(to=configs).bitcast[WorkerConfig]())
+    var num_jobs = min(seq_len, pool.get_capacity())
+    var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
     for i in range(num_jobs):
-        var start = i * cols_per_job
-        var end = min(start + cols_per_job, ctx.n_total)
+        var start = i * rows_per_job
+        var end = min(start + rows_per_job, seq_len)
+        configs[i] = WorkerConfig(act_dequant, end - start)
         var pack = pool.get_args_base() + i
-        pack[].arg0 = ctx_addr
-        pack[].arg1 = weight_ptr
-        pack[].arg2 = bias_ptr
-        pack[].arg3 = scale_ptr
-        pack[].arg4 = start
-        pack[].arg5 = end
+        pack[].arg0 = act_ptr + start * K
+        pack[].arg1 = wpacked_ptr
+        pack[].arg2 = colsum_ptr
+        pack[].arg3 = weight_scale_ptr
+        pack[].arg4 = dst_ptr + start * N * 2
+        pack[].arg5 = cfg_base + i * size_of[WorkerConfig]()
 
-    pool.dispatch(single_gemv_worker, pool.get_args_base(), num_jobs)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
-
-
-# ============================================================================
-# Batched dispatch — multiple matrices, one dispatch
-# ============================================================================
-
-
-def int8_gemv_batched[P: BurstThreadPool](
-    mut ctx: BatchedGemvCtx,
-    mut pool: P,
-) -> PoolFence[P]:
-    if ctx.seq_len == 0 or ctx.count == 0:
-        return PoolFence[P].completed()
-
-    var cap = pool.get_capacity()
-    var ctx_addr = Int(UnsafePointer(to=ctx))
-
-    var total_n = 0
-    for i in range(ctx.count):
-        total_n += ctx.entries[i].n_total
-
-    var job = 0
-    for i in range(ctx.count):
-        var n_i = ctx.entries[i].n_total
-        var jobs_i = max(1, cap * n_i // total_n)
-        if i == ctx.count - 1:
-            jobs_i = cap - job
-        var cols_per = (n_i + jobs_i - 1) // jobs_i
-        for j in range(jobs_i):
-            if job >= cap:
-                break
-            var pack = pool.get_args_base() + job
-            pack[].arg0 = ctx_addr
-            pack[].arg1 = j * cols_per
-            pack[].arg2 = min((j + 1) * cols_per, n_i)
-            pack[].arg3 = i
-            job += 1
-
-    pool.dispatch(batched_gemv_worker, pool.get_args_base(), job)
+    pool.dispatch(int8_gemv_worker[N, K], pool.get_args_base(), num_jobs)
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))

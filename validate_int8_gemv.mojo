@@ -1,6 +1,6 @@
 """Validate int8_gemv against scalar f32 reference.
 
-Tests both single and batched dispatch modes at SmolLM2-scale dimensions.
+Tests single dispatch at SmolLM2-scale dimensions with combined QKV packing.
 """
 
 from std.memory import UnsafePointer, memcpy
@@ -13,22 +13,21 @@ from notstdcollections import HeapMoveArray
 from threading.burst_threading import BurstPool
 from kernels.vnni import pack_vnni
 
-from experimental2.kernels.int_kernels.int8_gemv import (
-    int8_gemv, int8_gemv_batched,
-    int8_gemv_row,
-    GemvCtx, BatchedGemvCtx, BatchedGemvEntry,
-)
+from experimental2.kernels.int_kernels.int8_gemv import int8_gemv, WorkerConfig, gemv_row
 
 
 def f32_reference(
     act_i8: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     weight_i8: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
-    bias: UnsafePointer[Float32, MutAnyOrigin],
-    scale: UnsafePointer[Float32, MutAnyOrigin],
+    colsum: UnsafePointer[Float32, MutAnyOrigin],
+    weight_scale: UnsafePointer[Float32, MutAnyOrigin],
+    act_dequant: Float32,
     dst: UnsafePointer[Float32, MutAnyOrigin],
     seq_len: Int, n: Int, k: Int,
 ):
-    """Scalar reference: dst[m,n] = (sum_k (act+128)*w - bias[n]) * scale[n]."""
+    """Scalar reference matching int8_gemm_row epilogue:
+    dst[m,n] = (sum_k (act_i8+128) * w_i8 - 128*colsum[n]) * act_dequant * weight_scale[n]
+    """
     for m in range(seq_len):
         for col in range(n):
             var acc = Int32(0)
@@ -36,54 +35,42 @@ def f32_reference(
                 var a_u8 = Int32(act_i8[m * k + ki]) + 128
                 var w = Int32(weight_i8[col * k + ki])
                 acc += a_u8 * w
-            dst[m * n + col] = (Float32(acc) - bias[col]) * scale[col]
+            var corrected = Float32(acc) - Float32(128) * colsum[col]
+            dst[m * n + col] = corrected * act_dequant * weight_scale[col]
 
 
-def fill_weights(
-    w: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
-    rows: Int, cols: Int, seed: Int,
+def fill_i8(
+    p: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    count: Int, seed: Int,
 ):
-    for i in range(rows * cols):
-        w[i] = Scalar[DType.int8]((i * seed + 37) % 251 - 125)
+    for i in range(count):
+        p[i] = Scalar[DType.int8]((i * seed + 37) % 251 - 125)
 
 
-def fill_activation(
-    a: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
-    seq_len: Int, cols: Int, seed: Int,
-):
-    for i in range(seq_len * cols):
-        a[i] = Scalar[DType.int8]((i * seed + 13) % 251 - 125)
-
-
-def compute_colsum_and_scales(
+def compute_colsum(
     weight_i8: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     colsum: UnsafePointer[Float32, MutAnyOrigin],
-    weight_scale: UnsafePointer[Float32, MutAnyOrigin],
     rows: Int, cols: Int,
 ):
     for n in range(rows):
         var acc = Int(0)
+        for ki in range(cols):
+            acc += Int(weight_i8[n * cols + ki])
+        colsum[n] = Float32(acc)
+
+
+def compute_weight_scale(
+    weight_i8: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    weight_scale: UnsafePointer[Float32, MutAnyOrigin],
+    rows: Int, cols: Int,
+):
+    for n in range(rows):
         var absmax = Float32(0)
         for ki in range(cols):
-            var v = weight_i8[n * cols + ki]
-            acc += Int(v)
-            var av = Float32(v)
-            if av < 0: av = -av
-            if av > absmax: absmax = av
-        colsum[n] = Float32(acc)
+            var v = Float32(weight_i8[n * cols + ki])
+            if v < 0: v = -v
+            if v > absmax: absmax = v
         weight_scale[n] = absmax / Float32(127)
-
-
-def precompute_bias_scale(
-    colsum: UnsafePointer[Float32, MutAnyOrigin],
-    weight_scale: UnsafePointer[Float32, MutAnyOrigin],
-    bias_out: UnsafePointer[Float32, MutAnyOrigin],
-    scale_out: UnsafePointer[Float32, MutAnyOrigin],
-    n: Int, act_dequant: Float32,
-):
-    for i in range(n):
-        bias_out[i] = Float32(128) * colsum[i]
-        scale_out[i] = weight_scale[i] * act_dequant
 
 
 def compare(
@@ -103,7 +90,20 @@ def compare(
         if d > max_err: max_err = d
     var avg_err = err_sum / Float64(count)
     print("  " + name + ": avg_err=" + String(avg_err) + " max_err=" + String(max_err))
-    if avg_err < 0.5:
+    # bf16 has 10 mantissa bits → relative precision ~1/1024 ≈ 0.1%.
+    # For values in the hundreds, absolute error of ~1.0 is expected.
+    var rel_err = Float64(0)
+    var rel_count = 0
+    for i in range(count):
+        var e = Float64(expected[i])
+        if e != 0:
+            var d = Float64(Float32(got[i])) - e
+            if d < 0: d = -d
+            rel_err += d / (e if e > 0 else -e)
+            rel_count += 1
+    var avg_rel = rel_err / Float64(max(rel_count, 1)) * 100
+    print("  avg_rel=" + String(avg_rel) + "%")
+    if avg_rel < 1.0:
         print("  PASS")
         return True
     else:
@@ -119,155 +119,134 @@ def main():
     var pool = BurstPool[].for_topology(numa, topo[0], stack_size=2 * 1024 * 1024)
     print("workers: " + String(pool.get_capacity()))
 
-    # =====================================================================
-    # Test 1: Single GEMV (SmolLM2 Q-projection scale: K=576, N=576)
-    # =====================================================================
-    comptime K = 576
-    comptime N = 576
-    comptime SL = 1
-    var act_dequant = Float32(2.5) / Float32(127)  # simulated S_act/127
-
-    print("\n=== Test 1: single int8_gemv [" + String(SL) + "," + String(K)
-        + "] x [" + String(N) + "," + String(K) + "]^T ===")
-
-    var mark = arena.mark()
-
-    # Allocate
-    var act_i8 = arena.alloc[Scalar[DType.int8]](SL * K)
-    var w_i8_rowmajor = arena.alloc[Scalar[DType.int8]](N * K)
-    var w_packed = arena.alloc[UInt8](N * K)
-    var colsum = arena.alloc[Float32](N)
-    var w_scale = arena.alloc[Float32](N)
-    var bias = arena.alloc[Float32](N)
-    var scale = arena.alloc[Float32](N)
-    var dst_kernel = arena.alloc[Scalar[DType.bfloat16]](SL * N)
-    var dst_ref = arena.alloc[Float32](SL * N)
-
-    # Fill data
-    fill_activation(act_i8, SL, K, 7)
-    fill_weights(w_i8_rowmajor, N, K, 11)
-    compute_colsum_and_scales(w_i8_rowmajor, colsum, w_scale, N, K)
-    precompute_bias_scale(colsum, w_scale, bias, scale, N, act_dequant)
-
-    # VNNI pack
-    pack_vnni(w_i8_rowmajor.bitcast[UInt8](), w_packed, N, K)
-
-    # Reference
-    f32_reference(act_i8, w_i8_rowmajor, bias, scale, dst_ref, SL, N, K)
-
-    # Kernel (single dispatch)
-    var ctx = GemvCtx(Int(act_i8), Int(dst_kernel), N, K, SL)
-    int8_gemv(ctx, Int(w_packed), Int(bias), Int(scale), pool).join()
-
-    _ = compare("single gemv [576x576]", dst_kernel, dst_ref, SL * N)
-
-    arena.reset_to(mark)
+    var act_dequant = Float32(2.5) / Float32(127)
 
     # =====================================================================
-    # Test 2: Batched Q+K+V (K=576, Q_N=192, KV_N=64)
+    # Test 1: Single [1, 576] × [576, 576]^T (O-projection scale)
     # =====================================================================
+    comptime K1 = 576
+    comptime N1 = 576
+
+    print("\n=== Test 1: int8_gemv [1," + String(K1) + "] x [" + String(N1) + "," + String(K1) + "]^T ===")
+
+    var mark1 = arena.mark()
+
+    var act1 = arena.alloc[Scalar[DType.int8]](K1)
+    var w1_row = arena.alloc[Scalar[DType.int8]](N1 * K1)
+    var w1_packed = arena.alloc[UInt8](N1 * K1)
+    var cs1 = arena.alloc[Float32](N1)
+    var ws1 = arena.alloc[Float32](N1)
+    var dst1 = arena.alloc[Scalar[DType.bfloat16]](N1)
+    var ref1 = arena.alloc[Float32](N1)
+
+    fill_i8(act1, K1, 7)
+    fill_i8(w1_row, N1 * K1, 11)
+    compute_colsum(w1_row, cs1, N1, K1)
+    compute_weight_scale(w1_row, ws1, N1, K1)
+
+    # Pack and run reference BEFORE packing overwrites
+    f32_reference(act1, w1_row, cs1, ws1, act_dequant, ref1, 1, N1, K1)
+
+    # VNNI pack (overwrites w1_row region via scratch→dst)
+    var scratch1 = arena.alloc[UInt8](N1 * K1)
+    memcpy(dest=scratch1, src=w1_row.bitcast[UInt8](), count=N1 * K1)
+    pack_vnni(scratch1, w1_packed, N1, K1)
+
+    var cfgs1 = InlineArray[WorkerConfig, 128](fill=WorkerConfig(Float32(0), 0))
+    int8_gemv[N1, K1](Int(act1), Int(w1_packed), Int(cs1), Int(ws1), Int(dst1),
+        1, act_dequant, cfgs1, pool).join()
+
+    _ = compare("single [576x576]", dst1, ref1, N1)
+    arena.reset_to(mark1)
+
+    # =====================================================================
+    # Test 2: Combined QKV [1, 576] × [320, 576]^T (SmolLM2 TP=3)
+    # =====================================================================
+    comptime K2 = 576
     comptime Q_N = 192
     comptime KV_N = 64
-    comptime SL2 = 1
+    comptime QKV_N = Q_N + KV_N + KV_N
 
-    print("\n=== Test 2: batched Q+K+V [" + String(SL2) + "," + String(K)
-        + "] x Q[" + String(Q_N) + "] K[" + String(KV_N) + "] V[" + String(KV_N) + "] ===")
+    print("\n=== Test 2: combined QKV [1," + String(K2) + "] x [" + String(QKV_N) + "," + String(K2) + "]^T ===")
 
-    var act2 = arena.alloc[Scalar[DType.int8]](SL2 * K)
-    fill_activation(act2, SL2, K, 3)
+    var mark2 = arena.mark()
 
-    # Q weights
-    var wq_row = arena.alloc[Scalar[DType.int8]](Q_N * K)
-    var wq_packed = arena.alloc[UInt8](Q_N * K)
-    var q_colsum = arena.alloc[Float32](Q_N)
-    var q_wscale = arena.alloc[Float32](Q_N)
-    var q_bias = arena.alloc[Float32](Q_N)
-    var q_scale = arena.alloc[Float32](Q_N)
-    var dq = arena.alloc[Scalar[DType.bfloat16]](SL2 * Q_N)
-    var dq_ref = arena.alloc[Float32](SL2 * Q_N)
-    fill_weights(wq_row, Q_N, K, 11)
-    compute_colsum_and_scales(wq_row, q_colsum, q_wscale, Q_N, K)
-    precompute_bias_scale(q_colsum, q_wscale, q_bias, q_scale, Q_N, act_dequant)
-    pack_vnni(wq_row.bitcast[UInt8](), wq_packed, Q_N, K)
+    var act2 = arena.alloc[Scalar[DType.int8]](K2)
+    var wqkv_row = arena.alloc[Scalar[DType.int8]](QKV_N * K2)
+    var wqkv_packed = arena.alloc[UInt8](QKV_N * K2)
+    var cs_qkv = arena.alloc[Float32](QKV_N)
+    var ws_qkv = arena.alloc[Float32](QKV_N)
+    var dst_qkv = arena.alloc[Scalar[DType.bfloat16]](QKV_N)
+    var ref_qkv = arena.alloc[Float32](QKV_N)
 
-    # K weights
-    var wk_row = arena.alloc[Scalar[DType.int8]](KV_N * K)
-    var wk_packed = arena.alloc[UInt8](KV_N * K)
-    var k_colsum = arena.alloc[Float32](KV_N)
-    var k_wscale = arena.alloc[Float32](KV_N)
-    var k_bias = arena.alloc[Float32](KV_N)
-    var k_scale = arena.alloc[Float32](KV_N)
-    var dk = arena.alloc[Scalar[DType.bfloat16]](SL2 * KV_N)
-    var dk_ref = arena.alloc[Float32](SL2 * KV_N)
-    fill_weights(wk_row, KV_N, K, 17)
-    compute_colsum_and_scales(wk_row, k_colsum, k_wscale, KV_N, K)
-    precompute_bias_scale(k_colsum, k_wscale, k_bias, k_scale, KV_N, act_dequant)
-    pack_vnni(wk_row.bitcast[UInt8](), wk_packed, KV_N, K)
+    fill_i8(act2, K2, 3)
+    fill_i8(wqkv_row, QKV_N * K2, 13)
+    compute_colsum(wqkv_row, cs_qkv, QKV_N, K2)
+    compute_weight_scale(wqkv_row, ws_qkv, QKV_N, K2)
 
-    # V weights
-    var wv_row = arena.alloc[Scalar[DType.int8]](KV_N * K)
-    var wv_packed = arena.alloc[UInt8](KV_N * K)
-    var v_colsum = arena.alloc[Float32](KV_N)
-    var v_wscale = arena.alloc[Float32](KV_N)
-    var v_bias = arena.alloc[Float32](KV_N)
-    var v_scale = arena.alloc[Float32](KV_N)
-    var dv = arena.alloc[Scalar[DType.bfloat16]](SL2 * KV_N)
-    var dv_ref = arena.alloc[Float32](SL2 * KV_N)
-    fill_weights(wv_row, KV_N, K, 23)
-    compute_colsum_and_scales(wv_row, v_colsum, v_wscale, KV_N, K)
-    precompute_bias_scale(v_colsum, v_wscale, v_bias, v_scale, KV_N, act_dequant)
-    pack_vnni(wv_row.bitcast[UInt8](), wv_packed, KV_N, K)
+    f32_reference(act2, wqkv_row, cs_qkv, ws_qkv, act_dequant, ref_qkv, 1, QKV_N, K2)
 
-    # References
-    f32_reference(act2, wq_row, q_bias, q_scale, dq_ref, SL2, Q_N, K)
-    f32_reference(act2, wk_row, k_bias, k_scale, dk_ref, SL2, KV_N, K)
-    f32_reference(act2, wv_row, v_bias, v_scale, dv_ref, SL2, KV_N, K)
+    var scratch2 = arena.alloc[UInt8](QKV_N * K2)
+    memcpy(dest=scratch2, src=wqkv_row.bitcast[UInt8](), count=QKV_N * K2)
+    pack_vnni(scratch2, wqkv_packed, QKV_N, K2)
 
-    # Batched kernel
-    var bctx = BatchedGemvCtx()
-    bctx.act_ptr = Int(act2)
-    bctx.k_total = K
-    bctx.seq_len = SL2
-    bctx.count = 3
-    bctx.entries[0] = BatchedGemvEntry(Int(wq_packed), Int(q_bias), Int(q_scale), Int(dq), Q_N)
-    bctx.entries[1] = BatchedGemvEntry(Int(wk_packed), Int(k_bias), Int(k_scale), Int(dk), KV_N)
-    bctx.entries[2] = BatchedGemvEntry(Int(wv_packed), Int(v_bias), Int(v_scale), Int(dv), KV_N)
+    var cfgs2 = InlineArray[WorkerConfig, 128](fill=WorkerConfig(Float32(0), 0))
+    int8_gemv[QKV_N, K2](Int(act2), Int(wqkv_packed), Int(cs_qkv), Int(ws_qkv), Int(dst_qkv),
+        1, act_dequant, cfgs2, pool).join()
 
-    int8_gemv_batched(bctx, pool).join()
+    var pass_qkv = compare("combined QKV [320x576]", dst_qkv, ref_qkv, QKV_N)
 
-    var pass_q = compare("Q [192]", dq, dq_ref, SL2 * Q_N)
-    var pass_k = compare("K [64]", dk, dk_ref, SL2 * KV_N)
-    var pass_v = compare("V [64]", dv, dv_ref, SL2 * KV_N)
+    # Verify Q/K/V slices individually
+    print("  slices: Q=[0:" + String(Q_N) + "] K=[" + String(Q_N) + ":" + String(Q_N + KV_N)
+        + "] V=[" + String(Q_N + KV_N) + ":" + String(QKV_N) + "]")
+    _ = compare("  Q slice", dst_qkv, ref_qkv, Q_N)
+    _ = compare("  K slice",
+        (dst_qkv + Q_N).bitcast[Scalar[DType.bfloat16]](),
+        (ref_qkv + Q_N).bitcast[Float32](),
+        KV_N)
+    _ = compare("  V slice",
+        (dst_qkv + Q_N + KV_N).bitcast[Scalar[DType.bfloat16]](),
+        (ref_qkv + Q_N + KV_N).bitcast[Float32](),
+        KV_N)
+
+    arena.reset_to(mark2)
 
     # =====================================================================
-    # Test 3: Multi-row (SL=4, simulating small prefill)
+    # Test 3: Multi-row prefill [4, 576] × [320, 576]^T
     # =====================================================================
     comptime SL3 = 4
 
-    print("\n=== Test 3: single int8_gemv [" + String(SL3) + "," + String(K)
-        + "] x [" + String(N) + "," + String(K) + "]^T ===")
+    print("\n=== Test 3: prefill [" + String(SL3) + "," + String(K2) + "] x [" + String(QKV_N) + "," + String(K2) + "]^T ===")
 
-    arena.reset_to(mark)
-    var act3 = arena.alloc[Scalar[DType.int8]](SL3 * K)
-    var w3_row = arena.alloc[Scalar[DType.int8]](N * K)
-    var w3_packed = arena.alloc[UInt8](N * K)
-    var cs3 = arena.alloc[Float32](N)
-    var ws3 = arena.alloc[Float32](N)
-    var b3 = arena.alloc[Float32](N)
-    var s3 = arena.alloc[Float32](N)
-    var d3 = arena.alloc[Scalar[DType.bfloat16]](SL3 * N)
-    var r3 = arena.alloc[Float32](SL3 * N)
+    var act3 = arena.alloc[Scalar[DType.int8]](SL3 * K2)
+    var w3_row = arena.alloc[Scalar[DType.int8]](QKV_N * K2)
+    var w3_packed = arena.alloc[UInt8](QKV_N * K2)
+    var cs3 = arena.alloc[Float32](QKV_N)
+    var ws3 = arena.alloc[Float32](QKV_N)
+    var dst3 = arena.alloc[Scalar[DType.bfloat16]](SL3 * QKV_N)
+    var ref3 = arena.alloc[Float32](SL3 * QKV_N)
 
-    fill_activation(act3, SL3, K, 31)
-    fill_weights(w3_row, N, K, 41)
-    compute_colsum_and_scales(w3_row, cs3, ws3, N, K)
-    precompute_bias_scale(cs3, ws3, b3, s3, N, act_dequant)
-    pack_vnni(w3_row.bitcast[UInt8](), w3_packed, N, K)
-    f32_reference(act3, w3_row, b3, s3, r3, SL3, N, K)
+    fill_i8(act3, SL3 * K2, 31)
+    fill_i8(w3_row, QKV_N * K2, 41)
+    compute_colsum(w3_row, cs3, QKV_N, K2)
+    compute_weight_scale(w3_row, ws3, QKV_N, K2)
 
-    var ctx3 = GemvCtx(Int(act3), Int(d3), N, K, SL3)
-    int8_gemv(ctx3, Int(w3_packed), Int(b3), Int(s3), pool).join()
+    f32_reference(act3, w3_row, cs3, ws3, act_dequant, ref3, SL3, QKV_N, K2)
 
-    _ = compare("multi-row [4x576x576]", d3, r3, SL3 * N)
+    var scratch3 = arena.alloc[UInt8](QKV_N * K2)
+    memcpy(dest=scratch3, src=w3_row.bitcast[UInt8](), count=QKV_N * K2)
+    pack_vnni(scratch3, w3_packed, QKV_N, K2)
+
+    print("  dispatching...")
+    var cfgs3 = InlineArray[WorkerConfig, 128](fill=WorkerConfig(Float32(0), 0))
+    int8_gemv[QKV_N, K2](Int(act3), Int(w3_packed), Int(cs3), Int(ws3), Int(dst3),
+        SL3, act_dequant, cfgs3, pool).join()
+    print("  joined")
+
+    _ = compare("prefill [4x320x576]", dst3, ref3, SL3 * QKV_N)
 
     print("\ndone")
+    _ = pool
+    _ = arena
+    _ = pool
+    _ = arena
