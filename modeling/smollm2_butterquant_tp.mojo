@@ -662,11 +662,19 @@ def derive_layer_scales[tp: Int](arena_base: Int) -> InlineArray[LayerScales, C.
     """Compute per-layer fixed scales from weight Frobenius norms.
 
     See butterquant.md Sections 3.2 (Categories B, C).
+
+    The general per-component RMS of y = W'x for isotropic x with ||x|| = sqrt(d):
+        RMS = ||W'||_F / sqrt(M)
+    where M is the output dimension of the projection. The spec's simplified
+    formula ||W'||_F / sqrt(K) is only valid when M = K (e.g. Q projection).
+    For K/V projections M = KV_HIDDEN, for gate/up M = INTERMEDIATE.
     """
     comptime L = ButterQuantTPLayer[tp]
     comptime M = ButterQuantTPModel[tp]
     var cn = concentration_constant[FWHT_BLOCK]()
-    var sqrt_k = Float64(C.HIDDEN).__pow__(0.5)
+    var sqrt_hidden = Float64(C.HIDDEN).__pow__(0.5)
+    var sqrt_kv_hidden = Float64(C.KV_HIDDEN).__pow__(0.5)
+    var sqrt_intermediate = Float64(C.INTERMEDIATE).__pow__(0.5)
     comptime SILU_M2_COEFF = 0.298  # M_2(silu, 1) / 1^2, see spec Section 3.2C
 
     var scales = InlineArray[LayerScales, C.NUM_LAYERS](fill=LayerScales())
@@ -679,15 +687,15 @@ def derive_layer_scales[tp: Int](arena_base: Int) -> InlineArray[LayerScales, C.
         var gate_frob_sq = frobenius_from_quantized[L.GATE_PROJ, L.GATE_ROW_SCALE](arena_base, layer_base)
         var up_frob_sq = frobenius_from_quantized[L.UP_PROJ, L.UP_ROW_SCALE](arena_base, layer_base)
 
-        # Category B: S_proj = ||W'||_F / sqrt(K) * C(d_k)
-        scales[layer].q_layer_scale = Float32(q_frob_sq.__pow__(0.5) / sqrt_k * cn)
-        scales[layer].k_layer_scale = Float32(k_frob_sq.__pow__(0.5) / sqrt_k * cn)
-        scales[layer].v_layer_scale = Float32(v_frob_sq.__pow__(0.5) / sqrt_k * cn)
+        # Category B: S_proj = ||W'||_F / sqrt(M) * C(d_k)
+        scales[layer].q_layer_scale = Float32(q_frob_sq.__pow__(0.5) / sqrt_hidden * cn)
+        scales[layer].k_layer_scale = Float32(k_frob_sq.__pow__(0.5) / sqrt_kv_hidden * cn)
+        scales[layer].v_layer_scale = Float32(v_frob_sq.__pow__(0.5) / sqrt_kv_hidden * cn)
 
         # Category C: S_post = sqrt(M_2(silu, sigma_gate) * sigma_up^2) * C(n)
-        # where sigma = ||W'||_F / sqrt(K)
-        var sigma_gate = gate_frob_sq.__pow__(0.5) / sqrt_k
-        var sigma_up_sq = up_frob_sq / Float64(C.HIDDEN)
+        # where sigma = ||W'||_F / sqrt(M), M = INTERMEDIATE for gate/up
+        var sigma_gate = gate_frob_sq.__pow__(0.5) / sqrt_intermediate
+        var sigma_up_sq = up_frob_sq / Float64(C.INTERMEDIATE)
         var m2 = SILU_M2_COEFF * sigma_gate * sigma_gate
         scales[layer].post_layer_scale = Float32((m2 * sigma_up_sq).__pow__(0.5) * cn)
 
@@ -921,38 +929,16 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                 var kvc = rv.kv_cache(layer_idx)
                 var q_view = DynView[M.Q_VIEW](sb + q_buf.offset, seq_len)
 
-                if seq_len == 1:
-                    var wpg_hint = self.pools[rank].get_capacity() // M.LOCAL_KV_HEADS
-                    amx_decode[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM, C.MAX_SEQ_LEN](
-                        q_view, kvc, kvc,
-                        rv.rope_cos(), rv.rope_sin(),
-                        sb + attn.offset, pos,
-                        ls.q_layer_scale, ls.k_layer_scale, ls.v_layer_scale,
-                        wpg_hint, self.pools[rank],
-                    ).join()
-                    # Replicate decode's internal wpg capping for decode_merge
-                    comptime DECODE_BLOCK_N = 512
-                    var context = pos + 1
-                    var max_blocks = (context + DECODE_BLOCK_N - 1) // DECODE_BLOCK_N
-                    var wpg = min(min(wpg_hint, max_blocks),
-                                  self.pools[rank].get_capacity() // M.LOCAL_KV_HEADS)
-                    var vagg_scale = ls.v_layer_scale / (Float32(255) * Float32(127))
-                    decode_merge[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM](
-                        sb + attn.offset, wpg, vagg_scale,
-                    )
-                else:
-                    amx_prefill[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM, C.MAX_SEQ_LEN](
-                        q_view, kvc, kvc,
-                        rv.rope_cos(), rv.rope_sin(),
-                        sb + attn.offset, pos,
-                        ls.q_layer_scale, ls.k_layer_scale, ls.v_layer_scale,
-                        self.pools[rank],
-                    ).join()
+                amx_prefill[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM, C.MAX_SEQ_LEN](
+                    q_view, kvc, kvc,
+                    rv.rope_cos(), rv.rope_sin(),
+                    sb + attn.offset, pos,
+                    ls.q_layer_scale, ls.k_layer_scale, ls.v_layer_scale,
+                    self.pools[rank],
+                ).join()
 
-                # i8 output location within attn scratch
-                var attn_i8_addr = sb + attn.offset
-                if seq_len > 1:
-                    attn_i8_addr += seq_len * Q_COLS * size_of[Float32]()
+                # i8 output: prefill layout is [f32 accum | i8 output | ...]
+                var attn_i8_addr = sb + attn.offset + seq_len * Q_COLS * size_of[Float32]()
 
                 # int8_gemv O: attn_i8 → x_residual
                 var o_configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(Float32(0), 0))

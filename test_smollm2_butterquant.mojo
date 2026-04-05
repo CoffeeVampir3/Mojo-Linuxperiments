@@ -17,7 +17,7 @@ from experimental.amx import init_intel_amx
 comptime TOKENIZER_PATH = "checkpoints/SmolLM2/tokenizer.json"
 comptime MODEL_PATH = "quantized_models/SmolLM2-ButterQuant/model.safetensors"
 comptime VOCAB = SmolLM2Config.VOCAB_SIZE
-comptime MAX_NEW_TOKENS = 20
+comptime MAX_NEW_TOKENS = 512
 
 
 def greedy_argmax(read view: LogitsView[VOCAB]) -> Tuple[Int, Float32]:
@@ -156,6 +156,7 @@ He was named to the 2022 class of ACM Fellows"""
     for i in range(len(generated)):
         all_ids.append(generated[i])
 
+    print(all_ids)
     var full_text = tok.decode(all_ids)
     print("\n=== generated", MAX_NEW_TOKENS, "tokens ===")
     print(full_text)
