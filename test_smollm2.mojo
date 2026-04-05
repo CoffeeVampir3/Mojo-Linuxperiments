@@ -94,6 +94,25 @@ He was named to the 2022 class of ACM Fellows"""
     var t1 = perf_counter_ns()
     var logits = model.forward(Int(tp), seq_len, 0, profile=True)
     var prefill_ms = (perf_counter_ns() - t1) / 1_000_000
+
+    # Top-5 logits diagnostic
+    var top_vals = InlineArray[Float32, 5](fill=Float32(-1e30))
+    var top_ids = InlineArray[Int, 5](fill=0)
+    for j in range(0, VOCAB):
+        var v = logits.load_f32[1](j)
+        if v[0] > top_vals[4]:
+            top_vals[4] = v[0]
+            top_ids[4] = j
+            for k in range(3, -1, -1):
+                if top_vals[k + 1] > top_vals[k]:
+                    var tv = top_vals[k]; top_vals[k] = top_vals[k+1]; top_vals[k+1] = tv
+                    var ti = top_ids[k]; top_ids[k] = top_ids[k+1]; top_ids[k+1] = ti
+    print("top-5 logits after prefill:")
+    for i in range(5):
+        var id_list = List[Int]()
+        id_list.append(top_ids[i])
+        print(" ", i, "id=", top_ids[i], "val=", top_vals[i], "tok=", repr(tok.decode(id_list)))
+
     var result = greedy_argmax(logits)
     var next_id = result[0]
     logits^.release()

@@ -309,15 +309,15 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
     # Dispatch — two-pass write + Dekker wake check
     # ----------------------------------------------------------------
 
-    def dispatch[F: TrivialRegisterPassable](mut self, kernel: F,
+    def dispatch[T0: TrivialRegisterPassable, T1: TrivialRegisterPassable,
+        T2: TrivialRegisterPassable, T3: TrivialRegisterPassable,
+        T4: TrivialRegisterPassable, T5: TrivialRegisterPassable](
+        mut self, kernel: def(T0, T1, T2, T3, T4, T5) -> None,
         packs: UnsafePointer[ArgPack, MutAnyOrigin], num_jobs: Int = -1):
         var jobs = num_jobs if num_jobs >= 0 else self.capacity
         debug_assert(jobs <= self.capacity, "num_jobs must be <= pool capacity")
         if jobs <= 0:
             return
-
-        comptime KernelType = type_of(kernel)
-        comptime assert size_of[KernelType]() == 8, "kernel must be an 8-byte function pointer"
 
         debug_assert(self.active_jobs == 0,
             "previous dispatch still in flight; call join() first")
@@ -555,7 +555,13 @@ def worker_main[mask_size: Int](stack_head_ptr: Int):
     var done_ptr = UnsafePointer(to=join_flag[].done.value)
 
     # --- Main loop: spin on local mailbox, backoff to futex_wait ---
+    # Shutdown checked before job_ready: destructor sets both flags to wake
+    # sleeping workers, and stale job_ready must not trigger execution of
+    # a freed dispatch.
     while True:
+        if shared[].shutdown.load[ordering=Consistency.ACQUIRE]() != 0:
+            break
+
         if AtomicInt32.load[ordering=Consistency.ACQUIRE](ready_ptr) != 0:
             # Read dispatch data (local reads from worker's NUMA node)
             var func_addr = mailbox[].func_ptr
@@ -570,9 +576,6 @@ def worker_main[mask_size: Int](stack_head_ptr: Int):
             join_flag[].timestamp = Int(perf_counter_ns())
             AtomicInt32.store[ordering=Consistency.RELEASE](done_ptr, 1)
             continue
-
-        if shared[].shutdown.load[ordering=Consistency.ACQUIRE]() != 0:
-            break
 
         # Spin phase — brief spin on local job_ready
         var spins = 0

@@ -289,7 +289,10 @@ struct IsolatedBurstPool[mask_size: Int = 128](BurstThreadPool, SleepableThreadP
     # Dispatch — write mailboxes (remote to worker's node)
     # ----------------------------------------------------------------
 
-    def dispatch[F: TrivialRegisterPassable](mut self, kernel: F,
+    def dispatch[T0: TrivialRegisterPassable, T1: TrivialRegisterPassable,
+        T2: TrivialRegisterPassable, T3: TrivialRegisterPassable,
+        T4: TrivialRegisterPassable, T5: TrivialRegisterPassable](
+        mut self, kernel: def(T0, T1, T2, T3, T4, T5) -> None,
         packs: UnsafePointer[ArgPack, MutAnyOrigin], num_jobs: Int = -1):
         """Write dispatch data to worker mailboxes. Workers pick up work
         by polling job_ready locally."""
@@ -297,9 +300,6 @@ struct IsolatedBurstPool[mask_size: Int = 128](BurstThreadPool, SleepableThreadP
         debug_assert(jobs <= self.capacity, "num_jobs must be <= pool capacity")
         if jobs <= 0:
             return
-
-        comptime KernelType = type_of(kernel)
-        comptime assert size_of[KernelType]() == 8, "kernel must be an 8-byte function pointer"
 
         debug_assert(self.active_jobs == 0,
             "previous dispatch still in flight; call join() first")

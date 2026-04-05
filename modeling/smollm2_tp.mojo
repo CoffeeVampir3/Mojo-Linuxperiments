@@ -281,12 +281,12 @@ struct Ranks[E: Encoding, tp: Int]:
     def view(self, r: Int) -> RankView[Self.E, Self.tp]:
         return RankView[Self.E, Self.tp](self.bases[r])
 
-    def parallel[body: def[rank: Int] (RankView[Self.E, Self.tp], mut BurstPool[]) capturing -> PoolFence](self):
+    def parallel[body: def[rank: Int] (RankView[Self.E, Self.tp], mut BurstPool[]) capturing -> PoolFence[BurstPool[]]](self):
         @parameter
-        def dispatch[rank: Int]() -> PoolFence:
+        def dispatch[rank: Int]() -> PoolFence[BurstPool[]]:
             var rv = RankView[Self.E, Self.tp](self.bases[rank])
             return body[rank](rv, self.pool_ptrs[rank][])
-        parallel_for[Self.tp, dispatch]()
+        parallel_for[BurstPool[], Self.tp, dispatch]()
 
     def each[body: def (RankView[Self.E, Self.tp]) capturing -> None](self):
         for r in range(Self.tp):
@@ -433,22 +433,22 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
 
             # This serves as a way to get the right pointers in parallel easily.
             @parameter
-            def do_input_norm[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
+            def do_input_norm[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 return rmsnorm(rv.x_main(seq_len), rv.layer_weight[L.INPUT_NORM](layer_idx), rv.x_residual(seq_len), pool)
             ranks.parallel[do_input_norm]()
 
             @parameter
-            def do_q[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
+            def do_q[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 return gemm(rv.x_residual(seq_len), rv.layer_weight[L.Q_PROJ](layer_idx), rv.scratch_view[M.Q_VIEW](q, seq_len), pool)
             ranks.parallel[do_q]()
 
             @parameter
-            def do_k[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
+            def do_k[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 return gemm(rv.x_residual(seq_len), rv.layer_weight[L.K_PROJ](layer_idx), rv.scratch_view[M.KV_VIEW](k, seq_len), pool)
             ranks.parallel[do_k]()
 
             @parameter
-            def do_v[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
+            def do_v[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 return gemm(rv.x_residual(seq_len), rv.layer_weight[L.V_PROJ](layer_idx), rv.scratch_view[M.KV_VIEW](v, seq_len), pool)
             ranks.parallel[do_v]()
 
@@ -471,7 +471,7 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
             var attn_out = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.Q_VIEW.COLS]()
 
             @parameter
-            def do_attn[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
+            def do_attn[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 return attention[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM](
                     rv.scratch_view[M.Q_VIEW](q, seq_len), rv.k_cache(layer_idx), rv.v_cache(layer_idx),
                     rv.scratch_view[M.Q_VIEW](attn_out, seq_len), pos, pool)
@@ -480,7 +480,7 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
             q^.release()
 
             @parameter
-            def do_o[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
+            def do_o[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 return gemm(rv.scratch_view[M.Q_VIEW](attn_out, seq_len), rv.layer_weight[L.O_PROJ](layer_idx), rv.x_residual(seq_len), pool)
             ranks.parallel[do_o]()
 
@@ -496,7 +496,7 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
             # === MLP block ===
 
             @parameter
-            def do_post_norm[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
+            def do_post_norm[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 return rmsnorm(rv.x_main(seq_len), rv.layer_weight[L.POST_ATTN_NORM](layer_idx), rv.x_residual(seq_len), pool)
             ranks.parallel[do_post_norm]()
 
@@ -504,12 +504,12 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
             var up = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.MLP_VIEW.COLS]()
 
             @parameter
-            def do_gate[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
+            def do_gate[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 return gemm(rv.x_residual(seq_len), rv.layer_weight[L.GATE_PROJ](layer_idx), rv.scratch_view[M.MLP_VIEW](gate, seq_len), pool)
             ranks.parallel[do_gate]()
 
             @parameter
-            def do_up[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
+            def do_up[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 return gemm(rv.x_residual(seq_len), rv.layer_weight[L.UP_PROJ](layer_idx), rv.scratch_view[M.MLP_VIEW](up, seq_len), pool)
             ranks.parallel[do_up]()
 
@@ -521,7 +521,7 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
             up^.release()
 
             @parameter
-            def do_down[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence:
+            def do_down[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 return gemm(rv.scratch_view[M.MLP_VIEW](gate, seq_len), rv.layer_weight[L.DOWN_PROJ](layer_idx), rv.x_residual(seq_len), pool)
             ranks.parallel[do_down]()
 

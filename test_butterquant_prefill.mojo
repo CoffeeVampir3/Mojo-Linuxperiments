@@ -16,7 +16,7 @@ from experimental2.attn_amx_prefill import prefill, scratch_bytes
 from experimental.hadquant_impl import fwht_block
 from experimental2.kv_cache import KVCache
 from experimental.amx import init_intel_amx
-from simd_math import sqrt, exp_f32, quantize_i8
+from simd_math import sqrt, exp_f32, quantize_i8, roundeven
 from threading.threading_traits import BurstThreadPool
 from threading.burst_threading import BurstPool
 from threading.isolated_burst_pool import IsolatedBurstPool
@@ -48,6 +48,7 @@ def main():
             pools.push(IsolatedBurstPool[].for_topology(numa, topo[i], stack_size=2 * 1024 * 1024))
             print("  node " + String(topo[i]) + ": " + String(pools[i].capacity) + " workers")
         run_test(numa, topo, pools)
+        _ = pools
     else:
         print("mode: cold")
         var pools = HeapMoveArray[BurstPool[]](NUM_NODES)
@@ -55,6 +56,9 @@ def main():
             pools.push(BurstPool[].for_topology(numa, topo[i], stack_size=2 * 1024 * 1024))
             print("  node " + String(topo[i]) + ": " + String(pools[i].capacity) + " workers")
         run_test(numa, topo, pools)
+        _ = pools
+    _ = topo
+    _ = numa
 
 
 def run_test[P: BurstThreadPool](numa: NumaInfo,
@@ -189,6 +193,14 @@ def run_test[P: BurstThreadPool](numa: NumaInfo,
 
             corr_arena.reset_to(scores_mark)
 
+    # Quantize expected f32 → expected i8 (same as fused kernel epilogue)
+    var qi_inv = Float32(127) / v_layer_scale
+    var expected_i8 = corr_arena.alloc[Scalar[DType.int8]](SL * HIDDEN)
+    for i in range(SL * HIDDEN):
+        var qf = roundeven[DType.float32, 1](expected[i] * qi_inv)
+        var q = Int(min(max(qf, Float32(-128)), Float32(127)))
+        expected_i8[i] = Scalar[DType.int8](q)
+
     # Run kernel (unchunked — SL=16 fits in default prefill_chunk=512)
     prefill[NH, NKV, HD](
         DynView[QSlot](Int(q_bf16), SL),
@@ -199,21 +211,23 @@ def run_test[P: BurstThreadPool](numa: NumaInfo,
         pools[0],
     ).join()
 
-    # Compare
-    var rf32 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(scratch))
+    # Compare i8 kernel output vs i8-quantized reference
+    comptime qi_off = SL * HIDDEN * size_of[Float32]()
+    var ri8 = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=Int(scratch) + qi_off)
     var err_sum = Float64(0)
+    var max_err = 0
     var count = 0
-    for m in range(SL):
-        for d in range(HIDDEN):
-            var got = Float64(rf32[m * HIDDEN + d])
-            var rv = Float64(expected[m * HIDDEN + d])
-            var e = got - rv
-            if e < 0: e = -e
-            err_sum += e
-            count += 1
+    for i in range(SL * HIDDEN):
+        var got = Int(ri8[i])
+        var exp_val = Int(expected_i8[i])
+        var e = got - exp_val
+        if e < 0: e = -e
+        err_sum += Float64(e)
+        if e > max_err: max_err = e
+        count += 1
     var avg_err = err_sum / Float64(count)
-    print("avg_err: " + String(avg_err))
-    if avg_err < 0.1:
+    print("avg_i8_err: " + String(avg_err) + " max_i8_err: " + String(max_err))
+    if avg_err < 2.0 and max_err <= 3:
         print("PASS (unchunked)")
     else:
         print("FAIL (unchunked)")
@@ -231,20 +245,22 @@ def run_test[P: BurstThreadPool](numa: NumaInfo,
         pools[0],
     ).join()
 
-    var rf32_c = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(chunked_scratch))
+    comptime qi_off_c = SL * HIDDEN * size_of[Float32]()
+    var ri8_c = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=Int(chunked_scratch) + qi_off_c)
     var err_sum_c = Float64(0)
+    var max_err_c = 0
     var count_c = 0
-    for m in range(SL):
-        for d in range(HIDDEN):
-            var got = Float64(rf32_c[m * HIDDEN + d])
-            var rv = Float64(expected[m * HIDDEN + d])
-            var e = got - rv
-            if e < 0: e = -e
-            err_sum_c += e
-            count_c += 1
+    for i in range(SL * HIDDEN):
+        var got = Int(ri8_c[i])
+        var exp_val = Int(expected_i8[i])
+        var e = got - exp_val
+        if e < 0: e = -e
+        err_sum_c += Float64(e)
+        if e > max_err_c: max_err_c = e
+        count_c += 1
     var avg_err_c = err_sum_c / Float64(count_c)
-    print("avg_err (chunked): " + String(avg_err_c))
-    if avg_err_c < 0.1:
+    print("avg_i8_err: " + String(avg_err_c) + " max_i8_err: " + String(max_err_c))
+    if avg_err_c < 2.0 and max_err_c <= 3:
         print("PASS (chunked, prefill_chunk=4)")
     else:
         print("FAIL (chunked, prefill_chunk=4)")
@@ -369,3 +385,6 @@ def run_test[P: BurstThreadPool](numa: NumaInfo,
             print("  " + String(ctx_pos) + " | " + String(sl)
                   + " | " + String(total_us)
                   + " | " + String(per_pos))
+
+    _ = corr_arena
+    _ = perf_arenas

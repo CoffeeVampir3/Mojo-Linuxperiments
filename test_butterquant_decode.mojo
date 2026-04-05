@@ -12,11 +12,12 @@ from modeling.model_spec import (
     BF16, F32, I8, Replicated,
     Slot, Bound, DynView,
 )
-from experimental2.attn_amx_decode import decode, decode_merge, scratch_bytes, collect_profiles
+from experimental2.attn_amx_decode import decode, decode_merge, scratch_bytes, collect_profiles, per_worker_merge_bytes, DecodeWorkerScratch
+from experimental2.helpers import AttnCtx
 from experimental.hadquant_impl import fwht_block
 from experimental2.kv_cache import KVCache
 from experimental.amx import init_intel_amx
-from simd_math import sqrt, exp_f32, quantize_i8
+from simd_math import sqrt, exp_f32, quantize_i8, roundeven
 from threading.threading_traits import BurstThreadPool
 from threading.burst_threading import BurstPool
 from threading.isolated_burst_pool import IsolatedBurstPool
@@ -48,6 +49,7 @@ def main():
             pools.push(IsolatedBurstPool[].for_topology(numa, topo[i]))
             print("  node " + String(topo[i]) + ": " + String(pools[i].get_capacity()) + " workers")
         run_test(numa, topo, pools)
+        _ = pools
     else:
         print("mode: cold")
         var pools = HeapMoveArray[BurstPool[]](NUM_NODES)
@@ -55,6 +57,9 @@ def main():
             pools.push(BurstPool[].for_topology(numa, topo[i], stack_size=2 * 1024 * 1024))
             print("  node " + String(topo[i]) + ": " + String(pools[i].get_capacity()) + " workers")
         run_test(numa, topo, pools)
+        _ = pools
+    _ = topo
+    _ = numa
 
 
 def run_test[P: BurstThreadPool](numa: NumaInfo,
@@ -122,6 +127,8 @@ def run_test[P: BurstThreadPool](numa: NumaInfo,
     # F32 reference: same pipeline as the kernel, in scalar
     var inv_sqrt_hd = Float32(1.0) / sqrt[DType.float32, 1](Float32(HD))
     var context = POS + 1
+    var ref_exp_sum_h0 = Float32(0)
+    var ref_raw_i32_d0 = Int32(0)
     for h in range(NH):
         var g = h // GQA
         # Q: bf16 → f32 → RoPE → FWHT → fixed-scale i8
@@ -170,16 +177,30 @@ def run_test[P: BurstThreadPool](numa: NumaInfo,
         var vagg_scale = v_layer_scale / (Float32(255.0) * Float32(127.0))
         for d in range(HD):
             expected[h * HD + d] = Float32(0)
+        var ref_raw_d0_acc = Int32(0)
         for t in range(context):
             var w_u8 = UInt8(max(min(Int(scores[t] * 255.0 + 0.5), 255), 0))
             var v_data = kv_cache.v_head(t, g)
+            if h == 0:
+                ref_raw_d0_acc += Int32(w_u8) * Int32(v_data[0])
             for d in range(HD):
                 var v_i8 = Int32(v_data[d])
                 expected[h * HD + d] += Float32(Int32(w_u8) * v_i8) * vagg_scale
+        if h == 0:
+            ref_exp_sum_h0 = exp_sum
+            ref_raw_i32_d0 = ref_raw_d0_acc
         for d in range(HD):
             expected[h * HD + d] /= exp_sum
 
         corr_arena.reset_to(scores_mark)
+
+    # Quantize expected f32 → expected i8 (same as fused kernel epilogue)
+    var qi_inv = Float32(127) / v_layer_scale
+    var expected_i8 = corr_arena.alloc[Scalar[DType.int8]](HIDDEN)
+    for d in range(HIDDEN):
+        var qf = roundeven[DType.float32, 1](expected[d] * qi_inv)
+        var q = Int(min(max(qf, Float32(-128)), Float32(127)))
+        expected_i8[d] = Scalar[DType.int8](q)
 
     # Run kernel
     decode[NH, NKV, HD](
@@ -191,23 +212,51 @@ def run_test[P: BurstThreadPool](numa: NumaInfo,
         1,
         pools[0],
     ).join()
+
+    # === DIAGNOSTICS: compare kernel intermediates vs reference ===
+    var diag_woff = HIDDEN * size_of[Scalar[DType.int8]]() + size_of[AttnCtx]()
+    var diag_ws0 = UnsafePointer[DecodeWorkerScratch, MutAnyOrigin](
+        unsafe_from_address=Int(scratch) + diag_woff)
+    var kern_running_o0 = diag_ws0[].running_o[0]
+    var kern_running_l0 = diag_ws0[].running_l[0]
+    var kern_running_m0 = diag_ws0[].running_m[0]
+    print("\n--- DIAGNOSTICS (head 0, element 0) ---")
+    print("kernel: running_o[0]=" + String(kern_running_o0)
+        + "  running_l[0]=" + String(kern_running_l0)
+        + "  running_m[0]=" + String(kern_running_m0))
+    print("ref:    raw_i32_d0=" + String(ref_raw_i32_d0)
+        + "  exp_sum_h0=" + String(ref_exp_sum_h0))
+    print("ratio:  running_o/raw=" + String(kern_running_o0 / Float32(ref_raw_i32_d0))
+        + "  l/exp_sum=" + String(kern_running_l0 / ref_exp_sum_h0))
     var corr_vagg_scale = v_layer_scale / (Float32(255.0) * Float32(127.0))
+    var diag_merge_f32 = kern_running_o0 * corr_vagg_scale / kern_running_l0
+    print("merge f32=" + String(diag_merge_f32) + "  expected f32=" + String(expected[0]))
+    print("merge f32 ratio=" + String(diag_merge_f32 / expected[0]))
+    print("--- END DIAGNOSTICS ---\n")
+
     decode_merge[NH, NKV, HD](Int(scratch), 1, corr_vagg_scale)
 
-    # Compare
-    var rf32 = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=Int(scratch))
+    # Compare i8 kernel output vs i8-quantized reference
+    var ri8 = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=Int(scratch))
     var err_sum = Float64(0)
+    var max_err = 0
     var count = 0
+    for d in range(min(5, HIDDEN)):
+        var got = Int(ri8[d])
+        var exp_val = Int(expected_i8[d])
+        print("[" + String(d) + "] got_i8=" + String(got) + " exp_i8=" + String(exp_val)
+            + " exp_f32=" + String(expected[d]))
     for d in range(HIDDEN):
-        var got = Float64(rf32[d])
-        var rv = Float64(expected[d])
-        var e = got - rv
+        var got = Int(ri8[d])
+        var exp_val = Int(expected_i8[d])
+        var e = got - exp_val
         if e < 0: e = -e
-        err_sum += e
+        err_sum += Float64(e)
+        if e > max_err: max_err = e
         count += 1
     var avg_err = err_sum / Float64(count)
-    print("avg_err: " + String(avg_err))
-    if avg_err < 0.1:
+    print("avg_i8_err: " + String(avg_err) + " max_i8_err: " + String(max_err))
+    if avg_err < 2.0 and max_err <= 3:
         print("PASS")
     else:
         print("FAIL")
@@ -470,3 +519,6 @@ def run_test[P: BurstThreadPool](numa: NumaInfo,
             + "  kernel=" + String(best_kernel_max // 1000) + " us"
             + "  join_oh=" + String(best_join_oh) + " ns"
             + "  unaccounted=" + String(best_unaccounted // 1000) + " us")
+
+    _ = corr_arena
+    _ = perf_arenas

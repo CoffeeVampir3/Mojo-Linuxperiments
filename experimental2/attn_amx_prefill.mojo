@@ -24,7 +24,7 @@ from modeling.model_spec import (
     Bound, DynView,
 )
 from kernels.kernel_ops import PoolFence
-from simd_math import sqrt
+from simd_math import sqrt, roundeven
 from experimental2.kv_cache import KVCache
 from experimental2.helpers import AttnCtx, pack_v_tile_vnni, amx_gemm_2x2, prep_q_row, softmax_row
 from experimental.amx import (
@@ -61,9 +61,10 @@ struct WorkerScratch:
 
 def scratch_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int,
                   max_seq_len: Int, prefill_chunk: Int = 512](num_workers: Int) -> Int:
-    """Output buffer + AttnCtx + worker configs. All working memory is stack-allocated."""
+    """f32 accumulation buffer + i8 output + AttnCtx + worker configs."""
     comptime q_cols = num_heads * head_dim
-    return (max_seq_len * q_cols * size_of[Float32]()
+    return (max_seq_len * q_cols * size_of[Float32]()      # f32 V-agg accumulation
+          + max_seq_len * q_cols * size_of[Scalar[DType.int8]]()  # i8 quantized output
           + size_of[AttnCtx]()
           + num_workers * size_of[WorkerScratch]())
 
@@ -244,13 +245,19 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
                                 (ro_row + c).store((ro_row + c).load[width=width]() + raw)
                                 c += width
 
-        # --- Final normalize (in-place on output) ---
+        # --- Final normalize + quantize to i8 ---
+        comptime f32_lo = SIMD[DType.float32, width](-128.0)
+        comptime f32_hi = SIMD[DType.float32, width](127.0)
+        var qi_out = ctx[].qi_output
+        var vqi_scale = SIMD[DType.float32, width](ctx[].qi_scale)
         for local_idx in range(chunk_rows):
             var final_scale = vagg_scale / running_l[local_idx]
-            var out_row = output + output_offsets[local_idx]
+            var accum_row = output + output_offsets[local_idx]
+            var qi_row = qi_out + output_offsets[local_idx]
             var d = 0
             while d + width <= head_dim:
-                (out_row + d).store((out_row + d).load[width=width]() * final_scale)
+                var v = (accum_row + d).load[width=width]() * final_scale
+                (qi_row + d).store(min(max(roundeven(v * vqi_scale), f32_lo), f32_hi).cast[DType.int8]())
                 d += width
 
 
@@ -288,10 +295,12 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     var score_scale = q_layer_scale * k_layer_scale * inv_sqrt_hd / (Float32(127.0) * Float32(127.0))
     var vagg_scale = v_layer_scale / (Float32(255.0) * Float32(127.0))
 
-    # Write AttnCtx into scratch (after output buffer, before workers)
-    var output_bytes = q.seq_len * q_cols * size_of[Float32]()
+    # Scratch layout: [f32 accum | i8 output | AttnCtx | worker configs]
+    var accum_bytes = q.seq_len * q_cols * size_of[Float32]()
+    var qi_bytes = q.seq_len * q_cols * size_of[Scalar[DType.int8]]()
+    var qi_inv = Float32(127) / v_layer_scale
     var ctx_ptr = UnsafePointer[AttnCtx, MutAnyOrigin](
-        unsafe_from_address=scratch + output_bytes)
+        unsafe_from_address=scratch + accum_bytes + qi_bytes)
     ctx_ptr[] = AttnCtx(
         UnsafePointer[BFloat16, MutAnyOrigin](unsafe_from_address=q.ptr),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cos_table.ptr),
@@ -299,8 +308,10 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
         UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=k_cache.k_base),
         UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=v_cache.v_base),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=scratch),
+        UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=scratch + accum_bytes),
+        qi_inv,
     )
-    var workers_off = output_bytes + size_of[AttnCtx]()
+    var workers_off = accum_bytes + qi_bytes + size_of[AttnCtx]()
 
     var workers_per_group = max(1, pool.get_capacity() // num_kv_heads)
     var total_q_rows = q.seq_len * gqa_factor

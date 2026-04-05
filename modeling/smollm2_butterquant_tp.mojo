@@ -22,6 +22,7 @@ See butterquant.md for the full specification.
 
 from std.pathlib import Path
 from std.memory import UnsafePointer, memcpy
+from std.sys.info import size_of
 from std.collections import InlineArray
 
 from numa import NumaArena, NumaInfo
@@ -43,11 +44,19 @@ from modeling.model_spec import (
 )
 from kernels.vnni import VnniPacked, pack_vnni
 from kernels.kernel_ops import (
-    embed_lookup, elem_add,
+    embed_lookup, elem_add, rmsnorm,
     init_rope_tables,
     PoolFence, parallel_for,
 )
 from experimental2.kernels.float_kernels.float_gemv import float_gemv
+from experimental2.kernels.float_kernels.rmsnorm_fwht_quantize import rmsnorm_fwht_quantize
+from experimental2.kernels.int_kernels.int8_gemv import int8_gemv, WorkerConfig
+from experimental2.kernels.float_kernels.rope_and_kv_cache_write import rope_and_kv_cache_write
+from experimental2.kernels.float_kernels.silu_fwht_quantize import silu_fwht_quantize
+from experimental2.attn_amx_decode import (
+    decode as amx_decode, decode_merge,
+)
+from experimental2.attn_amx_prefill import prefill as amx_prefill
 from kernels.reductions import ring_allreduce, ring_broadcast
 from modeling.loader import load_safetensors
 from quant import quantize as butterquant_quantize
@@ -291,43 +300,46 @@ struct ButterQuantTPModel[tp: Int = 1](WeightIterable):
 
     @staticmethod
     def calculate_peak_scratch() -> Int:
-        """Peak scratch bytes across both phases of one layer.
+        """Peak scratch bytes across attention and MLP phases of one layer.
 
-        No per-token activation scales (S_act is model-global).
+        LIFO borrow pattern — inner borrows are released before the next
+        is allocated, so temporally non-overlapping regions share space.
 
-        Attention phase borrows:
-            act_i8:      MAX_SEQ_LEN * HIDDEN       (int8)
-            q:           MAX_SEQ_LEN * HIDDEN/tp * 2 (bf16)
-            k:           MAX_SEQ_LEN * KV_HIDDEN/tp * 2 (bf16)
-            v:           MAX_SEQ_LEN * KV_HIDDEN/tp * 2 (bf16)
-            attn_out:    MAX_SEQ_LEN * HIDDEN/tp * 2 (bf16, reuses k+v after cache write)
+        Attention phase (LIFO nesting: q_buf > qkv > act_work, then qkv > attn):
+            q_buf:       MAX_SEQ_LEN * Q_COLS * 2         (bf16, contiguous Q for attention)
+            qkv:         MAX_SEQ_LEN * QKV_N * 2          (bf16, combined GEMV output)
+            act_work:    MAX_SEQ_LEN * HIDDEN + work       (i8 + f32 rmsnorm scratch)
+            attn_scratch: MAX_SEQ_LEN * Q_COLS * 5 + overhead  (attention kernel internal)
 
-        MLP phase borrows:
-            act_i8:      MAX_SEQ_LEN * HIDDEN       (int8)
-            gate:        MAX_SEQ_LEN * INTERMEDIATE/tp * 2 (bf16)
-            up:          MAX_SEQ_LEN * INTERMEDIATE/tp * 2 (bf16)
-            post_i8:     MAX_SEQ_LEN * INTERMEDIATE  (int8, after silu+fwht+quant)
+        MLP phase (LIFO nesting: gate_up > mlp_work, then gate_up > post_work):
+            gate_up:     MAX_SEQ_LEN * GATE_UP_N * 2      (bf16, combined GEMV output)
+            mlp_work:    MAX_SEQ_LEN * HIDDEN + work       (i8 + f32 rmsnorm scratch)
+            post_work:   MAX_SEQ_LEN * GATE_ROWS + work    (i8 + f32 silu scratch)
         """
         comptime S = C.MAX_SEQ_LEN
         comptime H = C.HIDDEN
-        comptime KV = C.KV_HIDDEN
         comptime I = C.INTERMEDIATE
         comptime TP = Self.tp
+        comptime Q_COLS = H // TP
+        comptime QKV_N = (H + 2 * C.KV_HIDDEN) // TP
+        comptime GATE_UP_N = 2 * (I // TP)
+        comptime GATE_ROWS = I // TP
+        comptime MAX_WORKERS = 64
+        comptime WORK_OVERHEAD = H * MAX_WORKERS * 4  # f32 work buffer for rmsnorm
+        comptime SILU_WORK = GATE_ROWS * MAX_WORKERS * 4  # f32 work buffer for silu
 
-        comptime attn_peak = (
-            S * H                  # act_i8
-            + S * (H // TP) * 2   # q (bf16)
-            + S * (KV // TP) * 2  # k (bf16)
-            + S * (KV // TP) * 2  # v (bf16)
-            + S * (H // TP) * 2   # attn_out (bf16)
-        )
+        # Attention: q_buf + max(qkv + act_work, attn_scratch)
+        comptime q_buf = S * Q_COLS * 2
+        comptime qkv_act = S * QKV_N * 2 + S * H + WORK_OVERHEAD
+        comptime attn_scratch = S * Q_COLS * 5 + 1024 * 1024  # generous overhead
+        comptime attn_inner = attn_scratch if attn_scratch > qkv_act else qkv_act
+        comptime attn_peak = q_buf + attn_inner
 
-        comptime mlp_peak = (
-            S * H                  # act_i8
-            + S * (I // TP) * 2   # gate (bf16)
-            + S * (I // TP) * 2   # up (bf16)
-            + S * I                # post_i8
-        )
+        # MLP: gate_up + max(mlp_work, post_work)
+        comptime mlp_work = S * H + WORK_OVERHEAD
+        comptime post_work = S * GATE_ROWS + SILU_WORK
+        comptime mlp_inner = post_work if post_work > mlp_work else mlp_work
+        comptime mlp_peak = S * GATE_UP_N * 2 + mlp_inner
 
         comptime if attn_peak > mlp_peak:
             return attn_peak
@@ -696,6 +708,7 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
     var bases: InlineArray[Int, Self.tp]
     var pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]
     var layer_scales: InlineArray[LayerScales, C.NUM_LAYERS]
+    var s_act: Float32
 
     def __init__(out self, var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]],
                 var pools: HeapMoveArray[BurstPool[]],
@@ -706,6 +719,7 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
         )
         self.scratch = ScratchPool(Self.M.SCRATCH_CAPACITY)
         self.layer_scales = layer_scales^
+        self.s_act = Float32(concentration_constant[FWHT_BLOCK]())
         self.arenas = arenas^
         self.pools = pools^
         for rank in range(Self.tp):
@@ -799,7 +813,7 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
 
 
     # =========================================================================
-    # Forward pass (stub)
+    # Forward pass
     # =========================================================================
 
     def forward(
@@ -807,118 +821,236 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
     ) -> LogitsView[C.VOCAB_SIZE]:
         comptime M = Self.M
         comptime L = M.LAYER
+        var s_act = self.s_act
+        var s_act_dequant = s_act / Float32(127)
+        comptime QKV_N = L.QKV_N
+        comptime Q_ROWS = C.HIDDEN // Self.tp
+        comptime KV_ROWS = C.KV_HIDDEN // Self.tp
+        comptime Q_COLS = Q_ROWS  # = LOCAL_HEADS * HEAD_DIM
+        comptime GATE_UP_N = L.GATE_UP_N
+        comptime GATE_ROWS = C.INTERMEDIATE // Self.tp
+        comptime O_K = Q_COLS
+        comptime DOWN_K = GATE_ROWS
+        comptime MAX_WORKERS = 64
+        comptime WORK_F32 = C.HIDDEN * MAX_WORKERS  # f32 elems for rmsnorm work
+        comptime SILU_WORK_F32 = GATE_ROWS * MAX_WORKERS  # f32 elems for silu work
+        comptime ACT_WORK_BYTES = C.MAX_SEQ_LEN * C.HIDDEN + WORK_F32 * size_of[Float32]()
+        comptime MLP_WORK_BYTES = C.MAX_SEQ_LEN * C.HIDDEN + WORK_F32 * size_of[Float32]()
+        comptime POST_WORK_BYTES = C.MAX_SEQ_LEN * GATE_ROWS + SILU_WORK_F32 * size_of[Float32]()
+        comptime ATTN_SCRATCH_BYTES = C.MAX_SEQ_LEN * Q_COLS * (size_of[Float32]() + 1) + 1024 * 1024
 
         var ranks = Ranks[Self.tp](self.bases, self.pool_ptrs)
         var host = ranks.view(0)
 
-        # Model-global activation scale: S_act = C(n)
-        comptime s_act = Float32(concentration_constant[FWHT_BLOCK]())
-
         # --- Embed (host rank, then broadcast) ---
-        print("  embed_lookup")
         embed_lookup(host.weight[M.EMBED](), tokens_ptr, host.x_main(seq_len), self.pools[0]).join()
-        print("  ring_broadcast x_main")
         ring_broadcast[M.X_MAIN, Self.tp](host.x_main(seq_len).ptr, ranks.x_main_ptrs(seq_len), seq_len, ranks.pool_ptrs)
 
         for layer_idx in range(C.NUM_LAYERS):
             var ls = self.layer_scales[layer_idx]
-            print("layer " + String(layer_idx))
-
-            comptime s_act_dequant = s_act / Float32(127)
             var s_v_dequant = ls.v_layer_scale / Float32(127)
             var s_post_dequant = ls.post_layer_scale / Float32(127)
 
             # =============================================================
             # Attention block
             # =============================================================
+            # LIFO: q_buf > qkv > act_work (release) > attn (release) > (release qkv) > (release q_buf)
 
-            # Step 1-2: RMSNorm + FWHT + quantize → act_i8 (S_act)
-            var act_i8 = self.scratch.borrow[Scalar[DType.int8], C.MAX_SEQ_LEN * C.HIDDEN]()
-            print("  ranks.parallel(1w): rmsnorm_fwht_quantize → act_i8")
-
-            # Steps 3-5: Combined QKV int8_gemv (one [QKV_N, HIDDEN] GEMV)
-            # Output is contiguous bf16 [seq_len, QKV_N]; caller slices Q|K|V.
-            comptime QKV_N = L.QKV_N
+            var q_buf = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * Q_COLS]()
             var qkv = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * QKV_N]()
-            print("  ranks.parallel(pool): int8_gemv QKV [" + String(QKV_N) + "x" + String(C.HIDDEN) + "]")
-            # int8_gemv[QKV_N, HIDDEN](act_i8, W_QKV @ Q_PROJ.OFFSET,
-            #     colsum @ Q_COLSUM.OFFSET, scale @ Q_ROW_SCALE.OFFSET,
-            #     qkv, seq_len, s_act_dequant, pool)
+            var act_work = self.scratch.borrow[UInt8, ACT_WORK_BYTES]()
+            var act_i8_off = act_work.offset
+            var work_off = act_work.offset + C.MAX_SEQ_LEN * C.HIDDEN
 
-            act_i8^.release()
+            for rank in range(Self.tp):
+                var rv = ranks.view(rank)
+                var sb = rv.scratch_base()
 
-            # Step 6-7: KV cache write from K/V slices of qkv output
-            # Q = qkv[:, 0:Q_N], K = qkv[:, Q_N:Q_N+KV_N], V = qkv[:, Q_N+KV_N:QKV_N]
-            print("  ranks.parallel(1w): kv_cache_write_k + kv_cache_write_v")
+                # RMSNorm + FWHT + quantize: x_main → act_i8
+                rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
+                    rv.x_main(seq_len).ptr, sb + act_i8_off, sb + work_off,
+                    seq_len, s_act, self.pools[rank],
+                ).join()
 
-            # Steps 8-12: Attention (Q prep from Q slice, K/V from cache)
-            comptime ATTN_OUT_ELEMS = C.MAX_SEQ_LEN * M.LOCAL_HEADS * C.HEAD_DIM
-            var attn_scratch = self.scratch.borrow[Float32, ATTN_OUT_ELEMS]()
-            print("  ranks.parallel(pool): attention")
+                # int8_gemv QKV: act_i8 → qkv
+                var qkv_configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(Float32(0), 0))
+                int8_gemv[QKV_N, C.HIDDEN](
+                    sb + act_i8_off,
+                    rv.layer_weight[L.Q_PROJ](layer_idx).ptr,
+                    rv.layer_weight[L.Q_COLSUM](layer_idx).ptr,
+                    rv.layer_weight[L.Q_ROW_SCALE](layer_idx).ptr,
+                    sb + qkv.offset, seq_len, s_act_dequant,
+                    qkv_configs, self.pools[rank],
+                ).join()
+                _ = qkv_configs
+
+            act_work^.release()
+
+            # KV cache write + Q copy to contiguous buffer
+            for rank in range(Self.tp):
+                var rv = ranks.view(rank)
+                var sb = rv.scratch_base()
+                var kvc = rv.kv_cache(layer_idx)
+                var qkv_ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+                    unsafe_from_address=sb + qkv.offset)
+
+                rope_and_kv_cache_write[C.HEAD_DIM, M.LOCAL_KV_HEADS, C.MAX_SEQ_LEN](
+                    qkv_ptr + Q_ROWS,              # k_bf16 (after Q columns)
+                    qkv_ptr + Q_ROWS + KV_ROWS,    # v_bf16 (after K columns)
+                    QKV_N, QKV_N,                   # k_stride, v_stride (element stride)
+                    UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=rv.rope_cos().ptr),
+                    UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=rv.rope_sin().ptr),
+                    kvc, pos, seq_len,
+                    ls.k_layer_scale, ls.v_layer_scale,
+                )
+
+                # Copy Q from strided QKV to contiguous q_buf
+                var q_dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+                    unsafe_from_address=sb + q_buf.offset)
+                for m in range(seq_len):
+                    memcpy(dest=q_dst + m * Q_COLS, src=qkv_ptr + m * QKV_N, count=Q_COLS)
 
             qkv^.release()
 
-            # Step 13: Quantize attention output → i8 (S_V)
-            comptime ATTN_I8_ELEMS = C.MAX_SEQ_LEN * M.LOCAL_HEADS * C.HEAD_DIM
-            var attn_i8 = self.scratch.borrow[Scalar[DType.int8], ATTN_I8_ELEMS]()
-            print("  ranks.parallel(1w): quantize_fixed attn_out → attn_i8")
+            # Attention → i8 output (within attn_scratch)
+            var attn = self.scratch.borrow[UInt8, ATTN_SCRATCH_BYTES]()
 
-            attn_scratch^.release()
+            for rank in range(Self.tp):
+                var rv = ranks.view(rank)
+                var sb = rv.scratch_base()
+                var kvc = rv.kv_cache(layer_idx)
+                var q_view = DynView[M.Q_VIEW](sb + q_buf.offset, seq_len)
 
-            # Step 14: O projection (ColShard → allreduce after)
-            print("  ranks.parallel(pool): int8_gemv O_PROJ → x_residual")
-            # int8_gemv[O_N, LOCAL_HIDDEN](attn_i8, W_O, colsum_O, scale_O,
-            #     x_residual, seq_len, s_v_dequant, pool)
+                if seq_len == 1:
+                    var wpg_hint = self.pools[rank].get_capacity() // M.LOCAL_KV_HEADS
+                    amx_decode[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM, C.MAX_SEQ_LEN](
+                        q_view, kvc, kvc,
+                        rv.rope_cos(), rv.rope_sin(),
+                        sb + attn.offset, pos,
+                        ls.q_layer_scale, ls.k_layer_scale, ls.v_layer_scale,
+                        wpg_hint, self.pools[rank],
+                    ).join()
+                    # Replicate decode's internal wpg capping for decode_merge
+                    comptime DECODE_BLOCK_N = 512
+                    var context = pos + 1
+                    var max_blocks = (context + DECODE_BLOCK_N - 1) // DECODE_BLOCK_N
+                    var wpg = min(min(wpg_hint, max_blocks),
+                                  self.pools[rank].get_capacity() // M.LOCAL_KV_HEADS)
+                    var vagg_scale = ls.v_layer_scale / (Float32(255) * Float32(127))
+                    decode_merge[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM](
+                        sb + attn.offset, wpg, vagg_scale,
+                    )
+                else:
+                    amx_prefill[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM, C.MAX_SEQ_LEN](
+                        q_view, kvc, kvc,
+                        rv.rope_cos(), rv.rope_sin(),
+                        sb + attn.offset, pos,
+                        ls.q_layer_scale, ls.k_layer_scale, ls.v_layer_scale,
+                        self.pools[rank],
+                    ).join()
 
-            attn_i8^.release()
+                # i8 output location within attn scratch
+                var attn_i8_addr = sb + attn.offset
+                if seq_len > 1:
+                    attn_i8_addr += seq_len * Q_COLS * size_of[Float32]()
 
-            # Step 15: Allreduce + residual add
-            print("  ring_allreduce + elem_add")
+                # int8_gemv O: attn_i8 → x_residual
+                var o_configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(Float32(0), 0))
+                int8_gemv[C.HIDDEN, O_K](
+                    attn_i8_addr,
+                    rv.layer_weight[L.O_PROJ](layer_idx).ptr,
+                    rv.layer_weight[L.O_COLSUM](layer_idx).ptr,
+                    rv.layer_weight[L.O_ROW_SCALE](layer_idx).ptr,
+                    rv.x_residual(seq_len).ptr, seq_len, s_v_dequant,
+                    o_configs, self.pools[rank],
+                ).join()
+                _ = o_configs
+
+            attn^.release()
+            q_buf^.release()
+
+            # Allreduce + residual add
             ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
+            for rank in range(Self.tp):
+                var rv = ranks.view(rank)
+                elem_add(rv.x_main(seq_len), rv.x_residual(seq_len), rv.x_main(seq_len))
 
             # =============================================================
             # MLP block
             # =============================================================
+            # LIFO: gate_up > mlp_work (release) > post_work (release) > (release gate_up)
 
-            # Steps 16-17: RMSNorm + FWHT + quantize → mlp_i8 (S_act)
-            var mlp_i8 = self.scratch.borrow[Scalar[DType.int8], C.MAX_SEQ_LEN * C.HIDDEN]()
-            print("  ranks.parallel(1w): rmsnorm_fwht_quantize → mlp_i8")
-
-            # Steps 18-19: Combined gate+up int8_gemv
-            comptime GATE_UP_N = L.GATE_UP_N
             var gate_up = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * GATE_UP_N]()
-            print("  ranks.parallel(pool): int8_gemv gate+up [" + String(GATE_UP_N) + "x" + String(C.HIDDEN) + "]")
-            # int8_gemv[GATE_UP_N, HIDDEN](mlp_i8, W_gate_up @ GATE_PROJ.OFFSET,
-            #     colsum @ GATE_COLSUM.OFFSET, scale @ GATE_ROW_SCALE.OFFSET,
-            #     gate_up, seq_len, s_act_dequant, pool)
+            var mlp_work = self.scratch.borrow[UInt8, MLP_WORK_BYTES]()
+            var mlp_i8_off = mlp_work.offset
+            var mlp_work_off = mlp_work.offset + C.MAX_SEQ_LEN * C.HIDDEN
 
-            mlp_i8^.release()
+            for rank in range(Self.tp):
+                var rv = ranks.view(rank)
+                var sb = rv.scratch_base()
 
-            # Steps 20-21: SiLU + FWHT + quantize → post_i8 (S_post)
-            # gate = gate_up[:, 0:GATE_PROJ.ROWS], up = gate_up[:, GATE_PROJ.ROWS:]
-            var post_i8 = self.scratch.borrow[Scalar[DType.int8], C.MAX_SEQ_LEN * C.INTERMEDIATE]()
-            print("  ranks.parallel(1w): silu_fwht_quantize → post_i8")
+                # RMSNorm + FWHT + quantize: x_main → mlp_i8
+                rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
+                    rv.x_main(seq_len).ptr, sb + mlp_i8_off, sb + mlp_work_off,
+                    seq_len, s_act, self.pools[rank],
+                ).join()
 
+                # int8_gemv gate+up: mlp_i8 → gate_up
+                var gu_configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(Float32(0), 0))
+                int8_gemv[GATE_UP_N, C.HIDDEN](
+                    sb + mlp_i8_off,
+                    rv.layer_weight[L.GATE_PROJ](layer_idx).ptr,
+                    rv.layer_weight[L.GATE_COLSUM](layer_idx).ptr,
+                    rv.layer_weight[L.GATE_ROW_SCALE](layer_idx).ptr,
+                    sb + gate_up.offset, seq_len, s_act_dequant,
+                    gu_configs, self.pools[rank],
+                ).join()
+                _ = gu_configs
+
+            mlp_work^.release()
+
+            # SiLU + FWHT + quantize: gate_up → post_i8, then down projection
+            var post_work = self.scratch.borrow[UInt8, POST_WORK_BYTES]()
+            var post_i8_off = post_work.offset
+            var silu_work_off = post_work.offset + C.MAX_SEQ_LEN * GATE_ROWS
+
+            for rank in range(Self.tp):
+                var rv = ranks.view(rank)
+                var sb = rv.scratch_base()
+
+                silu_fwht_quantize[GATE_ROWS, GATE_UP_N, FWHT_BLOCK](
+                    sb + gate_up.offset, sb + post_i8_off, sb + silu_work_off,
+                    seq_len, ls.post_layer_scale, self.pools[rank],
+                ).join()
+
+                # int8_gemv down: post_i8 → x_residual
+                var dn_configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(Float32(0), 0))
+                int8_gemv[C.HIDDEN, DOWN_K](
+                    sb + post_i8_off,
+                    rv.layer_weight[L.DOWN_PROJ](layer_idx).ptr,
+                    rv.layer_weight[L.DOWN_COLSUM](layer_idx).ptr,
+                    rv.layer_weight[L.DOWN_ROW_SCALE](layer_idx).ptr,
+                    rv.x_residual(seq_len).ptr, seq_len, s_post_dequant,
+                    dn_configs, self.pools[rank],
+                ).join()
+                _ = dn_configs
+
+            post_work^.release()
             gate_up^.release()
 
-            # Step 22: Down projection (ColShard → allreduce after)
-            print("  ranks.parallel(pool): int8_gemv DOWN_PROJ → x_residual")
-            # int8_gemv[DOWN_N, INTERMEDIATE](post_i8, W_down, colsum_down, scale_down,
-            #     x_residual, seq_len, s_post_dequant, pool)
-
-            post_i8^.release()
-
-            # Step 23: Allreduce + residual add
-            print("  ring_allreduce + elem_add")
+            # Allreduce + residual add
             ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
+            for rank in range(Self.tp):
+                var rv = ranks.view(rank)
+                elem_add(rv.x_main(seq_len), rv.x_residual(seq_len), rv.x_main(seq_len))
 
             _ = layer_idx
 
         # --- Final norm + LM head (host rank only, tied embeddings) ---
-        print("  rmsnorm (final, no gamma absorption)")
-        print("  gemm LM head (tied embeddings, bf16 matmul)")
         var last_row_off = (seq_len - 1) * C.HIDDEN * M.X_MAIN.ELEMENT_BYTES
         var last_hidden = DynView[M.X_MAIN](host.x_main(seq_len).ptr + last_row_off, 1)
+        rmsnorm(last_hidden, host.weight[M.FINAL_NORM](), last_hidden, self.pools[0]).join()
+
         var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
         var logit_view = host.scratch_view[M.LOGITS](logit_lease, 1)
         float_gemv(last_hidden, host.weight[M.EMBED](), logit_view, self.pools[0]).join()

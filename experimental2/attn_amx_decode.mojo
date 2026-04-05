@@ -18,7 +18,7 @@ from modeling.model_spec import (
     Bound, DynView,
 )
 from kernels.kernel_ops import PoolFence
-from simd_math import sqrt
+from simd_math import sqrt, roundeven
 from simd_math import exp_f32_fast
 from experimental2.kv_cache import KVCache
 from experimental2.helpers import AttnCtx, pack_v_tile_vnni, amx_gemm_1x3, prep_q_row, softmax_row
@@ -79,7 +79,7 @@ def scratch_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int](
 ) -> Int:
     comptime q_cols = num_heads * head_dim
     comptime pw = per_worker_merge_bytes[num_heads, num_kv_heads, head_dim]()
-    return q_cols * size_of[Float32]() + size_of[AttnCtx]() + num_workers * pw
+    return q_cols * size_of[Scalar[DType.int8]]() + size_of[AttnCtx]() + num_workers * pw
 
 
 # ============================================================================
@@ -300,13 +300,19 @@ def decode_merge[num_heads: Int, num_kv_heads: Int, head_dim: Int](
     workers_per_group: Int,
     vagg_scale: Float32,
 ):
-    """Merge partial online softmax states from context-split workers."""
+    """Merge partial online softmax states, quantize output to i8."""
     comptime gqa_factor = num_heads // num_kv_heads
     comptime q_cols = num_heads * head_dim
     comptime pw = per_worker_merge_bytes[num_heads, num_kv_heads, head_dim]()
-    comptime WORKERS_OFF = q_cols * size_of[Float32]() + size_of[AttnCtx]()
+    comptime WORKERS_OFF = q_cols * size_of[Scalar[DType.int8]]() + size_of[AttnCtx]()
     comptime width = simd_width_of[DType.float32]()
-    var output = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=scratch)
+    comptime qi_lo = SIMD[DType.float32, width](-128.0)
+    comptime qi_hi = SIMD[DType.float32, width](127.0)
+
+    var ctx = UnsafePointer[AttnCtx, MutAnyOrigin](
+        unsafe_from_address=scratch + q_cols * size_of[Scalar[DType.int8]]())
+    var qi_output = ctx[].qi_output
+    var qi_scale = SIMD[DType.float32, width](ctx[].qi_scale)
 
     for g in range(num_kv_heads):
         var ws0_base = scratch + WORKERS_OFF + (g * workers_per_group) * pw
@@ -338,15 +344,16 @@ def decode_merge[num_heads: Int, num_kv_heads: Int, head_dim: Int](
                     (ro0 + d).store(vc0 * (ro0 + d).load[width=width]() + vcw * (row + d).load[width=width]())
                     d += width
 
-        # Final normalize
+        # Final normalize + quantize to i8
         for hi in range(gqa_factor):
             var h = g * gqa_factor + hi
             var final_scale = vagg_scale / l0[hi]
             var ro = o0 + hi * head_dim
-            var out = output + h * head_dim
+            var out = qi_output + h * head_dim
             var d = 0
             while d + width <= head_dim:
-                (out + d).store((ro + d).load[width=width]() * final_scale)
+                var v = (ro + d).load[width=width]() * final_scale
+                (out + d).store(min(max(roundeven(v * qi_scale), qi_lo), qi_hi).cast[DType.int8]())
                 d += width
 
 
@@ -360,7 +367,7 @@ def collect_profiles[num_heads: Int, num_kv_heads: Int, head_dim: Int](
 ) -> ProfileAggregator:
     comptime q_cols = num_heads * head_dim
     comptime pw = per_worker_merge_bytes[num_heads, num_kv_heads, head_dim]()
-    comptime WORKERS_OFF = q_cols * size_of[Float32]() + size_of[AttnCtx]()
+    comptime WORKERS_OFF = q_cols * size_of[Scalar[DType.int8]]() + size_of[AttnCtx]()
     var total = num_kv_heads * workers_per_group
     var agg = ProfileAggregator()
     for j in range(total):
@@ -408,8 +415,9 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     var q_quant_inv = Float32(127.0) / q_layer_scale
     var score_scale = q_layer_scale * k_layer_scale * inv_sqrt_hd / (Float32(127.0) * Float32(127.0))
 
-    # Write AttnCtx into scratch (after output buffer, before workers)
-    var output_bytes = q_cols * size_of[Float32]()
+    # Write AttnCtx into scratch (after i8 output buffer, before workers)
+    var output_bytes = q_cols * size_of[Scalar[DType.int8]]()
+    var qi_inv = Float32(127) / v_layer_scale
     var ctx_ptr = UnsafePointer[AttnCtx, MutAnyOrigin](
         unsafe_from_address=scratch + output_bytes)
     ctx_ptr[] = AttnCtx(
@@ -419,6 +427,8 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
         UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=k_cache.k_base),
         UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=v_cache.v_base),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=scratch),
+        UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=scratch),
+        qi_inv,
     )
     var workers_off = output_bytes + size_of[AttnCtx]()
 

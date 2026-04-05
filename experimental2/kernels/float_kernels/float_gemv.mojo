@@ -12,13 +12,13 @@ from modeling.model_spec import Encoding, Shaped, Bound, DynView
 from kernels.kernel_ops import PoolFence
 
 
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-
-
 def float_gemv_kernel[K: Int, N: Int](
-    ip: BF16Ptr, wp: BF16Ptr, dp: BF16Ptr,
+    in_ptr: Int, weight_ptr: Int, out_ptr: Int,
     start_col: Int, end_col: Int, unused: Int,
 ):
+    var ip = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=in_ptr)
+    var wp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=weight_ptr)
+    var dp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=out_ptr)
     comptime width = simd_width_of[DType.float32]()
     comptime Nr = 4
     var n_full = end_col - ((end_col - start_col) % Nr)

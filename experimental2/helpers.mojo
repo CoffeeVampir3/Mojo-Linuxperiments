@@ -31,6 +31,8 @@ struct AttnCtx:
     var k_base: UnsafePointer[UInt8, MutAnyOrigin]
     var v_base: UnsafePointer[Int8, MutAnyOrigin]
     var output: UnsafePointer[Float32, MutAnyOrigin]
+    var qi_output: UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
+    var qi_scale: Float32
 
 
 # ============================================================================
@@ -155,6 +157,7 @@ def pack_v_tile_vnni(
     """Pack V[pos,dim] i8 -> VNNI [K/4,N,4] via SIMD interleave."""
     comptime VNNI_GROUP_BYTES = TILE_N * VNNI_BLK
     comptime zeros = SIMD[DType.int8, VNNI_GROUP_BYTES](0)
+    comptime zero_row = SIMD[DType.int8, TILE_N](0)
     var full_groups = n_pos // VNNI_BLK
     for kg in range(full_groups):
         var p = pos_off + kg * VNNI_BLK
@@ -163,8 +166,25 @@ def pack_v_tile_vnni(
         var r2 = (v_base + (p + 2) * head_dim + dim_off).load[width=TILE_N]()
         var r3 = (v_base + (p + 3) * head_dim + dim_off).load[width=TILE_N]()
         (dst + kg * VNNI_GROUP_BYTES).store(r0.interleave(r2).interleave(r1.interleave(r3)))
-    for kg in range(full_groups, K_STEP // VNNI_BLK):
-        (dst + kg * VNNI_GROUP_BYTES).store(zeros)
+    var remainder = n_pos - full_groups * VNNI_BLK
+    if remainder > 0:
+        var p = pos_off + full_groups * VNNI_BLK
+        var r0 = zero_row
+        var r1 = zero_row
+        var r2 = zero_row
+        var r3 = zero_row
+        if remainder >= 1:
+            r0 = (v_base + (p + 0) * head_dim + dim_off).load[width=TILE_N]()
+        if remainder >= 2:
+            r1 = (v_base + (p + 1) * head_dim + dim_off).load[width=TILE_N]()
+        if remainder >= 3:
+            r2 = (v_base + (p + 2) * head_dim + dim_off).load[width=TILE_N]()
+        (dst + full_groups * VNNI_GROUP_BYTES).store(r0.interleave(r2).interleave(r1.interleave(r3)))
+        for kg in range(full_groups + 1, K_STEP // VNNI_BLK):
+            (dst + kg * VNNI_GROUP_BYTES).store(zeros)
+    else:
+        for kg in range(full_groups, K_STEP // VNNI_BLK):
+            (dst + kg * VNNI_GROUP_BYTES).store(zeros)
 
 
 # ============================================================================
