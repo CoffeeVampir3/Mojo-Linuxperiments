@@ -187,18 +187,19 @@ def int8_gemv[N: Int, K: Int, P: BurstThreadPool](
     colsum_ptr: Int, weight_scale_ptr: Int, dst_ptr: Int,
     seq_len: Int,
     act_scale_ptr: Int,
-    mut configs: InlineArray[WorkerConfig, 128],
+    configs_ptr: Int,
     mut pool: P,
 ) -> PoolFence[P]:
     """Dispatch int8 GEMV: [seq_len, K] x [N, K]^T -> [seq_len, N] bf16.
 
     act_scale_ptr: f32[seq_len] per-row activation scales (absmax from quantize).
+    configs_ptr: caller-owned WorkerConfig buffer (at least min(seq_len, capacity) elements).
     Dequant per row: (raw - 128*colsum) * (act_scale[m]/127) * weight_scale[n].
     """
     if seq_len == 0:
         return PoolFence[P].completed()
 
-    var cfg_base = Int(UnsafePointer(to=configs).bitcast[WorkerConfig]())
+    var configs = UnsafePointer[WorkerConfig, MutAnyOrigin](unsafe_from_address=configs_ptr)
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
@@ -212,7 +213,7 @@ def int8_gemv[N: Int, K: Int, P: BurstThreadPool](
         pack[].arg2 = colsum_ptr
         pack[].arg3 = weight_scale_ptr
         pack[].arg4 = dst_ptr + start * N * 2
-        pack[].arg5 = cfg_base + i * size_of[WorkerConfig]()
+        pack[].arg5 = configs_ptr + i * size_of[WorkerConfig]()
 
     pool.dispatch(int8_gemv_worker[N, K], pool.get_args_base(), num_jobs)
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
@@ -303,18 +304,19 @@ def fused_gu_silu[GATE_ROWS: Int, K: Int, FWHT_BLK: Int, P: BurstThreadPool](
     up_wpacked_ptr: Int, up_colsum_ptr: Int, up_wscale_ptr: Int,
     qi_ptr: Int, scale_ptr: Int,
     seq_len: Int, act_scale_ptr: Int,
-    mut configs: InlineArray[FusedGUSiluConfig, 128],
+    configs_ptr: Int,
     mut pool: P,
 ) -> PoolFence[P]:
     """Fused gate+up GEMV → SiLU → FWHT → i8 quantize.
 
     Eliminates the bf16 gate+up intermediate buffer entirely.
+    configs_ptr: caller-owned FusedGUSiluConfig buffer.
     Output is i8 [seq_len, GATE_ROWS] + f32 [seq_len] per-row scales.
     """
     if seq_len == 0:
         return PoolFence[P].completed()
 
-    var cfg_base = Int(UnsafePointer(to=configs).bitcast[FusedGUSiluConfig]())
+    var configs = UnsafePointer[FusedGUSiluConfig, MutAnyOrigin](unsafe_from_address=configs_ptr)
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
@@ -331,7 +333,7 @@ def fused_gu_silu[GATE_ROWS: Int, K: Int, FWHT_BLK: Int, P: BurstThreadPool](
         pack[].arg2 = up_wpacked_ptr
         pack[].arg3 = qi_ptr
         pack[].arg4 = scale_ptr
-        pack[].arg5 = cfg_base + i * size_of[FusedGUSiluConfig]()
+        pack[].arg5 = configs_ptr + i * size_of[FusedGUSiluConfig]()
 
     pool.dispatch(fused_gu_silu_worker[GATE_ROWS, K, FWHT_BLK], pool.get_args_base(), num_jobs)
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](

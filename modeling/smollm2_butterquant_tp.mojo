@@ -390,6 +390,7 @@ struct ButterQuantTPModel[tp: Int = 1](WeightIterable):
         MLP phase (fused gate+up GEMV → SiLU → FWHT → i8):
             mlp_work:    MAX_SEQ_LEN * HIDDEN + work       (i8 + f32 rmsnorm scratch)
             post_i8:     MAX_SEQ_LEN * GATE_ROWS           (i8 fused output)
+            Both live during fused kernel (input i8 must not alias output i8).
         """
         comptime S = C.MAX_SEQ_LEN
         comptime H = C.HIDDEN
@@ -411,10 +412,10 @@ struct ButterQuantTPModel[tp: Int = 1](WeightIterable):
         comptime attn_inner = attn_scratch if attn_scratch > act_work else act_work
         comptime attn_peak = qkv_buf + attn_inner
 
-        # MLP: max(mlp_work, post_i8) — fused, no bf16 intermediate
+        # MLP: mlp_work + post_i8 (both live during fused kernel)
         comptime mlp_work = S * H + WORK_OVERHEAD
         comptime post_i8_bytes = S * GATE_ROWS
-        comptime mlp_peak = mlp_work if mlp_work > post_i8_bytes else post_i8_bytes
+        comptime mlp_peak = mlp_work + post_i8_bytes
 
         comptime layer_peak = attn_peak if attn_peak > mlp_peak else mlp_peak
         return scale_arrays + layer_peak
@@ -745,8 +746,10 @@ def decode_merge_worker[num_heads: Int, num_kv_heads: Int, head_dim: Int](
 
 
 # =============================================================================
+# =============================================================================
 # Loaded model
 # =============================================================================
+
 
 
 struct SmolLM2ButterQuant[tp: Int](Movable):
@@ -797,6 +800,9 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
 
     def report_profile(self):
         self.profile.report()
+
+    def reset_profile(mut self):
+        self.profile = ForwardProfile()
 
     def token_buffer(self) -> UnsafePointer[Scalar[DType.int32], MutAnyOrigin]:
         return UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
@@ -865,6 +871,7 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
         return model^
 
 
+
     # =========================================================================
     # Forward pass
     # =========================================================================
@@ -904,6 +911,18 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
         var post_scale_lease = self.scratch.borrow[Float32, C.MAX_SEQ_LEN]()
         var v_scale_lease = self.scratch.borrow[Float32, C.MAX_SEQ_LEN]()
 
+        # Config buffers that outlive closures — enables truly parallel dispatch.
+        # Reused across layers (each ranks.parallel joins before the next phase).
+        comptime MAX_CFGS = 128 * Self.tp
+        var gemv_cfg_buf = InlineArray[WorkerConfig, MAX_CFGS](fill=WorkerConfig(0, 0, 0))
+        var gemv_cfg_base = Int(UnsafePointer(to=gemv_cfg_buf).bitcast[WorkerConfig]())
+        var fused_cfg_buf = InlineArray[FusedGUSiluConfig, MAX_CFGS](
+            fill=FusedGUSiluConfig(0, 0, 0, 0, 0, 0, 0))
+        var fused_cfg_base = Int(UnsafePointer(to=fused_cfg_buf).bitcast[FusedGUSiluConfig]())
+        var kv_cfg_buf = InlineArray[KVWriteConfig, Self.tp](
+            fill=KVWriteConfig(0, 0, 0, 0, 0, 0, 0, 0, 0, Float32(0)))
+        var kv_cfg_base = Int(UnsafePointer(to=kv_cfg_buf).bitcast[KVWriteConfig]())
+
         for layer_idx in range(C.NUM_LAYERS):
             var ls = self.layer_scales[layer_idx]
 
@@ -931,17 +950,15 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
             @parameter
             def do_qkv_gemv[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var sb = rv.scratch_base()
-                var configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(0, 0, 0))
-                int8_gemv[QKV_N, C.HIDDEN](
+                return int8_gemv[QKV_N, C.HIDDEN](
                     sb + act_i8_off,
                     rv.layer_weight[L.Q_PROJ](layer_idx).ptr,
                     rv.layer_weight[L.Q_COLSUM](layer_idx).ptr,
                     rv.layer_weight[L.Q_ROW_SCALE](layer_idx).ptr,
                     sb + qkv.offset, seq_len,
                     sb + act_scale_lease.offset,
-                    configs, pool).join()
-                _ = configs
-                return PoolFence[BurstPool[]].completed()
+                    gemv_cfg_base + rank * 128 * size_of[WorkerConfig](),
+                    pool)
             ranks.parallel[do_qkv_gemv]()
 
             act_work^.release()
@@ -951,7 +968,9 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
             @parameter
             def do_kv_write[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var sb = rv.scratch_base()
-                var cfg = KVWriteConfig(
+                var cfg_ptr = UnsafePointer[KVWriteConfig, MutAnyOrigin](
+                    unsafe_from_address=kv_cfg_base + rank * size_of[KVWriteConfig]())
+                cfg_ptr[] = KVWriteConfig(
                     sb + qkv.offset + Q_ROWS * 2,
                     sb + qkv.offset + (Q_ROWS + KV_ROWS) * 2,
                     QKV_N, QKV_N,
@@ -959,14 +978,12 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                     rv.kv_base(layer_idx),
                     pos, seq_len, ls.v_layer_scale)
                 var pack = pool.get_args_base()
-                pack[].arg0 = Int(UnsafePointer(to=cfg))
+                pack[].arg0 = Int(cfg_ptr)
                 pool.dispatch(
                     kv_write_worker[C.HEAD_DIM, M.LOCAL_KV_HEADS, C.MAX_SEQ_LEN, M.LOCAL_HEADS],
                     pool.get_args_base(), 1)
-                PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
-                    unsafe_from_address=Int(UnsafePointer(to=pool)))).join()
-                _ = cfg
-                return PoolFence[BurstPool[]].completed()
+                return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
+                    unsafe_from_address=Int(UnsafePointer(to=pool))))
             ranks.parallel[do_kv_write]()
 
             var td = Int(perf_counter_ns())
@@ -1018,17 +1035,15 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                 var attn_i8_addr = sb + attn.offset
                 if seq_len > 1:
                     attn_i8_addr += seq_len * Q_COLS * size_of[Float32]()
-                var configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(0, 0, 0))
-                int8_gemv[C.HIDDEN, O_K](
+                return int8_gemv[C.HIDDEN, O_K](
                     attn_i8_addr,
                     rv.layer_weight[L.O_PROJ](layer_idx).ptr,
                     rv.layer_weight[L.O_COLSUM](layer_idx).ptr,
                     rv.layer_weight[L.O_ROW_SCALE](layer_idx).ptr,
                     rv.x_residual(seq_len).ptr, seq_len,
                     sb + v_scale_lease.offset,
-                    configs, pool).join()
-                _ = configs
-                return PoolFence[BurstPool[]].completed()
+                    gemv_cfg_base + rank * 128 * size_of[WorkerConfig](),
+                    pool)
             ranks.parallel[do_o_gemv]()
 
             qkv^.release()
@@ -1068,18 +1083,16 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                     sb + act_scale_lease.offset, seq_len, pool)
             ranks.parallel[do_mlp_norm]()
 
-            mlp_work^.release()
-
             var th = Int(perf_counter_ns())
 
             # Fused gate+up GEMV → SiLU → FWHT → i8 (no bf16 intermediate)
+            # mlp_work stays alive: fused kernel reads i8 input from mlp_i8_off
             var post_i8 = self.scratch.borrow[Scalar[DType.int8], C.MAX_SEQ_LEN * GATE_ROWS]()
 
             @parameter
             def do_fused_gu_silu[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var sb = rv.scratch_base()
-                var configs = InlineArray[FusedGUSiluConfig, 128](fill=FusedGUSiluConfig(0, 0, 0, 0, 0, 0, 0))
-                fused_gu_silu[GATE_ROWS, C.HIDDEN, FWHT_BLOCK](
+                return fused_gu_silu[GATE_ROWS, C.HIDDEN, FWHT_BLOCK](
                     sb + mlp_i8_off,
                     rv.layer_weight[L.GATE_PROJ](layer_idx).ptr,
                     rv.layer_weight[L.GATE_COLSUM](layer_idx).ptr,
@@ -1090,10 +1103,11 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                     sb + post_i8.offset,
                     sb + post_scale_lease.offset,
                     seq_len, sb + act_scale_lease.offset,
-                    configs, pool).join()
-                _ = configs
-                return PoolFence[BurstPool[]].completed()
+                    fused_cfg_base + rank * 128 * size_of[FusedGUSiluConfig](),
+                    pool)
             ranks.parallel[do_fused_gu_silu]()
+
+            mlp_work^.release()
 
             var ti = Int(perf_counter_ns())
             var tj = ti  # silu is fused, no separate phase
@@ -1101,17 +1115,15 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
             @parameter
             def do_down_gemv[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var sb = rv.scratch_base()
-                var configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(0, 0, 0))
-                int8_gemv[C.HIDDEN, DOWN_K](
+                return int8_gemv[C.HIDDEN, DOWN_K](
                     sb + post_i8.offset,
                     rv.layer_weight[L.DOWN_PROJ](layer_idx).ptr,
                     rv.layer_weight[L.DOWN_COLSUM](layer_idx).ptr,
                     rv.layer_weight[L.DOWN_ROW_SCALE](layer_idx).ptr,
                     rv.x_residual(seq_len).ptr, seq_len,
                     sb + post_scale_lease.offset,
-                    configs, pool).join()
-                _ = configs
-                return PoolFence[BurstPool[]].completed()
+                    gemv_cfg_base + rank * 128 * size_of[WorkerConfig](),
+                    pool)
             ranks.parallel[do_down_gemv]()
 
             post_i8^.release()
