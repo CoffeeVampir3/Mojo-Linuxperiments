@@ -143,7 +143,8 @@ def gemv_row[N: Int, K: Int, OutDType: DType](
 
 @fieldwise_init
 struct WorkerConfig(Copyable, ImplicitlyCopyable):
-    var act_dequant: Float32
+    var act_scale_ptr: Int  # pointer to f32[seq_len] per-row activation scales
+    var start_row: Int      # global row offset for indexing into act_scale_ptr
     var row_count: Int
 
 
@@ -162,10 +163,13 @@ def int8_gemv_worker[N: Int, K: Int](
     var colsum = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=colsum_ptr)
     var wscale = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=weight_scale_ptr)
     var dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=dst_ptr)
+    var act_scales = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cfg[].act_scale_ptr)
+    var start = cfg[].start_row
 
     for m in range(cfg[].row_count):
+        var act_dequant = act_scales[start + m] / Float32(127)
         gemv_row[N, K, DType.bfloat16](
-            act + m * K, wpacked, cfg[].act_dequant, wscale, colsum, dst + m * N,
+            act + m * K, wpacked, act_dequant, wscale, colsum, dst + m * N,
         )
 
 
@@ -178,13 +182,14 @@ def int8_gemv[N: Int, K: Int, P: BurstThreadPool](
     act_ptr: Int, wpacked_ptr: Int,
     colsum_ptr: Int, weight_scale_ptr: Int, dst_ptr: Int,
     seq_len: Int,
-    act_dequant: Float32,
+    act_scale_ptr: Int,
     mut configs: InlineArray[WorkerConfig, 128],
     mut pool: P,
 ) -> PoolFence[P]:
     """Dispatch int8 GEMV: [seq_len, K] x [N, K]^T -> [seq_len, N] bf16.
 
-    Caller provides configs array. Workers split M rows.
+    act_scale_ptr: f32[seq_len] per-row activation scales (absmax from quantize).
+    Dequant per row: (raw - 128*colsum) * (act_scale[m]/127) * weight_scale[n].
     """
     if seq_len == 0:
         return PoolFence[P].completed()
@@ -196,7 +201,7 @@ def int8_gemv[N: Int, K: Int, P: BurstThreadPool](
     for i in range(num_jobs):
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
-        configs[i] = WorkerConfig(act_dequant, end - start)
+        configs[i] = WorkerConfig(act_scale_ptr, start, end - start)
         var pack = pool.get_args_base() + i
         pack[].arg0 = act_ptr + start * K
         pack[].arg1 = wpacked_ptr

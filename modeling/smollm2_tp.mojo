@@ -11,7 +11,7 @@ for input projections (allreduce after). Dispatch via parallel_for.
 
 from std.pathlib import Path
 
-from std.memory import UnsafePointer
+from std.memory import UnsafePointer, memcpy
 from std.collections import InlineArray
 from numa import NumaArena, NumaInfo
 from notstdcollections import HeapMoveArray
@@ -546,6 +546,119 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
         return LogitsView[C.VOCAB_SIZE](
             host.scratch_ptr[Scalar[DType.bfloat16]](logit_lease), logit_lease^,
         )
+
+    # =========================================================================
+    # === DEBUG === Stepped forward pass for layer-by-layer comparison
+    # =========================================================================
+
+    def debug_embed(mut self, tokens_ptr: Int, seq_len: Int)
+        where Self.E.DTYPE == DType.bfloat16:
+        comptime M = Self.M
+        var ranks = Ranks[Self.E, Self.tp](self.bases, self.pool_ptrs)
+        var host = ranks.view(0)
+        embed_lookup(host.weight[M.EMBED](), tokens_ptr, host.x_main(seq_len), ranks.pool_ptrs[0][]).join()
+        ring_broadcast[M.X_MAIN, Self.tp](host.x_main(seq_len).ptr, ranks.x_main_ptrs(seq_len), seq_len, ranks.pool_ptrs)
+
+    def debug_layer_attn(mut self, layer_idx: Int, seq_len: Int, pos: Int)
+        where Self.E.DTYPE == DType.bfloat16:
+        comptime M = Self.M
+        comptime L = M.LAYER
+        var ranks = Ranks[Self.E, Self.tp](self.bases, self.pool_ptrs)
+
+        var q = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.Q_VIEW.COLS]()
+        var k = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.KV_VIEW.COLS]()
+        var v = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.KV_VIEW.COLS]()
+
+        @parameter
+        def do_input_norm[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            return rmsnorm(rv.x_main(seq_len), rv.layer_weight[L.INPUT_NORM](layer_idx), rv.x_residual(seq_len), pool)
+        ranks.parallel[do_input_norm]()
+
+        @parameter
+        def do_q[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            return gemm(rv.x_residual(seq_len), rv.layer_weight[L.Q_PROJ](layer_idx), rv.scratch_view[M.Q_VIEW](q, seq_len), pool)
+        ranks.parallel[do_q]()
+        @parameter
+        def do_k[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            return gemm(rv.x_residual(seq_len), rv.layer_weight[L.K_PROJ](layer_idx), rv.scratch_view[M.KV_VIEW](k, seq_len), pool)
+        ranks.parallel[do_k]()
+        @parameter
+        def do_v[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            return gemm(rv.x_residual(seq_len), rv.layer_weight[L.V_PROJ](layer_idx), rv.scratch_view[M.KV_VIEW](v, seq_len), pool)
+        ranks.parallel[do_v]()
+
+        @parameter
+        def do_rope(rv: RankView[Self.E, Self.tp]):
+            rope[C.HEAD_DIM, M.LOCAL_HEADS](rv.scratch_view[M.Q_VIEW](q, seq_len), rv.rope_cos(), rv.rope_sin(), pos)
+            rope[C.HEAD_DIM, M.LOCAL_KV_HEADS](rv.scratch_view[M.KV_VIEW](k, seq_len), rv.rope_cos(), rv.rope_sin(), pos)
+        ranks.each[do_rope]()
+        @parameter
+        def do_kv_write(rv: RankView[Self.E, Self.tp]):
+            kv_cache_write(rv.scratch_view[M.KV_VIEW](k, seq_len), rv.k_cache(layer_idx), pos)
+            kv_cache_write(rv.scratch_view[M.KV_VIEW](v, seq_len), rv.v_cache(layer_idx), pos)
+        ranks.each[do_kv_write]()
+
+        v^.release(); k^.release()
+        var attn_out = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.Q_VIEW.COLS]()
+        @parameter
+        def do_attn[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            return attention[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM](
+                rv.scratch_view[M.Q_VIEW](q, seq_len), rv.k_cache(layer_idx), rv.v_cache(layer_idx),
+                rv.scratch_view[M.Q_VIEW](attn_out, seq_len), pos, pool)
+        ranks.parallel[do_attn]()
+        q^.release()
+        @parameter
+        def do_o[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            return gemm(rv.scratch_view[M.Q_VIEW](attn_out, seq_len), rv.layer_weight[L.O_PROJ](layer_idx), rv.x_residual(seq_len), pool)
+        ranks.parallel[do_o]()
+        attn_out^.release()
+
+        ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
+        @parameter
+        def do_res_add(rv: RankView[Self.E, Self.tp]):
+            elem_add(rv.x_main(seq_len), rv.x_residual(seq_len), rv.x_main(seq_len))
+        ranks.each[do_res_add]()
+
+    def debug_layer_mlp(mut self, layer_idx: Int, seq_len: Int, pos: Int)
+        where Self.E.DTYPE == DType.bfloat16:
+        comptime M = Self.M
+        comptime L = M.LAYER
+        var ranks = Ranks[Self.E, Self.tp](self.bases, self.pool_ptrs)
+
+        @parameter
+        def do_post_norm[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            return rmsnorm(rv.x_main(seq_len), rv.layer_weight[L.POST_ATTN_NORM](layer_idx), rv.x_residual(seq_len), pool)
+        ranks.parallel[do_post_norm]()
+
+        var gate = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.MLP_VIEW.COLS]()
+        var up = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.MLP_VIEW.COLS]()
+        @parameter
+        def do_gate[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            return gemm(rv.x_residual(seq_len), rv.layer_weight[L.GATE_PROJ](layer_idx), rv.scratch_view[M.MLP_VIEW](gate, seq_len), pool)
+        ranks.parallel[do_gate]()
+        @parameter
+        def do_up[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            return gemm(rv.x_residual(seq_len), rv.layer_weight[L.UP_PROJ](layer_idx), rv.scratch_view[M.MLP_VIEW](up, seq_len), pool)
+        ranks.parallel[do_up]()
+        @parameter
+        def do_silu(rv: RankView[Self.E, Self.tp]):
+            silu_mul(rv.scratch_view[M.MLP_VIEW](gate, seq_len), rv.scratch_view[M.MLP_VIEW](up, seq_len), rv.scratch_view[M.MLP_VIEW](gate, seq_len))
+        ranks.each[do_silu]()
+        up^.release()
+        @parameter
+        def do_down[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            return gemm(rv.scratch_view[M.MLP_VIEW](gate, seq_len), rv.layer_weight[L.DOWN_PROJ](layer_idx), rv.x_residual(seq_len), pool)
+        ranks.parallel[do_down]()
+        gate^.release()
+
+        ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
+        @parameter
+        def do_res_add(rv: RankView[Self.E, Self.tp]):
+            elem_add(rv.x_main(seq_len), rv.x_residual(seq_len), rv.x_main(seq_len))
+        ranks.each[do_res_add]()
+
+    def debug_x_main_ptr(self, seq_len: Int) -> Int:
+        return RankView[Self.E, Self.tp](self.bases[0]).x_main(seq_len).ptr
 
 
 # =============================================================================

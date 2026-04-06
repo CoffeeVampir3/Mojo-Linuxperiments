@@ -1,12 +1,13 @@
-"""RMSNorm + FWHT + fixed-scale i8 quantization.
+"""RMSNorm + FWHT + dynamic-scale i8 quantization.
 
-Per row: bf16 -> f32 -> divide by RMS -> block-diagonal FWHT -> quantize
-with fixed model-global scale S_act = C(n).
+Per row: bf16 -> f32 -> divide by RMS -> block-diagonal FWHT -> compute
+absmax -> quantize with per-row dynamic scale.
 
-No gamma (absorbed into weights). No per-token adaptive scale.
-Output is i8 in the Hadamard domain, ready for int8_gemv.
+No gamma (absorbed into weights). Per-row absmax scale written to output
+array for downstream GEMV dequantization.
 
-    qi[m, k] = clamp(round(FWHT(x[m] / rms(x[m])) * 127 / S_act), -128, 127)
+    absmax[m] = max(|FWHT(x[m] / rms(x[m]))|)
+    qi[m, k] = clamp(round(FWHT(x[m] / rms(x[m])) * 127 / absmax[m]), -128, 127)
 """
 
 from std.memory import UnsafePointer
@@ -105,13 +106,12 @@ def rmsnorm_fwht_quantize_row[cols: Int, block: Int](
     row_in: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     row_qi: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     work: UnsafePointer[Float32, MutAnyOrigin],
-    quant_inv: Float32,
+    scale_out: UnsafePointer[Float32, MutAnyOrigin],
     eps: Float32,
 ):
-    """One row: bf16 -> RMSNorm -> FWHT -> fixed-scale i8.
+    """One row: bf16 -> RMSNorm -> FWHT -> dynamic i8.
 
-    quant_inv = 127.0 / S_act (precomputed by caller).
-    work buffer must have at least cols f32 elements.
+    Computes per-row absmax after FWHT, writes it to scale_out, quantizes.
     """
     comptime width = simd_width_of[DType.float32]()
 
@@ -138,15 +138,25 @@ def rmsnorm_fwht_quantize_row[cols: Int, block: Int](
     for b in range(cols // block):
         fwht_block[block](work + b * block)
 
-    # Fixed-scale quantize: qi = clamp(round(x * 127 / S_act), -128, 127)
-    var vinv = SIMD[DType.float32, width](quant_inv)
+    # Dynamic absmax
+    var vmax = SIMD[DType.float32, width](0)
+    k = 0
+    while k + width <= cols:
+        vmax = max(vmax, (work + k).load[width=width]().__abs__())
+        k += width
+    var absmax = vmax.reduce_max()
+    if absmax < Float32(1e-10):
+        absmax = Float32(1e-10)
+    scale_out[] = absmax
+
+    # Quantize with dynamic scale
+    var vinv = SIMD[DType.float32, width](Float32(127) / absmax)
     comptime lo = SIMD[DType.float32, width](-128.0)
     comptime hi = SIMD[DType.float32, width](127.0)
     k = 0
     while k + width <= cols:
         var v = (work + k).load[width=width]()
-        var qi = min(max(roundeven(v * vinv), lo), hi).cast[DType.int8]()
-        (row_qi + k).store(qi)
+        (row_qi + k).store(min(max(roundeven(v * vinv), lo), hi).cast[DType.int8]())
         k += width
 
 
@@ -157,17 +167,16 @@ def rmsnorm_fwht_quantize_row[cols: Int, block: Int](
 
 def rmsnorm_fwht_quantize_worker[cols: Int, block: Int](
     in_ptr: Int, qi_ptr: Int, work_ptr: Int,
-    quant_inv_bits: Int, start_row: Int, end_row: Int,
+    scale_ptr: Int, start_row: Int, end_row: Int,
 ):
     var inp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=in_ptr)
     var qi = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=qi_ptr)
     var work = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=work_ptr)
-    var qi_bits = Int32(quant_inv_bits)
-    var quant_inv = UnsafePointer(to=qi_bits).bitcast[Float32]()[]
+    var scales = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=scale_ptr)
 
     for m in range(start_row, end_row):
         rmsnorm_fwht_quantize_row[cols, block](
-            inp + m * cols, qi + m * cols, work, quant_inv, 1e-5,
+            inp + m * cols, qi + m * cols, work, scales + m, 1e-5,
         )
 
 
@@ -178,23 +187,19 @@ def rmsnorm_fwht_quantize_worker[cols: Int, block: Int](
 
 def rmsnorm_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
     in_ptr: Int, qi_ptr: Int, work_ptr: Int,
+    scale_ptr: Int,
     seq_len: Int,
-    s_act: Float32,
     mut pool: P,
 ) -> PoolFence[P]:
-    """Dispatch RMSNorm + FWHT + fixed-scale quantize.
+    """Dispatch RMSNorm + FWHT + dynamic-scale quantize.
 
-    in_ptr:   bf16 [seq_len, cols]
-    qi_ptr:   i8   [seq_len, cols] output
-    work_ptr: f32  [cols] scratch per worker (caller provides cols * num_workers f32)
-    s_act:    model-global activation scale C(n)
+    in_ptr:    bf16 [seq_len, cols]
+    qi_ptr:    i8   [seq_len, cols] output
+    work_ptr:  f32  [cols] scratch per worker
+    scale_ptr: f32  [seq_len] output — per-row absmax scales for GEMV dequant
     """
     if seq_len == 0:
         return PoolFence[P].completed()
-
-    var quant_inv = Float32(127) / s_act
-    var qi_copy = quant_inv
-    var quant_inv_bits = Int(UnsafePointer(to=qi_copy).bitcast[Int32]()[])
 
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
@@ -206,7 +211,7 @@ def rmsnorm_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
         pack[].arg0 = in_ptr
         pack[].arg1 = qi_ptr
         pack[].arg2 = work_ptr + i * cols * size_of[Float32]()
-        pack[].arg3 = quant_inv_bits
+        pack[].arg3 = scale_ptr
         pack[].arg4 = start
         pack[].arg5 = end
 

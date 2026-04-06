@@ -10,7 +10,6 @@ error is bounded and the issue is elsewhere.
 """
 
 from std.memory import UnsafePointer
-from std.memory.unsafe_pointer import alloc
 from std.sys.info import simd_width_of
 from std.pathlib import Path
 
@@ -110,70 +109,31 @@ def main():
     # Embed
     reference.debug_embed(Int(reference_tp), seq_len)
     quant.debug_embed(Int(quant_tp), seq_len)
-
-    # === Layer 0 QKV isolation test ===
-    print("\n=== Layer 0 QKV isolation (identical input, bf16 output) ===")
-    var ref_q = alloc[Scalar[DType.bfloat16]](C.HIDDEN)
-    var ref_k = alloc[Scalar[DType.bfloat16]](C.KV_HIDDEN)
-    var ref_v = alloc[Scalar[DType.bfloat16]](C.KV_HIDDEN)
-    var q_q = alloc[Scalar[DType.bfloat16]](C.HIDDEN)
-    var q_k = alloc[Scalar[DType.bfloat16]](C.KV_HIDDEN)
-    var q_v = alloc[Scalar[DType.bfloat16]](C.KV_HIDDEN)
-
-    reference.debug_qkv(0, seq_len, ref_q, ref_k, ref_v)
-    quant.debug_qkv(0, seq_len, q_q, q_k, q_v)
-
-    compare_bf16(ref_q, q_q, C.HIDDEN, "L0 Q   ")
-    compare_bf16(ref_k, q_k, C.KV_HIDDEN, "L0 K   ")
-    compare_bf16(ref_v, q_v, C.KV_HIDDEN, "L0 V   ")
-
-    ref_q.free(); ref_k.free(); ref_v.free()
-    q_q.free(); q_k.free(); q_v.free()
-    print()
-
-    # Redo embed (debug_qkv doesn't modify x_main, but re-embed to be safe)
-    reference.debug_embed(Int(reference_tp), seq_len)
-    quant.debug_embed(Int(quant_tp), seq_len)
     compare_hidden(
         reference.debug_x_main_ptr(seq_len),
         quant.debug_x_main_ptr(seq_len),
         seq_len, "embed  ",
     )
 
-    # Snapshot buffers for MLP intermediates
-    comptime GATE_UP_N = 2 * (C.INTERMEDIATE // 1)  # tp=1
-    var ref_gu = alloc[Scalar[DType.bfloat16]](GATE_UP_N)
-    var q_gu = alloc[Scalar[DType.bfloat16]](GATE_UP_N)
-    var ref_dn = alloc[Scalar[DType.bfloat16]](C.HIDDEN)
-    var q_dn = alloc[Scalar[DType.bfloat16]](C.HIDDEN)
-
-    # Layer-by-layer with MLP intermediates
+    # Layer-by-layer: attn and mlp
     for layer in range(C.NUM_LAYERS):
         var lpad = " " + String(layer) if layer < 10 else String(layer)
-        var prefix = "layer " + lpad
 
         reference.debug_layer_attn(layer, seq_len, 0)
         quant.debug_layer_attn(layer, seq_len, 0)
         compare_hidden(
             reference.debug_x_main_ptr(seq_len),
             quant.debug_x_main_ptr(seq_len),
-            seq_len, prefix + " attn    ",
+            seq_len, "layer " + lpad + " attn",
         )
 
-        reference.debug_layer_mlp(layer, seq_len, 0, ref_gu, ref_dn)
-        quant.debug_layer_mlp(layer, seq_len, 0, q_gu, q_dn)
-
-        compare_bf16(ref_gu, q_gu, GATE_UP_N, prefix + " gate+up ")
-        compare_bf16(ref_dn, q_dn, C.HIDDEN, prefix + " down    ")
+        reference.debug_layer_mlp(layer, seq_len, 0)
+        quant.debug_layer_mlp(layer, seq_len, 0)
         compare_hidden(
             reference.debug_x_main_ptr(seq_len),
             quant.debug_x_main_ptr(seq_len),
-            seq_len, prefix + " res_add ",
+            seq_len, "layer " + lpad + "  mlp",
         )
 
-    ref_gu.free()
-    q_gu.free()
-    ref_dn.free()
-    q_dn.free()
     _ = reference
     _ = quant
