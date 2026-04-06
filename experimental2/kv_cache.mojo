@@ -1,4 +1,4 @@
-"""Flat KV cache — zero per-token metadata.
+"""Attention cache — K/V data with per-head dynamic scales for Q and K.
 
 K stored in VNNI tile format for direct AMX B-tile loads (no runtime
 transpose). Layout: [head][tile_idx][k_slice × TILE_BYTES] where each
@@ -6,7 +6,14 @@ tile covers TILE_N=16 consecutive positions. Writes scatter into VNNI
 via the 16×16 uint32 butterfly transpose.
 
 V stored as i8 in row-major [head][pos][dim] for tdpbusd signed operand.
-Quantization uses a per-layer fixed scale (not stored here).
+V uses a corrected per-layer fixed scale (not stored here).
+
+Per-head dynamic scales (f32):
+  K scales: [num_kv_heads][max_seq] — written at K cache write time
+  Q scales: [num_q_heads][max_seq]  — written at Q prep time
+
+These enable per-head absmax quantization for Q and K, eliminating the
+clipping caused by a single per-layer scale across heads with varying norms.
 """
 
 from std.memory import UnsafePointer
@@ -17,25 +24,33 @@ from simd_math.matrixops import transpose_rows
 from experimental.amx import TILE_M, TILE_N, TILE_BYTES, K_STEP
 
 
-struct KVCache[max_seq: Int, head_dim: Int, num_heads: Int]:
+struct KVCache[max_seq: Int, head_dim: Int, num_kv_heads: Int, num_q_heads: Int = 0]:
     var k_base: Int   # VNNI K: [head][tile][k_slice × TILE_BYTES]
     var v_base: Int   # row-major V: [head][pos][dim]
+    var k_scale_base: Int  # f32 K scales: [num_kv_heads][max_seq]
+    var q_scale_base: Int  # f32 Q scales: [num_q_heads][max_seq]
 
     comptime K_SLICES = Self.head_dim // K_STEP
     comptime TILE_K_BYTES = Self.K_SLICES * TILE_BYTES
     comptime MAX_TILES = (Self.max_seq + TILE_N - 1) // TILE_N
     comptime K_HEAD_STRIDE = Self.MAX_TILES * Self.TILE_K_BYTES
-    comptime K_TOTAL_BYTES = Self.num_heads * Self.K_HEAD_STRIDE
+    comptime K_TOTAL_BYTES = Self.num_kv_heads * Self.K_HEAD_STRIDE
 
     comptime V_HEAD_STRIDE = Self.max_seq * Self.head_dim
-    comptime V_TOTAL_BYTES = Self.num_heads * Self.V_HEAD_STRIDE
+    comptime V_TOTAL_BYTES = Self.num_kv_heads * Self.V_HEAD_STRIDE
 
-    comptime TOTAL_BYTES = Self.K_TOTAL_BYTES + Self.V_TOTAL_BYTES
+    comptime ACTUAL_Q_HEADS = Self.num_q_heads if Self.num_q_heads > 0 else Self.num_kv_heads
+    comptime K_SCALE_BYTES = Self.num_kv_heads * Self.max_seq * size_of[Float32]()
+    comptime Q_SCALE_BYTES = Self.ACTUAL_Q_HEADS * Self.max_seq * size_of[Float32]()
+
+    comptime TOTAL_BYTES = Self.K_TOTAL_BYTES + Self.V_TOTAL_BYTES + Self.K_SCALE_BYTES + Self.Q_SCALE_BYTES
 
     def __init__(out self, base: Int):
-        """K occupies [base, base + K_TOTAL_BYTES), V follows."""
+        """Layout: [K data | V data | K scales | Q scales]."""
         self.k_base = base
         self.v_base = base + Self.K_TOTAL_BYTES
+        self.k_scale_base = self.v_base + Self.V_TOTAL_BYTES
+        self.q_scale_base = self.k_scale_base + Self.K_SCALE_BYTES
 
     def write_k(self, pos: Int, head: Int,
         data_i8: UnsafePointer[Int8, MutAnyOrigin],
@@ -124,3 +139,41 @@ struct KVCache[max_seq: Int, head_dim: Int, num_heads: Int]:
         """V data pointer: i8 at [head][0]."""
         return UnsafePointer[Int8, MutAnyOrigin](
             unsafe_from_address=self.v_base + head * Self.V_HEAD_STRIDE)
+
+    # --- Per-head dynamic scales ---
+
+    def write_k_scale(self, pos: Int, head: Int, scale: Float32):
+        """Store the per-head absmax scale used to quantize K at this position."""
+        UnsafePointer[Float32, MutAnyOrigin](
+            unsafe_from_address=self.k_scale_base + head * Self.max_seq * size_of[Float32]() + pos * size_of[Float32]()
+        )[] = scale
+
+    def k_scale(self, pos: Int, head: Int) -> Float32:
+        """Read K quantization scale for a given position and head."""
+        return UnsafePointer[Float32, MutAnyOrigin](
+            unsafe_from_address=self.k_scale_base + head * Self.max_seq * size_of[Float32]() + pos * size_of[Float32]()
+        )[]
+
+    def k_scale_head_ptr(self, head: Int) -> UnsafePointer[Float32, MutAnyOrigin]:
+        """Pointer to K scales for a head: f32[max_seq]."""
+        return UnsafePointer[Float32, MutAnyOrigin](
+            unsafe_from_address=self.k_scale_base + head * Self.max_seq * size_of[Float32]()
+        )
+
+    def write_q_scale(self, pos: Int, head: Int, scale: Float32):
+        """Store the per-head absmax scale used to quantize Q at this position."""
+        UnsafePointer[Float32, MutAnyOrigin](
+            unsafe_from_address=self.q_scale_base + head * Self.max_seq * size_of[Float32]() + pos * size_of[Float32]()
+        )[] = scale
+
+    def q_scale(self, pos: Int, head: Int) -> Float32:
+        """Read Q quantization scale for a given position and head."""
+        return UnsafePointer[Float32, MutAnyOrigin](
+            unsafe_from_address=self.q_scale_base + head * Self.max_seq * size_of[Float32]() + pos * size_of[Float32]()
+        )[]
+
+    def q_scale_head_ptr(self, head: Int) -> UnsafePointer[Float32, MutAnyOrigin]:
+        """Pointer to Q scales for a head: f32[max_seq]."""
+        return UnsafePointer[Float32, MutAnyOrigin](
+            unsafe_from_address=self.q_scale_base + head * Self.max_seq * size_of[Float32]()
+        )

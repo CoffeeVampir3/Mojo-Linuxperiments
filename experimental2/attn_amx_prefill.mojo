@@ -1,14 +1,11 @@
-"""AMX prefill attention — uniform integer pipeline, zero per-token scales.
+"""AMX prefill attention — per-head dynamic Q/K scales, fixed V scale.
 
 K cache is u8 (i8 XOR 0x80) for tdpbsud. V cache is i8 directly for
-tdpbusd. Per-layer fixed scales derived from weight norms and Hadamard
-concentration. No per-token metadata. No per-row adaptive scaling.
+tdpbusd. Q and K use per-head dynamic absmax scales (stored in cache).
+V uses a corrected per-layer fixed scale.
 
-Score:  Q_i8 × K_u8_vnni → i32      (tdpbsud, signed Q × unsigned K)
-V-agg: W_u8 × V_i8_vnni → i32      (tdpbusd, unsigned W × signed V)
-
-Softmax directly produces u8 weights: round(exp(s - max) * 255).
-V-agg dequant is a single per-layer constant.
+Score dequant: (raw - b_q) * S_Q[head] / (127^2 * sqrt(d_k)) * S_K[head, pos]
+V-agg dequant: fixed per-layer constant from S_V.
 
 Parallelism: Q rows split across workers per KV group. Each worker
 redundantly packs K/V (all cores active, no barriers).
@@ -50,8 +47,6 @@ struct WorkerScratch:
     var q_row_end: Int
     var pos: Int
     var seq_len: Int
-    var q_quant_inv: Float32
-    var score_scale: Float32
     var vagg_scale: Float32
 
 
@@ -98,9 +93,9 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
     var my_q_rows = ws[].q_row_end - q_row_start
     var pos = ws[].pos
     var seq_len = ws[].seq_len
-    var score_scale = ws[].score_scale
     var vagg_scale = ws[].vagg_scale
-    var q_quant_inv = ws[].q_quant_inv
+    var inv_sqrt_hd = ctx[].inv_sqrt_hd
+    var inv_127sq = Float32(1.0) / (Float32(127.0) * Float32(127.0))
     if my_q_rows <= 0:
         return
 
@@ -141,6 +136,10 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
         var padded_chunk_rows = ((chunk_rows + M_STEP - 1) // M_STEP) * M_STEP
 
         # --- Compute output offsets + zero output + Q prep ---
+        # Per-row Q score partial: S_Q[head, pos] / (127^2 * sqrt(d_k))
+        var q_partials_arr = InlineArray[Float32, chunk_q_max](uninitialized=True)
+        var q_partials = UnsafePointer(to=q_partials_arr).bitcast[Float32]()
+
         for local_idx in range(chunk_rows):
             var abs_row = q_row_start + chunk_start + local_idx
             var m = abs_row // gqa_factor
@@ -154,14 +153,19 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
             while d + width <= head_dim:
                 (out_row + d).store(vzero)
                 d += width
-            # Q prep
-            qi_biases[local_idx] = prep_q_row[head_dim](
+            # Q prep — returns (bias, scale)
+            var qr = prep_q_row[head_dim](
                 ctx[].q + m * q_cols + h * head_dim,
                 ctx[].cos + actual_pos * half,
                 ctx[].sin + actual_pos * half,
-                q_quant_inv,
                 qi_buf + local_idx * head_dim,
             )
+            qi_biases[local_idx] = qr[0]
+            var q_scale = qr[1]
+            # Write Q scale to cache
+            (ctx[].q_scale_base + h * ctx[].max_seq + actual_pos)[] = q_scale
+            # Precompute Q-partial for scoring: S_Q / (127^2 * sqrt(d_k))
+            q_partials[local_idx] = q_scale * inv_127sq * inv_sqrt_hd
 
         # --- Init running_m/l for this chunk ---
         var i = 0
@@ -209,6 +213,8 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
                         )
 
                 # Softmax — accumulates directly into output
+                # K scales for this KV group
+                var k_scale_head = ctx[].k_scale_base + g * ctx[].max_seq
                 for qi_local in range(qb_len):
                     var qi_row = qb_start + qi_local
                     var abs_row = q_row_start + chunk_start + qi_row
@@ -216,7 +222,8 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
                     var causal_limit = min(pos + m_pos + 1 - block_start, block_len)
                     softmax_row[head_dim](
                         score_i32 + qi_local * BLOCK_N,
-                        qi_biases[qi_row], score_scale,
+                        qi_biases[qi_row], q_partials[qi_row],
+                        k_scale_head, block_start,
                         causal_limit, padded_chunk,
                         running_m + qi_row, running_l + qi_row,
                         output + output_offsets[qi_row],
@@ -266,33 +273,27 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
 # ============================================================================
 
 def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
+    num_q_heads: Int,
     QT: Encoding & Shaped,
     CosT: Encoding & Shaped, SinT: Encoding & Shaped,
     P: BurstThreadPool, prefill_chunk: Int = 512](
     q: DynView[QT],
-    k_cache: KVCache[max_seq, head_dim, num_kv_heads],
-    v_cache: KVCache[max_seq, head_dim, num_kv_heads],
+    cache: KVCache[max_seq, head_dim, num_kv_heads, num_q_heads],
     cos_table: Bound[CosT],
     sin_table: Bound[SinT],
     scratch: Int,
     pos: Int,
-    q_layer_scale: Float32,
-    k_layer_scale: Float32,
     v_layer_scale: Float32,
     mut pool: P,
 ) -> PoolFence[P]:
-    """Async AMX prefill — chunked Q processing, zero per-token scales.
+    """Async AMX prefill — per-head dynamic Q/K scales, fixed V scale.
 
-    seq_len can exceed prefill_chunk: the kernel internally processes Q rows
-    in chunks, reusing scratch buffers each iteration. Single dispatch.
+    Q/K scales are computed per-head at quantization time and stored in the
+    cache. V uses v_layer_scale (corrected fixed scale).
     """
     comptime gqa_factor = num_heads // num_kv_heads
     comptime q_cols = QT.COLS
     var inv_sqrt_hd = Float32(1.0 / Float64(sqrt[DType.float32, 1](Float32(head_dim))))
-
-    # Derived per-layer constants
-    var q_quant_inv = Float32(127.0) / q_layer_scale
-    var score_scale = q_layer_scale * k_layer_scale * inv_sqrt_hd / (Float32(127.0) * Float32(127.0))
     var vagg_scale = v_layer_scale / (Float32(255.0) * Float32(127.0))
 
     # Scratch layout: [f32 accum | i8 output | AttnCtx | worker configs]
@@ -305,11 +306,15 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
         UnsafePointer[BFloat16, MutAnyOrigin](unsafe_from_address=q.ptr),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cos_table.ptr),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=sin_table.ptr),
-        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=k_cache.k_base),
-        UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=v_cache.v_base),
+        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=cache.k_base),
+        UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=cache.v_base),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=scratch),
         UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=scratch + accum_bytes),
         qi_inv,
+        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cache.k_scale_base),
+        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cache.q_scale_base),
+        max_seq,
+        inv_sqrt_hd,
     )
     var workers_off = accum_bytes + qi_bytes + size_of[AttnCtx]()
 
@@ -332,8 +337,6 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
             ws[].q_row_end = q_end
             ws[].pos = pos
             ws[].seq_len = q.seq_len
-            ws[].q_quant_inv = q_quant_inv
-            ws[].score_scale = score_scale
             ws[].vagg_scale = vagg_scale
 
             var pack = pool.get_args_base() + job_idx

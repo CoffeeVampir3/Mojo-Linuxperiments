@@ -32,7 +32,12 @@ struct AttnCtx:
     var v_base: UnsafePointer[Int8, MutAnyOrigin]
     var output: UnsafePointer[Float32, MutAnyOrigin]
     var qi_output: UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
-    var qi_scale: Float32
+    var qi_scale: Float32  # 127 / S_V (fixed, for output quantization)
+    # Per-head dynamic scale pointers (into the cache's scale arrays)
+    var k_scale_base: UnsafePointer[Float32, MutAnyOrigin]  # K scales [head][pos]
+    var q_scale_base: UnsafePointer[Float32, MutAnyOrigin]  # Q scales [head][pos]
+    var max_seq: Int        # stride between heads in scale arrays
+    var inv_sqrt_hd: Float32  # 1/sqrt(head_dim), for score dequant
 
 
 # ============================================================================
@@ -44,15 +49,18 @@ def prep_q_row[head_dim: Int](
     q_row: UnsafePointer[BFloat16, MutAnyOrigin],
     cos_row: UnsafePointer[Float32, MutAnyOrigin],
     sin_row: UnsafePointer[Float32, MutAnyOrigin],
-    q_quant_inv: Float32,
     qi_out: UnsafePointer[Int8, MutAnyOrigin],
-) -> Float32:
-    """RoPE → FWHT → quantize one Q row. Returns qi_bias (128 * sum)."""
+) -> Tuple[Float32, Float32]:
+    """RoPE → FWHT → dynamic quantize one Q row.
+
+    Returns (qi_bias, q_scale) where:
+      qi_bias = 128 * sum(qi) — bias correction for tdpbsud scoring
+      q_scale = absmax of FWHT'd values — stored in cache for score dequant
+    """
     comptime half = head_dim // 2
     comptime fwht_w = fwht_width[DType.float32, head_dim]()
     comptime fwht_regs = head_dim // fwht_w
     comptime half_regs = fwht_regs // 2
-    var vq_inv = SIMD[DType.float32, fwht_w](q_quant_inv)
 
     var r = InlineArray[SIMD[DType.float32, fwht_w], fwht_regs](
         fill=SIMD[DType.float32, fwht_w](0))
@@ -67,12 +75,24 @@ def prep_q_row[head_dim: Int](
 
     fwht_apply[DType.float32, head_dim](r)
 
+    # Dynamic absmax across FWHT'd registers
+    var vmax = SIMD[DType.float32, fwht_w](0)
+    for ri in range(fwht_regs):
+        vmax = max(vmax, r[ri].__abs__())
+    var absmax = vmax.reduce_max()
+    if absmax < Float32(1e-10):
+        absmax = Float32(1e-10)
+
+    # Quantize with dynamic scale
+    var vq_inv = SIMD[DType.float32, fwht_w](Float32(127) / absmax)
     var q_sum_acc = SIMD[DType.int32, fwht_w](0)
     for ri in range(fwht_regs):
         var qi = quantize_i8[fwht_w](r[ri], vq_inv)
         (qi_out + ri * fwht_w).store(qi)
         q_sum_acc += qi.cast[DType.int32]()
-    return Float32(q_sum_acc.reduce_add()) * Float32(128)
+
+    var qi_bias = Float32(q_sum_acc.reduce_add()) * Float32(128)
+    return (qi_bias, absmax)
 
 
 # ============================================================================
@@ -83,7 +103,9 @@ def prep_q_row[head_dim: Int](
 def softmax_row[head_dim: Int](
     si_row: UnsafePointer[Int32, MutAnyOrigin],
     q_bias: Float32,
-    score_scale: Float32,
+    q_score_partial: Float32,
+    k_scales: UnsafePointer[Float32, MutAnyOrigin],
+    block_start: Int,
     causal_limit: Int,
     padded_chunk: Int,
     running_m: UnsafePointer[Float32, MutAnyOrigin],
@@ -91,19 +113,28 @@ def softmax_row[head_dim: Int](
     accum: UnsafePointer[Float32, MutAnyOrigin],
     w_row: UnsafePointer[UInt8, MutAnyOrigin],
 ):
-    """Online softmax for one Q row: max, correct accum, exp→u8."""
+    """Online softmax with per-position K scales.
+
+    Score dequant: (raw - q_bias) * q_score_partial * k_scales[block_start + t]
+    where q_score_partial = S_Q / (127^2 * sqrt(d_k)), constant for the Q row.
+    k_scales[pos] = per-head absmax from K cache write, varies per position.
+    """
     comptime width = simd_width_of[DType.float32]()
 
     # Max pass
     var vmax = SIMD[DType.float32, width](Float32(-1e30))
     var t = 0
     while t + width <= causal_limit:
-        var dq = ((si_row + t).load[width=width]().cast[DType.float32]() - q_bias) * score_scale
+        var raw = (si_row + t).load[width=width]().cast[DType.float32]() - q_bias
+        var ks = (k_scales + block_start + t).load[width=width]()
+        var dq = raw * q_score_partial * ks
         vmax = max(vmax, dq)
         t += width
     var scalar_max = Float32(-1e30)
     while t < causal_limit:
-        scalar_max = max(scalar_max, (Float32(si_row[t]) - q_bias) * score_scale)
+        var raw = Float32(si_row[t]) - q_bias
+        var ks = k_scales[block_start + t]
+        scalar_max = max(scalar_max, raw * q_score_partial * ks)
         t += 1
     var row_max = max(vmax.reduce_max(), scalar_max)
 
@@ -123,14 +154,18 @@ def softmax_row[head_dim: Int](
     var l_acc = SIMD[DType.float32, width](0)
     t = 0
     while t + width <= causal_limit:
-        var dq = ((si_row + t).load[width=width]().cast[DType.float32]() - q_bias) * score_scale
+        var raw = (si_row + t).load[width=width]().cast[DType.float32]() - q_bias
+        var ks = (k_scales + block_start + t).load[width=width]()
+        var dq = raw * q_score_partial * ks
         var e = exp_f32_fast(dq - m_new)
         (w_row + t).store(roundeven(e * Float32(255)).cast[DType.uint8]())
         l_acc += e
         t += width
     var l_contrib = l_acc.reduce_add()
     while t < causal_limit:
-        var dq = (Float32(si_row[t]) - q_bias) * score_scale
+        var raw = Float32(si_row[t]) - q_bias
+        var ks = k_scales[block_start + t]
+        var dq = raw * q_score_partial * ks
         var e = exp_f32_fast[1](dq - m_new)
         w_row[t] = roundeven[DType.float32, 1](e * Float32(255)).cast[DType.uint8]()
         l_contrib += e

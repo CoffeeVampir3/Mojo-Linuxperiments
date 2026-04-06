@@ -1,10 +1,10 @@
-"""AMX decode attention — 1-3-3 tiles, VNNI-primary K, multi-worker context split.
+"""AMX decode attention — per-head dynamic Q/K scales, fixed V scale.
 
 Workers within each KV group split the context range. Each worker processes
 its block range independently, then decode_merge combines their online
 softmax states and writes the final output.
 
-Score:  Q_i8 × K_u8_vnni → i32      (tdpbsud, signed Q × unsigned K)
+Score dequant: (raw - b_q) * S_Q[head] / (127^2 * sqrt(d_k)) * S_K[head, pos]
 V-agg: W_u8 × V_i8_vnni → i32      (tdpbusd, unsigned W × signed V)
 """
 
@@ -48,8 +48,6 @@ struct DecodeWorkerScratch:
     var ctx_start: Int
     var ctx_end: Int
     var pos: Int
-    var q_quant_inv: Float32
-    var score_scale: Float32
     var k_vnni_head: UnsafePointer[UInt8, MutAnyOrigin]
     # Merge-accessible (survive kernel for decode_merge + profiling)
     var running_o: UnsafePointer[Float32, MutAnyOrigin]
@@ -111,8 +109,8 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
     var ctx_start = ws[].ctx_start
     var ctx_end = ws[].ctx_end
     var pos = ws[].pos
-    var score_scale = ws[].score_scale
-    var q_quant_inv = ws[].q_quant_inv
+    var inv_sqrt_hd = ctx[].inv_sqrt_hd
+    var inv_127sq = Float32(1.0) / (Float32(127.0) * Float32(127.0))
 
     var t0 = tap()
 
@@ -132,6 +130,8 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
     var qi_buf = UnsafePointer(to=qi_arr).bitcast[Int8]()
     var bias_arr = InlineArray[Float32, padded_q](uninitialized=True)
     var qi_biases = UnsafePointer(to=bias_arr).bitcast[Float32]()
+    var q_partials_arr = InlineArray[Float32, padded_q](uninitialized=True)
+    var q_partials = UnsafePointer(to=q_partials_arr).bitcast[Float32]()
     var score_arr = InlineArray[Int32, padded_q * SCORE_N](uninitialized=True)
     var score_i32 = UnsafePointer(to=score_arr).bitcast[Int32]()
     var wu8_arr = InlineArray[UInt8, padded_q * BLOCK_N](uninitialized=True)
@@ -142,13 +142,18 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
     var v_base = ctx[].v_base + g * V_HEAD_STRIDE
     for hi in range(gqa_factor):
         var h = g * gqa_factor + hi
-        qi_biases[hi] = prep_q_row[head_dim](
+        var qr = prep_q_row[head_dim](
             ctx[].q + h * head_dim,
             ctx[].cos + pos * half,
             ctx[].sin + pos * half,
-            q_quant_inv,
             qi_buf + hi * head_dim,
         )
+        qi_biases[hi] = qr[0]
+        var q_scale = qr[1]
+        # Write Q scale to cache
+        (ctx[].q_scale_base + h * ctx[].max_seq + pos)[] = q_scale
+        # Precompute Q-partial: S_Q / (127^2 * sqrt(d_k))
+        q_partials[hi] = q_scale * inv_127sq * inv_sqrt_hd
 
     var t2 = tap()
 
@@ -226,10 +231,12 @@ def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
         var tb3 = tap()
 
         # --- Softmax ---
+        var k_scale_head = ctx[].k_scale_base + g * ctx[].max_seq
         for hi in range(gqa_factor):
             softmax_row[head_dim](
                 score_i32 + hi * SCORE_N,
-                qi_biases[hi], score_scale,
+                qi_biases[hi], q_partials[hi],
+                k_scale_head, block_start,
                 block_len, padded_chunk,
                 running_m + hi, running_l + hi,
                 running_o + hi * head_dim,
@@ -382,23 +389,21 @@ def collect_profiles[num_heads: Int, num_kv_heads: Int, head_dim: Int](
 # ============================================================================
 
 def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
+    num_q_heads: Int,
     QT: Encoding & Shaped,
     CosT: Encoding & Shaped, SinT: Encoding & Shaped,
     P: BurstThreadPool](
     q: DynView[QT],
-    k_cache: KVCache[max_seq, head_dim, num_kv_heads],
-    v_cache: KVCache[max_seq, head_dim, num_kv_heads],
+    cache: KVCache[max_seq, head_dim, num_kv_heads, num_q_heads],
     cos_table: Bound[CosT],
     sin_table: Bound[SinT],
     scratch: Int,
     pos: Int,
-    q_layer_scale: Float32,
-    k_layer_scale: Float32,
     v_layer_scale: Float32,
     workers_per_group: Int,
     mut pool: P,
 ) -> PoolFence[P]:
-    """Async AMX decode — multi-worker context split within each KV group."""
+    """Async AMX decode — per-head dynamic Q/K scales, fixed V scale."""
     comptime gqa_factor = num_heads // num_kv_heads
     comptime q_cols = QT.COLS
     comptime pw = per_worker_merge_bytes[num_heads, num_kv_heads, head_dim]()
@@ -411,10 +416,6 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     comptime v_k_tiles = BLOCK_N // K_STEP
     var inv_sqrt_hd = Float32(1.0 / Float64(sqrt[DType.float32, 1](Float32(head_dim))))
 
-    # Derived per-layer constants
-    var q_quant_inv = Float32(127.0) / q_layer_scale
-    var score_scale = q_layer_scale * k_layer_scale * inv_sqrt_hd / (Float32(127.0) * Float32(127.0))
-
     # Write AttnCtx into scratch (after i8 output buffer, before workers)
     var output_bytes = q_cols * size_of[Scalar[DType.int8]]()
     var qi_inv = Float32(127) / v_layer_scale
@@ -424,11 +425,15 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
         UnsafePointer[BFloat16, MutAnyOrigin](unsafe_from_address=q.ptr),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cos_table.ptr),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=sin_table.ptr),
-        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=k_cache.k_base),
-        UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=v_cache.v_base),
+        UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=cache.k_base),
+        UnsafePointer[Int8, MutAnyOrigin](unsafe_from_address=cache.v_base),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=scratch),
         UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=scratch),
         qi_inv,
+        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cache.k_scale_base),
+        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cache.q_scale_base),
+        max_seq,
+        inv_sqrt_hd,
     )
     var workers_off = output_bytes + size_of[AttnCtx]()
 
@@ -456,10 +461,8 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
             ws[].ctx_start = ctx_s
             ws[].ctx_end = ctx_e
             ws[].pos = pos
-            ws[].q_quant_inv = q_quant_inv
-            ws[].score_scale = score_scale
             ws[].k_vnni_head = UnsafePointer[UInt8, MutAnyOrigin](
-                unsafe_from_address=k_cache.k_base + g * k_head_stride)
+                unsafe_from_address=cache.k_base + g * k_head_stride)
             # Merge-accessible buffers (survive kernel for decode_merge)
             ws[].running_o = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=data + off)
             off += padded_q * head_dim * size_of[Float32]()

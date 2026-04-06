@@ -1,11 +1,14 @@
 """RoPE + KV cache write — bf16 GEMV output to quantized KV cache.
 
-K: bf16 -> f32 -> RoPE -> FWHT -> quantize(S_K) -> i8 -> cache (VNNI scatter)
-V: bf16 -> f32 -> FWHT -> quantize(S_V) -> i8 -> cache (row-major)
+K: bf16 -> f32 -> RoPE -> FWHT -> dynamic absmax quantize -> i8 -> cache
+V: bf16 -> f32 -> FWHT -> quantize(fixed S_V) -> i8 -> cache (row-major)
 
-RoPE is applied to K here (not in a separate pass) because the pipeline is
-bf16 -> f32 -> RoPE -> FWHT -> quantize, and splitting RoPE out would require
-materializing an f32 intermediate.
+K uses per-head dynamic scales: after FWHT, compute absmax of the head_dim
+values, quantize with that absmax, and store the scale in the cache alongside
+the i8 data. This eliminates clipping from fixed per-layer scales.
+
+V uses a corrected fixed scale (adequate because V norms are small and uniform
+across heads — see butterquant/test_hadamard_roundtrip.mojo for the proof).
 
 Input is a slice of the combined QKV bf16 output with stride QKV_N per row.
 Each KV head is head_dim elements wide within that row.
@@ -29,14 +32,16 @@ def write_k_head[head_dim: Int](
     src_bf16: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     cos: UnsafePointer[Float32, MutAnyOrigin],
     sin: UnsafePointer[Float32, MutAnyOrigin],
-    quant_inv: Float32,
     work: UnsafePointer[Float32, MutAnyOrigin],
     qi_buf: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
-    cache: KVCache[_, head_dim, _],
+    cache: KVCache[_, head_dim, _, _],
     pos: Int,
     head: Int,
 ):
-    """One K head: bf16 -> f32 -> RoPE -> FWHT -> quantize -> cache write."""
+    """One K head: bf16 -> f32 -> RoPE -> FWHT -> dynamic quantize -> cache write.
+
+    Computes per-head absmax after FWHT and stores the scale in the cache.
+    """
     comptime width = simd_width_of[DType.float32]()
     comptime half = head_dim // 2
 
@@ -60,8 +65,18 @@ def write_k_head[head_dim: Int](
     # FWHT (block = head_dim)
     fwht_block[head_dim](work)
 
-    # Fixed-scale quantize
-    var vinv = SIMD[DType.float32, width](quant_inv)
+    # Dynamic absmax
+    var vmax = SIMD[DType.float32, width](0)
+    k = 0
+    while k + width <= head_dim:
+        vmax = max(vmax, (work + k).load[width=width]().__abs__())
+        k += width
+    var absmax = vmax.reduce_max()
+    if absmax < Float32(1e-10):
+        absmax = Float32(1e-10)
+
+    # Quantize with dynamic scale
+    var vinv = SIMD[DType.float32, width](Float32(127) / absmax)
     comptime lo = SIMD[DType.float32, width](-128.0)
     comptime hi = SIMD[DType.float32, width](127.0)
     k = 0
@@ -71,6 +86,7 @@ def write_k_head[head_dim: Int](
         k += width
 
     cache.write_k(pos, head, qi_buf)
+    cache.write_k_scale(pos, head, absmax)
 
 
 # ============================================================================
@@ -83,11 +99,11 @@ def write_v_head[head_dim: Int](
     quant_inv: Float32,
     work: UnsafePointer[Float32, MutAnyOrigin],
     qi_buf: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
-    cache: KVCache[_, head_dim, _],
+    cache: KVCache[_, head_dim, _, _],
     pos: Int,
     head: Int,
 ):
-    """One V head: bf16 -> f32 -> FWHT -> quantize -> cache write."""
+    """One V head: bf16 -> f32 -> FWHT -> fixed-scale quantize -> cache write."""
     comptime width = simd_width_of[DType.float32]()
 
     # Load bf16 -> f32
@@ -117,31 +133,26 @@ def write_v_head[head_dim: Int](
 # ============================================================================
 
 
-def rope_and_kv_cache_write[head_dim: Int, num_kv_heads: Int, max_seq: Int](
+def rope_and_kv_cache_write[head_dim: Int, num_kv_heads: Int, max_seq: Int, num_q_heads: Int](
     k_bf16: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     v_bf16: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     k_stride: Int,
     v_stride: Int,
     cos: UnsafePointer[Float32, MutAnyOrigin],
     sin: UnsafePointer[Float32, MutAnyOrigin],
-    cache: KVCache[max_seq, head_dim, num_kv_heads],
+    cache: KVCache[max_seq, head_dim, num_kv_heads, num_q_heads],
     pos: Int,
     seq_len: Int,
-    s_k: Float32,
     s_v: Float32,
 ):
     """Write K and V from bf16 GEMV output into quantized KV cache.
 
-    k_bf16/v_bf16: pointers to the K/V region within the QKV output.
-    k_stride/v_stride: bf16 element stride between rows (= QKV_N for combined output).
-    cos/sin: RoPE tables, [max_seq, head_dim/2].
-    s_k/s_v: per-layer quantization scales.
+    K uses dynamic per-head absmax scales (computed here, stored in cache).
+    V uses fixed corrected scale s_v.
     """
     comptime half = head_dim // 2
-    var k_quant_inv = Float32(127) / s_k
     var v_quant_inv = Float32(127) / s_v
 
-    # Stack-allocated working memory
     var work_arr = InlineArray[Float32, head_dim](fill=Float32(0))
     var work = UnsafePointer(to=work_arr).bitcast[Float32]()
     var qi_arr = InlineArray[Scalar[DType.int8], head_dim](fill=Scalar[DType.int8](0))
@@ -156,7 +167,7 @@ def rope_and_kv_cache_write[head_dim: Int, num_kv_heads: Int, max_seq: Int](
             write_k_head[head_dim](
                 k_bf16 + m * k_stride + g * head_dim,
                 cos_row, sin_row,
-                k_quant_inv, work, qi_buf,
+                work, qi_buf,
                 cache, actual_pos, g,
             )
             write_v_head[head_dim](

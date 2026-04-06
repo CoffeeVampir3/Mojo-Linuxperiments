@@ -98,19 +98,15 @@ comptime FWHT_BLOCK = C.HEAD_DIM
 struct LayerScales(Copyable, ImplicitlyCopyable):
     """Per-layer fixed scales derived from weight Frobenius norms at load time.
 
-    S_Q = ||W'_Q||_F / sqrt(K) * C(d_k)
-    S_K = ||W'_K||_F / sqrt(K) * C(d_k)
-    S_V = ||W'_V||_F / sqrt(K) * C(d_k)
-    S_post = sqrt(M_2(silu, ||W'_gate||_F / sqrt(K)) * ||W'_up||_F^2 / K) * C(n)
+    Q/K scales are dynamic (per-head absmax, computed at runtime).
+    V and post-nonlinearity scales remain fixed:
+      S_V = ||W'_V||_F / sqrt(M) * C(d_k)      (M = KV_HIDDEN)
+      S_post = sqrt(M_2(silu, sigma_gate) * sigma_up^2) * C(n)
     """
-    var q_layer_scale: Float32
-    var k_layer_scale: Float32
     var v_layer_scale: Float32
     var post_layer_scale: Float32
 
     def __init__(out self):
-        self.q_layer_scale = Float32(0)
-        self.k_layer_scale = Float32(0)
         self.v_layer_scale = Float32(0)
         self.post_layer_scale = Float32(0)
 
@@ -233,10 +229,10 @@ struct ButterQuantTPLayer[tp: Int]:
     comptime QKV_N = Self.Q_PROJ.ROWS + Self.K_PROJ.ROWS + Self.V_PROJ.ROWS
     comptime GATE_UP_N = Self.GATE_PROJ.ROWS + Self.UP_PROJ.ROWS
 
-    # KV cache: flat u8/i8, zero per-token metadata.
-    # One KVCache instance per layer holds both K (VNNI) and V (row-major i8).
+    # Attention cache: K (VNNI), V (row-major i8), per-head dynamic Q/K scales.
     comptime LOCAL_KV_HEADS = C.NUM_KV_HEADS // Self.tp
-    comptime KVC = KVCache[C.MAX_SEQ_LEN, C.HEAD_DIM, Self.LOCAL_KV_HEADS]
+    comptime LOCAL_Q_HEADS = C.NUM_HEADS // Self.tp
+    comptime KVC = KVCache[C.MAX_SEQ_LEN, C.HEAD_DIM, Self.LOCAL_KV_HEADS, Self.LOCAL_Q_HEADS]
 
     # Weight iteration: norms before the projections they feed.
     # Column sums are excluded (computed at load time, not loaded from file).
@@ -659,20 +655,18 @@ def frobenius_from_quantized[W: Encoding & Shaped & Placed & Named,
 
 
 def derive_layer_scales[tp: Int](arena_base: Int) -> InlineArray[LayerScales, C.NUM_LAYERS]:
-    """Compute per-layer fixed scales from weight Frobenius norms.
+    """Compute per-layer fixed scales for V and post-nonlinearity.
 
-    See butterquant.md Sections 3.2 (Categories B, C).
+    Q/K scales are dynamic (per-head absmax at runtime). Only V and S_post
+    need offline derivation from weight Frobenius norms.
 
-    The general per-component RMS of y = W'x for isotropic x with ||x|| = sqrt(d):
-        RMS = ||W'||_F / sqrt(M)
-    where M is the output dimension of the projection. The spec's simplified
-    formula ||W'||_F / sqrt(K) is only valid when M = K (e.g. Q projection).
-    For K/V projections M = KV_HIDDEN, for gate/up M = INTERMEDIATE.
+    S_V = ||W'_V||_F / sqrt(KV_HIDDEN) * C(d_k)
+    S_post = sqrt(M_2(silu, sigma_gate) * sigma_up^2) * C(n)
+      where sigma = ||W'||_F / sqrt(INTERMEDIATE)
     """
     comptime L = ButterQuantTPLayer[tp]
     comptime M = ButterQuantTPModel[tp]
     var cn = concentration_constant[FWHT_BLOCK]()
-    var sqrt_hidden = Float64(C.HIDDEN).__pow__(0.5)
     var sqrt_kv_hidden = Float64(C.KV_HIDDEN).__pow__(0.5)
     var sqrt_intermediate = Float64(C.INTERMEDIATE).__pow__(0.5)
     comptime SILU_M2_COEFF = 0.298  # M_2(silu, 1) / 1^2, see spec Section 3.2C
@@ -681,19 +675,14 @@ def derive_layer_scales[tp: Int](arena_base: Int) -> InlineArray[LayerScales, C.
     for layer in range(C.NUM_LAYERS):
         var layer_base = M.LAYERS_OFF + layer * M.LAYER_STRIDE
 
-        var q_frob_sq = frobenius_from_quantized[L.Q_PROJ, L.Q_ROW_SCALE](arena_base, layer_base)
-        var k_frob_sq = frobenius_from_quantized[L.K_PROJ, L.K_ROW_SCALE](arena_base, layer_base)
         var v_frob_sq = frobenius_from_quantized[L.V_PROJ, L.V_ROW_SCALE](arena_base, layer_base)
         var gate_frob_sq = frobenius_from_quantized[L.GATE_PROJ, L.GATE_ROW_SCALE](arena_base, layer_base)
         var up_frob_sq = frobenius_from_quantized[L.UP_PROJ, L.UP_ROW_SCALE](arena_base, layer_base)
 
-        # Category B: S_proj = ||W'||_F / sqrt(M) * C(d_k)
-        scales[layer].q_layer_scale = Float32(q_frob_sq.__pow__(0.5) / sqrt_hidden * cn)
-        scales[layer].k_layer_scale = Float32(k_frob_sq.__pow__(0.5) / sqrt_kv_hidden * cn)
+        # V: S_V = ||W'_V||_F / sqrt(KV_HIDDEN) * C(d_k)
         scales[layer].v_layer_scale = Float32(v_frob_sq.__pow__(0.5) / sqrt_kv_hidden * cn)
 
-        # Category C: S_post = sqrt(M_2(silu, sigma_gate) * sigma_up^2) * C(n)
-        # where sigma = ||W'||_F / sqrt(M), M = INTERMEDIATE for gate/up
+        # S_post = sqrt(M_2(silu, sigma_gate) * sigma_up^2) * C(n)
         var sigma_gate = gate_frob_sq.__pow__(0.5) / sqrt_intermediate
         var sigma_up_sq = up_frob_sq / Float64(C.INTERMEDIATE)
         var m2 = SILU_M2_COEFF * sigma_gate * sigma_gate
@@ -862,7 +851,6 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
             # =============================================================
             # Attention block
             # =============================================================
-            # LIFO: q_buf > qkv > act_work (release) > attn (release) > (release qkv) > (release q_buf)
 
             var q_buf = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * Q_COLS]()
             var qkv = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * QKV_N]()
@@ -874,13 +862,11 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                 var rv = ranks.view(rank)
                 var sb = rv.scratch_base()
 
-                # RMSNorm + FWHT + quantize: x_main → act_i8
                 rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
                     rv.x_main(seq_len).ptr, sb + act_i8_off, sb + work_off,
                     seq_len, s_act, self.pools[rank],
                 ).join()
 
-                # int8_gemv QKV: act_i8 → qkv
                 var qkv_configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(Float32(0), 0))
                 int8_gemv[QKV_N, C.HIDDEN](
                     sb + act_i8_off,
@@ -894,7 +880,7 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
 
             act_work^.release()
 
-            # KV cache write + Q copy to contiguous buffer
+            # KV cache write (K: dynamic scales, V: fixed scale) + Q copy
             for rank in range(Self.tp):
                 var rv = ranks.view(rank)
                 var sb = rv.scratch_base()
@@ -902,17 +888,16 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                 var qkv_ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
                     unsafe_from_address=sb + qkv.offset)
 
-                rope_and_kv_cache_write[C.HEAD_DIM, M.LOCAL_KV_HEADS, C.MAX_SEQ_LEN](
-                    qkv_ptr + Q_ROWS,              # k_bf16 (after Q columns)
-                    qkv_ptr + Q_ROWS + KV_ROWS,    # v_bf16 (after K columns)
-                    QKV_N, QKV_N,                   # k_stride, v_stride (element stride)
+                rope_and_kv_cache_write[C.HEAD_DIM, M.LOCAL_KV_HEADS, C.MAX_SEQ_LEN, M.LOCAL_HEADS](
+                    qkv_ptr + Q_ROWS,
+                    qkv_ptr + Q_ROWS + KV_ROWS,
+                    QKV_N, QKV_N,
                     UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=rv.rope_cos().ptr),
                     UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=rv.rope_sin().ptr),
                     kvc, pos, seq_len,
-                    ls.k_layer_scale, ls.v_layer_scale,
+                    ls.v_layer_scale,
                 )
 
-                # Copy Q from strided QKV to contiguous q_buf
                 var q_dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
                     unsafe_from_address=sb + q_buf.offset)
                 for m in range(seq_len):
@@ -920,7 +905,7 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
 
             qkv^.release()
 
-            # Attention → i8 output (within attn_scratch)
+            # Attention (Q/K: dynamic scales from cache, V: fixed)
             var attn = self.scratch.borrow[UInt8, ATTN_SCRATCH_BYTES]()
 
             for rank in range(Self.tp):
@@ -929,16 +914,37 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                 var kvc = rv.kv_cache(layer_idx)
                 var q_view = DynView[M.Q_VIEW](sb + q_buf.offset, seq_len)
 
-                amx_prefill[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM, C.MAX_SEQ_LEN](
-                    q_view, kvc, kvc,
-                    rv.rope_cos(), rv.rope_sin(),
-                    sb + attn.offset, pos,
-                    ls.q_layer_scale, ls.k_layer_scale, ls.v_layer_scale,
-                    self.pools[rank],
-                ).join()
+                if seq_len == 1:
+                    var wpg_hint = self.pools[rank].get_capacity() // M.LOCAL_KV_HEADS
+                    amx_decode[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM, C.MAX_SEQ_LEN, M.LOCAL_HEADS](
+                        q_view, kvc,
+                        rv.rope_cos(), rv.rope_sin(),
+                        sb + attn.offset, pos,
+                        ls.v_layer_scale,
+                        wpg_hint, self.pools[rank],
+                    ).join()
+                    comptime DECODE_BLOCK_N = 512
+                    var context = pos + 1
+                    var max_blocks = (context + DECODE_BLOCK_N - 1) // DECODE_BLOCK_N
+                    var wpg = min(min(wpg_hint, max_blocks),
+                                  self.pools[rank].get_capacity() // M.LOCAL_KV_HEADS)
+                    var vagg_scale = ls.v_layer_scale / (Float32(255) * Float32(127))
+                    decode_merge[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM](
+                        sb + attn.offset, wpg, vagg_scale,
+                    )
+                else:
+                    amx_prefill[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM, C.MAX_SEQ_LEN, M.LOCAL_HEADS](
+                        q_view, kvc,
+                        rv.rope_cos(), rv.rope_sin(),
+                        sb + attn.offset, pos,
+                        ls.v_layer_scale,
+                        self.pools[rank],
+                    ).join()
 
-                # i8 output: prefill layout is [f32 accum | i8 output | ...]
-                var attn_i8_addr = sb + attn.offset + seq_len * Q_COLS * size_of[Float32]()
+                # i8 output location
+                var attn_i8_addr = sb + attn.offset
+                if seq_len > 1:
+                    attn_i8_addr += seq_len * Q_COLS * size_of[Float32]()
 
                 # int8_gemv O: attn_i8 → x_residual
                 var o_configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(Float32(0), 0))

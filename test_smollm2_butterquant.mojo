@@ -78,10 +78,9 @@ He was named to the 2022 class of ACM Fellows"""
     var load_ms = (perf_counter_ns() - t0) / 1_000_000
     print("model loaded in", load_ms, "ms")
     print("s_act =", model.s_act)
-    print("layer 0 scales: q=", model.layer_scales[0].q_layer_scale,
-          "k=", model.layer_scales[0].k_layer_scale,
-          "v=", model.layer_scales[0].v_layer_scale,
+    print("layer 0 scales: v=", model.layer_scales[0].v_layer_scale,
           "post=", model.layer_scales[0].post_layer_scale)
+    print("(Q/K scales are dynamic per-head, computed at runtime)")
     print()
 
     # --- Write tokens ---
