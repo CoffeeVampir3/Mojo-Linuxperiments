@@ -1,21 +1,14 @@
-"""SmolLM2-135M ButterQuant — isotropic int8 via Hadamard butterfly networks.
+"""SmolLM2-135M ButterQuant — Hadamard-rotated channelwise int8 quantization.
 
 Weights are FWHT-rotated on the contraction dimension and quantized to I8
 with per-row F32 scales. RMSNorm gamma is absorbed into projection weights
-offline. Activation quantization uses a single model-global scale S_act = C(n).
-KV cache is flat u8/i8 with per-layer fixed scales derived from weight norms.
+offline. All activation scales are dynamic per-row absmax, except V which
+uses a fixed per-layer scale derived from weight Frobenius norms.
 
 Weight layout per layer (distributed across ranks):
   - 7 I8 projections (VNNI-packed at load time)
   - 7 F32 per-row weight scales (from quantized checkpoint)
   - 7 F32 column sums (computed at load time for VNNI bias correction)
-
-Per-layer runtime constants (derived at load time from weight Frobenius norms):
-  - S_Q, S_K, S_V: projection scales for attention quantization
-  - S_post: post-nonlinearity scale for MLP re-quantization
-  - S_attn_out = S_V (see butterquant.md Section 3.2 Category D)
-
-Model-global constant: S_act = C(n) where n = FWHT_BLOCK = HEAD_DIM.
 
 See butterquant.md for the full specification.
 """
@@ -33,8 +26,8 @@ from modeling.model_spec import (
     Encoding, Shaped, Placed, Named, BF16, F32, I8,
     RowShard, ColShard, Replicated,
     PrincipleNodeLocal,
-    IsQuantizable, IsGammaQuantizable, IsPassthrough, IsAbsorbed, Quantizable,
-    Slot, PlacedSlot, Bound, DynView, CacheView, bind, byte_count,
+    IsQuantizable, IsGammaQuantizable, IsAbsorbed,
+    Slot, PlacedSlot, Bound, DynView, bind, byte_count,
     WeightIterable,
     next_offset,
     DEFAULT_ALIGNMENT,
@@ -48,11 +41,11 @@ from kernels.kernel_ops import (
     init_rope_tables,
     PoolFence, parallel_for,
 )
-from experimental2.kernels.float_kernels.float_gemv import float_gemv
-from experimental2.kernels.float_kernels.rmsnorm_fwht_quantize import rmsnorm_fwht_quantize
-from experimental2.kernels.int_kernels.int8_gemv import int8_gemv, WorkerConfig
-from experimental2.kernels.float_kernels.rope_and_kv_cache_write import rope_and_kv_cache_write
-from experimental2.kernels.float_kernels.silu_fwht_quantize import silu_fwht_quantize
+from experimental2.kernels.float_gemv import float_gemv
+from experimental2.kernels.rmsnorm_fwht_quantize import rmsnorm_fwht_quantize
+from experimental2.kernels.int8_gemv import int8_gemv, WorkerConfig
+from experimental2.kernels.rope_and_kv_cache_write import rope_and_kv_cache_write
+from experimental2.kernels.silu_fwht_quantize import silu_fwht_quantize
 from experimental2.attn_amx_decode import (
     decode as amx_decode, decode_merge,
 )
@@ -565,11 +558,6 @@ def init_column_sums[tp: Int](arena_base: Int):
         compute_column_sum[L.GATE_PROJ, L.GATE_COLSUM](arena_base, layer_base)
         compute_column_sum[L.UP_PROJ, L.UP_COLSUM](arena_base, layer_base)
         compute_column_sum[L.DOWN_PROJ, L.DOWN_COLSUM](arena_base, layer_base)
-
-
-# =============================================================================
-# GEMM epilogue table precomputation
-# =============================================================================
 
 
 # =============================================================================

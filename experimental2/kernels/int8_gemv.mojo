@@ -37,11 +37,12 @@ def dot_vnni[width: Int](
 ) -> SIMD[DType.int32, width]:
     """VNNI dot: width channels x 4 K values via vpdpbusd."""
     var w = wpacked.bitcast[Scalar[DType.int8]]().load[width = width * 4]()
-    var dword = (act_row + k_pos).bitcast[Scalar[DType.uint32]]()[0] ^ UInt32(0x80808080)
-    var dwords = SIMD[DType.uint32, width](dword)
-    var tmp = InlineArray[SIMD[DType.uint32, width], 1](fill=dwords)
-    var a = UnsafePointer(to=tmp).bitcast[UInt8]().load[width = width * 4]()
-    return vpdpbusd[width](acc, a, w)
+    var b4 = (act_row + k_pos).bitcast[UInt8]().load[width=4]() ^ SIMD[DType.uint8, 4](0x80)
+    var b8 = b4.join(b4)
+    var b16 = b8.join(b8)
+    var b32 = b16.join(b16)
+    var b64 = b32.join(b32)
+    return vpdpbusd[width](acc, b64.slice[width * 4](), w)
 
 
 @always_inline

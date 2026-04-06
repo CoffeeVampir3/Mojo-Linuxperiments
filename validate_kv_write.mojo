@@ -12,7 +12,7 @@ from kernels.kernel_ops import init_rope_tables, PoolFence
 from modeling.model_spec import F32, Replicated, Slot, Bound
 
 from experimental2.kv_cache import KVCache
-from experimental2.kernels.float_kernels.kv_cache_write import kv_cache_write
+from experimental2.kernels.kv_cache_write import kv_cache_write
 
 
 def scalar_fwht(buf: UnsafePointer[Float32, MutAnyOrigin], n: Int):

@@ -15,12 +15,12 @@ Each KV head is head_dim elements wide within that row.
 """
 
 from std.memory import UnsafePointer
-from std.sys.info import simd_width_of, size_of
+from std.sys.info import simd_width_of
 from std.collections import InlineArray
 
-from simd_math import sqrt, roundeven
 from experimental2.kv_cache import KVCache
-from experimental2.kernels.float_kernels.rmsnorm_fwht_quantize import fwht_block
+from experimental2.kernels.rmsnorm_fwht_quantize import fwht_block
+from experimental2.kernels.quantize import absmax_quantize_i8, fixed_quantize_i8
 
 
 # ============================================================================
@@ -65,26 +65,7 @@ def write_k_head[head_dim: Int](
     # FWHT (block = head_dim)
     fwht_block[head_dim](work)
 
-    # Dynamic absmax
-    var vmax = SIMD[DType.float32, width](0)
-    k = 0
-    while k + width <= head_dim:
-        vmax = max(vmax, (work + k).load[width=width]().__abs__())
-        k += width
-    var absmax = vmax.reduce_max()
-    if absmax < Float32(1e-10):
-        absmax = Float32(1e-10)
-
-    # Quantize with dynamic scale
-    var vinv = SIMD[DType.float32, width](Float32(127) / absmax)
-    comptime lo = SIMD[DType.float32, width](-128.0)
-    comptime hi = SIMD[DType.float32, width](127.0)
-    k = 0
-    while k + width <= head_dim:
-        var v = (work + k).load[width=width]()
-        (qi_buf + k).store(min(max(roundeven(v * vinv), lo), hi).cast[DType.int8]())
-        k += width
-
+    var absmax = absmax_quantize_i8[head_dim](work, qi_buf)
     cache.write_k(pos, head, qi_buf)
     cache.write_k_scale(pos, head, absmax)
 
@@ -115,15 +96,7 @@ def write_v_head[head_dim: Int](
     # FWHT (block = head_dim)
     fwht_block[head_dim](work)
 
-    # Fixed-scale quantize
-    var vinv = SIMD[DType.float32, width](quant_inv)
-    comptime lo = SIMD[DType.float32, width](-128.0)
-    comptime hi = SIMD[DType.float32, width](127.0)
-    k = 0
-    while k + width <= head_dim:
-        var v = (work + k).load[width=width]()
-        (qi_buf + k).store(min(max(roundeven(v * vinv), lo), hi).cast[DType.int8]())
-        k += width
+    fixed_quantize_i8[head_dim](work, qi_buf, quant_inv)
 
     cache.write_v(pos, head, qi_buf)
 

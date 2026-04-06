@@ -30,7 +30,7 @@ from modeling.smollm2_butterquant_tp import (
 )
 from tokenizer import load_tokenizer
 from experimental.amx import init_intel_amx
-from experimental2.kernels.float_kernels.rmsnorm_fwht_quantize import fwht_block
+from experimental2.kernels.rmsnorm_fwht_quantize import fwht_block
 from simd_math import roundeven, sqrt
 
 comptime C = SmolLM2Config

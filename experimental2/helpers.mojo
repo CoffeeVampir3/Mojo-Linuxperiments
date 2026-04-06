@@ -10,7 +10,7 @@ from std.sys.info import simd_width_of, size_of
 from std.collections import InlineArray
 
 from simd_math import roundeven, exp_f32_fast, quantize_i8
-from experimental.hadquant_impl import fwht_apply, fwht_width
+from experimental2.kernels.rmsnorm_fwht_quantize import fwht_apply, fwht_width
 from experimental.amx import (
     TILE_M, TILE_K, TILE_N, VNNI_BLK, M_STEP, N_STEP, K_STEP, TILE_BYTES,
     tilezero, tileload, tilestore, tile_dp,

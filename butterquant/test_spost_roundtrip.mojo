@@ -18,7 +18,7 @@ from modeling.smollm2_butterquant_tp import SmolLM2ButterQuant, SmolLM2Config, F
 from modeling.model_spec import BF16
 from tokenizer import load_tokenizer
 from experimental.amx import init_intel_amx
-from experimental2.kernels.float_kernels.rmsnorm_fwht_quantize import fwht_block
+from experimental2.kernels.rmsnorm_fwht_quantize import fwht_block
 from simd_math import roundeven, exp_f32
 
 comptime C = SmolLM2Config
@@ -155,8 +155,8 @@ def main():
     var act_i8_off = act_work.offset
     var work_off = act_work.offset + C.MAX_SEQ_LEN * C.HIDDEN
 
-    from experimental2.kernels.float_kernels.rmsnorm_fwht_quantize import rmsnorm_fwht_quantize
-    from experimental2.kernels.int_kernels.int8_gemv import int8_gemv, WorkerConfig
+    from experimental2.kernels.rmsnorm_fwht_quantize import rmsnorm_fwht_quantize
+    from experimental2.kernels.int8_gemv import int8_gemv, WorkerConfig
 
     rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
         rv.x_main(seq_len).ptr, sb + act_i8_off, sb + work_off,

@@ -9,7 +9,7 @@ from numa.arena import NumaArena
 from threading.burst_threading import BurstPool
 from simd_math import sqrt
 
-from experimental2.kernels.float_kernels.rmsnorm_fwht_quantize import (
+from experimental2.kernels.rmsnorm_fwht_quantize import (
     rmsnorm_fwht_quantize, fwht_block,
 )
 

@@ -13,7 +13,7 @@ from notstdcollections import HeapMoveArray
 from threading.burst_threading import BurstPool
 from kernels.vnni import pack_vnni
 
-from experimental2.kernels.int_kernels.int8_gemv import int8_gemv, WorkerConfig, gemv_row
+from experimental2.kernels.int8_gemv import int8_gemv, WorkerConfig, gemv_row
 
 
 def f32_reference(

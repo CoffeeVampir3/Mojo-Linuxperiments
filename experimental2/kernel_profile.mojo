@@ -138,33 +138,3 @@ def _print_phase(name: String, total_ns: Int, count: Int, wall_ns: Int):
     print("    " + name + ": " + String(avg_us) + " us avg (" + String(pct) + "%)")
 
 
-@fieldwise_init
-struct CallerProfile(Copyable, ImplicitlyCopyable):
-    """Caller-side timing for setup, dispatch, join, merge."""
-    var setup: Int
-    var dispatch: Int
-    var join: Int
-    var merge: Int
-    var total: Int
-
-    def __init__(out self):
-        self.setup = 0
-        self.dispatch = 0
-        self.join = 0
-        self.merge = 0
-        self.total = 0
-
-    def print_summary(self):
-        print("  caller total: " + String(self.total // 1000) + " us")
-        _print_caller_phase("setup", self.setup, self.total)
-        _print_caller_phase("dispatch", self.dispatch, self.total)
-        _print_caller_phase("join", self.join, self.total)
-        _print_caller_phase("merge", self.merge, self.total)
-
-
-def _print_caller_phase(name: String, ns: Int, total_ns: Int):
-    var us = ns // 1000
-    var pct = 0
-    if total_ns > 0:
-        pct = ns * 100 // total_ns
-    print("    " + name + ": " + String(us) + " us (" + String(pct) + "%)")

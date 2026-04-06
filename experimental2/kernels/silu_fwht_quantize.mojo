@@ -14,8 +14,9 @@ from std.sys.info import simd_width_of, size_of
 from threading.threading_traits import BurstThreadPool
 
 from kernels.kernel_ops import PoolFence
-from simd_math import exp_f32, roundeven
-from experimental2.kernels.float_kernels.rmsnorm_fwht_quantize import fwht_block
+from simd_math import exp_f32
+from experimental2.kernels.rmsnorm_fwht_quantize import fwht_block
+from experimental2.kernels.quantize import absmax_quantize_i8
 
 
 # ============================================================================
@@ -49,26 +50,7 @@ def silu_fwht_quantize_row[cols: Int, block: Int](
     for b in range(cols // block):
         fwht_block[block](work + b * block)
 
-    # Dynamic absmax
-    var vmax = SIMD[DType.float32, width](0)
-    k = 0
-    while k + width <= cols:
-        vmax = max(vmax, (work + k).load[width=width]().__abs__())
-        k += width
-    var absmax = vmax.reduce_max()
-    if absmax < Float32(1e-10):
-        absmax = Float32(1e-10)
-    scale_out[] = absmax
-
-    # Quantize with dynamic scale
-    var vinv = SIMD[DType.float32, width](Float32(127) / absmax)
-    comptime lo = SIMD[DType.float32, width](-128.0)
-    comptime hi = SIMD[DType.float32, width](127.0)
-    k = 0
-    while k + width <= cols:
-        var v = (work + k).load[width=width]()
-        (row_qi + k).store(min(max(roundeven(v * vinv), lo), hi).cast[DType.int8]())
-        k += width
+    scale_out[] = absmax_quantize_i8[cols](work, row_qi)
 
 
 # ============================================================================
