@@ -15,7 +15,8 @@ See butterquant.md for the full specification.
 
 from std.pathlib import Path
 from std.memory import UnsafePointer, memcpy
-from std.sys.info import size_of
+from std.sys.info import size_of, simd_width_of
+from std.time import perf_counter_ns
 from std.collections import InlineArray
 
 from numa import NumaArena, NumaInfo
@@ -37,15 +38,14 @@ from modeling.model_spec import (
 )
 from kernels.vnni import VnniPacked, pack_vnni
 from kernels.kernel_ops import (
-    embed_lookup, elem_add, rmsnorm,
+    embed_lookup, rmsnorm,
     init_rope_tables,
     PoolFence, parallel_for,
 )
 from experimental2.kernels.float_gemv import float_gemv
 from experimental2.kernels.rmsnorm_fwht_quantize import rmsnorm_fwht_quantize
-from experimental2.kernels.int8_gemv import int8_gemv, WorkerConfig
+from experimental2.kernels.int8_gemv import int8_gemv, WorkerConfig, fused_gu_silu, FusedGUSiluConfig
 from experimental2.kernels.rope_and_kv_cache_write import rope_and_kv_cache_write
-from experimental2.kernels.silu_fwht_quantize import silu_fwht_quantize
 from experimental2.attn_amx_decode import (
     decode as amx_decode, decode_merge,
 )
@@ -81,6 +81,90 @@ struct SmolLM2Config(Dims, Attention, GQA, FFN, Vocab, Sequence, RoPEConfig, RMS
 
 comptime C = SmolLM2Config
 comptime FWHT_BLOCK = C.HEAD_DIM
+
+
+# =============================================================================
+# Forward pass profiling
+# =============================================================================
+
+
+@fieldwise_init
+struct ForwardProfile(Copyable, Movable):
+    var count: Int
+    var embed_ns: Int
+    var attn_norm_ns: Int
+    var qkv_gemv_ns: Int
+    var kv_write_ns: Int
+    var attention_ns: Int
+    var o_gemv_ns: Int
+    var attn_reduce_ns: Int
+    var mlp_norm_ns: Int
+    var gu_gemv_ns: Int
+    var silu_ns: Int
+    var down_gemv_ns: Int
+    var mlp_reduce_ns: Int
+    var final_ns: Int
+
+    def __init__(out self):
+        self.count = 0
+        self.embed_ns = 0
+        self.attn_norm_ns = 0
+        self.qkv_gemv_ns = 0
+        self.kv_write_ns = 0
+        self.attention_ns = 0
+        self.o_gemv_ns = 0
+        self.attn_reduce_ns = 0
+        self.mlp_norm_ns = 0
+        self.gu_gemv_ns = 0
+        self.silu_ns = 0
+        self.down_gemv_ns = 0
+        self.mlp_reduce_ns = 0
+        self.final_ns = 0
+
+    def accumulate(mut self, mut other: Self):
+        self.count += 1
+        self.embed_ns += other.embed_ns
+        self.attn_norm_ns += other.attn_norm_ns
+        self.qkv_gemv_ns += other.qkv_gemv_ns
+        self.kv_write_ns += other.kv_write_ns
+        self.attention_ns += other.attention_ns
+        self.o_gemv_ns += other.o_gemv_ns
+        self.attn_reduce_ns += other.attn_reduce_ns
+        self.mlp_norm_ns += other.mlp_norm_ns
+        self.gu_gemv_ns += other.gu_gemv_ns
+        self.silu_ns += other.silu_ns
+        self.down_gemv_ns += other.down_gemv_ns
+        self.mlp_reduce_ns += other.mlp_reduce_ns
+        self.final_ns += other.final_ns
+
+    def report(self):
+        if self.count == 0:
+            print("(no forward passes profiled)")
+            return
+        var n = self.count
+        var total = (self.embed_ns + self.attn_norm_ns + self.qkv_gemv_ns
+            + self.kv_write_ns + self.attention_ns + self.o_gemv_ns
+            + self.attn_reduce_ns + self.mlp_norm_ns + self.gu_gemv_ns
+            + self.silu_ns + self.down_gemv_ns + self.mlp_reduce_ns
+            + self.final_ns)
+        print("forward profile (" + String(n) + " calls, avg " + String(total // n // 1000) + " us):")
+        Self.phase("  embed      ", self.embed_ns, n)
+        Self.phase("  attn_norm  ", self.attn_norm_ns, n)
+        Self.phase("  qkv_gemv   ", self.qkv_gemv_ns, n)
+        Self.phase("  kv_write   ", self.kv_write_ns, n)
+        Self.phase("  attention  ", self.attention_ns, n)
+        Self.phase("  o_gemv     ", self.o_gemv_ns, n)
+        Self.phase("  attn_reduce", self.attn_reduce_ns, n)
+        Self.phase("  mlp_norm   ", self.mlp_norm_ns, n)
+        Self.phase("  gu_gemv    ", self.gu_gemv_ns, n)
+        Self.phase("  silu       ", self.silu_ns, n)
+        Self.phase("  down_gemv  ", self.down_gemv_ns, n)
+        Self.phase("  mlp_reduce ", self.mlp_reduce_ns, n)
+        Self.phase("  final      ", self.final_ns, n)
+
+    @staticmethod
+    def phase(name: String, total_ns: Int, count: Int):
+        print(name + String(total_ns // count // 1000) + " us")
 
 
 # =============================================================================
@@ -298,16 +382,14 @@ struct ButterQuantTPModel[tp: Int = 1](WeightIterable):
             post_scales: MAX_SEQ_LEN * 4    (f32 per-row scales from silu_fwht_quantize)
             v_scales:    MAX_SEQ_LEN * 4    (f32 constant V scale for O GEMV)
 
-        Attention phase (LIFO nesting: q_buf > qkv > act_work, then qkv > attn):
-            q_buf:       MAX_SEQ_LEN * Q_COLS * 2         (bf16)
-            qkv:         MAX_SEQ_LEN * QKV_N * 2          (bf16)
+        Attention phase (LIFO nesting: qkv > act_work, then qkv + attn):
+            qkv:         MAX_SEQ_LEN * QKV_N * 2          (bf16, stays live for Q during attn)
             act_work:    MAX_SEQ_LEN * HIDDEN + work       (i8 + f32 rmsnorm scratch)
             attn_scratch: MAX_SEQ_LEN * Q_COLS * 5 + overhead
 
-        MLP phase (LIFO nesting: gate_up > mlp_work, then gate_up > post_work):
-            gate_up:     MAX_SEQ_LEN * GATE_UP_N * 2      (bf16)
+        MLP phase (fused gate+up GEMV → SiLU → FWHT → i8):
             mlp_work:    MAX_SEQ_LEN * HIDDEN + work       (i8 + f32 rmsnorm scratch)
-            post_work:   MAX_SEQ_LEN * GATE_ROWS + work    (i8 + f32 silu scratch)
+            post_i8:     MAX_SEQ_LEN * GATE_ROWS           (i8 fused output)
         """
         comptime S = C.MAX_SEQ_LEN
         comptime H = C.HIDDEN
@@ -315,27 +397,24 @@ struct ButterQuantTPModel[tp: Int = 1](WeightIterable):
         comptime TP = Self.tp
         comptime Q_COLS = H // TP
         comptime QKV_N = (H + 2 * C.KV_HIDDEN) // TP
-        comptime GATE_UP_N = 2 * (I // TP)
         comptime GATE_ROWS = I // TP
         comptime MAX_WORKERS = 64
         comptime WORK_OVERHEAD = H * MAX_WORKERS * 4  # f32 work buffer for rmsnorm
-        comptime SILU_WORK = GATE_ROWS * MAX_WORKERS * 4  # f32 work buffer for silu
 
         # Persistent scale arrays (3 × MAX_SEQ_LEN f32)
         comptime scale_arrays = 3 * S * 4
 
-        # Attention: q_buf + max(qkv + act_work, attn_scratch)
-        comptime q_buf = S * Q_COLS * 2
-        comptime qkv_act = S * QKV_N * 2 + S * H + WORK_OVERHEAD
-        comptime attn_scratch = S * Q_COLS * 5 + 1024 * 1024  # generous overhead
-        comptime attn_inner = attn_scratch if attn_scratch > qkv_act else qkv_act
-        comptime attn_peak = q_buf + attn_inner
+        # Attention: qkv + max(act_work, attn_scratch)
+        comptime qkv_buf = S * QKV_N * 2
+        comptime act_work = S * H + WORK_OVERHEAD
+        comptime attn_scratch = S * Q_COLS * 5 + 1024 * 1024
+        comptime attn_inner = attn_scratch if attn_scratch > act_work else act_work
+        comptime attn_peak = qkv_buf + attn_inner
 
-        # MLP: gate_up + max(mlp_work, post_work)
+        # MLP: max(mlp_work, post_i8) — fused, no bf16 intermediate
         comptime mlp_work = S * H + WORK_OVERHEAD
-        comptime post_work = S * GATE_ROWS + SILU_WORK
-        comptime mlp_inner = post_work if post_work > mlp_work else mlp_work
-        comptime mlp_peak = S * GATE_UP_N * 2 + mlp_inner
+        comptime post_i8_bytes = S * GATE_ROWS
+        comptime mlp_peak = mlp_work if mlp_work > post_i8_bytes else post_i8_bytes
 
         comptime layer_peak = attn_peak if attn_peak > mlp_peak else mlp_peak
         return scale_arrays + layer_peak
@@ -542,7 +621,8 @@ def pack_weights[tp: Int](arena_base: Int, scratch: UnsafePointer[UInt8, MutAnyO
         var lb = M.LAYERS_OFF + layer * M.LAYER_STRIDE
         pack_combined3[L.Q_PROJ, L.K_PROJ, L.V_PROJ](arena_base, lb, scratch)
         pack_single[L.O_PROJ](arena_base, lb, scratch)
-        pack_combined[L.GATE_PROJ, L.UP_PROJ](arena_base, lb, scratch)
+        pack_single[L.GATE_PROJ](arena_base, lb, scratch)
+        pack_single[L.UP_PROJ](arena_base, lb, scratch)
         pack_single[L.DOWN_PROJ](arena_base, lb, scratch)
 
 
@@ -610,6 +690,61 @@ def derive_layer_scales[tp: Int](arena_base: Int) -> InlineArray[LayerScales, C.
 
 
 # =============================================================================
+# NUMA-local dispatch kernels (BurstPool 6-Int-arg ABI)
+# =============================================================================
+
+
+@fieldwise_init
+struct KVWriteConfig(Copyable, ImplicitlyCopyable):
+    var k_ptr: Int
+    var v_ptr: Int
+    var k_stride: Int
+    var v_stride: Int
+    var cos_ptr: Int
+    var sin_ptr: Int
+    var cache_base: Int
+    var pos: Int
+    var seq_len: Int
+    var s_v: Float32
+
+
+def kv_write_worker[head_dim: Int, num_kv_heads: Int, max_seq: Int, num_q_heads: Int](
+    config_ptr: Int, unused0: Int, unused1: Int, unused2: Int, unused3: Int, unused4: Int,
+):
+    var cfg = UnsafePointer[KVWriteConfig, MutAnyOrigin](unsafe_from_address=config_ptr)
+    rope_and_kv_cache_write[head_dim, num_kv_heads, max_seq, num_q_heads](
+        UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=cfg[].k_ptr),
+        UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=cfg[].v_ptr),
+        cfg[].k_stride, cfg[].v_stride,
+        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cfg[].cos_ptr),
+        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cfg[].sin_ptr),
+        KVCache[max_seq, head_dim, num_kv_heads, num_q_heads](cfg[].cache_base),
+        cfg[].pos, cfg[].seq_len, cfg[].s_v,
+    )
+
+
+def elem_add_worker(
+    a_ptr: Int, b_ptr: Int, dst_ptr: Int, count: Int, unused0: Int, unused1: Int,
+):
+    var ap = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=a_ptr)
+    var bp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=b_ptr)
+    var dp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=dst_ptr)
+    comptime width = simd_width_of[DType.float32]()
+    for i in range(0, count, width):
+        var av = (ap + i).load[width=width]().cast[DType.float32]()
+        var bv = (bp + i).load[width=width]().cast[DType.float32]()
+        (dp + i).store((av + bv).cast[DType.bfloat16]())
+
+
+def decode_merge_worker[num_heads: Int, num_kv_heads: Int, head_dim: Int](
+    scratch: Int, wpg: Int, vagg_scale_bits: Int,
+    unused0: Int, unused1: Int, unused2: Int,
+):
+    var vagg_scale = Float32(from_bits=UInt32(vagg_scale_bits))
+    decode_merge[num_heads, num_kv_heads, head_dim](scratch, wpg, vagg_scale)
+
+
+# =============================================================================
 # Loaded model
 # =============================================================================
 
@@ -623,6 +758,7 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
     var bases: InlineArray[Int, Self.tp]
     var pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]
     var layer_scales: InlineArray[LayerScales, C.NUM_LAYERS]
+    var profile: ForwardProfile
 
     def __init__(out self, var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]],
                 var pools: HeapMoveArray[BurstPool[]],
@@ -633,6 +769,7 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
         )
         self.scratch = ScratchPool(Self.M.SCRATCH_CAPACITY)
         self.layer_scales = layer_scales^
+        self.profile = ForwardProfile()
         self.arenas = arenas^
         self.pools = pools^
         for rank in range(Self.tp):
@@ -657,6 +794,9 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
             print("  rank 0 (host): " + String(host_arena // (1024 * 1024)) + " MB")
             comptime for r in range(1, Self.tp):
                 print("  rank " + String(r) + ":        " + String(arena_per_rank // (1024 * 1024)) + " MB")
+
+    def report_profile(self):
+        self.profile.report()
 
     def token_buffer(self) -> UnsafePointer[Scalar[DType.int32], MutAnyOrigin]:
         return UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
@@ -737,18 +877,18 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
         comptime QKV_N = L.QKV_N
         comptime Q_ROWS = C.HIDDEN // Self.tp
         comptime KV_ROWS = C.KV_HIDDEN // Self.tp
-        comptime Q_COLS = Q_ROWS  # = LOCAL_HEADS * HEAD_DIM
-        comptime GATE_UP_N = L.GATE_UP_N
+        comptime Q_COLS = Q_ROWS
         comptime GATE_ROWS = C.INTERMEDIATE // Self.tp
         comptime O_K = Q_COLS
         comptime DOWN_K = GATE_ROWS
         comptime MAX_WORKERS = 64
-        comptime WORK_F32 = C.HIDDEN * MAX_WORKERS  # f32 elems for rmsnorm work
-        comptime SILU_WORK_F32 = GATE_ROWS * MAX_WORKERS  # f32 elems for silu work
+        comptime WORK_F32 = C.HIDDEN * MAX_WORKERS
         comptime ACT_WORK_BYTES = C.MAX_SEQ_LEN * C.HIDDEN + WORK_F32 * size_of[Float32]()
         comptime MLP_WORK_BYTES = C.MAX_SEQ_LEN * C.HIDDEN + WORK_F32 * size_of[Float32]()
-        comptime POST_WORK_BYTES = C.MAX_SEQ_LEN * GATE_ROWS + SILU_WORK_F32 * size_of[Float32]()
         comptime ATTN_SCRATCH_BYTES = C.MAX_SEQ_LEN * Q_COLS * (size_of[Float32]() + 1) + 1024 * 1024
+
+        var fp = ForwardProfile()
+        var t0 = Int(perf_counter_ns())
 
         var ranks = Ranks[Self.tp](self.bases, self.pool_ptrs)
         var host = ranks.view(0)
@@ -757,11 +897,9 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
         embed_lookup(host.weight[M.EMBED](), tokens_ptr, host.x_main(seq_len), self.pools[0]).join()
         ring_broadcast[M.X_MAIN, Self.tp](host.x_main(seq_len).ptr, ranks.x_main_ptrs(seq_len), seq_len, ranks.pool_ptrs)
 
-        # Per-row scale arrays (reused across layers, in scratch)
-        # act_scales: written by rmsnorm_fwht_quantize, read by QKV/gate+up GEMV
-        # post_scales: written by silu_fwht_quantize, read by down GEMV
-        # v_scales: constant-filled with v_layer_scale, read by O GEMV
-        comptime SCALE_BYTES = C.MAX_SEQ_LEN * size_of[Float32]()
+        var t1 = Int(perf_counter_ns())
+        fp.embed_ns = t1 - t0
+
         var act_scale_lease = self.scratch.borrow[Float32, C.MAX_SEQ_LEN]()
         var post_scale_lease = self.scratch.borrow[Float32, C.MAX_SEQ_LEN]()
         var v_scale_lease = self.scratch.borrow[Float32, C.MAX_SEQ_LEN]()
@@ -769,34 +907,31 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
         for layer_idx in range(C.NUM_LAYERS):
             var ls = self.layer_scales[layer_idx]
 
-            # Fill V scale array (constant per layer, used by O GEMV)
-            for rank in range(Self.tp):
-                var v_sc_ptr = UnsafePointer[Float32, MutAnyOrigin](
-                    unsafe_from_address=ranks.view(rank).scratch_base() + v_scale_lease.offset)
-                for m in range(seq_len):
-                    v_sc_ptr[m] = ls.v_layer_scale
-
             # =============================================================
             # Attention block
             # =============================================================
 
-            var q_buf = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * Q_COLS]()
             var qkv = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * QKV_N]()
             var act_work = self.scratch.borrow[UInt8, ACT_WORK_BYTES]()
             var act_i8_off = act_work.offset
             var work_off = act_work.offset + C.MAX_SEQ_LEN * C.HIDDEN
 
-            for rank in range(Self.tp):
-                var rv = ranks.view(rank)
+            var ta = Int(perf_counter_ns())
+
+            @parameter
+            def do_attn_norm[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var sb = rv.scratch_base()
-
-                rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
+                return rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
                     rv.x_main(seq_len).ptr, sb + act_i8_off, sb + work_off,
-                    sb + act_scale_lease.offset,
-                    seq_len, self.pools[rank],
-                ).join()
+                    sb + act_scale_lease.offset, seq_len, pool)
+            ranks.parallel[do_attn_norm]()
 
-                var qkv_configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(0, 0, 0))
+            var tb = Int(perf_counter_ns())
+
+            @parameter
+            def do_qkv_gemv[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var sb = rv.scratch_base()
+                var configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(0, 0, 0))
                 int8_gemv[QKV_N, C.HIDDEN](
                     sb + act_i8_off,
                     rv.layer_weight[L.Q_PROJ](layer_idx).ptr,
@@ -804,80 +939,86 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                     rv.layer_weight[L.Q_ROW_SCALE](layer_idx).ptr,
                     sb + qkv.offset, seq_len,
                     sb + act_scale_lease.offset,
-                    qkv_configs, self.pools[rank],
-                ).join()
-                _ = qkv_configs
+                    configs, pool).join()
+                _ = configs
+                return PoolFence[BurstPool[]].completed()
+            ranks.parallel[do_qkv_gemv]()
 
             act_work^.release()
 
-            # KV cache write (K: dynamic scales, V: fixed scale) + Q copy
-            for rank in range(Self.tp):
-                var rv = ranks.view(rank)
+            var tc = Int(perf_counter_ns())
+
+            @parameter
+            def do_kv_write[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var sb = rv.scratch_base()
-                var kvc = rv.kv_cache(layer_idx)
-                var qkv_ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-                    unsafe_from_address=sb + qkv.offset)
-
-                rope_and_kv_cache_write[C.HEAD_DIM, M.LOCAL_KV_HEADS, C.MAX_SEQ_LEN, M.LOCAL_HEADS](
-                    qkv_ptr + Q_ROWS,
-                    qkv_ptr + Q_ROWS + KV_ROWS,
+                var cfg = KVWriteConfig(
+                    sb + qkv.offset + Q_ROWS * 2,
+                    sb + qkv.offset + (Q_ROWS + KV_ROWS) * 2,
                     QKV_N, QKV_N,
-                    UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=rv.rope_cos().ptr),
-                    UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=rv.rope_sin().ptr),
-                    kvc, pos, seq_len,
-                    ls.v_layer_scale,
-                )
+                    rv.rope_cos().ptr, rv.rope_sin().ptr,
+                    rv.kv_base(layer_idx),
+                    pos, seq_len, ls.v_layer_scale)
+                var pack = pool.get_args_base()
+                pack[].arg0 = Int(UnsafePointer(to=cfg))
+                pool.dispatch(
+                    kv_write_worker[C.HEAD_DIM, M.LOCAL_KV_HEADS, C.MAX_SEQ_LEN, M.LOCAL_HEADS],
+                    pool.get_args_base(), 1)
+                PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
+                    unsafe_from_address=Int(UnsafePointer(to=pool)))).join()
+                _ = cfg
+                return PoolFence[BurstPool[]].completed()
+            ranks.parallel[do_kv_write]()
 
-                var q_dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-                    unsafe_from_address=sb + q_buf.offset)
-                for m in range(seq_len):
-                    memcpy(dest=q_dst + m * Q_COLS, src=qkv_ptr + m * QKV_N, count=Q_COLS)
+            var td = Int(perf_counter_ns())
 
-            qkv^.release()
-
-            # Attention (Q/K: dynamic scales from cache, V: fixed)
             var attn = self.scratch.borrow[UInt8, ATTN_SCRATCH_BYTES]()
 
-            for rank in range(Self.tp):
-                var rv = ranks.view(rank)
+            @parameter
+            def do_attention[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var sb = rv.scratch_base()
                 var kvc = rv.kv_cache(layer_idx)
-                var q_view = DynView[M.Q_VIEW](sb + q_buf.offset, seq_len)
-
+                var q_view = DynView[M.Q_VIEW](sb + qkv.offset, seq_len)
                 if seq_len == 1:
-                    var wpg_hint = self.pools[rank].get_capacity() // M.LOCAL_KV_HEADS
+                    var wpg_hint = pool.get_capacity() // M.LOCAL_KV_HEADS
                     amx_decode[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM, C.MAX_SEQ_LEN, M.LOCAL_HEADS](
-                        q_view, kvc,
+                        q_view, QKV_N, kvc,
                         rv.rope_cos(), rv.rope_sin(),
-                        sb + attn.offset, pos,
-                        ls.v_layer_scale,
-                        wpg_hint, self.pools[rank],
-                    ).join()
+                        sb + attn.offset, pos, ls.v_layer_scale,
+                        wpg_hint, pool).join()
                     comptime DECODE_BLOCK_N = 512
                     var context = pos + 1
                     var max_blocks = (context + DECODE_BLOCK_N - 1) // DECODE_BLOCK_N
-                    var wpg = min(min(wpg_hint, max_blocks),
-                                  self.pools[rank].get_capacity() // M.LOCAL_KV_HEADS)
+                    var wpg = min(min(wpg_hint, max_blocks), pool.get_capacity() // M.LOCAL_KV_HEADS)
                     var vagg_scale = ls.v_layer_scale / (Float32(255) * Float32(127))
-                    decode_merge[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM](
-                        sb + attn.offset, wpg, vagg_scale,
-                    )
+                    var pack = pool.get_args_base()
+                    pack[].arg0 = sb + attn.offset
+                    pack[].arg1 = wpg
+                    pack[].arg2 = Int(vagg_scale.to_bits())
+                    pool.dispatch(
+                        decode_merge_worker[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM],
+                        pool.get_args_base(), 1)
+                    return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
+                        unsafe_from_address=Int(UnsafePointer(to=pool))))
                 else:
-                    amx_prefill[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM, C.MAX_SEQ_LEN, M.LOCAL_HEADS](
-                        q_view, kvc,
+                    return amx_prefill[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM, C.MAX_SEQ_LEN, M.LOCAL_HEADS](
+                        q_view, QKV_N, kvc,
                         rv.rope_cos(), rv.rope_sin(),
-                        sb + attn.offset, pos,
-                        ls.v_layer_scale,
-                        self.pools[rank],
-                    ).join()
+                        sb + attn.offset, pos, ls.v_layer_scale, pool)
+            ranks.parallel[do_attention]()
 
-                # i8 output location
+            var te = Int(perf_counter_ns())
+
+            @parameter
+            def do_o_gemv[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var sb = rv.scratch_base()
+                var v_sc = UnsafePointer[Float32, MutAnyOrigin](
+                    unsafe_from_address=sb + v_scale_lease.offset)
+                for m in range(seq_len):
+                    v_sc[m] = ls.v_layer_scale
                 var attn_i8_addr = sb + attn.offset
                 if seq_len > 1:
                     attn_i8_addr += seq_len * Q_COLS * size_of[Float32]()
-
-                # int8_gemv O: attn_i8 → x_residual (V scale is fixed per layer)
-                var o_configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(0, 0, 0))
+                var configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(0, 0, 0))
                 int8_gemv[C.HIDDEN, O_K](
                     attn_i8_addr,
                     rv.layer_weight[L.O_PROJ](layer_idx).ptr,
@@ -885,93 +1026,133 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                     rv.layer_weight[L.O_ROW_SCALE](layer_idx).ptr,
                     rv.x_residual(seq_len).ptr, seq_len,
                     sb + v_scale_lease.offset,
-                    o_configs, self.pools[rank],
-                ).join()
-                _ = o_configs
+                    configs, pool).join()
+                _ = configs
+                return PoolFence[BurstPool[]].completed()
+            ranks.parallel[do_o_gemv]()
 
+            qkv^.release()
             attn^.release()
-            q_buf^.release()
 
-            # Allreduce + residual add
+            var tf = Int(perf_counter_ns())
+
             ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
-            for rank in range(Self.tp):
-                var rv = ranks.view(rank)
-                elem_add(rv.x_main(seq_len), rv.x_residual(seq_len), rv.x_main(seq_len))
+
+            @parameter
+            def do_attn_res_add[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var pack = pool.get_args_base()
+                pack[].arg0 = rv.x_main(seq_len).ptr
+                pack[].arg1 = rv.x_residual(seq_len).ptr
+                pack[].arg2 = rv.x_main(seq_len).ptr
+                pack[].arg3 = seq_len * C.HIDDEN
+                pool.dispatch(elem_add_worker, pool.get_args_base(), 1)
+                return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
+                    unsafe_from_address=Int(UnsafePointer(to=pool))))
+            ranks.parallel[do_attn_res_add]()
+
+            var tg = Int(perf_counter_ns())
 
             # =============================================================
             # MLP block
             # =============================================================
 
-            var gate_up = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * GATE_UP_N]()
             var mlp_work = self.scratch.borrow[UInt8, MLP_WORK_BYTES]()
             var mlp_i8_off = mlp_work.offset
             var mlp_work_off = mlp_work.offset + C.MAX_SEQ_LEN * C.HIDDEN
 
-            for rank in range(Self.tp):
-                var rv = ranks.view(rank)
+            @parameter
+            def do_mlp_norm[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var sb = rv.scratch_base()
-
-                rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
+                return rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
                     rv.x_main(seq_len).ptr, sb + mlp_i8_off, sb + mlp_work_off,
-                    sb + act_scale_lease.offset,
-                    seq_len, self.pools[rank],
-                ).join()
+                    sb + act_scale_lease.offset, seq_len, pool)
+            ranks.parallel[do_mlp_norm]()
 
-                var gu_configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(0, 0, 0))
-                int8_gemv[GATE_UP_N, C.HIDDEN](
+            mlp_work^.release()
+
+            var th = Int(perf_counter_ns())
+
+            # Fused gate+up GEMV → SiLU → FWHT → i8 (no bf16 intermediate)
+            var post_i8 = self.scratch.borrow[Scalar[DType.int8], C.MAX_SEQ_LEN * GATE_ROWS]()
+
+            @parameter
+            def do_fused_gu_silu[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var sb = rv.scratch_base()
+                var configs = InlineArray[FusedGUSiluConfig, 128](fill=FusedGUSiluConfig(0, 0, 0, 0, 0, 0, 0))
+                fused_gu_silu[GATE_ROWS, C.HIDDEN, FWHT_BLOCK](
                     sb + mlp_i8_off,
                     rv.layer_weight[L.GATE_PROJ](layer_idx).ptr,
                     rv.layer_weight[L.GATE_COLSUM](layer_idx).ptr,
                     rv.layer_weight[L.GATE_ROW_SCALE](layer_idx).ptr,
-                    sb + gate_up.offset, seq_len,
-                    sb + act_scale_lease.offset,
-                    gu_configs, self.pools[rank],
-                ).join()
-                _ = gu_configs
-
-            mlp_work^.release()
-
-            # SiLU + FWHT + dynamic quantize, then down projection
-            var post_work = self.scratch.borrow[UInt8, POST_WORK_BYTES]()
-            var post_i8_off = post_work.offset
-            var silu_work_off = post_work.offset + C.MAX_SEQ_LEN * GATE_ROWS
-
-            for rank in range(Self.tp):
-                var rv = ranks.view(rank)
-                var sb = rv.scratch_base()
-
-                silu_fwht_quantize[GATE_ROWS, GATE_UP_N, FWHT_BLOCK](
-                    sb + gate_up.offset, sb + post_i8_off, sb + silu_work_off,
+                    rv.layer_weight[L.UP_PROJ](layer_idx).ptr,
+                    rv.layer_weight[L.UP_COLSUM](layer_idx).ptr,
+                    rv.layer_weight[L.UP_ROW_SCALE](layer_idx).ptr,
+                    sb + post_i8.offset,
                     sb + post_scale_lease.offset,
-                    seq_len, self.pools[rank],
-                ).join()
+                    seq_len, sb + act_scale_lease.offset,
+                    configs, pool).join()
+                _ = configs
+                return PoolFence[BurstPool[]].completed()
+            ranks.parallel[do_fused_gu_silu]()
 
-                var dn_configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(0, 0, 0))
+            var ti = Int(perf_counter_ns())
+            var tj = ti  # silu is fused, no separate phase
+
+            @parameter
+            def do_down_gemv[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var sb = rv.scratch_base()
+                var configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(0, 0, 0))
                 int8_gemv[C.HIDDEN, DOWN_K](
-                    sb + post_i8_off,
+                    sb + post_i8.offset,
                     rv.layer_weight[L.DOWN_PROJ](layer_idx).ptr,
                     rv.layer_weight[L.DOWN_COLSUM](layer_idx).ptr,
                     rv.layer_weight[L.DOWN_ROW_SCALE](layer_idx).ptr,
                     rv.x_residual(seq_len).ptr, seq_len,
                     sb + post_scale_lease.offset,
-                    dn_configs, self.pools[rank],
-                ).join()
-                _ = dn_configs
+                    configs, pool).join()
+                _ = configs
+                return PoolFence[BurstPool[]].completed()
+            ranks.parallel[do_down_gemv]()
 
-            post_work^.release()
-            gate_up^.release()
+            post_i8^.release()
 
-            # Allreduce + residual add
+            var tk = Int(perf_counter_ns())
+
             ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
-            for rank in range(Self.tp):
-                var rv = ranks.view(rank)
-                elem_add(rv.x_main(seq_len), rv.x_residual(seq_len), rv.x_main(seq_len))
+
+            @parameter
+            def do_mlp_res_add[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var pack = pool.get_args_base()
+                pack[].arg0 = rv.x_main(seq_len).ptr
+                pack[].arg1 = rv.x_residual(seq_len).ptr
+                pack[].arg2 = rv.x_main(seq_len).ptr
+                pack[].arg3 = seq_len * C.HIDDEN
+                pool.dispatch(elem_add_worker, pool.get_args_base(), 1)
+                return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
+                    unsafe_from_address=Int(UnsafePointer(to=pool))))
+            ranks.parallel[do_mlp_res_add]()
+
+            var tl = Int(perf_counter_ns())
+
+            fp.attn_norm_ns += tb - ta
+            fp.qkv_gemv_ns += tc - tb
+            fp.kv_write_ns += td - tc
+            fp.attention_ns += te - td
+            fp.o_gemv_ns += tf - te
+            fp.attn_reduce_ns += tg - tf
+            fp.mlp_norm_ns += th - tg
+            fp.gu_gemv_ns += ti - th
+            fp.silu_ns += tj - ti
+            fp.down_gemv_ns += tk - tj
+            fp.mlp_reduce_ns += tl - tk
 
             _ = layer_idx
 
         v_scale_lease^.release()
         post_scale_lease^.release()
         act_scale_lease^.release()
+
+        var tfinal = Int(perf_counter_ns())
 
         # --- Final norm + LM head (host rank only, tied embeddings) ---
         var last_row_off = (seq_len - 1) * C.HIDDEN * M.X_MAIN.ELEMENT_BYTES
@@ -982,190 +1163,10 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
         var logit_view = host.scratch_view[M.LOGITS](logit_lease, 1)
         float_gemv(last_hidden, host.weight[M.EMBED](), logit_view, self.pools[0]).join()
 
+        fp.final_ns = Int(perf_counter_ns()) - tfinal
+        self.profile.accumulate(fp)
+
         return LogitsView[C.VOCAB_SIZE](
             host.scratch_ptr[Scalar[DType.bfloat16]](logit_lease), logit_lease^,
         )
 
-    # =========================================================================
-    # === DEBUG === Stepped forward pass for layer-by-layer comparison
-    # =========================================================================
-
-    def debug_embed(mut self, tokens_ptr: Int, seq_len: Int):
-        var ranks = Ranks[Self.tp](self.bases, self.pool_ptrs)
-        var host = ranks.view(0)
-        embed_lookup(host.weight[Self.M.EMBED](), tokens_ptr, host.x_main(seq_len), self.pools[0]).join()
-        ring_broadcast[Self.M.X_MAIN, Self.tp](host.x_main(seq_len).ptr, ranks.x_main_ptrs(seq_len), seq_len, ranks.pool_ptrs)
-
-    def debug_layer_attn(mut self, layer_idx: Int, seq_len: Int, pos: Int):
-        comptime M = Self.M
-        comptime L = M.LAYER
-        comptime QKV_N = L.QKV_N
-        comptime Q_ROWS = C.HIDDEN // Self.tp
-        comptime KV_ROWS = C.KV_HIDDEN // Self.tp
-        comptime Q_COLS = Q_ROWS
-        comptime O_K = Q_COLS
-        comptime WORK_F32 = C.HIDDEN * 64
-        comptime ACT_WORK_BYTES = C.MAX_SEQ_LEN * C.HIDDEN + WORK_F32 * size_of[Float32]()
-        comptime ATTN_SCRATCH_BYTES = C.MAX_SEQ_LEN * Q_COLS * (size_of[Float32]() + 1) + 1024 * 1024
-
-        var ranks = Ranks[Self.tp](self.bases, self.pool_ptrs)
-        var ls = self.layer_scales[layer_idx]
-
-        var act_scale_l = self.scratch.borrow[Float32, C.MAX_SEQ_LEN]()
-        var v_scale_l = self.scratch.borrow[Float32, C.MAX_SEQ_LEN]()
-        var q_buf = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * Q_COLS]()
-        var qkv = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * QKV_N]()
-        var act_work = self.scratch.borrow[UInt8, ACT_WORK_BYTES]()
-        var act_i8_off = act_work.offset
-        var work_off = act_work.offset + C.MAX_SEQ_LEN * C.HIDDEN
-
-        for rank in range(Self.tp):
-            var rv = ranks.view(rank)
-            var sb = rv.scratch_base()
-            rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
-                rv.x_main(seq_len).ptr, sb + act_i8_off, sb + work_off,
-                sb + act_scale_l.offset, seq_len, self.pools[rank],
-            ).join()
-            var qkv_configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(0, 0, 0))
-            int8_gemv[QKV_N, C.HIDDEN](
-                sb + act_i8_off,
-                rv.layer_weight[L.Q_PROJ](layer_idx).ptr,
-                rv.layer_weight[L.Q_COLSUM](layer_idx).ptr,
-                rv.layer_weight[L.Q_ROW_SCALE](layer_idx).ptr,
-                sb + qkv.offset, seq_len, sb + act_scale_l.offset,
-                qkv_configs, self.pools[rank],
-            ).join()
-            _ = qkv_configs
-        act_work^.release()
-
-        for rank in range(Self.tp):
-            var rv = ranks.view(rank)
-            var sb = rv.scratch_base()
-            var kvc = rv.kv_cache(layer_idx)
-            var qkv_ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-                unsafe_from_address=sb + qkv.offset)
-            rope_and_kv_cache_write[C.HEAD_DIM, M.LOCAL_KV_HEADS, C.MAX_SEQ_LEN, M.LOCAL_HEADS](
-                qkv_ptr + Q_ROWS, qkv_ptr + Q_ROWS + KV_ROWS,
-                QKV_N, QKV_N,
-                UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=rv.rope_cos().ptr),
-                UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=rv.rope_sin().ptr),
-                kvc, pos, seq_len, ls.v_layer_scale,
-            )
-            var q_dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-                unsafe_from_address=sb + q_buf.offset)
-            for m in range(seq_len):
-                memcpy(dest=q_dst + m * Q_COLS, src=qkv_ptr + m * QKV_N, count=Q_COLS)
-        qkv^.release()
-
-        # Fill V scale array for O GEMV
-        for rank in range(Self.tp):
-            var v_sc = UnsafePointer[Float32, MutAnyOrigin](
-                unsafe_from_address=ranks.view(rank).scratch_base() + v_scale_l.offset)
-            for m in range(seq_len):
-                v_sc[m] = ls.v_layer_scale
-
-        var attn = self.scratch.borrow[UInt8, ATTN_SCRATCH_BYTES]()
-        for rank in range(Self.tp):
-            var rv = ranks.view(rank)
-            var sb = rv.scratch_base()
-            var kvc = rv.kv_cache(layer_idx)
-            var q_view = DynView[M.Q_VIEW](sb + q_buf.offset, seq_len)
-            amx_prefill[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM, C.MAX_SEQ_LEN, M.LOCAL_HEADS](
-                q_view, kvc,
-                rv.rope_cos(), rv.rope_sin(),
-                sb + attn.offset, pos, ls.v_layer_scale,
-                self.pools[rank],
-            ).join()
-            var attn_i8_addr = sb + attn.offset + seq_len * Q_COLS * size_of[Float32]()
-            var o_configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(0, 0, 0))
-            int8_gemv[C.HIDDEN, O_K](
-                attn_i8_addr,
-                rv.layer_weight[L.O_PROJ](layer_idx).ptr,
-                rv.layer_weight[L.O_COLSUM](layer_idx).ptr,
-                rv.layer_weight[L.O_ROW_SCALE](layer_idx).ptr,
-                rv.x_residual(seq_len).ptr, seq_len, sb + v_scale_l.offset,
-                o_configs, self.pools[rank],
-            ).join()
-            _ = o_configs
-        attn^.release()
-        q_buf^.release()
-        v_scale_l^.release()
-        act_scale_l^.release()
-
-        ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
-        for rank in range(Self.tp):
-            var rv = ranks.view(rank)
-            elem_add(rv.x_main(seq_len), rv.x_residual(seq_len), rv.x_main(seq_len))
-
-    def debug_layer_mlp(mut self, layer_idx: Int, seq_len: Int, pos: Int):
-        comptime M = Self.M
-        comptime L = M.LAYER
-        comptime GATE_UP_N = L.GATE_UP_N
-        comptime GATE_ROWS = C.INTERMEDIATE // Self.tp
-        comptime DOWN_K = GATE_ROWS
-        comptime WORK_F32 = C.HIDDEN * 64
-        comptime SILU_WORK_F32 = GATE_ROWS * 64
-        comptime MLP_WORK_BYTES = C.MAX_SEQ_LEN * C.HIDDEN + WORK_F32 * size_of[Float32]()
-        comptime POST_WORK_BYTES = C.MAX_SEQ_LEN * GATE_ROWS + SILU_WORK_F32 * size_of[Float32]()
-
-        var ranks = Ranks[Self.tp](self.bases, self.pool_ptrs)
-
-        var act_scale_l = self.scratch.borrow[Float32, C.MAX_SEQ_LEN]()
-        var post_scale_l = self.scratch.borrow[Float32, C.MAX_SEQ_LEN]()
-        var gate_up = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * GATE_UP_N]()
-        var mlp_work = self.scratch.borrow[UInt8, MLP_WORK_BYTES]()
-        var mlp_i8_off = mlp_work.offset
-        var mlp_work_off = mlp_work.offset + C.MAX_SEQ_LEN * C.HIDDEN
-
-        for rank in range(Self.tp):
-            var rv = ranks.view(rank)
-            var sb = rv.scratch_base()
-            rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
-                rv.x_main(seq_len).ptr, sb + mlp_i8_off, sb + mlp_work_off,
-                sb + act_scale_l.offset, seq_len, self.pools[rank],
-            ).join()
-            var gu_configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(0, 0, 0))
-            int8_gemv[GATE_UP_N, C.HIDDEN](
-                sb + mlp_i8_off,
-                rv.layer_weight[L.GATE_PROJ](layer_idx).ptr,
-                rv.layer_weight[L.GATE_COLSUM](layer_idx).ptr,
-                rv.layer_weight[L.GATE_ROW_SCALE](layer_idx).ptr,
-                sb + gate_up.offset, seq_len, sb + act_scale_l.offset,
-                gu_configs, self.pools[rank],
-            ).join()
-            _ = gu_configs
-        mlp_work^.release()
-
-        var post_work = self.scratch.borrow[UInt8, POST_WORK_BYTES]()
-        var post_i8_off = post_work.offset
-        var silu_work_off = post_work.offset + C.MAX_SEQ_LEN * GATE_ROWS
-
-        for rank in range(Self.tp):
-            var rv = ranks.view(rank)
-            var sb = rv.scratch_base()
-            silu_fwht_quantize[GATE_ROWS, GATE_UP_N, FWHT_BLOCK](
-                sb + gate_up.offset, sb + post_i8_off, sb + silu_work_off,
-                sb + post_scale_l.offset, seq_len, self.pools[rank],
-            ).join()
-            var dn_configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(0, 0, 0))
-            int8_gemv[C.HIDDEN, DOWN_K](
-                sb + post_i8_off,
-                rv.layer_weight[L.DOWN_PROJ](layer_idx).ptr,
-                rv.layer_weight[L.DOWN_COLSUM](layer_idx).ptr,
-                rv.layer_weight[L.DOWN_ROW_SCALE](layer_idx).ptr,
-                rv.x_residual(seq_len).ptr, seq_len, sb + post_scale_l.offset,
-                dn_configs, self.pools[rank],
-            ).join()
-            _ = dn_configs
-        post_work^.release()
-        gate_up^.release()
-        post_scale_l^.release()
-        act_scale_l^.release()
-
-        ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
-        for rank in range(Self.tp):
-            var rv = ranks.view(rank)
-            elem_add(rv.x_main(seq_len), rv.x_residual(seq_len), rv.x_main(seq_len))
-
-    def debug_x_main_ptr(self, seq_len: Int) -> Int:
-        return RankView[Self.tp](self.bases[0]).x_main(seq_len).ptr

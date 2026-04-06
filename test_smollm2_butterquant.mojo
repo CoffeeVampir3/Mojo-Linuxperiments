@@ -70,7 +70,7 @@ He was named to the 2022 class of ACM Fellows"""
 
     # --- Load model ---
     var t0 = perf_counter_ns()
-    var model_opt = SmolLM2ButterQuant[1].load(Path(MODEL_PATH))
+    var model_opt = SmolLM2ButterQuant[3].load(Path(MODEL_PATH))
     if not model_opt:
         print("model load failed")
         return
@@ -82,14 +82,14 @@ He was named to the 2022 class of ACM Fellows"""
     print()
 
     # --- Write tokens ---
-    var tp = model.token_buffer()
+    var token_buf = model.token_buffer()
     var seq_len = len(token_ids)
     for i in range(seq_len):
-        tp[i] = Scalar[DType.int32](token_ids[i])
+        token_buf[i] = Scalar[DType.int32](token_ids[i])
 
     # --- Prefill ---
     var t1 = perf_counter_ns()
-    var logits = model.forward(Int(tp), seq_len, 0)
+    var logits = model.forward(Int(token_buf), seq_len, 0)
     var prefill_ms = (perf_counter_ns() - t1) / 1_000_000
 
     # Top-5 logits diagnostic
@@ -129,8 +129,8 @@ He was named to the 2022 class of ACM Fellows"""
     var decode_start = perf_counter_ns()
 
     for step in range(1, MAX_NEW_TOKENS):
-        tp[0] = Scalar[DType.int32](next_id)
-        logits = model.forward(Int(tp), 1, pos)
+        token_buf[0] = Scalar[DType.int32](next_id)
+        logits = model.forward(Int(token_buf), 1, pos)
         result = greedy_argmax(logits)
         next_id = result[0]
         logits^.release()
@@ -145,6 +145,10 @@ He was named to the 2022 class of ACM Fellows"""
         decode_elapsed_ms, "ms |",
         Int(decode_tps), "t/s",
     )
+
+    # --- Profile report (averaged over all decode steps) ---
+    print()
+    model.report_profile()
 
     # --- Final output ---
     var all_ids = List[Int]()

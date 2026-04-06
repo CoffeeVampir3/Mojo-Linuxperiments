@@ -189,16 +189,6 @@ def ring_broadcast[T: Encoding & Shaped, tp: Int](
             count=total_bytes,
         )
 
-    # Small-tensor fast path: sequential memcpy, no dispatch overhead.
-    if total_bytes < SMALL_THRESHOLD:
-        for r in range(1, tp):
-            memcpy(
-                dest=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=dst_ptrs[r]),
-                src=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=dst_ptrs[0]),
-                count=total_bytes,
-            )
-        return
-
     # Dispatch: each destination rank pulls from rank 0.
     for r in range(1, tp):
         var pack = pool_ptrs[r][].args_base
@@ -238,28 +228,9 @@ def ring_allreduce[T: Encoding & Shaped, tp: Int](
 
     var total_bytes = total_elements * T.ELEMENT_BYTES
 
-    # Small-tensor fast path: single-threaded reduce + broadcast.
-    if total_bytes < SMALL_THRESHOLD:
-        comptime width = simd_width_of[DType.float32]()
-        var dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=ptrs[0])
-        for r in range(1, tp):
-            var src = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=ptrs[r])
-            var i = 0
-            while i + width <= total_elements:
-                var d = (dst + i).load[width=width]().cast[DType.float32]()
-                var s = (src + i).load[width=width]().cast[DType.float32]()
-                (dst + i).store((d + s).cast[DType.bfloat16]())
-                i += width
-            while i < total_elements:
-                dst[i] = Scalar[DType.bfloat16](Float32(dst[i]) + Float32(src[i]))
-                i += 1
-        for r in range(1, tp):
-            memcpy(
-                dest=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=ptrs[r]),
-                src=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=ptrs[0]),
-                count=total_bytes,
-            )
-        return
+    # TODO: small-tensor fast path disabled — it runs on the main thread with
+    # remote NUMA reads/writes for tp>1. Need a NUMA-aware small-tensor path
+    # that dispatches to per-rank pools.
 
     var chunk = total_elements // tp
     var rem = total_elements - chunk * tp

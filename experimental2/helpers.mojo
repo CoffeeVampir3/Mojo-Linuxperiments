@@ -26,6 +26,7 @@ struct AttnCtx:
     """Pointers to long-lived allocations shared across all workers.
     Lives in scratch buffer — no per-dispatch temporaries."""
     var q: UnsafePointer[BFloat16, MutAnyOrigin]
+    var q_stride: Int  # bf16 elements between Q rows (may differ from q_cols if Q lives in QKV buffer)
     var cos: UnsafePointer[Float32, MutAnyOrigin]
     var sin: UnsafePointer[Float32, MutAnyOrigin]
     var k_base: UnsafePointer[UInt8, MutAnyOrigin]
@@ -33,11 +34,10 @@ struct AttnCtx:
     var output: UnsafePointer[Float32, MutAnyOrigin]
     var qi_output: UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
     var qi_scale: Float32  # 127 / S_V (fixed, for output quantization)
-    # Per-head dynamic scale pointers (into the cache's scale arrays)
-    var k_scale_base: UnsafePointer[Float32, MutAnyOrigin]  # K scales [head][pos]
-    var q_scale_base: UnsafePointer[Float32, MutAnyOrigin]  # Q scales [head][pos]
-    var max_seq: Int        # stride between heads in scale arrays
-    var inv_sqrt_hd: Float32  # 1/sqrt(head_dim), for score dequant
+    var k_scale_base: UnsafePointer[Float32, MutAnyOrigin]
+    var q_scale_base: UnsafePointer[Float32, MutAnyOrigin]
+    var max_seq: Int
+    var inv_sqrt_hd: Float32
 
 
 # ============================================================================

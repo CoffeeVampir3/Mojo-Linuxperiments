@@ -155,7 +155,7 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
                 d += width
             # Q prep — returns (bias, scale)
             var qr = prep_q_row[head_dim](
-                ctx[].q + m * q_cols + h * head_dim,
+                ctx[].q + m * ctx[].q_stride + h * head_dim,
                 ctx[].cos + actual_pos * half,
                 ctx[].sin + actual_pos * half,
                 qi_buf + local_idx * head_dim,
@@ -278,6 +278,7 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     CosT: Encoding & Shaped, SinT: Encoding & Shaped,
     P: BurstThreadPool, prefill_chunk: Int = 512](
     q: DynView[QT],
+    q_stride: Int,
     cache: KVCache[max_seq, head_dim, num_kv_heads, num_q_heads],
     cos_table: Bound[CosT],
     sin_table: Bound[SinT],
@@ -304,6 +305,7 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
         unsafe_from_address=scratch + accum_bytes + qi_bytes)
     ctx_ptr[] = AttnCtx(
         UnsafePointer[BFloat16, MutAnyOrigin](unsafe_from_address=q.ptr),
+        q_stride,
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cos_table.ptr),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=sin_table.ptr),
         UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=cache.k_base),

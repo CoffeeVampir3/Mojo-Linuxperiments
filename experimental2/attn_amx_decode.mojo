@@ -394,6 +394,7 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     CosT: Encoding & Shaped, SinT: Encoding & Shaped,
     P: BurstThreadPool](
     q: DynView[QT],
+    q_stride: Int,
     cache: KVCache[max_seq, head_dim, num_kv_heads, num_q_heads],
     cos_table: Bound[CosT],
     sin_table: Bound[SinT],
@@ -423,6 +424,7 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
         unsafe_from_address=scratch + output_bytes)
     ctx_ptr[] = AttnCtx(
         UnsafePointer[BFloat16, MutAnyOrigin](unsafe_from_address=q.ptr),
+        q_stride,
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cos_table.ptr),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=sin_table.ptr),
         UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=cache.k_base),
