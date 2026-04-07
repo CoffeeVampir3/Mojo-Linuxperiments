@@ -17,15 +17,7 @@ import linux.sys as linux
 from modeling.model_spec import (
     Encoding, Shaped, Bound, DynView, CacheView,
 )
-from simd_math import SinCosResult, sincos, exp_f32
-
-comptime PtrBF16 = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-
-@always_inline
-def bf16_f32[width: Int](ptr: PtrBF16, offset: Int) -> SIMD[DType.float32, width]:
-    """Load bf16 and cast to f32. Native cast now emits vpmovzxwd + vpslld."""
-    return (ptr + offset).load[width=width]().cast[DType.float32]()
-
+from simd_math import exp_f32
 
 # ================================================================
 # POOL FENCE — linear synchronization token
@@ -116,8 +108,8 @@ def gemm_kernel[K: Int, N: Int](
             var row_w = wp + n * K
             var acc = SIMD[DType.float32, width](0)
             for k in range(0, K, width):
-                var x = bf16_f32[width](row_in, k)
-                var w = bf16_f32[width](row_w, k)
+                var x = (row_in + k).load[width=width]().cast[DType.float32]()
+                var w = (row_w + k).load[width=width]().cast[DType.float32]()
                 acc = x.fma(w, acc)
             row_out[n] = acc.reduce_add().cast[DType.bfloat16]()
 
@@ -150,11 +142,11 @@ def gemv_kernel[K: Int, N: Int](
             var acc2 = SIMD[DType.float32, width](0)
             var acc3 = SIMD[DType.float32, width](0)
             for k in range(0, K, width):
-                var x = bf16_f32[width](row_in, k)
-                acc0 = x.fma(bf16_f32[width](w0, k), acc0)
-                acc1 = x.fma(bf16_f32[width](w1, k), acc1)
-                acc2 = x.fma(bf16_f32[width](w2, k), acc2)
-                acc3 = x.fma(bf16_f32[width](w3, k), acc3)
+                var x = (row_in + k).load[width=width]().cast[DType.float32]()
+                acc0 = x.fma((w0 + k).load[width=width]().cast[DType.float32](), acc0)
+                acc1 = x.fma((w1 + k).load[width=width]().cast[DType.float32](), acc1)
+                acc2 = x.fma((w2 + k).load[width=width]().cast[DType.float32](), acc2)
+                acc3 = x.fma((w3 + k).load[width=width]().cast[DType.float32](), acc3)
             row_out[n] = acc0.reduce_add().cast[DType.bfloat16]()
             row_out[n + 1] = acc1.reduce_add().cast[DType.bfloat16]()
             row_out[n + 2] = acc2.reduce_add().cast[DType.bfloat16]()
@@ -164,7 +156,8 @@ def gemv_kernel[K: Int, N: Int](
             var row_w = wp + n * K
             var acc = SIMD[DType.float32, width](0)
             for k in range(0, K, width):
-                acc = bf16_f32[width](row_in, k).fma(bf16_f32[width](row_w, k), acc)
+                acc = (row_in + k).load[width=width]().cast[DType.float32]().fma(
+                    (row_w + k).load[width=width]().cast[DType.float32](), acc)
             row_out[n] = acc.reduce_add().cast[DType.bfloat16]()
 
 
@@ -172,12 +165,10 @@ def rmsnorm_kernel[cols: Int](
     ip: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     wp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     dp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    start_row: Int, end_row: Int, eps_bits: Int,
+    start_row: Int, end_row: Int, eps: Float64,
 ):
     """RMSNorm row kernel. Fused reduction + normalize for
     rows [start_row, end_row)."""
-    var eps_i32 = Int32(eps_bits)
-    var eps = UnsafePointer(to=eps_i32).bitcast[Float32]()[]
     comptime width = simd_width_of[DType.float32]()
 
     for row in range(start_row, end_row):
@@ -186,15 +177,15 @@ def rmsnorm_kernel[cols: Int](
 
         var acc = SIMD[DType.float32, width](0)
         for j in range(0, cols, width):
-            var x = bf16_f32[width](row_in, j)
+            var x = (row_in + j).load[width=width]().cast[DType.float32]()
             acc = x.fma(x, acc)
         var sum_sq = acc.reduce_add()
-        var scale = Float32(1.0) / sqrt(sum_sq / Float32(cols) + eps)
+        var scale = Float32(1.0) / sqrt(sum_sq / Float32(cols) + Float32(eps))
 
         var sv = SIMD[DType.float32, width](scale)
         for j in range(0, cols, width):
-            var x = bf16_f32[width](row_in, j)
-            var w = bf16_f32[width](wp, j)
+            var x = (row_in + j).load[width=width]().cast[DType.float32]()
+            var w = (wp + j).load[width=width]().cast[DType.float32]()
             (row_out + j).store((x * sv * w).cast[DType.bfloat16]())
 
 
@@ -262,8 +253,8 @@ def gqa_kernel[
                     var dot_acc = SIMD[DType.float32, width](0)
                     comptime for c in range(chunks):
                         comptime off = c * width
-                        var qv = bf16_f32[width](q_head, off)
-                        var kv = bf16_f32[width](k_row, off)
+                        var qv = (q_head + off).load[width=width]().cast[DType.float32]()
+                        var kv = (k_row + off).load[width=width]().cast[DType.float32]()
                         dot_acc = qv.fma(kv, dot_acc)
                     var score = dot_acc.reduce_add() * scale_f32
 
@@ -281,7 +272,7 @@ def gqa_kernel[
                     comptime for c in range(chunks):
                         comptime off = c * width
                         var prior = acc.slice[width, offset=off]()
-                        var vv = bf16_f32[width](v_row, off)
+                        var vv = (v_row + off).load[width=width]().cast[DType.float32]()
                         acc = acc.insert[offset=off](prior * correction + vv * w)
 
                     running_sum = correction * running_sum + w
@@ -378,9 +369,6 @@ def rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shape
     if seq_len == 0:
         return PoolFence[P].completed()
 
-    var eps_copy = eps
-    var eps_int = Int(UnsafePointer(to=eps_copy).bitcast[Int32]()[])
-
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
@@ -393,7 +381,8 @@ def rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shape
         pack[].arg2 = output.ptr
         pack[].arg3 = start
         pack[].arg4 = end
-        pack[].arg5 = eps_int
+        var eps_f64 = Float64(eps)
+        pack[].arg5 = UnsafePointer(to=eps_f64).bitcast[Int]()[]
 
     pool.dispatch(rmsnorm_kernel[InT.COLS], pool.get_args_base(), num_jobs)
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
@@ -462,8 +451,8 @@ def silu_mul[GT: Encoding & Shaped, UT: Encoding & Shaped, DstT: Encoding & Shap
     comptime width = simd_width_of[DType.float32]()
 
     for i in range(0, seq_len * cols, width):
-        var g = bf16_f32[width](gp, i)
-        var u = bf16_f32[width](up_, i)
+        var g = (gp + i).load[width=width]().cast[DType.float32]()
+        var u = (up_ + i).load[width=width]().cast[DType.float32]()
         var sig = 1.0 / (1.0 + exp_f32[width](-g))
         (dp + i).store((g * sig * u).cast[DType.bfloat16]())
 
@@ -495,91 +484,9 @@ def elem_add[AT: Encoding & Shaped, BT: Encoding & Shaped, DstT: Encoding & Shap
     comptime width = simd_width_of[DType.float32]()
 
     for i in range(0, seq_len * AT.COLS, width):
-        var av = bf16_f32[width](ap, i)
-        var bv = bf16_f32[width](bp, i)
+        var av = (ap + i).load[width=width]().cast[DType.float32]()
+        var bv = (bp + i).load[width=width]().cast[DType.float32]()
         (dp + i).store((av + bv).cast[DType.bfloat16]())
-
-
-def init_rope_tables[CosT: Encoding & Shaped, SinT: Encoding & Shaped](
-    cos_buf: Bound[CosT], sin_buf: Bound[SinT], theta: Float64 = 10000.0,
-) where CosT.DTYPE == DType.float32:
-    """Precompute cos/sin tables for RoPE. Call once at model init."""
-    comptime assert SinT.DTYPE == DType.float32, "rope init: sin must be f32"
-    comptime assert CosT.ROWS == SinT.ROWS, "rope init: cos/sin rows mismatch"
-    comptime assert CosT.COLS == SinT.COLS, "rope init: cos/sin cols mismatch"
-    comptime assert CosT.COLS % simd_width_of[DType.float64]() == 0, "rope init: cols must be f64-simd-aligned"
-
-    var cp = UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
-        unsafe_from_address=cos_buf.ptr
-    )
-    var sp = UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
-        unsafe_from_address=sin_buf.ptr
-    )
-    comptime half = CosT.COLS
-    comptime head_dim = half * 2
-    comptime f64w = simd_width_of[DType.float64]()
-
-    for j in range(0, half, f64w):
-        var inv = SIMD[DType.float64, f64w]()
-        for k in range(f64w):
-            inv[k] = 1.0 / (theta ** (Float64(2 * (j + k)) / Float64(head_dim)))
-
-        for pos in range(CosT.ROWS):
-            var sc = sincos[f64w](SIMD[DType.float64, f64w](Float64(pos)) * inv)
-            (cp + pos * half + j).store(sc.cos_val.cast[DType.float32]())
-            (sp + pos * half + j).store(sc.sin_val.cast[DType.float32]())
-
-
-def rope[head_dim: Int, num_heads: Int,
-    XT: Encoding & Shaped, CosT: Encoding & Shaped, SinT: Encoding & Shaped](
-    x: DynView[XT], cos_table: Bound[CosT], sin_table: Bound[SinT], pos: Int,
-) where CosT.DTYPE == DType.float32:
-    """Rotary position embeddings, applied in-place per head."""
-    comptime assert XT.DTYPE == DType.bfloat16, "rope: must be bf16"
-    comptime assert XT.COLS == head_dim * num_heads, "rope: cols != heads * dim"
-    comptime assert head_dim % 2 == 0, "rope: head_dim must be even"
-    comptime assert SinT.DTYPE == DType.float32, "rope: sin table must be f32"
-    comptime assert CosT.COLS == head_dim // 2, "rope: cos cols != head_dim/2"
-    comptime assert SinT.COLS == head_dim // 2, "rope: sin cols != head_dim/2"
-    comptime assert CosT.ROWS == SinT.ROWS, "rope: cos/sin capacity mismatch"
-    comptime assert (head_dim // 2) % simd_width_of[DType.float32]() == 0, "rope: half must be f32-simd-aligned"
-
-    var seq_len = x.seq_len
-    if seq_len == 0:
-        return
-
-    var xp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-        unsafe_from_address=x.ptr
-    )
-    var cp = UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
-        unsafe_from_address=cos_table.ptr
-    )
-    var sn = UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
-        unsafe_from_address=sin_table.ptr
-    )
-    comptime half = head_dim // 2
-    comptime width = simd_width_of[DType.float32]()
-    comptime row_stride = num_heads * head_dim
-
-    for m in range(seq_len):
-        var actual_pos = pos + m
-        var cos_row = cp + actual_pos * half
-        var sin_row = sn + actual_pos * half
-        var row_base = xp + m * row_stride
-
-        for h in range(num_heads):
-            var head_base = row_base + h * head_dim
-            for j in range(0, half, width):
-                var x_lo = bf16_f32[width](head_base, j)
-                var x_hi = bf16_f32[width](head_base, half + j)
-                var cv = (cos_row + j).load[width=width]()
-                var sv = (sin_row + j).load[width=width]()
-                (head_base + j).store(
-                    (x_lo * cv - x_hi * sv).cast[DType.bfloat16]()
-                )
-                (head_base + half + j).store(
-                    (x_hi * cv + x_lo * sv).cast[DType.bfloat16]()
-                )
 
 
 def kv_cache_write[SrcT: Encoding & Shaped, CT: Encoding & Shaped](
@@ -594,6 +501,8 @@ def kv_cache_write[SrcT: Encoding & Shaped, CT: Encoding & Shaped](
     var seq_len = src.seq_len
     if seq_len == 0:
         return
+    debug_assert(pos >= 0 and pos + seq_len <= CT.ROWS,
+        "kv_write: position range exceeds cache capacity")
 
     var sp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
         unsafe_from_address=src.ptr

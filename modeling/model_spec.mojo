@@ -157,17 +157,6 @@ comptime RowShard = Shard2D[Divide, Keep]
 comptime ColShard = Shard2D[Keep, Divide]
 comptime Replicated = Shard2D[Keep, Keep]
 
-trait NodeLocal(ShardStrategy):
-    ...
-
-struct PrincipleNodeLocal(NodeLocal):
-    @staticmethod
-    def shard_rows(r: Int, tp: Int) -> Int:
-        return r
-    @staticmethod
-    def shard_cols(c: Int, tp: Int) -> Int:
-        return c
-
 
 struct Slot[E: Encoding, S: ShardStrategy, rows: Int, cols: Int, tp: Int](
     Encoding, Shaped
@@ -186,7 +175,6 @@ struct PlacedSlot[
     Tiling: RowTiled & ColTiled & PanelHeight = Untiled,
 ](
     Encoding, Shaped, Placed, Named, ShardStrategy,
-    NodeLocal where conforms_to(S, NodeLocal),
     Quantizable where conforms_to(Tag, Quantizable),
     Gamma where conforms_to(Tag, Gamma),
     Passthrough where conforms_to(Tag, Passthrough),
@@ -262,9 +250,10 @@ struct WeightDesc(Copyable):
     var quantizable: Bool
     var absorbed: Bool
     var pack_fn: PackFn
+    var target_rank: Int
 
 def weight_desc[T: Encoding & Shaped & Placed & Named](
-    prefix: String = "", base: Int = 0,
+    prefix: String = "", base: Int = 0, target_rank: Int = -1,
 ) -> WeightDesc:
     comptime is_quantizable = conforms_to(T, Quantizable)
     comptime is_absorbed = conforms_to(T, Absorbed)
@@ -276,13 +265,14 @@ def weight_desc[T: Encoding & Shaped & Placed & Named](
         quantizable=is_quantizable,
         absorbed=is_absorbed,
         pack_fn=T.PACK_FN,
+        target_rank=target_rank,
     )
 
 
 trait WeightIterable:
     @staticmethod
     def for_each_weight[
-        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
+        func: def[T: Encoding & Shaped & Placed & Named] (String, Int, Int) capturing -> None,
     ](): ...
 
 

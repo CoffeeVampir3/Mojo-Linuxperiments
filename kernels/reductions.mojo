@@ -66,7 +66,7 @@ def memcpy_kernel(
 
 def fused_reduce_gather_kernel(
     config_addr: Int, start_element: Int, end_element: Int,
-    my_rank: Int, n4: Int, n5: Int,
+    my_rank: Int, worker_idx: Int, num_workers: Int,
 ):
     """Each BurstPool worker: reduce slice → signal → pull from completed ranks.
 
@@ -117,11 +117,7 @@ def fused_reduce_gather_kernel(
         )
 
     # --- Pull from other ranks as they complete ---
-    var worker_slice = end_element - start_element
-    var worker_idx = 0
-    if worker_slice > 0:
-        worker_idx = (start_element - my_rank * chunk) // worker_slice
-    var num_workers = (chunk + worker_slice - 1) // worker_slice if worker_slice > 0 else 1
+    var workers = num_workers if num_workers > 0 else 1
 
     for src_rank in range(tp):
         if src_rank == my_rank:
@@ -133,7 +129,7 @@ def fused_reduce_gather_kernel(
         var src_chunk_start = src_rank * chunk
         var src_chunk_count = chunk + (rem if src_rank == tp - 1 else 0)
 
-        var copy_per_worker = (src_chunk_count + num_workers - 1) // num_workers
+        var copy_per_worker = (src_chunk_count + workers - 1) // workers
         var copy_start = src_chunk_start + worker_idx * copy_per_worker
         var copy_end = min(copy_start + copy_per_worker, src_chunk_start + src_chunk_count)
 
@@ -221,6 +217,8 @@ def ring_allreduce[T: Encoding & Shaped, tp: Int](
     transition to the allgather: polling other ranks' done flags and copying
     their chunks locally, with the copy work divided among all workers.
     """
+    comptime assert T.DTYPE == DType.bfloat16, "ring_allreduce: only bf16 tensors are supported"
+    comptime assert T.ELEMENT_BYTES == 2, "ring_allreduce: bf16 byte width mismatch"
     comptime cols = T.COLS
     var total_elements = seq_len * cols
     if total_elements <= 0 or tp <= 1:
@@ -236,7 +234,8 @@ def ring_allreduce[T: Encoding & Shaped, tp: Int](
     var rem = total_elements - chunk * tp
 
     # Per-rank completion state (cache-line padded, stack-allocated).
-    var state_mem = InlineArray[UInt8, tp * RANK_STATE_STRIDE](fill=0)
+    # Atomic counters/flags need stronger-than-byte alignment.
+    var state_mem = InlineArray[Int64, tp * (RANK_STATE_STRIDE // 8)](fill=0)
     var state_base = Int(UnsafePointer(to=state_mem))
 
     # Initialize counters.
@@ -274,6 +273,8 @@ def ring_allreduce[T: Encoding & Shaped, tp: Int](
             pack[].arg1 = w_start
             pack[].arg2 = w_end
             pack[].arg3 = r
+            pack[].arg4 = w
+            pack[].arg5 = num_workers
 
         pool_ptrs[r][].dispatch(fused_reduce_gather_kernel, pool_ptrs[r][].args_base, num_workers)
 

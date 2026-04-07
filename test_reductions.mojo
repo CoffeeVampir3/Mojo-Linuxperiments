@@ -103,7 +103,7 @@ struct FusedConfig:
 
 def fused_reduce_gather_kernel(
     config_addr: Int, start_element: Int, end_element: Int,
-    my_rank: Int, n4: Int, n5: Int,
+    my_rank: Int, worker_idx: Int, num_workers: Int,
 ):
     """Each worker: reduce slice → signal → pull from completed ranks."""
     var cfg = UnsafePointer[FusedConfig, MutAnyOrigin](unsafe_from_address=config_addr)
@@ -147,11 +147,7 @@ def fused_reduce_gather_kernel(
         )
 
     # --- Pull from other ranks as they complete ---
-    var worker_slice = end_element - start_element
-    var worker_idx = 0
-    if worker_slice > 0:
-        worker_idx = (start_element - my_rank * chunk) // worker_slice
-    var num_workers_approx = (chunk + worker_slice - 1) // worker_slice if worker_slice > 0 else 1
+    var workers = num_workers if num_workers > 0 else 1
 
     for src_rank in range(tp):
         if src_rank == my_rank:
@@ -163,8 +159,7 @@ def fused_reduce_gather_kernel(
         var src_chunk_start = src_rank * chunk
         var src_chunk_count = chunk + (rem if src_rank == tp - 1 else 0)
 
-        var total_workers = num_workers_approx if num_workers_approx > 0 else 1
-        var copy_per_worker = (src_chunk_count + total_workers - 1) // total_workers
+        var copy_per_worker = (src_chunk_count + workers - 1) // workers
         var copy_start = src_chunk_start + worker_idx * copy_per_worker
         var copy_end = min(copy_start + copy_per_worker, src_chunk_start + src_chunk_count)
 
@@ -186,7 +181,7 @@ def fused_allreduce(
     var chunk = total_elements // TP
     var rem = total_elements - chunk * TP
 
-    var state_mem = InlineArray[UInt8, TP * RANK_STATE_STRIDE](fill=0)
+    var state_mem = InlineArray[Int64, TP * (RANK_STATE_STRIDE // 8)](fill=0)
     var state_base = Int(UnsafePointer(to=state_mem))
 
     for r in range(TP):
@@ -226,6 +221,8 @@ def fused_allreduce(
             pack[].arg1 = w_start
             pack[].arg2 = w_end
             pack[].arg3 = r
+            pack[].arg4 = w
+            pack[].arg5 = num_workers
 
         pool_ptrs_full[r][].dispatch(fused_reduce_gather_kernel, pool_ptrs_full[r][].args_base, num_workers)
 
@@ -282,6 +279,23 @@ def fill_value(ptr: Int, elements: Int, value: Float32):
         p[i] = v
 
 
+def pattern_value(rank: Int, idx: Int) -> Float32:
+    return Float32(rank + 1) * 0.25 + Float32((idx * 13 + rank * 17) % 97) * 0.03125
+
+
+def fill_pattern_f32(ptr: Int, elements: Int, rank: Int):
+    var p = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=ptr)
+    for i in range(elements):
+        p[i] = Scalar[DType.bfloat16](pattern_value(rank, i))
+
+
+def expected_pattern_sum(idx: Int) -> Float32:
+    var acc = Float32(0)
+    for r in range(TP):
+        acc += Float32(Scalar[DType.bfloat16](pattern_value(r, idx)))
+    return Float32(Scalar[DType.bfloat16](acc))
+
+
 def fill_pattern(ptr: Int, elements: Int, seed: Int):
     var p = UnsafePointer[UInt16, MutAnyOrigin](unsafe_from_address=ptr)
     for i in range(elements):
@@ -305,6 +319,17 @@ def clear_buffer(ptr: Int, total_bytes: Int):
     var p = UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=ptr)
     for i in range(total_bytes):
         p[i] = 0
+
+
+def buffer_matches_pattern_sum(ptr: Int, elements: Int) -> Bool:
+    var p = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=ptr)
+    for i in range(elements):
+        var got = Float32(p[i])
+        var expected = expected_pattern_sum(i)
+        if got != expected:
+            print("FAIL patterned_allreduce idx", i, "got", got, "expected", expected)
+            return False
+    return True
 
 
 def sort_times(mut times: List[Int]):
@@ -482,6 +507,18 @@ def main():
                 fused_ar_ok = False
     print("fused_allreduce:", "PASS" if fused_ar_ok else "FAIL",
           "( sum =", expected_bf16, ")")
+
+    # Patterned buffers: catches offset/copy bugs constants can hide.
+    for r in range(TP):
+        fill_pattern_f32(bases[r], TOTAL_ELEMENTS, r)
+    fused_allreduce(bases, TOTAL_ELEMENTS, pp_full)
+    var patterned_ok = buffer_matches_pattern_sum(bases[0], TOTAL_ELEMENTS)
+    if patterned_ok:
+        for r in range(1, TP):
+            if not buffers_match(bases[0], bases[r], TOTAL_ELEMENTS):
+                print("FAIL patterned_allreduce rank", r, "differs from rank 0")
+                patterned_ok = False
+    print("patterned_allreduce:", "PASS" if patterned_ok else "FAIL")
 
     print()
 

@@ -20,7 +20,6 @@ from threading import BurstPool
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named, BF16, F32,
     RowShard, ColShard, Replicated,
-    PrincipleNodeLocal,
     IsQuantizable, IsPassthrough,
     Slot, PlacedSlot, Bound, DynView, CacheView, bind, byte_count,
     WeightIterable,
@@ -30,10 +29,11 @@ from modeling.model_spec import (
     LogitsView,
 )
 from kernels.kernel_ops import (
-    gemm, rmsnorm, embed_lookup, silu_mul, elem_add, rope, kv_cache_write,
-    attention, init_rope_tables,
+    gemm, rmsnorm, embed_lookup, silu_mul, elem_add, kv_cache_write,
+    attention,
     PoolFence, parallel_for,
 )
+from kernels.kv_rotors import init_rope_tables, rope
 from kernels.reductions import ring_allreduce, ring_broadcast
 from modeling.loader import load_safetensors
 from kernels.profiler import Profiler
@@ -87,17 +87,17 @@ struct TPLayer[E: Encoding, tp: Int]:
 
     @staticmethod
     def for_each_weight[
-        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
+        func: def[T: Encoding & Shaped & Placed & Named] (String, Int, Int) capturing -> None,
     ](prefix: String, base: Int):
-        func[Self.Q_PROJ](prefix, base)
-        func[Self.K_PROJ](prefix, base)
-        func[Self.V_PROJ](prefix, base)
-        func[Self.O_PROJ](prefix, base)
-        func[Self.GATE_PROJ](prefix, base)
-        func[Self.UP_PROJ](prefix, base)
-        func[Self.DOWN_PROJ](prefix, base)
-        func[Self.INPUT_NORM](prefix, base)
-        func[Self.POST_ATTN_NORM](prefix, base)
+        func[Self.Q_PROJ](prefix, base, -1)
+        func[Self.K_PROJ](prefix, base, -1)
+        func[Self.V_PROJ](prefix, base, -1)
+        func[Self.O_PROJ](prefix, base, -1)
+        func[Self.GATE_PROJ](prefix, base, -1)
+        func[Self.UP_PROJ](prefix, base, -1)
+        func[Self.DOWN_PROJ](prefix, base, -1)
+        func[Self.INPUT_NORM](prefix, base, -1)
+        func[Self.POST_ATTN_NORM](prefix, base, -1)
 
     @staticmethod
     def cache_bytes() -> Int:
@@ -185,21 +185,21 @@ struct TPModel[E: Encoding, tp: Int](WeightIterable):
     comptime ROPE_SIN_OFF = Self.ROPE_COS_OFF + byte_count[Self.ROPE_COS]()
     comptime STATE_BYTES = Self.ROPE_SIN_OFF + byte_count[Self.ROPE_SIN]()
 
-    # NodeLocal weights (host arena only).
-    comptime NODE_LOCAL_OFF = ((Self.DISTRIBUTED_BYTES + Self.STATE_BYTES + DEFAULT_ALIGNMENT - 1) // DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT
-    comptime FINAL_NORM = PlacedSlot[BF16, PrincipleNodeLocal, C.HIDDEN, 1, Self.tp, Self.NODE_LOCAL_OFF, "model.norm.weight"]
-    comptime EMBED = PlacedSlot[Self.E, PrincipleNodeLocal, C.VOCAB_SIZE, C.HIDDEN, Self.tp, next_offset[Self.FINAL_NORM](), "model.embed_tokens.weight"]
+    # Host-only weights (host arena only).
+    comptime HOST_ONLY_OFF = ((Self.DISTRIBUTED_BYTES + Self.STATE_BYTES + DEFAULT_ALIGNMENT - 1) // DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT
+    comptime FINAL_NORM = PlacedSlot[BF16, Replicated, C.HIDDEN, 1, Self.tp, Self.HOST_ONLY_OFF, "model.norm.weight"]
+    comptime EMBED = PlacedSlot[Self.E, Replicated, C.VOCAB_SIZE, C.HIDDEN, Self.tp, next_offset[Self.FINAL_NORM](), "model.embed_tokens.weight"]
 
     @staticmethod
     def for_each_weight[
-        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
+        func: def[T: Encoding & Shaped & Placed & Named] (String, Int, Int) capturing -> None,
     ]():
         comptime for i in range(C.NUM_LAYERS):
             var prefix = "model.layers." + String(i) + "."
             var base = Self.LAYERS_OFF + i * Self.LAYER_STRIDE
             Self.LAYER.for_each_weight[func](prefix, base)
-        func[Self.FINAL_NORM]("", 0)
-        func[Self.EMBED]("", 0)
+        func[Self.FINAL_NORM]("", 0, 0)
+        func[Self.EMBED]("", 0, 0)
 
     @staticmethod
     def arena_bytes() -> Int:
@@ -414,6 +414,8 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
         comptime M = Self.M
         comptime L = M.LAYER
         var prof = Profiler(profile)
+        debug_assert(seq_len > 0 and pos >= 0 and pos + seq_len <= C.MAX_SEQ_LEN,
+            "forward: sequence range exceeds MAX_SEQ_LEN")
 
         var ranks = Ranks[Self.E, Self.tp](self.bases, self.pool_ptrs)
         var host = ranks.view(0)
@@ -477,14 +479,13 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
                     rv.scratch_view[M.Q_VIEW](attn_out, seq_len), pos, pool)
             ranks.parallel[do_attn]()
 
-            q^.release()
-
             @parameter
             def do_o[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 return gemm(rv.scratch_view[M.Q_VIEW](attn_out, seq_len), rv.layer_weight[L.O_PROJ](layer_idx), rv.x_residual(seq_len), pool)
             ranks.parallel[do_o]()
 
             attn_out^.release()
+            q^.release()
 
             ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
 
@@ -553,6 +554,8 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
 
     def debug_embed(mut self, tokens_ptr: Int, seq_len: Int)
         where Self.E.DTYPE == DType.bfloat16:
+        debug_assert(seq_len >= 0 and seq_len <= C.MAX_SEQ_LEN,
+            "debug_embed: seq_len exceeds MAX_SEQ_LEN")
         comptime M = Self.M
         var ranks = Ranks[Self.E, Self.tp](self.bases, self.pool_ptrs)
         var host = ranks.view(0)
@@ -561,6 +564,8 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
 
     def debug_layer_attn(mut self, layer_idx: Int, seq_len: Int, pos: Int)
         where Self.E.DTYPE == DType.bfloat16:
+        debug_assert(seq_len >= 0 and pos >= 0 and pos + seq_len <= C.MAX_SEQ_LEN,
+            "debug_layer_attn: sequence range exceeds MAX_SEQ_LEN")
         comptime M = Self.M
         comptime L = M.LAYER
         var ranks = Ranks[Self.E, Self.tp](self.bases, self.pool_ptrs)
@@ -606,12 +611,12 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
                 rv.scratch_view[M.Q_VIEW](q, seq_len), rv.k_cache(layer_idx), rv.v_cache(layer_idx),
                 rv.scratch_view[M.Q_VIEW](attn_out, seq_len), pos, pool)
         ranks.parallel[do_attn]()
-        q^.release()
         @parameter
         def do_o[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
             return gemm(rv.scratch_view[M.Q_VIEW](attn_out, seq_len), rv.layer_weight[L.O_PROJ](layer_idx), rv.x_residual(seq_len), pool)
         ranks.parallel[do_o]()
         attn_out^.release()
+        q^.release()
 
         ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
         @parameter
@@ -621,6 +626,8 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
 
     def debug_layer_mlp(mut self, layer_idx: Int, seq_len: Int, pos: Int)
         where Self.E.DTYPE == DType.bfloat16:
+        debug_assert(seq_len >= 0 and pos >= 0 and pos + seq_len <= C.MAX_SEQ_LEN,
+            "debug_layer_mlp: sequence range exceeds MAX_SEQ_LEN")
         comptime M = Self.M
         comptime L = M.LAYER
         var ranks = Ranks[Self.E, Self.tp](self.bases, self.pool_ptrs)

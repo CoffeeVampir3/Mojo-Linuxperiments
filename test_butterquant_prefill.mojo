@@ -23,7 +23,8 @@ from threading.isolated_burst_pool import IsolatedBurstPool
 from numa import NumaInfo, NumaTopology
 from numa.arena import NumaArena
 from notstdcollections import HeapMoveArray
-from kernels.kernel_ops import init_rope_tables, parallel_for, PoolFence
+from kernels.kernel_ops import parallel_for, PoolFence
+from kernels.kv_rotors import init_rope_tables
 
 
 comptime NUM_NODES = 4
