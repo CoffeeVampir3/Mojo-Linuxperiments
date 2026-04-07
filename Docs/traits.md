@@ -700,6 +700,47 @@ def mutate_span(span: Span[mut=True, Byte, ...]) raises:
             span.swap_elements(i, i + 1)
 
 If the compiler can't infer the value of an infer-only parameter, and it's not specified by keyword, compilation fails.
+
+#### Origin-polymorphic trait methods
+
+Trait methods that accept `UnsafePointer` (or other origin-parameterized types) often need to work with any caller-provided origin rather than requiring `MutAnyOrigin`. This avoids forcing callers to launder their pointer origins through `Int` and back.
+
+The pattern is to add an `origin: MutOrigin` parameter that the compiler infers from the argument:
+
+```mojo
+trait Pool:
+    def dispatch[Args: Copyable & ImplicitlyCopyable,
+        kernel: def (Args) -> None, origin: MutOrigin](
+        mut self, args: UnsafePointer[Args, origin], num_jobs: Int): ...
+
+struct MyPool(Pool):
+    def dispatch[Args: Copyable & ImplicitlyCopyable,
+        kernel: def (Args) -> None, origin: MutOrigin](
+        mut self, args: UnsafePointer[Args, origin], num_jobs: Int):
+        for i in range(num_jobs):
+            kernel((args + i)[])
+```
+
+Callers pass stack-local pointers directly without origin laundering:
+
+```mojo
+def use_pool[P: Pool](mut pool: P):
+    var jobs = InlineArray[MyArgs, 128](uninitialized=True)
+    jobs[0] = MyArgs(10, 20)
+    # origin inferred from jobs — no MutAnyOrigin cast needed
+    pool.dispatch[MyArgs, my_kernel](UnsafePointer(to=jobs[0]), 1)
+```
+
+Without origin polymorphism, the caller would need to erase and reconstruct the origin:
+
+```mojo
+# Bad: origin laundering through Int
+pool.dispatch[MyArgs, my_kernel](
+    UnsafePointer[MyArgs, MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=jobs[0]))), 1)
+```
+
+Use `MutOrigin` when the data is always mutable (the common case for dispatch buffers). For read-only access, use the `is_mutable: Bool, //, origin: Origin[mut=is_mutable]` pattern to accept both mutable and immutable origins.
+
 Parameter expressions are just Mojo code
 
 A parameter expression is any code expression (such as a+b) that occurs where a parameter is expected. Parameter expressions support operators and function calls, just like runtime code, and all parameter types use the same type system as the runtime program (such as Int and DType).

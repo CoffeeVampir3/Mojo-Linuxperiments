@@ -10,7 +10,7 @@ Uses IsolatedBurstPool when CPU isolation is configured, BurstPool otherwise.
 
 from threading.threading_traits import BurstThreadPool
 from threading.burst_threading import BurstPool
-from threading.isolated_burst_pool import IsolatedBurstPool, ArgPack
+from threading.isolated_burst_pool import IsolatedBurstPool
 from std.memory import UnsafePointer
 from std.time import perf_counter_ns
 from std.benchmark import keep
@@ -19,12 +19,18 @@ from notstdcollections import HeapMoveArray
 import linux.sys as linux
 
 
-def delay_kernel(out_addr: Int, job_id: Int, pauses: Int,
-                 unused1: Int, unused2: Int, unused3: Int):
+@fieldwise_init
+struct DelayArgs(Copyable, ImplicitlyCopyable):
+    var out_addr: UnsafePointer[Int, MutAnyOrigin]
+    var job_id: Int
+    var pauses: Int
+
+
+def delay_kernel(args: DelayArgs):
     var sys = linux.linux_sys()
-    for _ in range(pauses):
+    for _ in range(args.pauses):
         sys.arch_cpu_relax()
-    UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=out_addr)[] = job_id + 1
+    args.out_addr[] = args.job_id + 1
 
 
 comptime LAYERS = 40
@@ -33,19 +39,19 @@ comptime TRIALS = 50
 
 
 def run_bench[P: BurstThreadPool](mut pools: HeapMoveArray[P], num_nodes: Int):
-    var node_packs = HeapMoveArray[HeapMoveArray[ArgPack]](num_nodes)
+    var node_args = HeapMoveArray[HeapMoveArray[DelayArgs]](num_nodes)
     var node_outputs = HeapMoveArray[HeapMoveArray[Int]](num_nodes)
     for i in range(num_nodes):
         var nc = pools[i].get_capacity()
-        var np = HeapMoveArray[ArgPack](nc)
+        var na = HeapMoveArray[DelayArgs](nc)
         var no = HeapMoveArray[Int](nc)
-        for _ in range(nc):
-            np.push(ArgPack())
+        for j in range(nc):
+            na.push(DelayArgs(UnsafePointer[Int, MutAnyOrigin](), j, 0))
             no.push(0)
         for j in range(nc):
-            (np.ptr + j)[].arg0 = Int(no.ptr + j)
-            (np.ptr + j)[].arg1 = j
-        node_packs.push(np^)
+            (na.ptr + j)[].out_addr = UnsafePointer[Int, MutAnyOrigin](
+                unsafe_from_address=Int(no.ptr + j))
+        node_args.push(na^)
         node_outputs.push(no^)
 
     print("\nwork       dispatch    join      join_overhead")
@@ -62,12 +68,12 @@ def run_bench[P: BurstThreadPool](mut pools: HeapMoveArray[P], num_nodes: Int):
 
         for i in range(num_nodes):
             for j in range(pools[i].get_capacity()):
-                (node_packs[i].ptr + j)[].arg2 = pauses
+                (node_args[i].ptr + j)[].pauses = pauses
 
         for _ in range(WARMUP):
             for _ in range(LAYERS):
                 for i in range(num_nodes):
-                    pools[i].dispatch(delay_kernel, node_packs[i].ptr, pools[i].get_capacity())
+                    pools[i].dispatch[DelayArgs, delay_kernel](node_args[i].ptr, pools[i].get_capacity())
                 for i in range(num_nodes):
                     pools[i].join()
 
@@ -81,7 +87,7 @@ def run_bench[P: BurstThreadPool](mut pools: HeapMoveArray[P], num_nodes: Int):
             for _ in range(LAYERS):
                 var t0 = Int(perf_counter_ns())
                 for i in range(num_nodes):
-                    pools[i].dispatch(delay_kernel, node_packs[i].ptr, pools[i].get_capacity())
+                    pools[i].dispatch[DelayArgs, delay_kernel](node_args[i].ptr, pools[i].get_capacity())
                 var t1 = Int(perf_counter_ns())
                 for i in range(num_nodes):
                     pools[i].join()

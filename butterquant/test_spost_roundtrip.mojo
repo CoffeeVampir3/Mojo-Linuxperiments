@@ -156,7 +156,7 @@ def main():
     var work_off = act_work.offset + C.MAX_SEQ_LEN * C.HIDDEN
 
     from experimental2.kernels.rmsnorm_fwht_quantize import rmsnorm_fwht_quantize
-    from experimental2.kernels.int8_gemv import int8_gemv, WorkerConfig
+    from experimental2.kernels.int8_gemv import int8_gemv
 
     rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
         rv.x_main(seq_len).ptr, sb + act_i8_off, sb + work_off,
@@ -165,16 +165,14 @@ def main():
 
     # Gate+up GEMV
     var gate_up_lease = model.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * GATE_UP_N]()
-    var gu_configs = InlineArray[WorkerConfig, 128](fill=WorkerConfig(Float32(0), 0))
     int8_gemv[GATE_UP_N, C.HIDDEN](
         sb + act_i8_off,
         rv.layer_weight[L.GATE_PROJ](0).ptr,
         rv.layer_weight[L.GATE_COLSUM](0).ptr,
         rv.layer_weight[L.GATE_ROW_SCALE](0).ptr,
         sb + gate_up_lease.offset, seq_len, s_act_dequant,
-        gu_configs, model.pools[0],
+        model.pools[0],
     ).join()
-    _ = gu_configs
     act_work^.release()
 
     # Extract last token's gate and up bf16 outputs, compute silu(gate)*up in f32

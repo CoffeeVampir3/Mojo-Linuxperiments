@@ -4,7 +4,7 @@ from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 
 from simd_math import exp_f32
-from kernels.kernel_ops import gemv_kernel
+from kernels.kernel_ops import gemv_kernel, GemmArgs
 
 
 # =============================================================================
@@ -111,7 +111,7 @@ def expert_ffn_kernel[intermediate: Int, hidden: Int](
         unsafe_from_address=Int(UnsafePointer(to=fused_act[0]))
     )
 
-    gemv_kernel[hidden, fused](input, gate_up_weight, fused_ptr, 0, fused, 1)
+    gemv_kernel[hidden, fused](GemmArgs(input, gate_up_weight, fused_ptr, 0, fused, 1))
 
     # SiLU(gate[:intermediate]) * up[intermediate:] → write back to first half
     var gate_ptr = fused_ptr
@@ -123,7 +123,7 @@ def expert_ffn_kernel[intermediate: Int, hidden: Int](
         (gate_ptr + i).store((g * sig * u).cast[DType.bfloat16]())
 
     # Down GEMV: [hidden] = down_w[hidden, intermediate] @ silu_result[intermediate]
-    gemv_kernel[intermediate, hidden](gate_ptr, down_weight, output, 0, hidden, 1)
+    gemv_kernel[intermediate, hidden](GemmArgs(gate_ptr, down_weight, output, 0, hidden, 1))
 
     # Gate scaling
     var scale = Float32(gate_val)

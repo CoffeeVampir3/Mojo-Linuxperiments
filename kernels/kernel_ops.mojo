@@ -12,12 +12,62 @@ from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 from std.time import perf_counter_ns
 from threading.threading_traits import BurstThreadPool
+from threading.threading_shared import ptr as tptr
 import linux.sys as linux
 
 from modeling.model_spec import (
     Encoding, Shaped, Bound, DynView, CacheView,
 )
 from simd_math import exp_f32
+
+
+# ================================================================
+# DISPATCH ARG STRUCTS
+# ================================================================
+
+comptime MAX_POOL_CAPACITY = 128
+comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
+
+
+@fieldwise_init
+struct GemmArgs(Copyable, ImplicitlyCopyable):
+    var input: BF16Ptr
+    var weight: BF16Ptr
+    var output: BF16Ptr
+    var start: Int
+    var end: Int
+    var seq_len: Int
+
+
+@fieldwise_init
+struct RMSNormArgs(Copyable, ImplicitlyCopyable):
+    var input: BF16Ptr
+    var weight: BF16Ptr
+    var output: BF16Ptr
+    var start_row: Int
+    var end_row: Int
+    var eps: Float64
+
+
+@fieldwise_init
+struct EmbedArgs(Copyable, ImplicitlyCopyable):
+    var table: BF16Ptr
+    var tokens: UnsafePointer[Scalar[DType.int32], MutAnyOrigin]
+    var output: BF16Ptr
+    var start_row: Int
+    var end_row: Int
+
+
+@fieldwise_init
+struct GQAArgs(Copyable, ImplicitlyCopyable):
+    var qp: BF16Ptr
+    var dp: BF16Ptr
+    var kp: BF16Ptr
+    var vp: BF16Ptr
+    var start_group: Int
+    var end_group: Int
+    var pos: Int
+    var seq_len: Int
 
 # ================================================================
 # POOL FENCE — linear synchronization token
@@ -91,17 +141,15 @@ def timed_parallel_for[P: BurstThreadPool, tp: Int,
 # ================================================================
 
 
-def gemm_kernel[K: Int, N: Int](
-    ip: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    wp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    dp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    start_row: Int, end_row: Int, _unused: Int,
-):
+def gemm_kernel[K: Int, N: Int](args: GemmArgs):
     """GEMM row kernel. dst[m,n] = dot(input[m,:], weight[n,:])
     for rows [start_row, end_row)."""
+    var ip = args.input
+    var wp = args.weight
+    var dp = args.output
     comptime width = simd_width_of[DType.float32]()
 
-    for m in range(start_row, end_row):
+    for m in range(args.start, args.end):
         var row_in = ip + m * K
         var row_out = dp + m * N
         for n in range(N):
@@ -114,25 +162,23 @@ def gemm_kernel[K: Int, N: Int](
             row_out[n] = acc.reduce_add().cast[DType.bfloat16]()
 
 
-def gemv_kernel[K: Int, N: Int](
-    ip: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    wp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    dp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    start_col: Int, end_col: Int, seq_len: Int,
-):
+def gemv_kernel[K: Int, N: Int](args: GemmArgs):
     """N-tiled GEMV kernel — processes 4 output columns simultaneously,
     reusing each input load across 4 independent FMA chains to hide
     FMA latency and reduce input bandwidth."""
+    var ip = args.input
+    var wp = args.weight
+    var dp = args.output
     comptime width = simd_width_of[DType.float32]()
     comptime Nr = 4
 
-    var n_full = end_col - ((end_col - start_col) % Nr)
+    var n_full = args.end - ((args.end - args.start) % Nr)
 
-    for m in range(seq_len):
+    for m in range(args.seq_len):
         var row_in = ip + m * K
         var row_out = dp + m * N
 
-        for n in range(start_col, n_full, Nr):
+        for n in range(args.start, n_full, Nr):
             var w0 = wp + n * K
             var w1 = wp + (n + 1) * K
             var w2 = wp + (n + 2) * K
@@ -152,7 +198,7 @@ def gemv_kernel[K: Int, N: Int](
             row_out[n + 2] = acc2.reduce_add().cast[DType.bfloat16]()
             row_out[n + 3] = acc3.reduce_add().cast[DType.bfloat16]()
 
-        for n in range(n_full, end_col):
+        for n in range(n_full, args.end):
             var row_w = wp + n * K
             var acc = SIMD[DType.float32, width](0)
             for k in range(0, K, width):
@@ -161,17 +207,15 @@ def gemv_kernel[K: Int, N: Int](
             row_out[n] = acc.reduce_add().cast[DType.bfloat16]()
 
 
-def rmsnorm_kernel[cols: Int](
-    ip: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    wp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    dp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    start_row: Int, end_row: Int, eps: Float64,
-):
+def rmsnorm_kernel[cols: Int](args: RMSNormArgs):
     """RMSNorm row kernel. Fused reduction + normalize for
     rows [start_row, end_row)."""
+    var ip = args.input
+    var wp = args.weight
+    var dp = args.output
     comptime width = simd_width_of[DType.float32]()
 
-    for row in range(start_row, end_row):
+    for row in range(args.start_row, args.end_row):
         var row_in = ip + row * cols
         var row_out = dp + row * cols
 
@@ -180,7 +224,7 @@ def rmsnorm_kernel[cols: Int](
             var x = (row_in + j).load[width=width]().cast[DType.float32]()
             acc = x.fma(x, acc)
         var sum_sq = acc.reduce_add()
-        var scale = Float32(1.0) / sqrt(sum_sq / Float32(cols) + Float32(eps))
+        var scale = Float32(1.0) / sqrt(sum_sq / Float32(cols) + Float32(args.eps))
 
         var sv = SIMD[DType.float32, width](scale)
         for j in range(0, cols, width):
@@ -189,17 +233,15 @@ def rmsnorm_kernel[cols: Int](
             (row_out + j).store((x * sv * w).cast[DType.bfloat16]())
 
 
-def embed_lookup_kernel[cols: Int](
-    tp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    tokens: UnsafePointer[Scalar[DType.int32], MutAnyOrigin],
-    dp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    start_row: Int, end_row: Int, _unused: Int,
-):
+def embed_lookup_kernel[cols: Int](args: EmbedArgs):
     """Embed gather kernel. Copies table[token_id] → dst
     for rows [start_row, end_row)."""
+    var tp = args.table
+    var tokens = args.tokens
+    var dp = args.output
     comptime width = simd_width_of[DType.bfloat16]()
 
-    for i in range(start_row, end_row):
+    for i in range(args.start_row, args.end_row):
         var src = tp + Int(tokens[i]) * cols
         var out = dp + i * cols
         for j in range(0, cols, width):
@@ -209,17 +251,15 @@ def embed_lookup_kernel[cols: Int](
 def gqa_kernel[
     num_heads: Int, num_kv_heads: Int, head_dim: Int,
     kv_cols: Int,
-](
-    qp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    dp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    kp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    vp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    start_end_packed: Int, pos_seq_packed: Int,
-):
+](args: GQAArgs):
     """GQA attention kernel. Per query head, fuses:
       1. GEMV — dot(q, K[t]) → score
       2. Online softmax — streaming max + exp + sum
       3. V accumulation — weighted sum in f32 registers"""
+    var qp = args.qp
+    var dp = args.dp
+    var kp = args.kp
+    var vp = args.vp
     comptime heads_per_group = num_heads // num_kv_heads
     comptime q_stride = num_heads * head_dim
     comptime kv_stride = kv_cols
@@ -227,15 +267,10 @@ def gqa_kernel[
     comptime chunks = head_dim // width
     comptime scale_f32 = Float32(1.0 / sqrt(Float64(head_dim)))
 
-    var start_group = start_end_packed >> 32
-    var end_group = start_end_packed & 0xFFFFFFFF
-    var pos = pos_seq_packed >> 32
-    var seq_len = pos_seq_packed & 0xFFFFFFFF
+    for m in range(args.seq_len):
+        var causal_len = args.pos + m + 1
 
-    for m in range(seq_len):
-        var causal_len = pos + m + 1
-
-        for g in range(start_group, end_group):
+        for g in range(args.start_group, args.end_group):
             var kv_head_offset = g * head_dim
 
             for qh in range(heads_per_group):
@@ -313,6 +348,11 @@ def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped,
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))
 
+    var ip = tptr[Scalar[DType.bfloat16]](input.ptr)
+    var wp = tptr[Scalar[DType.bfloat16]](weight.ptr)
+    var op = tptr[Scalar[DType.bfloat16]](output.ptr)
+    var jobs = InlineArray[GemmArgs, MAX_POOL_CAPACITY](uninitialized=True)
+
     if seq_len < pool.get_capacity():
         # Decode path: partition N (output columns) across workers
         comptime N = W.ROWS
@@ -322,15 +362,10 @@ def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped,
         for i in range(num_jobs):
             var start = i * cols_per_job
             var end = min(start + cols_per_job, N)
-            var pack = pool.get_args_base() + i
-            pack[].arg0 = input.ptr
-            pack[].arg1 = weight.ptr
-            pack[].arg2 = output.ptr
-            pack[].arg3 = start
-            pack[].arg4 = end
-            pack[].arg5 = seq_len
+            jobs[i] = GemmArgs(ip, wp, op, start, end, seq_len)
 
-        pool.dispatch(gemv_kernel[InT.COLS, N], pool.get_args_base(), num_jobs)
+        pool.dispatch[GemmArgs, gemv_kernel[InT.COLS, N]](
+            UnsafePointer(to=jobs[0]), num_jobs)
     else:
         # Prefill path: partition M (input rows) across workers
         var num_jobs = min(seq_len, pool.get_capacity())
@@ -339,15 +374,10 @@ def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped,
         for i in range(num_jobs):
             var start = i * rows_per_job
             var end = min(start + rows_per_job, seq_len)
-            var pack = pool.get_args_base() + i
-            pack[].arg0 = input.ptr
-            pack[].arg1 = weight.ptr
-            pack[].arg2 = output.ptr
-            pack[].arg3 = start
-            pack[].arg4 = end
-            pack[].arg5 = 0
+            jobs[i] = GemmArgs(ip, wp, op, start, end, 0)
 
-        pool.dispatch(gemm_kernel[InT.COLS, W.ROWS], pool.get_args_base(), num_jobs)
+        pool.dispatch[GemmArgs, gemm_kernel[InT.COLS, W.ROWS]](
+            UnsafePointer(to=jobs[0]), num_jobs)
 
     return fence^
 
@@ -372,19 +402,17 @@ def rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shape
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
+    var ip = tptr[Scalar[DType.bfloat16]](input.ptr)
+    var wp = tptr[Scalar[DType.bfloat16]](weight.ptr)
+    var op = tptr[Scalar[DType.bfloat16]](output.ptr)
+    var jobs = InlineArray[RMSNormArgs, MAX_POOL_CAPACITY](uninitialized=True)
     for i in range(num_jobs):
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
-        var pack = pool.get_args_base() + i
-        pack[].arg0 = input.ptr
-        pack[].arg1 = weight.ptr
-        pack[].arg2 = output.ptr
-        pack[].arg3 = start
-        pack[].arg4 = end
-        var eps_f64 = Float64(eps)
-        pack[].arg5 = UnsafePointer(to=eps_f64).bitcast[Int]()[]
+        jobs[i] = RMSNormArgs(ip, wp, op, start, end, Float64(eps))
 
-    pool.dispatch(rmsnorm_kernel[InT.COLS], pool.get_args_base(), num_jobs)
+    pool.dispatch[RMSNormArgs, rmsnorm_kernel[InT.COLS]](
+        UnsafePointer(to=jobs[0]), num_jobs)
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))
@@ -406,18 +434,17 @@ def embed_lookup[W: Encoding & Shaped, OutT: Encoding & Shaped,
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
+    var tp = tptr[Scalar[DType.bfloat16]](table.ptr)
+    var tkp = tptr[Scalar[DType.int32]](tokens)
+    var op = tptr[Scalar[DType.bfloat16]](output.ptr)
+    var jobs = InlineArray[EmbedArgs, MAX_POOL_CAPACITY](uninitialized=True)
     for i in range(num_jobs):
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
-        var pack = pool.get_args_base() + i
-        pack[].arg0 = table.ptr
-        pack[].arg1 = tokens
-        pack[].arg2 = output.ptr
-        pack[].arg3 = start
-        pack[].arg4 = end
-        pack[].arg5 = 0
+        jobs[i] = EmbedArgs(tp, tkp, op, start, end)
 
-    pool.dispatch(embed_lookup_kernel[W.COLS], pool.get_args_base(), num_jobs)
+    pool.dispatch[EmbedArgs, embed_lookup_kernel[W.COLS]](
+        UnsafePointer(to=jobs[0]), num_jobs)
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))
@@ -545,26 +572,21 @@ def attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
     if seq_len == 0:
         return PoolFence[P].completed()
 
-    var pos_seq = (pos << 32) | seq_len
-
     var num_jobs = min(num_kv_heads, pool.get_capacity())
     var groups_per_job = (num_kv_heads + num_jobs - 1) // num_jobs
 
+    var qpp = tptr[Scalar[DType.bfloat16]](q.ptr)
+    var opp = tptr[Scalar[DType.bfloat16]](output.ptr)
+    var kpp = tptr[Scalar[DType.bfloat16]](k_cache.ptr)
+    var vpp = tptr[Scalar[DType.bfloat16]](v_cache.ptr)
+    var jobs = InlineArray[GQAArgs, MAX_POOL_CAPACITY](uninitialized=True)
     for i in range(num_jobs):
         var start = i * groups_per_job
         var end = min(start + groups_per_job, num_kv_heads)
-        var pack = pool.get_args_base() + i
-        pack[].arg0 = q.ptr
-        pack[].arg1 = output.ptr
-        pack[].arg2 = k_cache.ptr
-        pack[].arg3 = v_cache.ptr
-        pack[].arg4 = (start << 32) | end
-        pack[].arg5 = pos_seq
+        jobs[i] = GQAArgs(qpp, opp, kpp, vpp, start, end, pos, seq_len)
 
-    pool.dispatch(
-        gqa_kernel[num_heads, num_kv_heads, head_dim, KCT.COLS],
-        pool.get_args_base(), num_jobs,
-    )
+    pool.dispatch[GQAArgs, gqa_kernel[num_heads, num_kv_heads, head_dim, KCT.COLS]](
+        UnsafePointer(to=jobs[0]), num_jobs)
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))

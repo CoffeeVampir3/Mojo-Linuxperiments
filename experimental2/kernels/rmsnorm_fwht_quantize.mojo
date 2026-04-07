@@ -15,6 +15,7 @@ from std.sys.info import simd_width_of, size_of
 from std.collections import InlineArray
 from std.utils import IndexList
 from threading.threading_traits import BurstThreadPool
+from threading.threading_shared import ptr as tptr
 
 from kernels.kernel_ops import PoolFence
 from simd_math import sqrt
@@ -143,20 +144,27 @@ def rmsnorm_fwht_quantize_row[cols: Int, block: Int](
 
 
 # ============================================================================
-# Worker kernel (BurstPool ABI: 6 Int args)
+# Worker args + kernel
 # ============================================================================
 
 
-def rmsnorm_fwht_quantize_worker[cols: Int, block: Int](
-    in_ptr: Int, qi_ptr: Int, work_ptr: Int,
-    scale_ptr: Int, start_row: Int, end_row: Int,
-):
-    var inp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=in_ptr)
-    var qi = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=qi_ptr)
-    var work = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=work_ptr)
-    var scales = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=scale_ptr)
+@fieldwise_init
+struct RmsNormFwhtArgs(Copyable, ImplicitlyCopyable):
+    var in_ptr: Int
+    var qi_ptr: Int
+    var work_ptr: Int
+    var scale_ptr: Int
+    var start_row: Int
+    var end_row: Int
 
-    for m in range(start_row, end_row):
+
+def rmsnorm_fwht_quantize_worker[cols: Int, block: Int](args: RmsNormFwhtArgs):
+    var inp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.in_ptr)
+    var qi = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=args.qi_ptr)
+    var work = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.work_ptr)
+    var scales = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.scale_ptr)
+
+    for m in range(args.start_row, args.end_row):
         rmsnorm_fwht_quantize_row[cols, block](
             inp + m * cols, qi + m * cols, work, scales + m, 1e-5,
         )
@@ -183,24 +191,22 @@ def rmsnorm_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
     if seq_len == 0:
         return PoolFence[P].completed()
 
+    comptime MAX_POOL_CAPACITY = 128
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
+    var jobs = InlineArray[RmsNormFwhtArgs, MAX_POOL_CAPACITY](
+        fill=RmsNormFwhtArgs(0, 0, 0, 0, 0, 0))
     for i in range(num_jobs):
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
-        var pack = pool.get_args_base() + i
-        pack[].arg0 = in_ptr
-        pack[].arg1 = qi_ptr
-        pack[].arg2 = work_ptr + i * cols * size_of[Float32]()
-        pack[].arg3 = scale_ptr
-        pack[].arg4 = start
-        pack[].arg5 = end
+        jobs[i] = RmsNormFwhtArgs(
+            in_ptr, qi_ptr,
+            work_ptr + i * cols * size_of[Float32](),
+            scale_ptr, start, end)
 
-    pool.dispatch(
-        rmsnorm_fwht_quantize_worker[cols, block],
-        pool.get_args_base(), num_jobs,
-    )
+    pool.dispatch[RmsNormFwhtArgs, rmsnorm_fwht_quantize_worker[cols, block]](
+        UnsafePointer(to=jobs[0]), num_jobs)
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))

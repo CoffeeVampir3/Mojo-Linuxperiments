@@ -15,6 +15,7 @@ from std.collections import InlineArray
 from std.sys.info import simd_width_of
 from std.os.atomic import Atomic, Consistency
 from threading import BurstPool
+from threading.threading_shared import ptr as tptr
 import linux.sys as linux
 
 from modeling.model_spec import Encoding, Shaped
@@ -49,26 +50,42 @@ def done_ptr(state_base: Int, rank: Int) -> UnsafePointer[Int32, MutAnyOrigin]:
 
 
 # =============================================================================
-# Dispatch kernels (BurstPool ABI: 6 Int args)
+# Dispatch args structs
 # =============================================================================
 
 
-def memcpy_kernel(
-    dst: Int, src: Int, count: Int,
-    n3: Int, n4: Int, n5: Int,
-):
+@fieldwise_init
+struct MemcpyArgs(Copyable, ImplicitlyCopyable):
+    var dst: Int
+    var src: Int
+    var count: Int
+
+
+@fieldwise_init
+struct FusedReduceGatherArgs(Copyable, ImplicitlyCopyable):
+    var config_addr: Int
+    var start_element: Int
+    var end_element: Int
+    var my_rank: Int
+    var worker_idx: Int
+    var num_workers: Int
+
+
+# =============================================================================
+# Dispatch kernels
+# =============================================================================
+
+
+def memcpy_kernel(args: MemcpyArgs):
     memcpy(
-        dest=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=dst),
-        src=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=src),
-        count=count,
+        dest=tptr[Byte](args.dst),
+        src=tptr[Byte](args.src),
+        count=args.count,
     )
 
 
-def fused_reduce_gather_kernel(
-    config_addr: Int, start_element: Int, end_element: Int,
-    my_rank: Int, worker_idx: Int, num_workers: Int,
-):
-    """Each BurstPool worker: reduce slice → signal → pull from completed ranks.
+def fused_reduce_gather_kernel(args: FusedReduceGatherArgs):
+    """Each BurstPool worker: reduce slice -> signal -> pull from completed ranks.
 
     Reads FusedConfig from config_addr for buffer pointers, completion state,
     and chunk layout. The reduce reads from all tp source buffers and writes
@@ -76,8 +93,15 @@ def fused_reduce_gather_kernel(
     All workers then pull completed chunks from other ranks, dividing the
     copy work among themselves.
     """
-    var cfg = UnsafePointer[FusedConfig, MutAnyOrigin](unsafe_from_address=config_addr)
-    var ptrs = UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=cfg[].ptrs_addr)
+    var config_addr = args.config_addr
+    var start_element = args.start_element
+    var end_element = args.end_element
+    var my_rank = args.my_rank
+    var worker_idx = args.worker_idx
+    var num_workers = args.num_workers
+
+    var cfg = tptr[FusedConfig](config_addr)
+    var ptrs = tptr[Int](cfg[].ptrs_addr)
     var state_base = cfg[].state_base
     var chunk = cfg[].chunk
     var rem = cfg[].rem
@@ -85,7 +109,7 @@ def fused_reduce_gather_kernel(
     var sys = linux.linux_sys()
 
     var my_buf = ptrs[my_rank]
-    var dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=my_buf)
+    var dst = tptr[Scalar[DType.bfloat16]](my_buf)
     comptime width = simd_width_of[DType.float32]()
 
     # --- Reduce my slice from all tp sources ---
@@ -186,12 +210,13 @@ def ring_broadcast[T: Encoding & Shaped, tp: Int](
         )
 
     # Dispatch: each destination rank pulls from rank 0.
+    var mcpy_jobs = InlineArray[MemcpyArgs, tp](
+        fill=MemcpyArgs(0, 0, 0)
+    )
     for r in range(1, tp):
-        var pack = pool_ptrs[r][].args_base
-        pack[].arg0 = dst_ptrs[r]
-        pack[].arg1 = dst_ptrs[0]
-        pack[].arg2 = total_bytes
-        pool_ptrs[r][].dispatch(memcpy_kernel, pool_ptrs[r][].args_base, 1)
+        mcpy_jobs[r] = MemcpyArgs(dst_ptrs[r], dst_ptrs[0], total_bytes)
+        pool_ptrs[r][].dispatch[MemcpyArgs, memcpy_kernel](
+            UnsafePointer(to=mcpy_jobs[r]), 1)
     for r in range(1, tp):
         pool_ptrs[r][].join()
 
@@ -256,6 +281,9 @@ def ring_allreduce[T: Encoding & Shaped, tp: Int](
     var config_addr = Int(UnsafePointer(to=cfg))
 
     # Dispatch: each rank's full pool, workers partition the chunk.
+    var jobs = InlineArray[FusedReduceGatherArgs, 128](
+        fill=FusedReduceGatherArgs(0, 0, 0, 0, 0, 0)
+    )
     for r in range(tp):
         var rank_start = r * chunk
         var rank_count = chunk + (rem if r == tp - 1 else 0)
@@ -268,15 +296,12 @@ def ring_allreduce[T: Encoding & Shaped, tp: Int](
             if w_start >= rank_start + rank_count:
                 w_start = rank_start + rank_count
                 w_end = w_start
-            var pack = pool_ptrs[r][].args_base + w
-            pack[].arg0 = config_addr
-            pack[].arg1 = w_start
-            pack[].arg2 = w_end
-            pack[].arg3 = r
-            pack[].arg4 = w
-            pack[].arg5 = num_workers
+            jobs[w] = FusedReduceGatherArgs(
+                config_addr, w_start, w_end, r, w, num_workers
+            )
 
-        pool_ptrs[r][].dispatch(fused_reduce_gather_kernel, pool_ptrs[r][].args_base, num_workers)
+        pool_ptrs[r][].dispatch[FusedReduceGatherArgs, fused_reduce_gather_kernel](
+            UnsafePointer(to=jobs[0]), num_workers)
 
     for r in range(tp):
         pool_ptrs[r][].join()

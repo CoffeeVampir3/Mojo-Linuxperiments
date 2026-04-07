@@ -11,7 +11,9 @@ with the down projection. Per-row absmax scales written to output array.
 
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of, size_of
+from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
+from threading.threading_shared import ptr as tptr
 
 from kernels.kernel_ops import PoolFence
 from simd_math import exp_f32
@@ -54,20 +56,27 @@ def silu_fwht_quantize_row[cols: Int, block: Int](
 
 
 # ============================================================================
-# Worker kernel (BurstPool ABI: 6 Int args)
+# Worker args + kernel
 # ============================================================================
 
 
-def silu_fwht_quantize_worker[cols: Int, stride: Int, block: Int](
-    gate_up_ptr: Int, qi_ptr: Int, work_ptr: Int,
-    scale_ptr: Int, start_row: Int, end_row: Int,
-):
-    var gate_up = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=gate_up_ptr)
-    var qi = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=qi_ptr)
-    var work = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=work_ptr)
-    var scales = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=scale_ptr)
+@fieldwise_init
+struct SiluFwhtArgs(Copyable, ImplicitlyCopyable):
+    var gate_up_ptr: Int
+    var qi_ptr: Int
+    var work_ptr: Int
+    var scale_ptr: Int
+    var start_row: Int
+    var end_row: Int
 
-    for m in range(start_row, end_row):
+
+def silu_fwht_quantize_worker[cols: Int, stride: Int, block: Int](args: SiluFwhtArgs):
+    var gate_up = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.gate_up_ptr)
+    var qi = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=args.qi_ptr)
+    var work = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.work_ptr)
+    var scales = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.scale_ptr)
+
+    for m in range(args.start_row, args.end_row):
         silu_fwht_quantize_row[cols, block](
             gate_up + m * stride,
             gate_up + m * stride + cols,
@@ -97,24 +106,22 @@ def silu_fwht_quantize[cols: Int, stride: Int, block: Int, P: BurstThreadPool](
     if seq_len == 0:
         return PoolFence[P].completed()
 
+    comptime MAX_POOL_CAPACITY = 128
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
+    var jobs = InlineArray[SiluFwhtArgs, MAX_POOL_CAPACITY](
+        fill=SiluFwhtArgs(0, 0, 0, 0, 0, 0))
     for i in range(num_jobs):
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
-        var pack = pool.get_args_base() + i
-        pack[].arg0 = gate_up_ptr
-        pack[].arg1 = qi_ptr
-        pack[].arg2 = work_ptr + i * cols * size_of[Float32]()
-        pack[].arg3 = scale_ptr
-        pack[].arg4 = start
-        pack[].arg5 = end
+        jobs[i] = SiluFwhtArgs(
+            gate_up_ptr, qi_ptr,
+            work_ptr + i * cols * size_of[Float32](),
+            scale_ptr, start, end)
 
-    pool.dispatch(
-        silu_fwht_quantize_worker[cols, stride, block],
-        pool.get_args_base(), num_jobs,
-    )
+    pool.dispatch[SiluFwhtArgs, silu_fwht_quantize_worker[cols, stride, block]](
+        UnsafePointer(to=jobs[0]), num_jobs)
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))

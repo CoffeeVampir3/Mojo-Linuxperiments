@@ -34,41 +34,33 @@ comptime EXPERT_STRIDE = DOWN_OFF + DOWN_SIZE
 comptime EXPERTS_PER_NODE = N_EXPERTS // TP
 comptime NODE_ARENA_SIZE = EXPERTS_PER_NODE * EXPERT_STRIDE + ALIGNMENT
 
+comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
 
-def expert_ffn_kernel(
-    input_ptr: Int, expert_base: Int, output_ptr: Int,
-    gate_bits: Int, intermediate: Int, hidden: Int,
-):
-    """Run one expert FFN: gate+up → silu_mul → down. Writes gated result.
 
-    Args packed as Ints via ArgPack:
-        input_ptr: bf16 hidden state [HIDDEN]
-        expert_base: base address of this expert's weights
-        output_ptr: bf16 output buffer [HIDDEN] (write gated result here)
-        gate_bits: f32 gate value as raw bits
-        intermediate: expert intermediate dim
-        hidden: hidden dim
-    """
+@fieldwise_init
+struct ExpertFFNArgs(Copyable, ImplicitlyCopyable):
+    var input_ptr: BF16Ptr
+    var expert_base: Int
+    var output_ptr: BF16Ptr
+    var gate_val: Float32
+    var intermediate: Int
+    var hidden: Int
+
+
+def expert_ffn_kernel(args: ExpertFFNArgs):
+    """Run one expert FFN: gate+up -> silu_mul -> down. Writes gated result."""
     comptime width = simd_width_of[DType.float32]()
 
-    var inp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=input_ptr)
-    var gate_w = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=expert_base + GATE_OFF)
-    var up_w = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=expert_base + UP_OFF)
-    var down_w = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=expert_base + DOWN_OFF)
-    var out = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=output_ptr)
-
-    # Recover gate float from bits
-    var gate_i32 = Int32(gate_bits)
-    var gate_val = UnsafePointer(to=gate_i32).bitcast[Float32]()[]
-
-    # gate_proj: [intermediate] = gate_w[intermediate, hidden] @ input[hidden]
-    # up_proj:   [intermediate] = up_w[intermediate, hidden] @ input[hidden]
-    # silu_mul:  [intermediate] = silu(gate_result) * up_result
-    # down_proj: [hidden] = down_w[hidden, intermediate] @ silu_result
-    # output:    [hidden] = gate_val * down_result
+    var inp = args.input_ptr
+    var gate_w = BF16Ptr(unsafe_from_address=args.expert_base + GATE_OFF)
+    var up_w = BF16Ptr(unsafe_from_address=args.expert_base + UP_OFF)
+    var down_w = BF16Ptr(unsafe_from_address=args.expert_base + DOWN_OFF)
+    var out = args.output_ptr
+    var gate_val = args.gate_val
+    var intermediate = args.intermediate
+    var hidden = args.hidden
 
     # Phase 1: gate + up GEMVs, fused with silu_mul into intermediate buffer
-    # Use stack buffer for intermediate activations
     var inter = InlineArray[Float32, INTERMEDIATE](fill=Float32(0))
 
     for n in range(intermediate):
@@ -98,15 +90,12 @@ def expert_ffn_kernel(
 
 
 def sequential_expert_ffn(
-    inp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    expert_base: Int,
-    gate_val: Float32,
-    dst: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    inp: BF16Ptr, expert_base: Int, gate_val: Float32, dst: BF16Ptr,
 ):
     """Reference sequential expert FFN for verification."""
-    var gate_w = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=expert_base + GATE_OFF)
-    var up_w = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=expert_base + UP_OFF)
-    var down_w = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=expert_base + DOWN_OFF)
+    var gate_w = BF16Ptr(unsafe_from_address=expert_base + GATE_OFF)
+    var up_w = BF16Ptr(unsafe_from_address=expert_base + UP_OFF)
+    var down_w = BF16Ptr(unsafe_from_address=expert_base + DOWN_OFF)
 
     var inter = InlineArray[Float32, INTERMEDIATE](fill=Float32(0))
 
@@ -168,7 +157,7 @@ def main():
         var node = e % TP
         var local_idx = e // TP
         var base = arena_bases[node] + local_idx * EXPERT_STRIDE
-        var wp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=base)
+        var wp = BF16Ptr(unsafe_from_address=base)
         var total_elems = EXPERT_STRIDE // 2
         for i in range(total_elems):
             wp[i] = Scalar[DType.bfloat16](Float32(e * 1000 + i) * 0.001 - 5.0)
@@ -177,7 +166,7 @@ def main():
     var input_buf = InlineArray[Scalar[DType.bfloat16], HIDDEN](fill=Scalar[DType.bfloat16](0))
     for i in range(HIDDEN):
         input_buf[i] = Scalar[DType.bfloat16](Float32(i) * 0.01 - 0.5)
-    var input_ptr = Int(UnsafePointer(to=input_buf[0]))
+    var input_ptr = BF16Ptr(unsafe_from_address=Int(UnsafePointer(to=input_buf[0])))
 
     # --- Simulate router: pick TOP_K experts ---
     var selected_ids = InlineArray[Int, TOP_K](fill=0)
@@ -227,14 +216,11 @@ def main():
         if count == 0:
             continue
 
+        var job_args = InlineArray[ExpertFFNArgs, TOP_K](uninitialized=True)
         for j in range(count):
             var eid = node_expert_ids[node][j]
             var local_idx = eid // TP
             var expert_base = arena_bases[node] + local_idx * EXPERT_STRIDE
-
-            # Encode gate as raw f32 bits
-            var gv = node_expert_gates[node][j]
-            var gate_bits = Int(UnsafePointer(to=gv).bitcast[Int32]()[])
 
             # Find which global selection index this is (for output buffer)
             var out_idx = 0
@@ -243,15 +229,17 @@ def main():
                     out_idx = s
                     break
 
-            var pack = pool_ptrs[node][].get_args_base() + j
-            pack[].arg0 = input_ptr
-            pack[].arg1 = expert_base
-            pack[].arg2 = Int(UnsafePointer(to=expert_outputs[out_idx][0]))
-            pack[].arg3 = gate_bits
-            pack[].arg4 = INTERMEDIATE
-            pack[].arg5 = HIDDEN
+            job_args[j] = ExpertFFNArgs(
+                input_ptr,
+                expert_base,
+                BF16Ptr(unsafe_from_address=Int(UnsafePointer(to=expert_outputs[out_idx][0]))),
+                node_expert_gates[node][j],
+                INTERMEDIATE,
+                HIDDEN,
+            )
 
-        pool_ptrs[node][].dispatch(expert_ffn_kernel, pool_ptrs[node][].get_args_base(), count)
+        pool_ptrs[node][].dispatch[ExpertFFNArgs, expert_ffn_kernel](
+            UnsafePointer(to=job_args[0]), count)
 
     # Join all nodes
     for node in range(TP):
@@ -270,16 +258,15 @@ def main():
     # --- Sequential reference ---
     var ref_result = InlineArray[Float32, HIDDEN](fill=Float32(0))
     var ref_out_buf = InlineArray[Scalar[DType.bfloat16], HIDDEN](fill=Scalar[DType.bfloat16](0))
-    var ref_inp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=input_ptr)
 
     for s in range(TOP_K):
         var eid = selected_ids[s]
         var node = eid % TP
         var local_idx = eid // TP
         var expert_base = arena_bases[node] + local_idx * EXPERT_STRIDE
+        var ref_out = BF16Ptr(unsafe_from_address=Int(UnsafePointer(to=ref_out_buf[0])))
 
-        sequential_expert_ffn(ref_inp, expert_base, selected_gates[s],
-            UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=Int(UnsafePointer(to=ref_out_buf[0]))))
+        sequential_expert_ffn(input_ptr, expert_base, selected_gates[s], ref_out)
 
         for h in range(HIDDEN):
             ref_result[h] += Float32(ref_out_buf[h])

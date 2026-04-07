@@ -26,7 +26,9 @@ from numa import NumaInfo, CpuMask
 from notstdcollections import HeapMoveArray
 from .threading_traits import BurstThreadPool
 from .threading_shared import (
-    AtomicInt32, KernelFn, ArgPack, JoinFlag, SlotLayout,
+    AtomicInt32, KernelFn, JoinFlag, SlotLayout,
+    MAILBOX_DATA_SLOTS, MAILBOX_DATA_BYTES,
+    typed_trampoline,
     compute_slot_size, ptr,
 )
 
@@ -37,21 +39,22 @@ from .threading_shared import (
 
 @align(64)
 struct WorkerMailbox:
-    """Dispatch slot on the worker's NUMA node. Exactly one cache line.
+    """Dispatch slot on the worker's NUMA node.
 
     Worker reads locally. Dispatcher writes remotely.
     sleeping flag is for Dekker backoff protocol.
+    data holds the kernel's args struct (up to MAILBOX_DATA_BYTES).
     """
     var job_ready: AtomicInt32  # 0=idle, 1=work available
     var sleeping: AtomicInt32   # Dekker: worker sets before futex_wait
     var func_ptr: Int
-    var pack: ArgPack
+    var data: InlineArray[Int, MAILBOX_DATA_SLOTS]
 
     def __init__(out self):
         self.job_ready = AtomicInt32(0)
         self.sleeping = AtomicInt32(0)
         self.func_ptr = 0
-        self.pack = ArgPack()
+        self.data = InlineArray[Int, MAILBOX_DATA_SLOTS](fill=0)
 
 
 # ============================================================================
@@ -178,7 +181,6 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
 
     # Main-thread-side (on main's NUMA node)
     var join_flags: UnsafePointer[JoinFlag, MutAnyOrigin]
-    var args_base: UnsafePointer[ArgPack, MutAnyOrigin]
     var join_arena: Int
     var join_arena_size: Int
 
@@ -218,7 +220,6 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
         self.mailboxes = UnsafePointer[WorkerMailbox, MutAnyOrigin]()
         self.shared = UnsafePointer[SharedState, MutAnyOrigin]()
         self.join_flags = UnsafePointer[JoinFlag, MutAnyOrigin]()
-        self.args_base = UnsafePointer[ArgPack, MutAnyOrigin]()
 
         install_burst_sigsegv_handler()
 
@@ -273,9 +274,8 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
             slot.child_tid[] = 0
             self.slots.push(slot^)
 
-        # --- Join arena: join flags + argpacks (on main thread's NUMA node) ---
-        var args_bytes = capacity * size_of[ArgPack]()
-        self.join_arena_size = capacity * size_of[JoinFlag]() + args_bytes
+        # --- Join arena: join flags (on main thread's NUMA node) ---
+        self.join_arena_size = capacity * size_of[JoinFlag]()
         self.join_arena = sys.sys_mmap[
             prot=linux.Prot.RW,
             flags=linux.MapFlag.PRIVATE | linux.MapFlag.ANONYMOUS | linux.MapFlag.POPULATE
@@ -290,8 +290,6 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
         self.join_flags = ptr[JoinFlag](self.join_arena)
         for i in range(capacity):
             (self.join_flags + i)[] = JoinFlag()
-
-        self.args_base = ptr[ArgPack](self.join_arena + capacity * size_of[JoinFlag]())
 
         self.spawn_workers()
 
@@ -309,11 +307,12 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
     # Dispatch — two-pass write + Dekker wake check
     # ----------------------------------------------------------------
 
-    def dispatch[T0: TrivialRegisterPassable, T1: TrivialRegisterPassable,
-        T2: TrivialRegisterPassable, T3: TrivialRegisterPassable,
-        T4: TrivialRegisterPassable, T5: TrivialRegisterPassable](
-        mut self, kernel: def(T0, T1, T2, T3, T4, T5) -> None,
-        packs: UnsafePointer[ArgPack, MutAnyOrigin], num_jobs: Int = -1):
+    def dispatch[Args: Copyable & ImplicitlyCopyable,
+        kernel: def (Args) -> None, origin: MutOrigin](
+        mut self, args: UnsafePointer[Args, origin], num_jobs: Int = -1):
+        """Typed dispatch: copy args[i] into mailbox[i], invoke kernel via trampoline."""
+        comptime assert size_of[Args]() <= MAILBOX_DATA_BYTES, "args exceed mailbox capacity"
+
         var jobs = num_jobs if num_jobs >= 0 else self.capacity
         debug_assert(jobs <= self.capacity, "num_jobs must be <= pool capacity")
         if jobs <= 0:
@@ -322,16 +321,16 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
         debug_assert(self.active_jobs == 0,
             "previous dispatch still in flight; call join() first")
 
-        var kernel_copy = kernel
-        var kernel_ptr = UnsafePointer(to=kernel_copy).bitcast[Int]()[]
+        var tramp = typed_trampoline[Args, kernel]
+        var tramp_ptr = UnsafePointer(to=tramp).bitcast[Int]()[]
 
         self.active_jobs = jobs
 
         # Pass 1: write dispatch data to worker mailboxes (remote to worker's node)
         for i in range(jobs):
             var mb = self.mailboxes + i
-            mb[].func_ptr = kernel_ptr
-            mb[].pack = (packs + i)[]
+            mb[].func_ptr = tramp_ptr
+            UnsafePointer(to=mb[].data[0]).bitcast[Args]()[] = (args + i)[]
 
         # Pass 2: set job_ready flags (remote writes, RELEASE ordering)
         for i in range(jobs):
@@ -367,9 +366,6 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
 
     def get_capacity(self) -> Int:
         return self.capacity
-
-    def get_args_base(self) -> UnsafePointer[ArgPack, MutAnyOrigin]:
-        return self.args_base
 
     def last_worker_timestamp(self) -> Int:
         """Max completion timestamp across workers from the last dispatch.
@@ -565,13 +561,11 @@ def worker_main[mask_size: Int](stack_head_ptr: Int):
         if AtomicInt32.load[ordering=Consistency.ACQUIRE](ready_ptr) != 0:
             # Read dispatch data (local reads from worker's NUMA node)
             var func_addr = mailbox[].func_ptr
-            var p = mailbox[].pack
+            var data_ptr = Int(UnsafePointer(to=mailbox[].data[0]))
             # Clear job_ready (local write)
             AtomicInt32.store[ordering=Consistency.RELEASE](ready_ptr, 0)
-            # Execute kernel
-            UnsafePointer(to=func_addr).bitcast[KernelFn]()[](
-                p.arg0, p.arg1, p.arg2, p.arg3, p.arg4, p.arg5,
-            )
+            # Execute kernel — single pointer to NUMA-local data area
+            UnsafePointer(to=func_addr).bitcast[KernelFn]()[](data_ptr)
             # Signal completion (remote writes to main's NUMA node)
             join_flag[].timestamp = Int(perf_counter_ns())
             AtomicInt32.store[ordering=Consistency.RELEASE](done_ptr, 1)

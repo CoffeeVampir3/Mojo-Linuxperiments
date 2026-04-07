@@ -3,31 +3,33 @@ from std.memory import UnsafePointer
 from std.os.atomic import Atomic
 
 comptime AtomicInt32 = Atomic[DType.int32]
-comptime KernelFn = def (Int, Int, Int, Int, Int, Int) -> None
 
-# Aligned to avoid false sharing.
+# Single-pointer ABI: worker passes pointer to NUMA-local mailbox data area.
+comptime KernelFn = def (Int) -> None
+
+# Mailbox data area: 256 bytes (32 Int slots), stored inline in each worker's
+# mailbox on the worker's NUMA node. Dispatch copies the caller's args struct
+# into this area; the worker reads locally.
+comptime MAILBOX_DATA_SLOTS = 32
+comptime MAILBOX_DATA_BYTES = 256
 
 
 # ============================================================================
-# Kernel call ABI
+# Typed dispatch trampoline
 # ============================================================================
 
-@fieldwise_init
-struct ArgPack(Copyable, ImplicitlyCopyable):
-    var arg0: Int
-    var arg1: Int
-    var arg2: Int
-    var arg3: Int
-    var arg4: Int
-    var arg5: Int
 
-    def __init__(out self):
-        self.arg0 = 0
-        self.arg1 = 0
-        self.arg2 = 0
-        self.arg3 = 0
-        self.arg4 = 0
-        self.arg5 = 0
+def typed_trampoline[
+    Args: Copyable & ImplicitlyCopyable,
+    kernel: def (Args) -> None,
+](data_ptr: Int):
+    """Reconstruct Args from mailbox data pointer, call kernel.
+
+    Both Args and kernel are comptime parameters, so this is a plain
+    non-capturing function. Each (Args, kernel) pair monomorphizes to
+    a unique function pointer extractable by the dispatch machinery.
+    """
+    kernel(UnsafePointer[Args, MutAnyOrigin](unsafe_from_address=data_ptr)[])
 
 
 # ============================================================================

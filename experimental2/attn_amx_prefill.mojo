@@ -15,6 +15,7 @@ from std.memory import UnsafePointer
 from std.sys.info import simd_width_of, size_of
 from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
+from threading.threading_shared import ptr as tptr
 
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named,
@@ -65,16 +66,21 @@ def scratch_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int,
 
 
 # ============================================================================
-# Kernel
+# Kernel args + kernel
 # ============================================================================
+
+@fieldwise_init
+struct PrefillKernelArgs(Copyable, ImplicitlyCopyable):
+    var ctx_addr: Int
+    var ws_addr: Int
+
 
 def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
                  max_seq: Int, prefill_chunk: Int = 512](
-    ctx_addr: Int, ws_addr: Int, unused0: Int, unused1: Int,
-    unused2: Int, unused3: Int,
+    args: PrefillKernelArgs,
 ):
-    var ctx = UnsafePointer[AttnCtx, MutAnyOrigin](unsafe_from_address=ctx_addr)
-    var ws = UnsafePointer[WorkerScratch, MutAnyOrigin](unsafe_from_address=ws_addr)
+    var ctx = UnsafePointer[AttnCtx, MutAnyOrigin](unsafe_from_address=args.ctx_addr)
+    var ws = UnsafePointer[WorkerScratch, MutAnyOrigin](unsafe_from_address=args.ws_addr)
     comptime width = simd_width_of[DType.float32]()
     comptime half = head_dim // 2
     comptime gqa_factor = num_heads // num_kv_heads
@@ -320,10 +326,14 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     )
     var workers_off = accum_bytes + qi_bytes + size_of[AttnCtx]()
 
+    comptime MAX_POOL_CAPACITY = 128
     var workers_per_group = max(1, pool.get_capacity() // num_kv_heads)
     var total_q_rows = q.seq_len * gqa_factor
     var rows_per_worker = (total_q_rows + workers_per_group - 1) // workers_per_group
     var total_jobs = num_kv_heads * workers_per_group
+
+    var jobs = InlineArray[PrefillKernelArgs, MAX_POOL_CAPACITY](
+        fill=PrefillKernelArgs(0, 0))
 
     for g in range(num_kv_heads):
         for w in range(workers_per_group):
@@ -341,18 +351,10 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
             ws[].seq_len = q.seq_len
             ws[].vagg_scale = vagg_scale
 
-            var pack = pool.get_args_base() + job_idx
-            pack[].arg0 = Int(ctx_ptr)
-            pack[].arg1 = ws_base
-            pack[].arg2 = 0
-            pack[].arg3 = 0
-            pack[].arg4 = 0
-            pack[].arg5 = 0
+            jobs[job_idx] = PrefillKernelArgs(Int(ctx_ptr), ws_base)
 
-    pool.dispatch(
-        attn_prefill[num_heads, num_kv_heads, head_dim, max_seq, prefill_chunk],
-        pool.get_args_base(), total_jobs,
-    )
+    pool.dispatch[PrefillKernelArgs, attn_prefill[num_heads, num_kv_heads, head_dim, max_seq, prefill_chunk]](
+        UnsafePointer(to=jobs[0]), total_jobs)
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))

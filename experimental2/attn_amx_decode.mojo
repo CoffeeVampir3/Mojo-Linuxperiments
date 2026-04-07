@@ -12,6 +12,7 @@ from std.memory import UnsafePointer
 from std.sys.info import simd_width_of, size_of
 from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
+from threading.threading_shared import ptr as tptr
 
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named,
@@ -81,16 +82,21 @@ def scratch_bytes[num_heads: Int, num_kv_heads: Int, head_dim: Int](
 
 
 # ============================================================================
-# Kernel — processes [ctx_start, ctx_end), no final normalize
+# Kernel args + kernel — processes [ctx_start, ctx_end), no final normalize
 # ============================================================================
 
+@fieldwise_init
+struct DecodeKernelArgs(Copyable, ImplicitlyCopyable):
+    var ctx_addr: Int
+    var ws_addr: Int
+
+
 def attn_decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int](
-    ctx_addr: Int, ws_addr: Int, unused0: Int, unused1: Int,
-    unused2: Int, unused3: Int,
+    args: DecodeKernelArgs,
 ):
     var t_entry = tap()
-    var ctx = UnsafePointer[AttnCtx, MutAnyOrigin](unsafe_from_address=ctx_addr)
-    var ws = UnsafePointer[DecodeWorkerScratch, MutAnyOrigin](unsafe_from_address=ws_addr)
+    var ctx = UnsafePointer[AttnCtx, MutAnyOrigin](unsafe_from_address=args.ctx_addr)
+    var ws = UnsafePointer[DecodeWorkerScratch, MutAnyOrigin](unsafe_from_address=args.ws_addr)
     comptime width = simd_width_of[DType.float32]()
     comptime gqa_factor = num_heads // num_kv_heads
     comptime q_cols = num_heads * head_dim
@@ -440,11 +446,15 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     var workers_off = output_bytes + size_of[AttnCtx]()
 
     var context = pos + 1
+    comptime MAX_POOL_CAPACITY = 128
     var max_blocks = (context + BLOCK_N - 1) // BLOCK_N
     var max_wpg = pool.get_capacity() // num_kv_heads
     var wpg = min(min(workers_per_group, max_blocks), max_wpg)
     var blocks_per_worker = (max_blocks + wpg - 1) // wpg
     var total_jobs = num_kv_heads * wpg
+
+    var jobs = InlineArray[DecodeKernelArgs, MAX_POOL_CAPACITY](
+        fill=DecodeKernelArgs(0, 0))
 
     for g in range(num_kv_heads):
         for w in range(wpg):
@@ -475,18 +485,10 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
             ws[].profile = UnsafePointer[KernelProfile, MutAnyOrigin](unsafe_from_address=data + off)
             ws[].profile[] = KernelProfile()
 
-            var pack = pool.get_args_base() + job_idx
-            pack[].arg0 = Int(ctx_ptr)
-            pack[].arg1 = ws_base
-            pack[].arg2 = 0
-            pack[].arg3 = 0
-            pack[].arg4 = 0
-            pack[].arg5 = 0
+            jobs[job_idx] = DecodeKernelArgs(Int(ctx_ptr), ws_base)
 
-    pool.dispatch(
-        attn_decode[num_heads, num_kv_heads, head_dim, max_seq],
-        pool.get_args_base(), total_jobs,
-    )
+    pool.dispatch[DecodeKernelArgs, attn_decode[num_heads, num_kv_heads, head_dim, max_seq]](
+        UnsafePointer(to=jobs[0]), total_jobs)
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))

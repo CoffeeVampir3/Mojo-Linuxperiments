@@ -17,10 +17,44 @@ from std.math import sqrt
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 from threading.threading_traits import BurstThreadPool
+from threading.threading_shared import ptr as tptr
 
 from modeling.model_spec import Encoding, Shaped, Bound, DynView, CacheView
 from kernels.kernel_ops import PoolFence
 from simd_math import exp_f32
+
+
+comptime MAX_POOL_CAPACITY = 128
+comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
+
+
+# =============================================================================
+# Dispatch arg structs
+# =============================================================================
+
+
+@fieldwise_init
+struct MLAArgs(Copyable, ImplicitlyCopyable):
+    var qp: BF16Ptr
+    var dp: BF16Ptr
+    var ckv_p: BF16Ptr
+    var kr_p: BF16Ptr
+    var kvb_p: BF16Ptr
+    var start_head: Int
+    var end_head: Int
+    var pos: Int
+    var seq_len: Int
+
+
+@fieldwise_init
+struct MLAKVSplitArgs(Copyable, ImplicitlyCopyable):
+    var src_p: BF16Ptr
+    var norm_p: BF16Ptr
+    var ckv_p: BF16Ptr
+    var kr_p: BF16Ptr
+    var start_row: Int
+    var end_row: Int
+    var pos: Int
 
 
 # =============================================================================
@@ -35,23 +69,21 @@ def mla_kernel[
     kv_lora_rank: Int,
     v_head_dim: Int,
     softmax_scale: Float64,
-](
-    qp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    dp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    ckv_p: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    kr_p: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    kvb_p: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    packed: Int,
-):
+](args: MLAArgs):
     """Weight-absorbed MLA attention.
 
-    qp:    Q buffer     [seq, num_heads * (nope_dim + rope_dim)]
-    dp:    output       [seq, num_heads * v_head_dim]
-    ckv_p: c_KV cache   [capacity, kv_lora_rank]
-    kr_p:  k_R cache    [capacity, rope_dim]
-    kvb_p: kv_b_proj    [num_heads * (nope_dim + v_head_dim), kv_lora_rank]
-    packed: start_head[63:56] | end_head[55:48] | pos[47:24] | seq_len[23:0]
+    args.qp:    Q buffer     [seq, num_heads * (nope_dim + rope_dim)]
+    args.dp:    output       [seq, num_heads * v_head_dim]
+    args.ckv_p: c_KV cache   [capacity, kv_lora_rank]
+    args.kr_p:  k_R cache    [capacity, rope_dim]
+    args.kvb_p: kv_b_proj    [num_heads * (nope_dim + v_head_dim), kv_lora_rank]
     """
+    var qp = args.qp
+    var dp = args.dp
+    var ckv_p = args.ckv_p
+    var kr_p = args.kr_p
+    var kvb_p = args.kvb_p
+
     comptime width = simd_width_of[DType.float32]()
     comptime q_head_dim = nope_dim + rope_dim
     comptime q_stride = num_heads * q_head_dim
@@ -59,10 +91,10 @@ def mla_kernel[
     comptime kvb_head_dim = nope_dim + v_head_dim
     comptime scale = Float32(softmax_scale)
 
-    var start_head = (packed >> 56) & 0xFF
-    var end_head = (packed >> 48) & 0xFF
-    var pos = (packed >> 24) & 0xFFFFFF
-    var seq_len = packed & 0xFFFFFF
+    var start_head = args.start_head
+    var end_head = args.end_head
+    var pos = args.pos
+    var seq_len = args.seq_len
 
     for m in range(seq_len):
         var causal_len = pos + m + 1
@@ -233,21 +265,20 @@ def mla_attention[
     var num_jobs = min(num_heads, pool.get_capacity())
     var heads_per_job = (num_heads + num_jobs - 1) // num_jobs
 
+    var qpp = tptr[Scalar[DType.bfloat16]](q.ptr)
+    var opp = tptr[Scalar[DType.bfloat16]](output.ptr)
+    var ckv_pp = tptr[Scalar[DType.bfloat16]](ckv_cache.ptr)
+    var kr_pp = tptr[Scalar[DType.bfloat16]](kr_cache.ptr)
+    var kvb_pp = tptr[Scalar[DType.bfloat16]](kv_b_proj.ptr)
+    var jobs = InlineArray[MLAArgs, MAX_POOL_CAPACITY](uninitialized=True)
     for i in range(num_jobs):
         var start = i * heads_per_job
         var end = min(start + heads_per_job, num_heads)
-        var pack = pool.get_args_base() + i
-        pack[].arg0 = q.ptr
-        pack[].arg1 = output.ptr
-        pack[].arg2 = ckv_cache.ptr
-        pack[].arg3 = kr_cache.ptr
-        pack[].arg4 = kv_b_proj.ptr
-        pack[].arg5 = (start << 56) | (end << 48) | (pos << 24) | seq_len
+        jobs[i] = MLAArgs(qpp, opp, ckv_pp, kr_pp, kvb_pp, start, end, pos, seq_len)
 
-    pool.dispatch(
-        mla_kernel[num_heads, nope_dim, rope_dim, kv_lora_rank, v_head_dim, softmax_scale],
-        pool.get_args_base(), num_jobs,
-    )
+    pool.dispatch[MLAArgs, mla_kernel[
+        num_heads, nope_dim, rope_dim, kv_lora_rank, v_head_dim, softmax_scale,
+    ]](UnsafePointer(to=jobs[0]), num_jobs)
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))
@@ -259,34 +290,35 @@ def mla_attention[
 
 
 def mla_kv_split_kernel[kv_lora_rank: Int, rope_dim: Int, eps: Float64](
-    src_p: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    norm_p: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    ckv_p: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    kr_p: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    start_end: Int,
-    pos: Int,
+    args: MLAKVSplitArgs,
 ):
     """Split kv_a output, RMSNorm the c_KV portion, write both to caches.
 
-    src_p:  kv_a buffer  [seq, kv_lora_rank + rope_dim]  (strided rows)
-    norm_p: layernorm γ  [kv_lora_rank]
-    ckv_p:  c_KV cache   [capacity, kv_lora_rank]
-    kr_p:   k_R cache    [capacity, rope_dim]
+    args.src_p:  kv_a buffer  [seq, kv_lora_rank + rope_dim]  (strided rows)
+    args.norm_p: layernorm gamma  [kv_lora_rank]
+    args.ckv_p:  c_KV cache   [capacity, kv_lora_rank]
+    args.kr_p:   k_R cache    [capacity, rope_dim]
 
     Assumes mla_rope_kr has already been applied to src in-place.
     """
+    var src_p = args.src_p
+    var norm_p = args.norm_p
+    var ckv_p = args.ckv_p
+    var kr_p = args.kr_p
+
     comptime stride = kv_lora_rank + rope_dim
     comptime f32w = simd_width_of[DType.float32]()
     comptime bf16w = simd_width_of[DType.bfloat16]()
     comptime eps_f = Float32(eps)
 
-    var start_row = start_end >> 32
-    var end_row = start_end & 0xFFFFFFFF
+    var start_row = args.start_row
+    var end_row = args.end_row
+    var pos = args.pos
 
     for row in range(start_row, end_row):
         var src_row = src_p + row * stride
 
-        # RMSNorm c_KV portion → write to cache
+        # RMSNorm c_KV portion -> write to cache
         var sq_acc = SIMD[DType.float32, f32w](0)
         for c in range(0, kv_lora_rank, f32w):
             var x = (src_row + c).load[width=f32w]().cast[DType.float32]()
@@ -302,7 +334,7 @@ def mla_kv_split_kernel[kv_lora_rank: Int, rope_dim: Int, eps: Float64](
             var g = (norm_p + c).load[width=f32w]().cast[DType.float32]()
             (dst_ckv + c).store((x * sv * g).cast[DType.bfloat16]())
 
-        # Copy k_R (already RoPE'd) → write to cache
+        # Copy k_R (already RoPE'd) -> write to cache
         var dst_kr = kr_p + (pos + row) * rope_dim
         for c in range(0, rope_dim, bf16w):
             (dst_kr + c).store(
@@ -350,21 +382,18 @@ def mla_kv_cache_write[
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
+    var src_pp = tptr[Scalar[DType.bfloat16]](src.ptr)
+    var norm_pp = tptr[Scalar[DType.bfloat16]](norm.ptr)
+    var ckv_pp = tptr[Scalar[DType.bfloat16]](ckv_cache.ptr)
+    var kr_pp = tptr[Scalar[DType.bfloat16]](kr_cache.ptr)
+    var jobs = InlineArray[MLAKVSplitArgs, MAX_POOL_CAPACITY](uninitialized=True)
     for i in range(num_jobs):
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
-        var pack = pool.get_args_base() + i
-        pack[].arg0 = src.ptr
-        pack[].arg1 = norm.ptr
-        pack[].arg2 = ckv_cache.ptr
-        pack[].arg3 = kr_cache.ptr
-        pack[].arg4 = (start << 32) | end
-        pack[].arg5 = pos
+        jobs[i] = MLAKVSplitArgs(src_pp, norm_pp, ckv_pp, kr_pp, start, end, pos)
 
-    pool.dispatch(
-        mla_kv_split_kernel[kv_lora_rank, rope_dim, eps],
-        pool.get_args_base(), num_jobs,
-    )
+    pool.dispatch[MLAKVSplitArgs, mla_kv_split_kernel[kv_lora_rank, rope_dim, eps]](
+        UnsafePointer(to=jobs[0]), num_jobs)
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))

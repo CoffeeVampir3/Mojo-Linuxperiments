@@ -22,6 +22,7 @@ from std.collections import InlineArray
 from numa import NumaArena, NumaInfo
 from notstdcollections import HeapMoveArray
 from threading import BurstPool
+from threading.threading_shared import ptr as tptr
 
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named, BF16, F32, I8,
@@ -43,7 +44,7 @@ from kernels.kernel_ops import (
 from kernels.kv_rotors import init_rope_tables
 from experimental2.kernels.float_gemv import float_gemv
 from experimental2.kernels.rmsnorm_fwht_quantize import rmsnorm_fwht_quantize
-from experimental2.kernels.int8_gemv import int8_gemv, WorkerConfig, fused_gu_silu, FusedGUSiluConfig
+from experimental2.kernels.int8_gemv import int8_gemv, fused_gu_silu
 from experimental2.kernels.rope_and_kv_cache_write import rope_and_kv_cache_write
 from experimental2.attn_amx_decode import (
     decode as amx_decode, decode_merge,
@@ -690,7 +691,7 @@ def derive_layer_scales[tp: Int](arena_base: Int) -> InlineArray[LayerScales, C.
 
 
 # =============================================================================
-# NUMA-local dispatch kernels (BurstPool 6-Int-arg ABI)
+# NUMA-local dispatch kernels (typed dispatch ABI)
 # =============================================================================
 
 
@@ -709,39 +710,50 @@ struct KVWriteConfig(Copyable, ImplicitlyCopyable):
 
 
 def kv_write_worker[head_dim: Int, num_kv_heads: Int, max_seq: Int, num_q_heads: Int](
-    config_ptr: Int, unused0: Int, unused1: Int, unused2: Int, unused3: Int, unused4: Int,
+    cfg: KVWriteConfig,
 ):
-    var cfg = UnsafePointer[KVWriteConfig, MutAnyOrigin](unsafe_from_address=config_ptr)
     rope_and_kv_cache_write[head_dim, num_kv_heads, max_seq, num_q_heads](
-        UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=cfg[].k_ptr),
-        UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=cfg[].v_ptr),
-        cfg[].k_stride, cfg[].v_stride,
-        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cfg[].cos_ptr),
-        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cfg[].sin_ptr),
-        KVCache[max_seq, head_dim, num_kv_heads, num_q_heads](cfg[].cache_base),
-        cfg[].pos, cfg[].seq_len, cfg[].s_v,
+        UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=cfg.k_ptr),
+        UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=cfg.v_ptr),
+        cfg.k_stride, cfg.v_stride,
+        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cfg.cos_ptr),
+        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cfg.sin_ptr),
+        KVCache[max_seq, head_dim, num_kv_heads, num_q_heads](cfg.cache_base),
+        cfg.pos, cfg.seq_len, cfg.s_v,
     )
 
 
-def elem_add_worker(
-    a_ptr: Int, b_ptr: Int, dst_ptr: Int, count: Int, unused0: Int, unused1: Int,
-):
-    var ap = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=a_ptr)
-    var bp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=b_ptr)
-    var dp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=dst_ptr)
+@fieldwise_init
+struct ElemAddArgs(Copyable, ImplicitlyCopyable):
+    var a_ptr: Int
+    var b_ptr: Int
+    var dst_ptr: Int
+    var count: Int
+
+
+def elem_add_worker(args: ElemAddArgs):
+    var ap = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.a_ptr)
+    var bp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.b_ptr)
+    var dp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.dst_ptr)
     comptime width = simd_width_of[DType.float32]()
-    for i in range(0, count, width):
+    for i in range(0, args.count, width):
         var av = (ap + i).load[width=width]().cast[DType.float32]()
         var bv = (bp + i).load[width=width]().cast[DType.float32]()
         (dp + i).store((av + bv).cast[DType.bfloat16]())
 
 
+@fieldwise_init
+struct DecodeMergeArgs(Copyable, ImplicitlyCopyable):
+    var scratch: Int
+    var wpg: Int
+    var vagg_scale_bits: Int
+
+
 def decode_merge_worker[num_heads: Int, num_kv_heads: Int, head_dim: Int](
-    scratch: Int, wpg: Int, vagg_scale_bits: Int,
-    unused0: Int, unused1: Int, unused2: Int,
+    args: DecodeMergeArgs,
 ):
-    var vagg_scale = Float32(from_bits=UInt32(vagg_scale_bits))
-    decode_merge[num_heads, num_kv_heads, head_dim](scratch, wpg, vagg_scale)
+    var vagg_scale = Float32(from_bits=UInt32(args.vagg_scale_bits))
+    decode_merge[num_heads, num_kv_heads, head_dim](args.scratch, args.wpg, vagg_scale)
 
 
 # =============================================================================
@@ -910,14 +922,6 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
         var post_scale_lease = self.scratch.borrow[Float32, C.MAX_SEQ_LEN]()
         var v_scale_lease = self.scratch.borrow[Float32, C.MAX_SEQ_LEN]()
 
-        # Config buffers that outlive closures — enables truly parallel dispatch.
-        # Reused across layers (each ranks.parallel joins before the next phase).
-        comptime MAX_CFGS = 128 * Self.tp
-        var gemv_cfg_buf = InlineArray[WorkerConfig, MAX_CFGS](fill=WorkerConfig(0, 0, 0))
-        var gemv_cfg_base = Int(UnsafePointer(to=gemv_cfg_buf).bitcast[WorkerConfig]())
-        var fused_cfg_buf = InlineArray[FusedGUSiluConfig, MAX_CFGS](
-            fill=FusedGUSiluConfig(0, 0, 0, 0, 0, 0, 0))
-        var fused_cfg_base = Int(UnsafePointer(to=fused_cfg_buf).bitcast[FusedGUSiluConfig]())
         var kv_cfg_buf = InlineArray[KVWriteConfig, Self.tp](
             fill=KVWriteConfig(0, 0, 0, 0, 0, 0, 0, 0, 0, Float32(0)))
         var kv_cfg_base = Int(UnsafePointer(to=kv_cfg_buf).bitcast[KVWriteConfig]())
@@ -956,7 +960,6 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                     rv.layer_weight[L.Q_ROW_SCALE](layer_idx).ptr,
                     sb + qkv.offset, seq_len,
                     sb + act_scale_lease.offset,
-                    gemv_cfg_base + rank * 128 * size_of[WorkerConfig](),
                     pool)
             ranks.parallel[do_qkv_gemv]()
 
@@ -976,11 +979,9 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                     rv.rope_cos().ptr, rv.rope_sin().ptr,
                     rv.kv_base(layer_idx),
                     pos, seq_len, ls.v_layer_scale)
-                var pack = pool.get_args_base()
-                pack[].arg0 = Int(cfg_ptr)
-                pool.dispatch(
-                    kv_write_worker[C.HEAD_DIM, M.LOCAL_KV_HEADS, C.MAX_SEQ_LEN, M.LOCAL_HEADS],
-                    pool.get_args_base(), 1)
+                pool.dispatch[KVWriteConfig,
+                    kv_write_worker[C.HEAD_DIM, M.LOCAL_KV_HEADS, C.MAX_SEQ_LEN, M.LOCAL_HEADS]](
+                    cfg_ptr, 1)
                 return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                     unsafe_from_address=Int(UnsafePointer(to=pool))))
             ranks.parallel[do_kv_write]()
@@ -1006,13 +1007,11 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                     var max_blocks = (context + DECODE_BLOCK_N - 1) // DECODE_BLOCK_N
                     var wpg = min(min(wpg_hint, max_blocks), pool.get_capacity() // M.LOCAL_KV_HEADS)
                     var vagg_scale = ls.v_layer_scale / (Float32(255) * Float32(127))
-                    var pack = pool.get_args_base()
-                    pack[].arg0 = sb + attn.offset
-                    pack[].arg1 = wpg
-                    pack[].arg2 = Int(vagg_scale.to_bits())
-                    pool.dispatch(
-                        decode_merge_worker[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM],
-                        pool.get_args_base(), 1)
+                    var merge_args = InlineArray[DecodeMergeArgs, 1](
+                        fill=DecodeMergeArgs(sb + attn.offset, wpg, Int(vagg_scale.to_bits())))
+                    pool.dispatch[DecodeMergeArgs,
+                        decode_merge_worker[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM]](
+                        UnsafePointer(to=merge_args[0]), 1)
                     return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                         unsafe_from_address=Int(UnsafePointer(to=pool))))
                 else:
@@ -1041,7 +1040,6 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                     rv.layer_weight[L.O_ROW_SCALE](layer_idx).ptr,
                     rv.x_residual(seq_len).ptr, seq_len,
                     sb + v_scale_lease.offset,
-                    gemv_cfg_base + rank * 128 * size_of[WorkerConfig](),
                     pool)
             ranks.parallel[do_o_gemv]()
 
@@ -1054,12 +1052,14 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
 
             @parameter
             def do_attn_res_add[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                var pack = pool.get_args_base()
-                pack[].arg0 = rv.x_main(seq_len).ptr
-                pack[].arg1 = rv.x_residual(seq_len).ptr
-                pack[].arg2 = rv.x_main(seq_len).ptr
-                pack[].arg3 = seq_len * C.HIDDEN
-                pool.dispatch(elem_add_worker, pool.get_args_base(), 1)
+                var add_args = InlineArray[ElemAddArgs, 1](
+                    fill=ElemAddArgs(
+                        rv.x_main(seq_len).ptr,
+                        rv.x_residual(seq_len).ptr,
+                        rv.x_main(seq_len).ptr,
+                        seq_len * C.HIDDEN))
+                pool.dispatch[ElemAddArgs, elem_add_worker](
+                    UnsafePointer(to=add_args[0]), 1)
                 return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                     unsafe_from_address=Int(UnsafePointer(to=pool))))
             ranks.parallel[do_attn_res_add]()
@@ -1102,7 +1102,6 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                     sb + post_i8.offset,
                     sb + post_scale_lease.offset,
                     seq_len, sb + act_scale_lease.offset,
-                    fused_cfg_base + rank * 128 * size_of[FusedGUSiluConfig](),
                     pool)
             ranks.parallel[do_fused_gu_silu]()
 
@@ -1121,7 +1120,6 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                     rv.layer_weight[L.DOWN_ROW_SCALE](layer_idx).ptr,
                     rv.x_residual(seq_len).ptr, seq_len,
                     sb + post_scale_lease.offset,
-                    gemv_cfg_base + rank * 128 * size_of[WorkerConfig](),
                     pool)
             ranks.parallel[do_down_gemv]()
 
@@ -1133,12 +1131,14 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
 
             @parameter
             def do_mlp_res_add[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                var pack = pool.get_args_base()
-                pack[].arg0 = rv.x_main(seq_len).ptr
-                pack[].arg1 = rv.x_residual(seq_len).ptr
-                pack[].arg2 = rv.x_main(seq_len).ptr
-                pack[].arg3 = seq_len * C.HIDDEN
-                pool.dispatch(elem_add_worker, pool.get_args_base(), 1)
+                var add_args = InlineArray[ElemAddArgs, 1](
+                    fill=ElemAddArgs(
+                        rv.x_main(seq_len).ptr,
+                        rv.x_residual(seq_len).ptr,
+                        rv.x_main(seq_len).ptr,
+                        seq_len * C.HIDDEN))
+                pool.dispatch[ElemAddArgs, elem_add_worker](
+                    UnsafePointer(to=add_args[0]), 1)
                 return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                     unsafe_from_address=Int(UnsafePointer(to=pool))))
             ranks.parallel[do_mlp_res_add]()

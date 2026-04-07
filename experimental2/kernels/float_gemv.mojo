@@ -6,21 +6,31 @@ Workers split N (output columns), 4-wide column tiling per worker.
 
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
+from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
+from threading.threading_shared import ptr as tptr
 
 from modeling.model_spec import Encoding, Shaped, Bound, DynView
 from kernels.kernel_ops import PoolFence
 
 
-def float_gemv_kernel[K: Int, N: Int](
-    in_ptr: Int, weight_ptr: Int, out_ptr: Int,
-    start_col: Int, end_col: Int, unused: Int,
-):
-    var ip = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=in_ptr)
-    var wp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=weight_ptr)
-    var dp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=out_ptr)
+@fieldwise_init
+struct FloatGemvArgs(Copyable, ImplicitlyCopyable):
+    var in_ptr: Int
+    var weight_ptr: Int
+    var out_ptr: Int
+    var start_col: Int
+    var end_col: Int
+
+
+def float_gemv_kernel[K: Int, N: Int](args: FloatGemvArgs):
+    var ip = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.in_ptr)
+    var wp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.weight_ptr)
+    var dp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.out_ptr)
     comptime width = simd_width_of[DType.float32]()
     comptime Nr = 4
+    var start_col = args.start_col
+    var end_col = args.end_col
     var n_full = end_col - ((end_col - start_col) % Nr)
 
     for n in range(start_col, n_full, Nr):
@@ -67,20 +77,19 @@ def float_gemv[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Sh
         return PoolFence[P].completed()
 
     comptime N = W.ROWS
+    comptime MAX_POOL_CAPACITY = 128
     var num_jobs = pool.get_capacity()
     var cols_per_job = (N + num_jobs - 1) // num_jobs
 
+    var jobs = InlineArray[FloatGemvArgs, MAX_POOL_CAPACITY](
+        fill=FloatGemvArgs(0, 0, 0, 0, 0))
     for i in range(num_jobs):
         var start = i * cols_per_job
         var end = min(start + cols_per_job, N)
-        var pack = pool.get_args_base() + i
-        pack[].arg0 = input.ptr
-        pack[].arg1 = weight.ptr
-        pack[].arg2 = output.ptr
-        pack[].arg3 = start
-        pack[].arg4 = end
+        jobs[i] = FloatGemvArgs(input.ptr, weight.ptr, output.ptr, start, end)
 
-    pool.dispatch(float_gemv_kernel[InT.COLS, N], pool.get_args_base(), num_jobs)
+    pool.dispatch[FloatGemvArgs, float_gemv_kernel[InT.COLS, N]](
+        UnsafePointer(to=jobs[0]), num_jobs)
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))

@@ -1,7 +1,6 @@
 """BurstPool stress test — correctness + timing comparison with jthread."""
 
 from threading.burst_threading import BurstPool
-from threading.threading_shared import ArgPack
 from notstdcollections import HeapMoveArray
 from std.memory import UnsafePointer
 from std.collections import InlineArray
@@ -27,19 +26,25 @@ def calc_scratch_sum(iter: Int, job_idx: Int) -> Int:
     return (iter + job_idx) * 128 + 8128
 
 
-def stress_kernel(out_addr: Int, iter: Int, job_idx: Int,
-                  unused1: Int, unused2: Int, unused3: Int):
+@fieldwise_init
+struct StressArgs(Copyable, ImplicitlyCopyable):
+    var out_addr: UnsafePointer[Int, MutAnyOrigin]
+    var iter: Int
+    var job_idx: Int
+
+
+def stress_kernel(args: StressArgs):
     var scratch = InlineArray[Int, 128](uninitialized=True)
     for i in range(128):
-        scratch[i] = iter + job_idx + i
+        scratch[i] = args.iter + args.job_idx + i
 
-    var x = calc_result(iter, job_idx)
+    var x = calc_result(args.iter, args.job_idx)
 
     var scratch_sum = 0
     for i in range(128):
         scratch_sum += scratch[i]
 
-    UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=out_addr)[] = x + scratch_sum
+    args.out_addr[] = x + scratch_sum
 
 
 def main():
@@ -54,10 +59,6 @@ def main():
     var output = HeapMoveArray[Int](CAPACITY)
     for _ in range(CAPACITY):
         output.push(0)
-
-    var packs = HeapMoveArray[ArgPack](CAPACITY)
-    for _ in range(CAPACITY):
-        packs.push(ArgPack())
 
     var total_dispatch_ns = 0
     var total_join_ns = 0
@@ -75,14 +76,14 @@ def main():
         elif iter_i % 5 == 3:
             jobs = (CAPACITY * 3) // 4
 
+        var job_args = InlineArray[StressArgs, CAPACITY](uninitialized=True)
         for j in range(jobs):
-            var pack_ptr = packs.ptr + j
-            pack_ptr[].arg0 = Int(output.ptr + j)
-            pack_ptr[].arg1 = iter_i
-            pack_ptr[].arg2 = j
+            job_args[j] = StressArgs(
+                UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(output.ptr + j)),
+                iter_i, j)
 
         var t0 = Int(perf_counter_ns())
-        pool.dispatch(stress_kernel, packs.ptr, jobs)
+        pool.dispatch[StressArgs, stress_kernel](UnsafePointer(to=job_args[0]), jobs)
         var t1 = Int(perf_counter_ns())
         pool.join()
         var t2 = Int(perf_counter_ns())
