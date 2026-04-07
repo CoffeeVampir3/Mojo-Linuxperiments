@@ -244,6 +244,39 @@ def is_deepseek_v3_pretokenizer_signature(stages: List[PreTokenizerStageSignatur
     return True
 
 
+def is_deepseek_v2_lite_pretokenizer_signature(stages: List[PreTokenizerStageSignature]) -> Bool:
+    if len(stages) != 7:
+        return False
+
+    # Stage 0: Split newlines
+    if stages[0].stage_type != "Split" or stages[0].behavior != "Isolated":
+        return False
+    if not ("[\\r\\n]" in stages[0].regex_pattern or "[\r\n]" in stages[0].regex_pattern):
+        return False
+
+    # Stage 1: Split unicode letters
+    if stages[1].stage_type != "Split" or stages[1].behavior != "Isolated":
+        return False
+    if not ("[A-Za-z" in stages[1].regex_pattern):
+        return False
+
+    # Stage 2: Split punctuation/symbols
+    if stages[2].stage_type != "Split" or stages[2].behavior != "Isolated":
+        return False
+    if not ("[!-/" in stages[2].regex_pattern):
+        return False
+
+    # Stage 5: Digits
+    if stages[5].stage_type != "Digits":
+        return False
+
+    # Stage 6: ByteLevel
+    if stages[6].stage_type != "ByteLevel":
+        return False
+
+    return True
+
+
 def detect_tokenizer_flavor(path: Path) -> Int:
     var file_bytes: List[Byte]
     try:
@@ -276,6 +309,8 @@ def detect_tokenizer_flavor(path: Path) -> Int:
     if is_gpt2_pretokenizer_signature(stages):
         return TOKENIZER_FLAVOR_GPT2
     if is_deepseek_v3_pretokenizer_signature(stages):
+        return TOKENIZER_FLAVOR_DEEPSEEK_V3
+    if is_deepseek_v2_lite_pretokenizer_signature(stages):
         return TOKENIZER_FLAVOR_DEEPSEEK_V3
     return TOKENIZER_FLAVOR_UNSUPPORTED
 

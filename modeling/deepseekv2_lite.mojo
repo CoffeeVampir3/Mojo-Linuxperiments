@@ -23,7 +23,13 @@ from modeling.model_spec import (
     LogitsView,
 )
 from modeling.loader import load_weights, LoadResult
-from kernels.kv_rotors import init_rope_tables
+from kernels.kernel_ops import (
+    gemm, rmsnorm, embed_lookup, silu_mul, elem_add, PoolFence,
+)
+from kernels.mla_attn import mla_attention, mla_kv_cache_write
+from kernels.kv_rotors import init_rope_tables, mla_rope_q, mla_rope_kr, yarn_softmax_scale
+from kernels.moe_kernels import moe_dispatch, BF16Ptr
+from threading.threading_shared import ptr as tptr
 from experimental.linear_borrow_pool import ScratchPool, ScratchLease
 
 
@@ -220,11 +226,19 @@ struct DSV2Model[tp: Int](WeightIterable):
     # Per-rank head counts
     comptime LOCAL_HEADS = C.NUM_HEADS // Self.tp
 
-    # Per-rank activation slots
+    # Per-rank activation slots (state arena, not scratch)
     comptime ROPE_COS    = Slot[F32, Replicated, C.MAX_SEQ_LEN, C.ROPE_HALF, Self.tp]
     comptime ROPE_SIN    = Slot[F32, Replicated, C.MAX_SEQ_LEN, C.ROPE_HALF, Self.tp]
     comptime X_MAIN      = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.HIDDEN,   Self.tp]
-    comptime X_RESIDUAL   = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.HIDDEN,   Self.tp]
+    comptime X_RESIDUAL  = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.HIDDEN,   Self.tp]
+
+    # Scratch view shapes (for ScratchPool borrow → scratch_view)
+    comptime Q_VIEW      = Slot[BF16, RowShard, C.MAX_SEQ_LEN, C.Q_PROJ_DIM,        Self.tp]
+    comptime KVA_VIEW    = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.KV_A_DIM,        Self.tp]
+    comptime ATTN_VIEW   = Slot[BF16, RowShard, C.MAX_SEQ_LEN, C.O_PROJ_DIM,        Self.tp]
+    comptime SHARED_VIEW = Slot[BF16, RowShard, C.MAX_SEQ_LEN, C.SHARED_INTERMEDIATE, Self.tp]
+    comptime LOGITS      = Slot[BF16, Replicated, 1, C.VOCAB_SIZE, Self.tp]
+    comptime DENSE_MLP   = Slot[BF16, RowShard, C.MAX_SEQ_LEN, C.DENSE_INTERMEDIATE, Self.tp]
 
     comptime SCRATCH_CAPACITY = Self.calculate_peak_scratch()
 
@@ -233,21 +247,27 @@ struct DSV2Model[tp: Int](WeightIterable):
         comptime S  = C.MAX_SEQ_LEN
         comptime TP = Self.tp
 
-        # Attention phase: q + kv_a (latent) + attn_out
+        # Attention phase: q + kv_a + attn_out (all live simultaneously)
         comptime attn_peak = (
             S * (C.Q_PROJ_DIM // TP) * 2
             + S * C.KV_A_DIM * 2
             + S * (C.O_PROJ_DIM // TP) * 2
         )
 
-        # MoE phase: shared gate+up (always active)
-        comptime moe_peak = S * (C.SHARED_INTERMEDIATE // TP) * 2 * 2
+        # Dense FFN phase (layer 0): gate + up
+        comptime dense_peak = S * (C.DENSE_INTERMEDIATE // TP) * 2 * 2
+
+        # MoE phase: shared gate + up + per-expert output buffers
+        comptime moe_peak = (
+            S * (C.SHARED_INTERMEDIATE // TP) * 2 * 2
+            + C.N_EXPERTS_PER_TOK * C.HIDDEN * 2
+        )
 
         # Logits (post-loop)
         comptime logit_bytes = C.VOCAB_SIZE * 2
 
-        comptime layer_peak = attn_peak if attn_peak > moe_peak else moe_peak
-        return layer_peak if layer_peak > logit_bytes else logit_bytes
+        comptime layer_peak = max(attn_peak, max(dense_peak, moe_peak))
+        return max(layer_peak, logit_bytes)
 
     # KV cache layout (same shape for all layers)
     comptime KV_CACHE_STRIDE = Self.DENSE.cache_bytes()
@@ -299,6 +319,8 @@ struct DSV2Model[tp: Int](WeightIterable):
 
 struct RankView[tp: Int]:
     comptime M = DSV2Model[Self.tp]
+    comptime D = DenseLayer[Self.tp]
+    comptime E = MoELayer[Self.tp]
     var base: Int
 
     def __init__(out self, arena_base: Int):
@@ -310,11 +332,21 @@ struct RankView[tp: Int]:
     def state_base(self) -> Int:
         return self.base + Self.M.DISTRIBUTED_BYTES
 
+    # --- Weight accessors ---
+
     def dense_layer_weight[T: Encoding & Shaped & Placed & Named](self) -> Bound[T]:
         return bind[T](self.weight_base() + Self.M.LAYERS_OFF)
 
     def moe_layer_weight[T: Encoding & Shaped & Placed & Named](self, layer: Int) -> Bound[T]:
         return bind[T](self.weight_base() + Self.M.MOE_LAYERS_OFF + (layer - C.FIRST_K_DENSE) * Self.M.MOE_STRIDE)
+
+    def host_weight[T: Encoding & Shaped & Placed & Named](self) -> Bound[T]:
+        return bind[T](self.weight_base())
+
+    def expert_weight_base(self, layer: Int) -> Int:
+        return self.weight_base() + Self.M.MOE_LAYERS_OFF + (layer - C.FIRST_K_DENSE) * Self.M.MOE_STRIDE + Self.E.EXPERTS_OFF
+
+    # --- Activation state ---
 
     def x_main(self, seq_len: Int) -> DynView[Self.M.X_MAIN]:
         return DynView[Self.M.X_MAIN](self.state_base() + Self.M.X_MAIN_OFF, seq_len)
@@ -322,8 +354,29 @@ struct RankView[tp: Int]:
     def x_residual(self, seq_len: Int) -> DynView[Self.M.X_RESIDUAL]:
         return DynView[Self.M.X_RESIDUAL](self.state_base() + Self.M.X_RESIDUAL_OFF, seq_len)
 
+    # --- KV caches ---
+
+    def ckv_cache(self, layer: Int) -> CacheView[Self.D.CKV_CACHE]:
+        return CacheView[Self.D.CKV_CACHE](
+            self.state_base() + Self.M.KV_OFF + layer * Self.M.KV_CACHE_STRIDE)
+
+    def kr_cache(self, layer: Int) -> CacheView[Self.D.KR_CACHE]:
+        return CacheView[Self.D.KR_CACHE](
+            self.state_base() + Self.M.KV_OFF + layer * Self.M.KV_CACHE_STRIDE
+            + byte_count[Self.D.CKV_CACHE]())
+
+    # --- Scratch ---
+
     def scratch_base(self) -> Int:
         return self.state_base() + Self.M.SCRATCH_OFF
+
+    def scratch_view[V: Encoding & Shaped](self, read lease: ScratchLease, seq_len: Int) -> DynView[V]:
+        return DynView[V](self.scratch_base() + lease.offset, seq_len)
+
+    def scratch_ptr[T: AnyType](self, read lease: ScratchLease) -> UnsafePointer[T, MutAnyOrigin]:
+        return UnsafePointer[T, MutAnyOrigin](unsafe_from_address=self.scratch_base() + lease.offset)
+
+    # --- RoPE ---
 
     def rope_cos(self) -> Bound[Self.M.ROPE_COS]:
         return Bound[Self.M.ROPE_COS](self.state_base() + Self.M.ROPE_COS_OFF)
@@ -463,15 +516,215 @@ struct DeepSeekV2Lite[tp: Int](Movable):
         return model^
 
     def forward(mut self, tokens_ptr: Int, seq_len: Int, pos: Int) -> LogitsView[C.VOCAB_SIZE]:
-        """Stub forward — returns zeroed logits without computation."""
-        var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
+        comptime M = Self.M
+        comptime D = M.DENSE
+        comptime E = M.MOE
+        comptime softmax_scale = yarn_softmax_scale(
+            C.Q_HEAD_DIM, Float64(C.YARN_FACTOR), Float64(C.YARN_MSCALE_ALL_DIM))
+
+        debug_assert(seq_len > 0 and pos >= 0 and pos + seq_len <= C.MAX_SEQ_LEN,
+            "forward: sequence range exceeds MAX_SEQ_LEN")
+
         var host = self.rank(0)
-        var logit_ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-            unsafe_from_address=host.scratch_base() + logit_lease.offset
+        var pool = self.pool_ptrs[0]
+
+        # --- Embed ---
+        embed_lookup(host.host_weight[M.EMBED](), tokens_ptr,
+                     host.x_main(seq_len), pool[]).join()
+
+        for layer_idx in range(C.NUM_LAYERS):
+
+            # =============================================================
+            # Attention block (same for dense and MoE layers)
+            # =============================================================
+
+            var q_lease = self.scratch.borrow[Scalar[DType.bfloat16],
+                C.MAX_SEQ_LEN * M.Q_VIEW.COLS]()
+            var kva_lease = self.scratch.borrow[Scalar[DType.bfloat16],
+                C.MAX_SEQ_LEN * M.KVA_VIEW.COLS]()
+
+            # input_layernorm
+            if layer_idx < C.FIRST_K_DENSE:
+                rmsnorm(host.x_main(seq_len),
+                        host.dense_layer_weight[D.INPUT_NORM](),
+                        host.x_residual(seq_len), pool[],
+                        Float32(C.RMS_NORM_EPS)).join()
+            else:
+                rmsnorm(host.x_main(seq_len),
+                        host.moe_layer_weight[E.INPUT_NORM](layer_idx),
+                        host.x_residual(seq_len), pool[],
+                        Float32(C.RMS_NORM_EPS)).join()
+
+            # Q projection
+            if layer_idx < C.FIRST_K_DENSE:
+                gemm(host.x_residual(seq_len),
+                     host.dense_layer_weight[D.Q_PROJ](),
+                     host.scratch_view[M.Q_VIEW](q_lease, seq_len), pool[]).join()
+            else:
+                gemm(host.x_residual(seq_len),
+                     host.moe_layer_weight[E.Q_PROJ](layer_idx),
+                     host.scratch_view[M.Q_VIEW](q_lease, seq_len), pool[]).join()
+
+            # KV-A projection (latent + RoPE key)
+            if layer_idx < C.FIRST_K_DENSE:
+                gemm(host.x_residual(seq_len),
+                     host.dense_layer_weight[D.KV_A_PROJ](),
+                     host.scratch_view[M.KVA_VIEW](kva_lease, seq_len), pool[]).join()
+            else:
+                gemm(host.x_residual(seq_len),
+                     host.moe_layer_weight[E.KV_A_PROJ](layer_idx),
+                     host.scratch_view[M.KVA_VIEW](kva_lease, seq_len), pool[]).join()
+
+            # RoPE on q_pe and k_R
+            mla_rope_q[C.QK_ROPE_HEAD_DIM, C.QK_NOPE_HEAD_DIM, C.NUM_HEADS](
+                host.scratch_view[M.Q_VIEW](q_lease, seq_len),
+                host.rope_cos(), host.rope_sin(), pos)
+            mla_rope_kr[C.QK_ROPE_HEAD_DIM](
+                host.scratch_view[M.KVA_VIEW](kva_lease, seq_len),
+                host.rope_cos(), host.rope_sin(), pos)
+
+            # Split kv_a → c_KV (normed) + k_R caches
+            if layer_idx < C.FIRST_K_DENSE:
+                mla_kv_cache_write[C.KV_LORA_RANK, C.QK_ROPE_HEAD_DIM, C.RMS_NORM_EPS](
+                    host.scratch_view[M.KVA_VIEW](kva_lease, seq_len),
+                    host.dense_layer_weight[D.KV_A_NORM](),
+                    host.ckv_cache(layer_idx), host.kr_cache(layer_idx),
+                    pos, pool[]).join()
+            else:
+                mla_kv_cache_write[C.KV_LORA_RANK, C.QK_ROPE_HEAD_DIM, C.RMS_NORM_EPS](
+                    host.scratch_view[M.KVA_VIEW](kva_lease, seq_len),
+                    host.moe_layer_weight[E.KV_A_NORM](layer_idx),
+                    host.ckv_cache(layer_idx), host.kr_cache(layer_idx),
+                    pos, pool[]).join()
+
+            kva_lease^.release()
+
+            # MLA attention
+            var attn_lease = self.scratch.borrow[Scalar[DType.bfloat16],
+                C.MAX_SEQ_LEN * M.ATTN_VIEW.COLS]()
+
+            if layer_idx < C.FIRST_K_DENSE:
+                mla_attention[C.NUM_HEADS, C.QK_NOPE_HEAD_DIM, C.QK_ROPE_HEAD_DIM,
+                              C.KV_LORA_RANK, C.V_HEAD_DIM, softmax_scale](
+                    host.scratch_view[M.Q_VIEW](q_lease, seq_len),
+                    host.ckv_cache(layer_idx), host.kr_cache(layer_idx),
+                    host.dense_layer_weight[D.KV_B_PROJ](),
+                    host.scratch_view[M.ATTN_VIEW](attn_lease, seq_len),
+                    pos, pool[]).join()
+            else:
+                mla_attention[C.NUM_HEADS, C.QK_NOPE_HEAD_DIM, C.QK_ROPE_HEAD_DIM,
+                              C.KV_LORA_RANK, C.V_HEAD_DIM, softmax_scale](
+                    host.scratch_view[M.Q_VIEW](q_lease, seq_len),
+                    host.ckv_cache(layer_idx), host.kr_cache(layer_idx),
+                    host.moe_layer_weight[E.KV_B_PROJ](layer_idx),
+                    host.scratch_view[M.ATTN_VIEW](attn_lease, seq_len),
+                    pos, pool[]).join()
+
+            q_lease^.release()
+
+            # O projection → x_residual
+            if layer_idx < C.FIRST_K_DENSE:
+                gemm(host.scratch_view[M.ATTN_VIEW](attn_lease, seq_len),
+                     host.dense_layer_weight[D.O_PROJ](),
+                     host.x_residual(seq_len), pool[]).join()
+            else:
+                gemm(host.scratch_view[M.ATTN_VIEW](attn_lease, seq_len),
+                     host.moe_layer_weight[E.O_PROJ](layer_idx),
+                     host.x_residual(seq_len), pool[]).join()
+
+            attn_lease^.release()
+
+            # Residual add
+            elem_add(host.x_main(seq_len), host.x_residual(seq_len),
+                     host.x_main(seq_len))
+
+            # =============================================================
+            # FFN block
+            # =============================================================
+
+            # post_attention_layernorm
+            if layer_idx < C.FIRST_K_DENSE:
+                rmsnorm(host.x_main(seq_len),
+                        host.dense_layer_weight[D.POST_ATTN_NORM](),
+                        host.x_residual(seq_len), pool[],
+                        Float32(C.RMS_NORM_EPS)).join()
+            else:
+                rmsnorm(host.x_main(seq_len),
+                        host.moe_layer_weight[E.POST_ATTN_NORM](layer_idx),
+                        host.x_residual(seq_len), pool[],
+                        Float32(C.RMS_NORM_EPS)).join()
+
+            if layer_idx < C.FIRST_K_DENSE:
+                # --- Dense FFN (layer 0) ---
+                var gate_lease = self.scratch.borrow[Scalar[DType.bfloat16],
+                    C.MAX_SEQ_LEN * M.DENSE_MLP.COLS]()
+                var up_lease = self.scratch.borrow[Scalar[DType.bfloat16],
+                    C.MAX_SEQ_LEN * M.DENSE_MLP.COLS]()
+
+                gemm(host.x_residual(seq_len),
+                     host.dense_layer_weight[D.GATE_PROJ](),
+                     host.scratch_view[M.DENSE_MLP](gate_lease, seq_len), pool[]).join()
+                gemm(host.x_residual(seq_len),
+                     host.dense_layer_weight[D.UP_PROJ](),
+                     host.scratch_view[M.DENSE_MLP](up_lease, seq_len), pool[]).join()
+                silu_mul(host.scratch_view[M.DENSE_MLP](gate_lease, seq_len),
+                         host.scratch_view[M.DENSE_MLP](up_lease, seq_len),
+                         host.scratch_view[M.DENSE_MLP](gate_lease, seq_len))
+                up_lease^.release()
+                gemm(host.scratch_view[M.DENSE_MLP](gate_lease, seq_len),
+                     host.dense_layer_weight[D.DOWN_PROJ](),
+                     host.x_residual(seq_len), pool[]).join()
+                gate_lease^.release()
+            else:
+                # --- MoE FFN (layers 1-26) ---
+                var sg_lease = self.scratch.borrow[Scalar[DType.bfloat16],
+                    C.MAX_SEQ_LEN * M.SHARED_VIEW.COLS]()
+                var su_lease = self.scratch.borrow[Scalar[DType.bfloat16],
+                    C.MAX_SEQ_LEN * M.SHARED_VIEW.COLS]()
+                var eo_lease = self.scratch.borrow[Scalar[DType.bfloat16],
+                    C.N_EXPERTS_PER_TOK * C.HIDDEN]()
+
+                moe_dispatch[C.N_ROUTED_EXPERTS, C.N_EXPERTS_PER_TOK,
+                             C.MOE_INTERMEDIATE, C.SHARED_INTERMEDIATE,
+                             C.HIDDEN, Self.tp](
+                    tptr[Scalar[DType.bfloat16]](host.x_residual(seq_len).ptr),
+                    tptr[Scalar[DType.bfloat16]](host.moe_layer_weight[E.ROUTER](layer_idx).ptr),
+                    host.expert_weight_base(layer_idx),
+                    E.EXPERT.STRIDE,
+                    tptr[Scalar[DType.bfloat16]](host.moe_layer_weight[E.SHARED_GATE](layer_idx).ptr),
+                    tptr[Scalar[DType.bfloat16]](host.moe_layer_weight[E.SHARED_UP](layer_idx).ptr),
+                    tptr[Scalar[DType.bfloat16]](host.moe_layer_weight[E.SHARED_DOWN](layer_idx).ptr),
+                    host.scratch_ptr[Scalar[DType.bfloat16]](sg_lease),
+                    host.scratch_ptr[Scalar[DType.bfloat16]](su_lease),
+                    host.scratch_ptr[Scalar[DType.bfloat16]](eo_lease),
+                    tptr[Scalar[DType.bfloat16]](host.x_residual(seq_len).ptr),
+                    0,
+                    pool[],
+                )
+
+                eo_lease^.release()
+                su_lease^.release()
+                sg_lease^.release()
+
+            # Residual add
+            elem_add(host.x_main(seq_len), host.x_residual(seq_len),
+                     host.x_main(seq_len))
+
+            _ = layer_idx
+
+        # --- Final norm + LM head ---
+        rmsnorm(host.x_main(seq_len), host.host_weight[M.FINAL_NORM](),
+                host.x_main(seq_len), pool[], Float32(C.RMS_NORM_EPS)).join()
+
+        var last_row_off = (seq_len - 1) * C.HIDDEN * M.X_MAIN.ELEMENT_BYTES
+        var last_hidden = DynView[M.X_MAIN](host.x_main(seq_len).ptr + last_row_off, 1)
+        var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
+        var logit_view = host.scratch_view[M.LOGITS](logit_lease, 1)
+        gemm(last_hidden, host.host_weight[M.LM_HEAD](), logit_view, pool[]).join()
+
+        return LogitsView[C.VOCAB_SIZE](
+            host.scratch_ptr[Scalar[DType.bfloat16]](logit_lease), logit_lease^,
         )
-        for i in range(C.VOCAB_SIZE):
-            logit_ptr[i] = Scalar[DType.bfloat16](0)
-        return LogitsView[C.VOCAB_SIZE](logit_ptr, logit_lease^)
 
     @staticmethod
     def bf16_variance(ptr: Int, n: Int) -> Float64:
