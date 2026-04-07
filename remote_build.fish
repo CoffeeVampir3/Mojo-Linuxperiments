@@ -3,6 +3,20 @@
 set REMOTE_USER blackroot
 set REMOTE_HOST 192.168.50.93
 set REMOTE_PATH /home/blackroot/Desktop/linuxperiments
+set DEFAULT_TARGET test_smollm2_butterquant.mojo
+
+if test (count $argv) -gt 0
+    set TARGET $argv[1]
+else
+    set TARGET $DEFAULT_TARGET
+end
+
+if not test -f $TARGET
+    echo "Target not found: $TARGET"
+    exit 1
+end
+
+set BINARY (string replace -r '\.mojo$' '' (basename $TARGET))
 
 rsync -av \
     --exclude='.*' \
@@ -20,5 +34,6 @@ rsync -av \
     $REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/
 
 echo "✓ Synced to $REMOTE_HOST:$REMOTE_PATH"
+echo "→ Building and running $TARGET on $REMOTE_HOST"
 
-ssh $REMOTE_USER@$REMOTE_HOST "cd $REMOTE_PATH && pixi run mojo build -I . test_smollm2_butterquant.mojo && ./test_smollm2_butterquant"
+ssh $REMOTE_USER@$REMOTE_HOST "cd $REMOTE_PATH && env MOJO_ENABLE_RUNTIME=0 pixi run mojo build -I . $TARGET && ./$BINARY"

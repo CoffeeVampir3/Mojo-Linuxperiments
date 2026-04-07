@@ -10,7 +10,7 @@ Memory layout — dual arena for NUMA-optimal access:
     Workers read mailboxes locally. Dispatcher writes remotely.
 
   Join arena (first-touch on main thread's NUMA node):
-    JoinFlags + ArgPacks
+    JoinFlags
     Main thread polls JoinFlags locally. Workers write done remotely once.
 
 Dispatch: two-pass stores to N worker mailboxes + Dekker wake check.

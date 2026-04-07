@@ -667,6 +667,21 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
     def debug_x_main_ptr(self, seq_len: Int) -> Int:
         return RankView[Self.E, Self.tp](self.bases[0]).x_main(seq_len).ptr
 
+    def debug_set_x_main(mut self, src_ptr: Int, seq_len: Int)
+        where Self.E.DTYPE == DType.bfloat16:
+        debug_assert(seq_len >= 0 and seq_len <= C.MAX_SEQ_LEN,
+            "debug_set_x_main: seq_len exceeds MAX_SEQ_LEN")
+        comptime M = Self.M
+        var ranks = Ranks[Self.E, Self.tp](self.bases, self.pool_ptrs)
+        var host = ranks.view(0)
+        memcpy(
+            dest=UnsafePointer[Byte, MutAnyOrigin](
+                unsafe_from_address=host.x_main(seq_len).ptr),
+            src=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=src_ptr),
+            count=seq_len * C.HIDDEN * 2)
+        ring_broadcast[M.X_MAIN, Self.tp](
+            host.x_main(seq_len).ptr, ranks.x_main_ptrs(seq_len), seq_len, ranks.pool_ptrs)
+
 
 # =============================================================================
 # Entry point — TP=3

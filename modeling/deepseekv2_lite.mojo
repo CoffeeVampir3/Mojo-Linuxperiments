@@ -163,9 +163,9 @@ struct MoELayer[tp: Int]:
 
     # --- MoE FFN ---
     comptime ROUTER      = PlacedSlot[BF16, Replicated, C.N_ROUTED_EXPERTS,  C.HIDDEN,             Self.tp, next_offset[Self.POST_ATTN_NORM](), "mlp.gate.weight"]
-    comptime SHARED_GATE = PlacedSlot[BF16, Replicated, C.SHARED_INTERMEDIATE, C.HIDDEN,           Self.tp, next_offset[Self.ROUTER](),         "mlp.shared_experts.gate_proj.weight"]
-    comptime SHARED_UP   = PlacedSlot[BF16, Replicated, C.SHARED_INTERMEDIATE, C.HIDDEN,           Self.tp, next_offset[Self.SHARED_GATE](),    "mlp.shared_experts.up_proj.weight"]
-    comptime SHARED_DOWN = PlacedSlot[BF16, Replicated, C.HIDDEN,             C.SHARED_INTERMEDIATE, Self.tp, next_offset[Self.SHARED_UP](),     "mlp.shared_experts.down_proj.weight"]
+    comptime SHARED_GATE = PlacedSlot[BF16, RowShard, C.SHARED_INTERMEDIATE, C.HIDDEN,             Self.tp, next_offset[Self.ROUTER](),         "mlp.shared_experts.gate_proj.weight"]
+    comptime SHARED_UP   = PlacedSlot[BF16, RowShard, C.SHARED_INTERMEDIATE, C.HIDDEN,             Self.tp, next_offset[Self.SHARED_GATE](),    "mlp.shared_experts.up_proj.weight"]
+    comptime SHARED_DOWN = PlacedSlot[BF16, ColShard, C.HIDDEN,             C.SHARED_INTERMEDIATE, Self.tp, next_offset[Self.SHARED_UP](),     "mlp.shared_experts.down_proj.weight"]
 
     # Routed experts: 64 experts, each with gate/up/down projections
     comptime EXPERTS_OFF = next_offset[Self.SHARED_DOWN]()
@@ -241,7 +241,7 @@ struct DSV2Model[tp: Int](WeightIterable):
         )
 
         # MoE phase: shared gate+up (always active)
-        comptime moe_peak = S * C.SHARED_INTERMEDIATE * 2 * 2
+        comptime moe_peak = S * (C.SHARED_INTERMEDIATE // TP) * 2 * 2
 
         # Logits (post-loop)
         comptime logit_bytes = C.VOCAB_SIZE * 2
