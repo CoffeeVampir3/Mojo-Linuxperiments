@@ -11,14 +11,17 @@ from jsontools.parser import (
     RBRACKET,
     QUOTE,
 )
-from .tokenizer import BPETokenizer, ByteTransformCapability, PreTokenizerCapability
+from .tokenizer import BPETokenizer, ByteTransformCapability, PreTokenizerCapability, span_to_string
+from .bpe import pack_pair_ids
 from .deepseek_v3 import DeepSeekV3ByteTransform, DeepSeekV3PreTokenizer
 from .gpt2 import GPT2ByteTransform, GPT2PreTokenizer, pre_tokenize as gpt2_pre_tokenize
+from .gpt_oss import GptOssByteTransform, GptOssPreTokenizer, pre_tokenize_gpt_oss
 
 
 comptime TOKENIZER_FLAVOR_UNSUPPORTED = 0
 comptime TOKENIZER_FLAVOR_GPT2 = 1
 comptime TOKENIZER_FLAVOR_DEEPSEEK_V3 = 2
+comptime TOKENIZER_FLAVOR_GPT_OSS = 3
 
 
 struct AutoPreTokenizer(PreTokenizerCapability):
@@ -34,6 +37,8 @@ struct AutoPreTokenizer(PreTokenizerCapability):
             return gpt2_pre_tokenize(text)
         if self.flavor == TOKENIZER_FLAVOR_DEEPSEEK_V3:
             return self.deepseek.pre_tokenize(text)
+        if self.flavor == TOKENIZER_FLAVOR_GPT_OSS:
+            return pre_tokenize_gpt_oss(text)
 
         var out = List[String]()
         out.append(text.copy())
@@ -41,27 +46,21 @@ struct AutoPreTokenizer(PreTokenizerCapability):
 
 
 struct ModelOptions(Movable):
-    var ignore_merges: Bool
     var fuse_unk: Bool
     var byte_fallback: Bool
     var unk_token: String
 
     def __init__(out self):
-        self.ignore_merges = False
         self.fuse_unk = False
         self.byte_fallback = False
         self.unk_token = String("")
 
 
 struct TokenizerConfigOptions(Movable):
-    var add_bos_token: Bool
-    var add_eos_token: Bool
     var bos_token: String
     var eos_token: String
 
     def __init__(out self):
-        self.add_bos_token = False
-        self.add_eos_token = False
         self.bos_token = String("")
         self.eos_token = String("")
 
@@ -244,34 +243,29 @@ def is_deepseek_v3_pretokenizer_signature(stages: List[PreTokenizerStageSignatur
     return True
 
 
-def is_deepseek_v2_lite_pretokenizer_signature(stages: List[PreTokenizerStageSignature]) -> Bool:
-    if len(stages) != 7:
+def is_gpt_oss_pretokenizer_signature(stages: List[PreTokenizerStageSignature]) -> Bool:
+    if len(stages) != 2:
         return False
 
-    # Stage 0: Split newlines
-    if stages[0].stage_type != "Split" or stages[0].behavior != "Isolated":
+    var s0 = stages[0]
+    var s1 = stages[1]
+
+    # Stage 0: Split with Isolated behavior and the o200k regex
+    if s0.stage_type != "Split" or s0.behavior != "Isolated":
         return False
-    if not ("[\\r\\n]" in stages[0].regex_pattern or "[\r\n]" in stages[0].regex_pattern):
+    if not ("\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}" in s0.regex_pattern):
+        return False
+    if not ("\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}" in s0.regex_pattern):
+        return False
+    if not ("\\p{N}{1,3}" in s0.regex_pattern):
         return False
 
-    # Stage 1: Split unicode letters
-    if stages[1].stage_type != "Split" or stages[1].behavior != "Isolated":
+    # Stage 1: ByteLevel with use_regex=false
+    if s1.stage_type != "ByteLevel":
         return False
-    if not ("[A-Za-z" in stages[1].regex_pattern):
+    if s1.use_regex:
         return False
-
-    # Stage 2: Split punctuation/symbols
-    if stages[2].stage_type != "Split" or stages[2].behavior != "Isolated":
-        return False
-    if not ("[!-/" in stages[2].regex_pattern):
-        return False
-
-    # Stage 5: Digits
-    if stages[5].stage_type != "Digits":
-        return False
-
-    # Stage 6: ByteLevel
-    if stages[6].stage_type != "ByteLevel":
+    if s1.add_prefix_space:
         return False
 
     return True
@@ -310,8 +304,8 @@ def detect_tokenizer_flavor(path: Path) -> Int:
         return TOKENIZER_FLAVOR_GPT2
     if is_deepseek_v3_pretokenizer_signature(stages):
         return TOKENIZER_FLAVOR_DEEPSEEK_V3
-    if is_deepseek_v2_lite_pretokenizer_signature(stages):
-        return TOKENIZER_FLAVOR_DEEPSEEK_V3
+    if is_gpt_oss_pretokenizer_signature(stages):
+        return TOKENIZER_FLAVOR_GPT_OSS
     return TOKENIZER_FLAVOR_UNSUPPORTED
 
 
@@ -368,11 +362,7 @@ def parse_tokenizer_config(path: Path) -> TokenizerConfigOptions:
 
         while True:
             var key = parser.object_key()
-            if key == "add_bos_token":
-                opts.add_bos_token = parse_optional_bool(parser, opts.add_bos_token)
-            elif key == "add_eos_token":
-                opts.add_eos_token = parse_optional_bool(parser, opts.add_eos_token)
-            elif key == "bos_token":
+            if key == "bos_token":
                 opts.bos_token = parse_token_string_value(parser)
             elif key == "eos_token":
                 opts.eos_token = parse_token_string_value(parser)
@@ -433,13 +423,84 @@ def parse_added_tokens_array(
         if not parser.delimited_next(RBRACKET):
             break
 
+def split_merge_string(pair: String) -> Optional[Tuple[String, String]]:
+    """Split a space-delimited merge string like 'a b' into ('a', 'b')."""
+    var bytes = pair.as_bytes()
+    for i in range(len(bytes)):
+        if bytes[i] == Byte(32):
+            return (
+                span_to_string(bytes, 0, i),
+                span_to_string(bytes, i + 1, len(bytes)),
+            )
+    return None
+
+
+def parse_merge_pair(mut parser: Parser) raises ParseError -> Tuple[String, String]:
+    """Parse a single merge entry: either a string 'a b' or an array ['a', 'b']."""
+    parser.skip_whitespace()
+    if parser.has_more() and parser.peek() == LBRACKET:
+        if not parser.consume(LBRACKET):
+            raise ParseError("expected '[' for merge pair", parser.pos)
+        parser.skip_whitespace()
+        var left = parser.parse_string()
+        if not parser.delimited_next(RBRACKET):
+            raise ParseError("expected second element in merge pair", parser.pos)
+        var right = parser.parse_string()
+        parser.skip_whitespace()
+        if not parser.consume(RBRACKET):
+            raise ParseError("expected ']' for merge pair", parser.pos)
+        return (left^, right^)
+
+    var merged = parser.parse_string()
+    var split = split_merge_string(merged)
+    if not split:
+        raise ParseError("invalid merge string (no space delimiter)", parser.pos)
+    return split.take()
+
+
+def parse_merges(
+    mut parser: Parser,
+    vocab: Dict[String, Int],
+    mut merge_pair_ranks: Dict[UInt64, Int],
+    mut merge_pair_out: Dict[UInt64, Int],
+) raises ParseError -> Int:
+    """Parse the merges array, building pair rank/output dicts directly.
+    Returns the number of merges parsed."""
+    if not parser.consume(LBRACKET):
+        raise ParseError("expected '[' for merges", parser.pos)
+    parser.skip_whitespace()
+    if parser.consume(RBRACKET):
+        return 0
+
+    var count = 0
+    while True:
+        var pair = parse_merge_pair(parser)
+        var left_tok = pair[0]
+        var right_tok = pair[1]
+        var left_id = vocab.get(left_tok)
+        var right_id = vocab.get(right_tok)
+        if left_id and right_id:
+            var merged_tok = left_tok + right_tok
+            var out_id = vocab.get(merged_tok)
+            if out_id:
+                var key = pack_pair_ids(left_id.value(), right_id.value())
+                merge_pair_ranks[key] = count
+                merge_pair_out[key] = out_id.value()
+        count += 1
+        if not parser.delimited_next(RBRACKET):
+            break
+    return count
+
+
 def parse_model_section(
     mut parser: Parser,
     mut vocab: Dict[String, Int],
-    mut merges: List[String],
+    mut merge_pair_ranks: Dict[UInt64, Int],
+    mut merge_pair_out: Dict[UInt64, Int],
+    mut merge_count: Int,
     mut opts: ModelOptions,
 ) raises ParseError:
-    """Parse the 'model' object, extracting vocab/merges/options."""
+    """Parse the 'model' object, extracting vocab and building merge dicts."""
     if not parser.consume(LBRACE):
         raise ParseError("expected '{' for model", parser.pos)
     parser.skip_whitespace()
@@ -450,9 +511,9 @@ def parse_model_section(
         if key == "vocab":
             vocab = parser.parse_string_uint_dict()
         elif key == "merges":
-            merges = parser.parse_string_array()
-        elif key == "ignore_merges":
-            opts.ignore_merges = parser.parse_bool()
+            merge_count = parse_merges(
+                parser, vocab, merge_pair_ranks, merge_pair_out,
+            )
         elif key == "fuse_unk":
             opts.fuse_unk = parser.parse_bool()
         elif key == "byte_fallback":
@@ -486,7 +547,9 @@ def load_tokenizer_with_capabilities[
     var parser = Parser(Span(file_bytes))
 
     var vocab = Dict[String, Int]()
-    var merges = List[String]()
+    var merge_pair_ranks = Dict[UInt64, Int]()
+    var merge_pair_out = Dict[UInt64, Int]()
+    var merge_count = 0
     var added_tokens = Dict[String, Int]()
     var added_token_order = List[String]()
     var special_tokens = Dict[String, Int]()
@@ -515,7 +578,11 @@ def load_tokenizer_with_capabilities[
                     special_ids,
                 )
             elif key == "model":
-                parse_model_section(parser, vocab, merges, model_opts)
+                parse_model_section(
+                    parser, vocab,
+                    merge_pair_ranks, merge_pair_out, merge_count,
+                    model_opts,
+                )
             else:
                 parser.skip_value()
             if not parser.delimited_next(RBRACE):
@@ -547,17 +614,18 @@ def load_tokenizer_with_capabilities[
     var vocab_size = len(vocab)
     return BPETokenizer[pretokenizer_type, byte_transform_type](
         vocab^,
-        merges^,
+        merge_count,
+        merge_pair_ranks^,
+        merge_pair_out^,
         added_tokens^,
         added_token_order^,
         special_tokens^,
         special_ids^,
-        model_opts.ignore_merges,
         model_opts.fuse_unk,
         model_opts.byte_fallback,
         model_opts.unk_token^,
-        tokenizer_cfg.add_bos_token,
-        tokenizer_cfg.add_eos_token,
+        False,
+        False,
         bos_token_id,
         eos_token_id,
         vocab_size,
@@ -569,7 +637,11 @@ def load_tokenizer_with_capabilities[
 def load_tokenizer(path: Path) -> Optional[BPETokenizer[AutoPreTokenizer, GPT2ByteTransform]]:
     """Load a BPETokenizer by auto-detecting supported pre-tokenizer semantics."""
     var flavor = detect_tokenizer_flavor(path)
-    if flavor == TOKENIZER_FLAVOR_GPT2 or flavor == TOKENIZER_FLAVOR_DEEPSEEK_V3:
+    if (
+        flavor == TOKENIZER_FLAVOR_GPT2
+        or flavor == TOKENIZER_FLAVOR_DEEPSEEK_V3
+        or flavor == TOKENIZER_FLAVOR_GPT_OSS
+    ):
         return load_tokenizer_with_capabilities(
             path,
             AutoPreTokenizer(flavor),
@@ -577,7 +649,7 @@ def load_tokenizer(path: Path) -> Optional[BPETokenizer[AutoPreTokenizer, GPT2By
         )
 
     print("tokenizer: unsupported pre-tokenizer semantics in", path)
-    print("tokenizer: supported flavors are GPT-2 and DeepSeek V3 only")
+    print("tokenizer: supported flavors are GPT-2, DeepSeek V3, and GPT-OSS only")
     return None
 
 
@@ -596,4 +668,15 @@ def load_deepseek_v3_tokenizer(path: Path) -> Optional[
         path,
         DeepSeekV3PreTokenizer(),
         DeepSeekV3ByteTransform(),
+    )
+
+
+def load_gpt_oss_tokenizer(path: Path) -> Optional[
+    BPETokenizer[GptOssPreTokenizer, GptOssByteTransform]
+]:
+    """Load a BPETokenizer using GPT-OSS pre-tokenizer semantics."""
+    return load_tokenizer_with_capabilities(
+        path,
+        GptOssPreTokenizer(),
+        GptOssByteTransform(),
     )

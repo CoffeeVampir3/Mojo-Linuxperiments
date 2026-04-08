@@ -10,18 +10,6 @@ def pack_pair_ids(left: Int, right: Int) -> UInt64:
     return (UInt64(UInt32(left)) << UInt64(32)) | UInt64(UInt32(right))
 
 
-@always_inline
-def split_merge_pair(pair: String) -> Optional[Tuple[String, String]]:
-    var bytes = pair.as_bytes()
-    for i in range(len(bytes)):
-        if bytes[i] == Byte(32):
-            return (
-                span_to_string(bytes, 0, i),
-                span_to_string(bytes, i + 1, len(bytes)),
-            )
-    return None
-
-
 @fieldwise_init
 struct MergeCandidate(Copyable, ImplicitlyCopyable):
     var rank: Int

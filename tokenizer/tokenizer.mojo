@@ -1,7 +1,7 @@
 """Core tokenizer module: traits, Unicode classification, shared utilities, and BPETokenizer."""
 
 from std.collections import Dict
-from std.memory import Span, UnsafePointer
+from std.memory import Span
 
 from .unicode_props import (
     LETTER_RANGES,
@@ -120,25 +120,10 @@ comptime CODEPOINT_TO_BYTE = make_codepoint_to_byte()
 
 
 struct UnicodeContext(TrivialRegisterPassable):
-    """Bundled Unicode range table pointers. Materializes comptime tables
-    once and provides all classification pointers in a single value."""
-    var letters: UnsafePointer[UInt32, MutAnyOrigin]
-    var numbers: UnsafePointer[UInt32, MutAnyOrigin]
-    var whitespace: UnsafePointer[UInt32, MutAnyOrigin]
-    var marks: UnsafePointer[UInt32, MutAnyOrigin]
-    var punct_symbols: UnsafePointer[UInt32, MutAnyOrigin]
-
+    """Zero-size marker passed to classification functions. All table
+    access goes through comptime indexing — no pointers, no lifetime issues."""
     def __init__(out self):
-        self.letters = UnsafePointer[UInt32, MutAnyOrigin](
-            unsafe_from_address=Int(materialize[LETTER_RANGES]().unsafe_ptr()))
-        self.numbers = UnsafePointer[UInt32, MutAnyOrigin](
-            unsafe_from_address=Int(materialize[NUMBER_RANGES]().unsafe_ptr()))
-        self.whitespace = UnsafePointer[UInt32, MutAnyOrigin](
-            unsafe_from_address=Int(materialize[WHITESPACE_RANGES]().unsafe_ptr()))
-        self.marks = UnsafePointer[UInt32, MutAnyOrigin](
-            unsafe_from_address=Int(materialize[MARK_RANGES]().unsafe_ptr()))
-        self.punct_symbols = UnsafePointer[UInt32, MutAnyOrigin](
-            unsafe_from_address=Int(materialize[PUNCT_SYMBOL_RANGES]().unsafe_ptr()))
+        pass
 
 
 # =============================================================================
@@ -192,7 +177,10 @@ def decode_utf8_codepoint(data: Span[Byte, _], pos: Int, n: Int) -> Tuple[UInt32
 
 
 @always_inline
-def in_unicode_ranges(cp: UInt32, ranges: UnsafePointer[UInt32, _], pair_count: Int) -> Bool:
+def in_comptime_ranges[
+    ranges: InlineArray[UInt32, _],
+    pair_count: Int,
+](cp: UInt32) -> Bool:
     var lo = 0
     var hi = pair_count
     while lo < hi:
@@ -214,7 +202,7 @@ def is_unicode_letter_cp(cp: UInt32, ctx: UnicodeContext) -> Bool:
         return is_ascii_letter(Byte(cp))
     if cp < LETTER_MIN or cp > LETTER_MAX:
         return False
-    return in_unicode_ranges(cp, ctx.letters, LETTER_PAIR_COUNT)
+    return in_comptime_ranges[LETTER_RANGES, LETTER_PAIR_COUNT](cp)
 
 
 @always_inline
@@ -223,7 +211,7 @@ def is_unicode_number_cp(cp: UInt32, ctx: UnicodeContext) -> Bool:
         return is_ascii_digit(Byte(cp))
     if cp < NUMBER_MIN or cp > NUMBER_MAX:
         return False
-    return in_unicode_ranges(cp, ctx.numbers, NUMBER_PAIR_COUNT)
+    return in_comptime_ranges[NUMBER_RANGES, NUMBER_PAIR_COUNT](cp)
 
 
 @always_inline
@@ -232,7 +220,7 @@ def is_unicode_whitespace_cp(cp: UInt32, ctx: UnicodeContext) -> Bool:
         return is_ascii_regex_space(Byte(cp))
     if cp < WHITESPACE_MIN or cp > WHITESPACE_MAX:
         return False
-    return in_unicode_ranges(cp, ctx.whitespace, WHITESPACE_PAIR_COUNT)
+    return in_comptime_ranges[WHITESPACE_RANGES, WHITESPACE_PAIR_COUNT](cp)
 
 
 @always_inline
@@ -251,14 +239,14 @@ def is_unicode_punct_symbol_cp(cp: UInt32, ctx: UnicodeContext) -> Bool:
         return is_ascii_punct_symbol(Byte(cp))
     if cp < PUNCT_SYMBOL_MIN or cp > PUNCT_SYMBOL_MAX:
         return False
-    return in_unicode_ranges(cp, ctx.punct_symbols, PUNCT_SYMBOL_PAIR_COUNT)
+    return in_comptime_ranges[PUNCT_SYMBOL_RANGES, PUNCT_SYMBOL_PAIR_COUNT](cp)
 
 
 @always_inline
 def is_unicode_mark_cp(cp: UInt32, ctx: UnicodeContext) -> Bool:
     if cp < MARK_MIN or cp > MARK_MAX:
         return False
-    return in_unicode_ranges(cp, ctx.marks, MARK_PAIR_COUNT)
+    return in_comptime_ranges[MARK_RANGES, MARK_PAIR_COUNT](cp)
 
 
 @always_inline
@@ -419,15 +407,13 @@ struct BPETokenizer[
 ](Tokenizer):
     var vocab: Dict[String, Int]
     var vocab_rev: List[String]
-    var merges: List[String]
-    var merge_ranks: Dict[String, Int]
+    var merge_count: Int
     var merge_pair_ranks: Dict[UInt64, Int]
     var merge_pair_out: Dict[UInt64, Int]
     var added_tokens: Dict[String, Int]
     var added_token_order: List[String]
     var special_tokens: Dict[String, Int]
     var special_ids: List[Int]
-    var ignore_merges: Bool
     var fuse_unk: Bool
     var byte_fallback: Bool
     var unk_token: String
@@ -444,12 +430,13 @@ struct BPETokenizer[
     def __init__(
         out self,
         var vocab: Dict[String, Int],
-        var merges: List[String],
+        merge_count: Int,
+        var merge_pair_ranks: Dict[UInt64, Int],
+        var merge_pair_out: Dict[UInt64, Int],
         var added_tokens: Dict[String, Int],
         var added_token_order: List[String],
         var special_tokens: Dict[String, Int],
         var special_ids: List[Int],
-        ignore_merges: Bool,
         fuse_unk: Bool,
         byte_fallback: Bool,
         unk_token: String,
@@ -461,33 +448,22 @@ struct BPETokenizer[
         var pretokenizer: Self.pretokenizer_type,
         var byte_transform: Self.byte_transform_type,
     ):
-        var vocab_rev = List[String](length=vocab_size, fill=String(""))
+        # Determine the max ID across vocab and added tokens to size vocab_rev
+        var max_id = vocab_size - 1
+        for item in added_tokens.items():
+            if item.value > max_id:
+                max_id = item.value
+        var rev_size = max_id + 1
+
+        var vocab_rev = List[String](length=rev_size, fill=String(""))
         for item in vocab.items():
             var id = item.value
-            if id >= 0 and id < vocab_size:
+            if id >= 0 and id < rev_size:
                 vocab_rev[id] = item.key.copy()
-
-        var merge_ranks = Dict[String, Int]()
-        var merge_pair_ranks = Dict[UInt64, Int]()
-        var merge_pair_out = Dict[UInt64, Int]()
-        for i in range(len(merges)):
-            merge_ranks[merges[i].copy()] = i
-            var split = split_merge_pair(merges[i])
-            if not split:
-                continue
-            var left_tok = split.value()[0]
-            var right_tok = split.value()[1]
-            var left_id = vocab.get(left_tok)
-            var right_id = vocab.get(right_tok)
-            if not left_id or not right_id:
-                continue
-            var merged_tok = left_tok + right_tok
-            var out_id = vocab.get(merged_tok)
-            if not out_id:
-                continue
-            var key = pack_pair_ids(left_id.value(), right_id.value())
-            merge_pair_ranks[key] = i
-            merge_pair_out[key] = out_id.value()
+        for item in added_tokens.items():
+            var id = item.value
+            if id >= 0 and id < rev_size:
+                vocab_rev[id] = item.key.copy()
 
         sort_strings_by_byte_length_desc(added_token_order)
 
@@ -499,15 +475,13 @@ struct BPETokenizer[
 
         self.vocab = vocab^
         self.vocab_rev = vocab_rev^
-        self.merges = merges^
-        self.merge_ranks = merge_ranks^
+        self.merge_count = merge_count
         self.merge_pair_ranks = merge_pair_ranks^
         self.merge_pair_out = merge_pair_out^
         self.added_tokens = added_tokens^
         self.added_token_order = added_token_order^
         self.special_tokens = special_tokens^
         self.special_ids = special_ids^
-        self.ignore_merges = ignore_merges
         self.fuse_unk = fuse_unk
         self.byte_fallback = byte_fallback
         self.unk_token = unk_token
@@ -528,10 +502,13 @@ struct BPETokenizer[
         var found = self.vocab.get(token)
         if found:
             return found.value()
+        var added = self.added_tokens.get(token)
+        if added:
+            return added.value()
         return None
 
     def id_to_token(self, id: Int) -> Optional[String]:
-        if id >= 0 and id < self._vocab_size:
+        if id >= 0 and id < len(self.vocab_rev):
             var tok = self.vocab_rev[id]
             if tok.byte_length() > 0:
                 return tok
@@ -546,14 +523,8 @@ struct BPETokenizer[
                 return True
         return False
 
-    def merge_rank(self, pair: String) -> Int:
-        var found = self.merge_ranks.get(pair)
-        if found:
-            return found.value()
-        return -1
-
     def num_merges(self) -> Int:
-        return len(self.merges)
+        return self.merge_count
 
     def num_special_tokens(self) -> Int:
         return len(self.special_tokens)
@@ -573,8 +544,7 @@ struct BPETokenizer[
                 symbol_ids.append(found.value())
             elif self.unk_token_id >= 0:
                 symbol_ids.append(self.unk_token_id)
-        if not self.ignore_merges:
-            symbol_ids = bpe_merge_ids(symbol_ids, self.merge_pair_ranks, self.merge_pair_out)
+        symbol_ids = bpe_merge_ids(symbol_ids, self.merge_pair_ranks, self.merge_pair_out)
 
         self.piece_cache.put(piece.copy(), symbol_ids)
 
@@ -624,7 +594,7 @@ struct BPETokenizer[
         var encoded_parts = List[Byte]()
         var decoded = String("")
         for id in ids:
-            if id < 0 or id >= self._vocab_size:
+            if id < 0 or id >= len(self.vocab_rev):
                 continue
 
             var tok = self.vocab_rev[id]

@@ -638,6 +638,8 @@ struct DeepSeekV2Lite[tp: Int](Movable):
             elem_add(host.x_main(seq_len), host.x_residual(seq_len),
                      host.x_main(seq_len))
 
+            Self.layer_stats("L" + String(layer_idx) + " attn", host.x_main(seq_len).ptr, seq_len * C.HIDDEN)
+
             # =============================================================
             # FFN block
             # =============================================================
@@ -677,6 +679,16 @@ struct DeepSeekV2Lite[tp: Int](Movable):
                 gate_lease^.release()
             else:
                 # --- MoE FFN (layers 1-26) ---
+                # Borrow a copy of the normed input — moe_dispatch writes
+                # its output to x_residual, so they can't alias.
+                var moe_input_lease = self.scratch.borrow[Scalar[DType.bfloat16],
+                    C.MAX_SEQ_LEN * C.HIDDEN]()
+                var moe_inp = host.scratch_ptr[Scalar[DType.bfloat16]](moe_input_lease)
+                var res_p = tptr[Scalar[DType.bfloat16]](host.x_residual(seq_len).ptr)
+                comptime bf16w = simd_width_of[DType.bfloat16]()
+                for i in range(0, seq_len * C.HIDDEN, bf16w):
+                    (moe_inp + i).store((res_p + i).load[width=bf16w]())
+
                 var sg_lease = self.scratch.borrow[Scalar[DType.bfloat16],
                     C.MAX_SEQ_LEN * M.SHARED_VIEW.COLS]()
                 var su_lease = self.scratch.borrow[Scalar[DType.bfloat16],
@@ -687,7 +699,7 @@ struct DeepSeekV2Lite[tp: Int](Movable):
                 moe_dispatch[C.N_ROUTED_EXPERTS, C.N_EXPERTS_PER_TOK,
                              C.MOE_INTERMEDIATE, C.SHARED_INTERMEDIATE,
                              C.HIDDEN, Self.tp](
-                    tptr[Scalar[DType.bfloat16]](host.x_residual(seq_len).ptr),
+                    moe_inp,
                     tptr[Scalar[DType.bfloat16]](host.moe_layer_weight[E.ROUTER](layer_idx).ptr),
                     host.expert_weight_base(layer_idx),
                     E.EXPERT.STRIDE,
@@ -705,10 +717,13 @@ struct DeepSeekV2Lite[tp: Int](Movable):
                 eo_lease^.release()
                 su_lease^.release()
                 sg_lease^.release()
+                moe_input_lease^.release()
 
             # Residual add
             elem_add(host.x_main(seq_len), host.x_residual(seq_len),
                      host.x_main(seq_len))
+
+            Self.layer_stats("L" + String(layer_idx) + " ffn ", host.x_main(seq_len).ptr, seq_len * C.HIDDEN)
 
             _ = layer_idx
 
@@ -725,6 +740,23 @@ struct DeepSeekV2Lite[tp: Int](Movable):
         return LogitsView[C.VOCAB_SIZE](
             host.scratch_ptr[Scalar[DType.bfloat16]](logit_lease), logit_lease^,
         )
+
+    @staticmethod
+    def layer_stats(label: String, ptr: Int, n: Int):
+        var p = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=ptr)
+        comptime width = simd_width_of[DType.float32]()
+        var min_v = Float32(1e30)
+        var max_v = Float32(-1e30)
+        var sum_sq = Float64(0)
+        for i in range(0, n, width):
+            var v = (p + i).load[width=width]().cast[DType.float32]()
+            for k in range(width):
+                if v[k] < min_v: min_v = v[k]
+                if v[k] > max_v: max_v = v[k]
+                sum_sq += Float64(v[k]) * Float64(v[k])
+        print(label, "| var=", Float32(sum_sq / Float64(n)),
+              "[", min_v, ",", max_v, "]")
 
     @staticmethod
     def bf16_variance(ptr: Int, n: Int) -> Float64:

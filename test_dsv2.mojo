@@ -80,6 +80,11 @@ def run_test(
         id_list.append(top_ids[i])
         print(" ", i, "id=", top_ids[i], "val=", top_vals[i], "tok=", repr(tok.decode(id_list)))
 
+    # Specific token probes
+    print("logit[5726] 'User':", logits.load_f32[1](5726))
+    print("logit[2] '#':", logits.load_f32[1](2))
+    print("logit[185] '\\n':", logits.load_f32[1](185))
+
     # Greedy decode
     var result = greedy_argmax(logits)
     var next_id = result[0]
@@ -117,27 +122,9 @@ def main():
         return
     var model = model_opt.take()
 
-    # Test A: our tokenizer (Ġ-prefixed, with BOS)
-    var our_ids = tok.encode("The capital of France is")
-    run_test(model, tok, "Our tokenizer (Ġ-prefixed)", our_ids)
-
-    # Test B: HF token IDs (space-dropped, no BOS)
-    var hf_ids = List[Int]()
-    hf_ids.append(549)    # The
-    hf_ids.append(42394)  # capital
-    hf_ids.append(994)    # of
-    hf_ids.append(36715)  # France
-    hf_ids.append(262)    # is
-    run_test(model, tok, "HF tokenizer (bare, no BOS)", hf_ids)
-
-    # Test C: HF token IDs with BOS prepended
-    var hf_bos_ids = List[Int]()
-    hf_bos_ids.append(100000)  # BOS
-    hf_bos_ids.append(549)
-    hf_bos_ids.append(42394)
-    hf_bos_ids.append(994)
-    hf_bos_ids.append(36715)
-    hf_bos_ids.append(262)
-    run_test(model, tok, "HF tokenizer (bare, with BOS)", hf_bos_ids)
+    # Single-token test: BOS → should predict "User" (5726) for instruct model
+    var a_ids = List[Int]()
+    a_ids.append(100000)
+    run_test(model, tok, "BOS only (seq_len=1)", a_ids)
 
     _ = model

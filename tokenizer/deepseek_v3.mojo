@@ -159,12 +159,14 @@ def try_match_main_pattern(
     # \s*[\r\n]+ | \s+(?!\S) | \s+
     if is_whitespace_start_at(data, pos, end, ctx):
         var ws_end = pos
+        var last_ws_start = pos
         var last_newline_end = -1
         while ws_end < end:
             var wb = data[ws_end]
             if wb < Byte(0x80):
                 if not is_ascii_regex_space(wb):
                     break
+                last_ws_start = ws_end
                 ws_end += 1
                 if is_newline_byte(wb):
                     last_newline_end = ws_end
@@ -173,12 +175,16 @@ def try_match_main_pattern(
             var ws_parsed = decode_utf8_codepoint(data, ws_end, end)
             if not is_unicode_whitespace_cp(ws_parsed[0], ctx):
                 break
+            last_ws_start = ws_end
             ws_end += ws_parsed[1]
 
         if last_newline_end >= 0:
             return last_newline_end
         if ws_end == end:
             return ws_end
+        # Backtrack: leave last ws char as prefix for next token
+        if last_ws_start > pos:
+            return last_ws_start
         return ws_end
 
     return -1
