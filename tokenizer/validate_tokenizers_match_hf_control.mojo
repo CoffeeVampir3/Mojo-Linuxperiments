@@ -349,6 +349,116 @@ def test_gpt_oss(mut tok: BPETokenizer[...]) -> Tuple[Int, Int]:
     return (p, f)
 
 
+def test_gemma4(mut tok: BPETokenizer[...]) -> Tuple[Int, Int]:
+    var p = 0
+    var f = 0
+
+    # Basic English
+    if check(tok, "Hello, world!", [9259, 236764, 1902, 236888]): p += 1
+    else: f += 1
+    if check(tok, "The quick brown fox jumps over the lazy dog.",
+        [818, 3823, 8864, 37423, 38167, 1024, 506, 31770, 4799, 236761]): p += 1
+    else: f += 1
+
+    # CamelCase
+    if check(tok, "CamelCase XMLParser HTMLElement",
+        [114919, 9818, 27161, 13449, 127839]): p += 1
+    else: f += 1
+    if check(tok, "DON'T don't Can't can't",
+        [70266, 236789, 236774, 1537, 236789, 236745, 3199, 236789, 236745,
+         740, 236789, 236745]): p += 1
+    else: f += 1
+    if check(tok, "ALLCAPS lowercase MiXeD",
+        [7602, 31832, 236773, 67505, 14402, 109299, 236796]): p += 1
+    else: f += 1
+
+    # Numbers
+    if check(tok, "12345 123 1 42 999",
+        [236770, 236778, 236800, 236812, 236810, 236743, 236770, 236778,
+         236800, 236743, 236770, 236743, 236812, 236778, 236743, 236819,
+         236819, 236819]): p += 1
+    else: f += 1
+    if check(tok, "Hello123 world! 42test",
+        [9259, 236770, 236778, 236800, 1902, 236888, 236743, 236812,
+         236778, 2181]): p += 1
+    else: f += 1
+
+    # Whitespace
+    if check(tok, " leading space", [5830, 2557]): p += 1
+    else: f += 1
+    if check(tok, "multiple   spaces   here",
+        [43819, 139, 35220, 139, 8472]): p += 1
+    else: f += 1
+    if check(tok, "line1\nline2\nline3",
+        [1257, 236770, 107, 1257, 236778, 107, 1257, 236800]): p += 1
+    else: f += 1
+    if check(tok, "tabs\there\ttoo",
+        [39218, 255968, 8472, 255968, 38574]): p += 1
+    else: f += 1
+
+    # Symbols / code
+    if check(tok, "symbols: @#$%^&*()",
+        [79766, 236787, 1392, 190494, 236884, 202079, 825]): p += 1
+    else: f += 1
+    if check(tok, "code: def foo(x): return x + 1",
+        [3970, 236787, 1096, 46293, 236769, 236781, 1473, 994, 1123,
+         900, 236743, 236770]): p += 1
+    else: f += 1
+
+    # Chinese
+    if check(tok, "你好世界", [144626, 12811]): p += 1
+    else: f += 1
+    if check(tok, "深度学习是人工智能的一个分支。",
+        [70126, 23486, 237026, 136119, 55399, 132286, 236924]): p += 1
+    else: f += 1
+
+    # Japanese
+    if check(tok, "こんにちは世界", [85141, 12811]): p += 1
+    else: f += 1
+    if check(tok, "カタカナとひらがなの混合テスト",
+        [131906, 123729, 237032, 239043, 155159, 178677, 60478, 88733]): p += 1
+    else: f += 1
+
+    # Korean
+    if check(tok, "안녕하세요 세계", [61659, 67195]): p += 1
+    else: f += 1
+    if check(tok, "한국어 테스트입니다",
+        [114216, 237430, 112196, 15245]): p += 1
+    else: f += 1
+
+    # Arabic
+    if check(tok, "مرحبا بالعالم",
+        [236873, 150345, 107602, 17193]): p += 1
+    else: f += 1
+
+    # Russian
+    if check(tok, "Привет мир", [116130, 58562]): p += 1
+    else: f += 1
+    if check(tok, "Тестирование токенизатора",
+        [41273, 2898, 39620, 3277, 5923, 948, 3086, 18862]): p += 1
+    else: f += 1
+
+    # Thai
+    if check(tok, "สวัสดีชาวโลก", [49366, 138863, 95266]): p += 1
+    else: f += 1
+
+    # Emoji
+    if check(tok, "emoji: 👩\u200d💻 🚀 ❤️",
+        [67906, 236787, 236743, 243767, 237243, 244862, 236743, 242015,
+         64813]): p += 1
+    else: f += 1
+
+    # Mixed scripts
+    if check(tok, "中英混合test测试123",
+        [237103, 238251, 60478, 2181, 30203, 236770, 236778, 236800]): p += 1
+    else: f += 1
+    if check(tok, "日本語English混在テキスト",
+        [94951, 27832, 239262, 237075, 95830]): p += 1
+    else: f += 1
+
+    return (p, f)
+
+
 def main():
     var total_pass = 0
     var total_fail = 0
@@ -393,6 +503,21 @@ def main():
         print("Vocab:", gpt.vocab_size(), "Merges:", gpt.num_merges())
         var result = test_gpt_oss(gpt)
         print("GPT-OSS:", result[0], "passed,", result[1], "failed")
+        total_pass += result[0]
+        total_fail += result[1]
+
+    print()
+
+    # Gemma 4
+    print("=== Gemma 4 ===")
+    var g4_opt = load_tokenizer(Path("checkpoints/gemma4/tokenizer.json"))
+    if not g4_opt:
+        print("FAILED to load Gemma 4 tokenizer")
+    else:
+        var g4 = g4_opt.take()
+        print("Vocab:", g4.vocab_size(), "Merges:", g4.num_merges())
+        var result = test_gemma4(g4)
+        print("Gemma 4:", result[0], "passed,", result[1], "failed")
         total_pass += result[0]
         total_fail += result[1]
 

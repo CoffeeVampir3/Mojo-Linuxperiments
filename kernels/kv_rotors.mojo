@@ -52,12 +52,16 @@ def init_rope_tables[CosT: Encoding & Shaped, SinT: Encoding & Shaped](
     original_max_pos: Int = 4096,
     beta_fast: Float64 = 32.0,
     beta_slow: Float64 = 1.0,
+    mscale: Float64 = 0.0,
 ) where CosT.DTYPE == DType.float32:
-    """Precompute cos/sin tables for RoPE. Supports both standard and YaRN.
+    """Precompute cos/sin tables for RoPE. Supports standard, YaRN, and mscale.
 
     With factor=1.0 (default), produces standard RoPE frequencies.
     With factor>1.0, applies YaRN linear ramp interpolation between
     original and scaled frequencies.
+    With mscale>0.0, multiplies cos/sin values by yarn_mscale(factor, mscale).
+    This bakes the attention scaling correction into the positional encoding
+    so the scoring kernel needs no extra scale factor.
     """
     comptime assert SinT.DTYPE == DType.float32, "rope init: sin must be f32"
     comptime assert CosT.ROWS == SinT.ROWS, "rope init: cos/sin rows mismatch"
@@ -83,6 +87,11 @@ def init_rope_tables[CosT: Encoding & Shaped, SinT: Encoding & Shaped](
         ramp_low = ramp[0]
         ramp_high = ramp[1]
 
+    var ms = Float64(1.0)
+    if mscale > 0.0 and factor > 1.0:
+        ms = yarn_mscale(factor, mscale)
+    var ms_f32 = SIMD[DType.float32, f64w](Float32(ms))
+
     for j in range(0, half, f64w):
         var inv = SIMD[DType.float64, f64w]()
         for k in range(f64w):
@@ -97,8 +106,8 @@ def init_rope_tables[CosT: Encoding & Shaped, SinT: Encoding & Shaped](
 
         for pos in range(CosT.ROWS):
             var sc = sincos[f64w](SIMD[DType.float64, f64w](Float64(pos)) * inv)
-            (cp + pos * half + j).store(sc.cos_val.cast[DType.float32]())
-            (sp + pos * half + j).store(sc.sin_val.cast[DType.float32]())
+            (cp + pos * half + j).store(sc.cos_val.cast[DType.float32]() * ms_f32)
+            (sp + pos * half + j).store(sc.sin_val.cast[DType.float32]() * ms_f32)
 
 
 def yarn_mscale(factor: Float64, mscale_all_dim: Float64) -> Float64:
@@ -182,6 +191,72 @@ def rope_apply[
                 )
 
 
+def rope_apply_partial[
+    head_dim: Int,
+    rotary_dim: Int,
+    num_blocks: Int,
+    block_stride: Int,
+    block_offset: Int,
+    CosT: Encoding & Shaped, SinT: Encoding & Shaped,
+](
+    ptr: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    row_stride: Int,
+    seq_len: Int,
+    cos_table: Bound[CosT], sin_table: Bound[SinT],
+    pos: Int,
+) where CosT.DTYPE == DType.float32:
+    """Apply RoPE in-place to only the leading rotary_dim channels of each head.
+
+    The input still uses the standard rotate_half layout for the full head_dim:
+    the first rotary_dim/2 entries of the low half are rotated against the
+    first rotary_dim/2 entries of the high half, while the remaining channels
+    are left untouched.
+    """
+    comptime assert SinT.DTYPE == DType.float32, "rope partial: sin must be f32"
+    comptime assert head_dim % 2 == 0, "rope partial: head_dim must be even"
+    comptime assert rotary_dim % 2 == 0, "rope partial: rotary_dim must be even"
+    comptime assert rotary_dim <= head_dim, "rope partial: rotary_dim must fit within head_dim"
+    comptime assert CosT.COLS == rotary_dim // 2, "rope partial: cos cols mismatch"
+    comptime assert SinT.COLS == rotary_dim // 2, "rope partial: sin cols mismatch"
+    comptime assert CosT.ROWS == SinT.ROWS, "rope partial: cos/sin capacity mismatch"
+    comptime assert (rotary_dim // 2) % simd_width_of[DType.float32]() == 0, "rope partial: half must be f32-simd-aligned"
+
+    if seq_len == 0:
+        return
+    debug_assert(pos >= 0 and pos + seq_len <= CosT.ROWS,
+        "rope partial: position range exceeds table capacity")
+
+    var cp = UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
+        unsafe_from_address=cos_table.ptr
+    )
+    var sn = UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
+        unsafe_from_address=sin_table.ptr
+    )
+    comptime full_half = head_dim // 2
+    comptime rotary_half = rotary_dim // 2
+    comptime width = simd_width_of[DType.float32]()
+
+    for m in range(seq_len):
+        var actual_pos = pos + m
+        var cos_row = cp + actual_pos * rotary_half
+        var sin_row = sn + actual_pos * rotary_half
+        var row_base = ptr + m * row_stride
+
+        for b in range(num_blocks):
+            var base = row_base + b * block_stride + block_offset
+            for j in range(0, rotary_half, width):
+                var x_lo = (base + j).load[width=width]().cast[DType.float32]()
+                var x_hi = (base + full_half + j).load[width=width]().cast[DType.float32]()
+                var cv = (cos_row + j).load[width=width]()
+                var sv = (sin_row + j).load[width=width]()
+                (base + j).store(
+                    (x_lo * cv - x_hi * sv).cast[DType.bfloat16]()
+                )
+                (base + full_half + j).store(
+                    (x_hi * cv + x_lo * sv).cast[DType.bfloat16]()
+                )
+
+
 # =============================================================================
 # Typed wrappers — constrain shapes at compile time via DynView
 # =============================================================================
@@ -199,6 +274,22 @@ def rope[head_dim: Int, num_heads: Int,
         unsafe_from_address=x.ptr
     )
     rope_apply[head_dim, num_heads, head_dim, 0](
+        xp, XT.COLS, x.seq_len, cos_table, sin_table, pos,
+    )
+
+
+def rope_partial[head_dim: Int, rotary_dim: Int, num_heads: Int,
+    XT: Encoding & Shaped, CosT: Encoding & Shaped, SinT: Encoding & Shaped](
+    x: DynView[XT], cos_table: Bound[CosT], sin_table: Bound[SinT], pos: Int,
+) where CosT.DTYPE == DType.float32:
+    """RoPE wrapper for heads where only a prefix of channels is rotary."""
+    comptime assert XT.DTYPE == DType.bfloat16, "rope partial: must be bf16"
+    comptime assert XT.COLS == head_dim * num_heads, "rope partial: cols != heads * dim"
+
+    var xp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+        unsafe_from_address=x.ptr
+    )
+    rope_apply_partial[head_dim, rotary_dim, num_heads, head_dim, 0](
         xp, XT.COLS, x.seq_len, cos_table, sin_table, pos,
     )
 

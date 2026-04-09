@@ -397,6 +397,27 @@ def split_numbers(
 
 
 # =============================================================================
+# Byte fallback
+# =============================================================================
+
+
+comptime HEX_DIGITS = "0123456789ABCDEF"
+
+
+def byte_to_hex_token(b: Byte) -> String:
+    var hex = HEX_DIGITS.as_bytes()
+    var buf = List[Byte](capacity=7)
+    buf.append(Byte(0x3C))
+    buf.append(Byte(0x30))
+    buf.append(Byte(0x78))
+    buf.append(hex[Int(b) >> 4])
+    buf.append(hex[Int(b) & 0xF])
+    buf.append(Byte(0x3E))
+    buf.append(Byte(0))
+    return String(unsafe_from_utf8=buf^)
+
+
+# =============================================================================
 # BPETokenizer
 # =============================================================================
 
@@ -423,6 +444,7 @@ struct BPETokenizer[
     var bos_token_id: Int
     var eos_token_id: Int
     var _vocab_size: Int
+    var use_piece_cache: Bool
     var piece_cache: PieceCache
     var pretokenizer: Self.pretokenizer_type
     var byte_transform: Self.byte_transform_type
@@ -445,6 +467,7 @@ struct BPETokenizer[
         bos_token_id: Int,
         eos_token_id: Int,
         vocab_size: Int,
+        use_piece_cache: Bool,
         var pretokenizer: Self.pretokenizer_type,
         var byte_transform: Self.byte_transform_type,
     ):
@@ -491,6 +514,7 @@ struct BPETokenizer[
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self._vocab_size = vocab_size
+        self.use_piece_cache = use_piece_cache
         self.piece_cache = PieceCache()
         self.pretokenizer = pretokenizer^
         self.byte_transform = byte_transform^
@@ -533,7 +557,7 @@ struct BPETokenizer[
         if piece.byte_length() == 0:
             return
 
-        if self.piece_cache.get(piece, ids):
+        if self.use_piece_cache and self.piece_cache.get(piece, ids):
             return
 
         var transformed = self.byte_transform.encode_bytes(piece.as_bytes())
@@ -542,11 +566,22 @@ struct BPETokenizer[
             var found = self.vocab.get(String(slice))
             if found:
                 symbol_ids.append(found.value())
+            elif self.byte_fallback:
+                var ch_str = String(slice)
+                var ch_bytes = ch_str.as_bytes()
+                for j in range(ch_str.byte_length()):
+                    var hex_tok = byte_to_hex_token(ch_bytes[j])
+                    var fb = self.vocab.get(hex_tok)
+                    if fb:
+                        symbol_ids.append(fb.value())
+                    elif self.unk_token_id >= 0:
+                        symbol_ids.append(self.unk_token_id)
             elif self.unk_token_id >= 0:
                 symbol_ids.append(self.unk_token_id)
         symbol_ids = bpe_merge_ids(symbol_ids, self.merge_pair_ranks, self.merge_pair_out)
 
-        self.piece_cache.put(piece.copy(), symbol_ids)
+        if self.use_piece_cache:
+            self.piece_cache.put(piece.copy(), symbol_ids)
 
         for id in symbol_ids:
             ids.append(id)

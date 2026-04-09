@@ -44,6 +44,13 @@ def validate_weight(
                 "expected [" + String(desc.global_rows) + ", " + String(desc.global_cols) + "]",
                 "got [" + String(found_shape[0]) + ", " + String(found_shape[1]) + "]")
             return False
+    elif len(found_shape) == 3:
+        var folded_rows = found_shape[0] * found_shape[1]
+        if desc.global_rows != folded_rows or desc.global_cols != found_shape[2]:
+            print("shape mismatch for", desc.name + ":",
+                "expected [" + String(desc.global_rows) + ", " + String(desc.global_cols) + "]",
+                "got [" + String(found_shape[0]) + ", " + String(found_shape[1]) + ", " + String(found_shape[2]) + "]")
+            return False
     else:
         print("unexpected rank for", desc.name + ":", len(found_shape))
         return False

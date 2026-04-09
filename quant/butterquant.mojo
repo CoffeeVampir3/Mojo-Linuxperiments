@@ -1,12 +1,13 @@
 """ButterQuant offline weight quantizer.
 
-Implements butterquant.md Section IV exactly:
-  1. Gamma absorption: W'[n,k] = W[n,k] * gamma[k]
-  2. FWHT rotation on contraction dimension K per row
-  3. Per-row symmetric i8 quantization: s[n] = absmax(row)/127
+Per quantizable weight:
+  1. Gamma absorption (if preceding norm): W'[n,k] = W[n,k] * gamma[k]
+  2. FWHT rotation on contraction dimension K per row (block = largest pow2 factor of K, cap 256)
+  3. DC correction for post-nonlinearity weights (block < 256): element 0 of each block *= DC_SCALE
+  4. Per-row symmetric i8 quantization: s[n] = absmax(row)/127
 
-Phase 1 uses for_each_weight to collect weight metadata into a runtime list.
-Phase 2 iterates that list in a normal loop — no closures, no capture issues.
+Supports multi-shard checkpoints. The for_each_weight interface uses the
+3-arg signature (prefix, base, target_rank).
 """
 
 from std.memory import UnsafePointer, memcpy
@@ -27,6 +28,7 @@ from modeling.model_spec import (
     Quantizable, Gamma, Absorbed,
     WeightIterable,
 )
+from notstdcollections import HeapMoveArray
 from experimental.hadquant_impl import fwht_row
 from simd_math import roundeven
 
@@ -34,8 +36,9 @@ comptime PtrU8 = UnsafePointer[UInt8, MutAnyOrigin]
 comptime PtrF32 = UnsafePointer[Float32, MutAnyOrigin]
 comptime PtrI8 = UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
 comptime WIDTH = simd_width_of[DType.float32]()
+comptime DC_SCALE = Float32(0.5)
+comptime MAX_FWHT_BLOCK = 256
 
-# Weight task kinds.
 comptime ABSORBED = 0
 comptime GAMMA_QUANTIZE = 1
 comptime QUANTIZE = 2
@@ -51,6 +54,7 @@ comptime PASSTHROUGH = 3
 struct WeightTask(Copyable, ImplicitlyCopyable, Movable):
     var name: String
     var kind: Int
+    var cols: Int
 
 
 # =============================================================================
@@ -72,7 +76,7 @@ struct OutputEntry(Copyable, ImplicitlyCopyable, Movable):
 
 
 # =============================================================================
-# Safetensors header
+# Safetensors header builder
 # =============================================================================
 
 
@@ -112,6 +116,21 @@ def build_header(entries: List[OutputEntry]) -> List[UInt8]:
 
 
 # =============================================================================
+# FWHT block size computation
+# =============================================================================
+
+
+def fwht_block_for_cols(cols: Int) -> Int:
+    """Largest power-of-2 factor of cols, capped at MAX_FWHT_BLOCK."""
+    var block = 1
+    var c = cols
+    while c % 2 == 0 and block < MAX_FWHT_BLOCK:
+        block *= 2
+        c //= 2
+    return block
+
+
+# =============================================================================
 # Core transforms
 # =============================================================================
 
@@ -130,9 +149,26 @@ def absorb_gamma(work: PtrF32, gamma_buf: PtrF32, rows: Int, cols: Int):
             k += 1
 
 
-def fwht_rotate[block: Int](work: PtrF32, rows: Int, cols: Int):
+def fwht_rotate(work: PtrF32, rows: Int, cols: Int, block: Int):
     for r in range(rows):
-        fwht_row[DType.float32, block](work + r * cols, cols)
+        if block == 256:
+            fwht_row[DType.float32, 256](work + r * cols, cols)
+        elif block == 128:
+            fwht_row[DType.float32, 128](work + r * cols, cols)
+        elif block == 64:
+            fwht_row[DType.float32, 64](work + r * cols, cols)
+        else:
+            fwht_row[DType.float32, 32](work + r * cols, cols)
+
+
+def apply_dc_correction(work: PtrF32, rows: Int, cols: Int, block: Int):
+    """Scale element 0 of each FWHT block by DC_SCALE. Applied to post-nonlinearity
+    weights (down projections) where the DC component is a systematic outlier."""
+    var num_blocks = cols // block
+    for r in range(rows):
+        var row = work + r * cols
+        for b in range(num_blocks):
+            row[b * block] *= DC_SCALE
 
 
 def quantize_rows(work: PtrF32, qi: PtrI8, scales_buf: PtrF32, rows: Int, cols: Int):
@@ -221,36 +257,93 @@ struct RingIO(Movable):
 
 
 # =============================================================================
+# Multi-shard tensor lookup
+# =============================================================================
+
+
+def find_tensor(headers: HeapMoveArray[SafetensorsHeader], name: String) -> Tuple[Int, TensorMeta]:
+    """Find a tensor across multiple shard headers. Returns (shard_index, meta)."""
+    for i in range(len(headers)):
+        var opt = headers[i].tensors.get(name)
+        if opt:
+            return (i, opt.value().copy())
+    return (-1, TensorMeta(DType.uint8, List[Int](), 0, 0))
+
+
+def fold_shape(shape: List[Int]) -> Tuple[Int, Int]:
+    """Fold 3D shape [a, b, c] → (a*b, c). Pass through 2D and 1D."""
+    if len(shape) == 3:
+        return (shape[0] * shape[1], shape[2])
+    elif len(shape) == 2:
+        return (shape[0], shape[1])
+    else:
+        return (shape[0], 1)
+
+
+def discover_shards(dir_path: Path) -> List[Path]:
+    var shards = List[Path]()
+    try:
+        for entry in dir_path.listdir():
+            var name = String(entry)
+            if name.endswith(".safetensors") and name.startswith("model-"):
+                shards.append(dir_path / name)
+    except:
+        pass
+    for i in range(len(shards)):
+        for j in range(i + 1, len(shards)):
+            if String(shards[j]) < String(shards[i]):
+                var tmp = shards[i]
+                shards[i] = shards[j]
+                shards[j] = tmp
+    return shards^
+
+
+# =============================================================================
 # Quantizer
 # =============================================================================
 
 
-def quantize[M: WeightIterable, block: Int](
-    source_path: Path, output_path: Path,
+def quantize[M: WeightIterable](
+    source_dir: Path, output_path: Path,
 ) -> Bool:
+    """Quantize a multi-shard checkpoint directory to a single output safetensors.
+
+    Discovers all model-*.safetensors in source_dir, parses headers, then
+    processes each weight according to its trait tags. Per-weight FWHT block
+    is computed from column count. DC correction applied for small blocks.
+    """
     var t0 = Int(perf_counter_ns())
 
-    # Parse source header.
-    var header_opt = parse_safetensors_header(source_path)
-    if not header_opt:
-        print("quantize: failed to parse source header")
+    # Discover and parse all source shards.
+    var shard_paths = discover_shards(source_dir)
+    if len(shard_paths) == 0:
+        print("quantize: no shards found in " + String(source_dir))
         return False
-    var header = header_opt.take()
+    print("found " + String(len(shard_paths)) + " shard(s)")
+
+    var headers = HeapMoveArray[SafetensorsHeader](len(shard_paths))
+    for i in range(len(shard_paths)):
+        var h = parse_safetensors_header(shard_paths[i])
+        if not h:
+            print("quantize: failed to parse " + String(shard_paths[i]))
+            return False
+        headers.push(h.take())
 
     # --- Phase 1: collect weight tasks via comptime dispatch ---
     var tasks = List[WeightTask]()
 
     @parameter
-    def collect[T: Encoding & Shaped & Placed & Named](prefix: String, base: Int):
+    def collect[T: Encoding & Shaped & Placed & Named](prefix: String, base: Int, target_rank: Int):
         var name = prefix + String(T.NAME)
+        comptime cols = T.COLS
         comptime if conforms_to(T, Absorbed):
-            tasks.append(WeightTask(name, ABSORBED))
+            tasks.append(WeightTask(name, ABSORBED, cols))
         elif conforms_to(T, Gamma):
-            tasks.append(WeightTask(name, GAMMA_QUANTIZE))
+            tasks.append(WeightTask(name, GAMMA_QUANTIZE, cols))
         elif conforms_to(T, Quantizable):
-            tasks.append(WeightTask(name, QUANTIZE))
+            tasks.append(WeightTask(name, QUANTIZE, cols))
         else:
-            tasks.append(WeightTask(name, PASSTHROUGH))
+            tasks.append(WeightTask(name, PASSTHROUGH, cols))
 
     M.for_each_weight[collect]()
 
@@ -266,13 +359,14 @@ def quantize[M: WeightIterable, block: Int](
             continue
 
         if task.kind == GAMMA_QUANTIZE or task.kind == QUANTIZE:
-            var meta_opt = header.tensors.get(task.name)
-            if not meta_opt:
+            var result = find_tensor(headers, task.name)
+            if result[0] < 0:
                 print("quantize: missing weight " + task.name)
                 return False
-            var meta = meta_opt.value().copy()
-            var rows = meta.shape[0]
-            var cols = meta.shape[1] if len(meta.shape) > 1 else 1
+            var meta = result[1].copy()
+            var rc = fold_shape(meta.shape)
+            var rows = rc[0]
+            var cols = rc[1]
             var weight_bytes = rows * cols
             entries.append(OutputEntry(task.name, DType.int8, rows, cols, offset, offset + weight_bytes))
             offset += weight_bytes
@@ -285,13 +379,14 @@ def quantize[M: WeightIterable, block: Int](
                 max_cols = cols
 
         elif task.kind == PASSTHROUGH:
-            var meta_opt = header.tensors.get(task.name)
-            if not meta_opt:
-                continue  # not in source (e.g. row scales) — skip
-            var meta = meta_opt.value().copy()
+            var result = find_tensor(headers, task.name)
+            if result[0] < 0:
+                continue
+            var meta = result[1].copy()
             var byte_size = meta.end - meta.start
-            var rows = meta.shape[0]
-            var cols = meta.shape[1] if len(meta.shape) > 1 else 1
+            var rc = fold_shape(meta.shape)
+            var rows = rc[0]
+            var cols = rc[1]
             entries.append(OutputEntry(task.name, meta.dtype, rows, cols, offset, offset + byte_size))
             offset += byte_size
             if byte_size > max_elements:
@@ -302,21 +397,23 @@ def quantize[M: WeightIterable, block: Int](
     var data_start = len(header_bytes)
 
     var rio = RingIO()
-    var paths = List[Path]()
-    paths.append(source_path)
-    paths.append(output_path)
+    var all_paths = List[Path]()
+    for i in range(len(shard_paths)):
+        all_paths.append(shard_paths[i])
+    all_paths.append(output_path)
+    var output_file_idx = len(shard_paths)
     try:
-        _ = rio.ring.register_files[ReadWriteMode](paths)
+        _ = rio.ring.register_files[ReadWriteMode](all_paths)
     except:
         print("quantize: failed to register files")
         return False
 
-    if not rio.write(1, 0, PtrU8(unsafe_from_address=Int(UnsafePointer(to=header_bytes[0]))), len(header_bytes)):
+    if not rio.write(output_file_idx, 0, PtrU8(unsafe_from_address=Int(UnsafePointer(to=header_bytes[0]))), len(header_bytes)):
         print("quantize: failed to write header")
         return False
     print("header: " + String(len(header_bytes)) + " bytes, " + String(len(entries)) + " entries")
 
-    # --- Phase 2: process weights in a normal loop ---
+    # --- Phase 2: process weights ---
     var read_buf = alloc[UInt8](max_elements * 2)
     var work = alloc[Scalar[DType.float32]](max_elements)
     var qi = alloc[Scalar[DType.int8]](max_elements)
@@ -331,9 +428,12 @@ def quantize[M: WeightIterable, block: Int](
         var task = tasks[i]
 
         if task.kind == ABSORBED:
-            var meta = header.tensors.get(task.name).value().copy()
+            var result = find_tensor(headers, task.name)
+            var shard_idx = result[0]
+            var meta = result[1].copy()
             var byte_size = meta.end - meta.start
-            if not rio.read(0, header.data_offset + meta.start, read_buf.bitcast[UInt8](), byte_size):
+            if not rio.read(shard_idx, headers[shard_idx].data_offset + meta.start,
+                    read_buf.bitcast[UInt8](), byte_size):
                 print("quantize: failed to read " + task.name)
                 return False
             bf16_to_f32(read_buf.bitcast[UInt8](), gamma_buf, meta.shape[0])
@@ -341,12 +441,16 @@ def quantize[M: WeightIterable, block: Int](
             print("  absorbed: " + task.name)
 
         elif task.kind == GAMMA_QUANTIZE or task.kind == QUANTIZE:
-            var meta = header.tensors.get(task.name).value().copy()
-            var rows = meta.shape[0]
-            var cols = meta.shape[1] if len(meta.shape) > 1 else 1
+            var result = find_tensor(headers, task.name)
+            var shard_idx = result[0]
+            var meta = result[1].copy()
+            var rc = fold_shape(meta.shape)
+            var rows = rc[0]
+            var cols = rc[1]
             var byte_size = meta.end - meta.start
 
-            if not rio.read(0, header.data_offset + meta.start, read_buf.bitcast[UInt8](), byte_size):
+            if not rio.read(shard_idx, headers[shard_idx].data_offset + meta.start,
+                    read_buf.bitcast[UInt8](), byte_size):
                 print("quantize: failed to read " + task.name)
                 return False
 
@@ -355,44 +459,53 @@ def quantize[M: WeightIterable, block: Int](
             if task.kind == GAMMA_QUANTIZE and has_gamma:
                 absorb_gamma(work, gamma_buf, rows, cols)
 
-            fwht_rotate[block](work, rows, cols)
+            var block = fwht_block_for_cols(cols)
+            fwht_rotate(work, rows, cols, block)
+
+            if block < MAX_FWHT_BLOCK:
+                apply_dc_correction(work, rows, cols, block)
+                print("  quantized: " + task.name + " [" + String(rows) + "x" + String(cols)
+                    + "] block=" + String(block) + " DC-corrected")
+            else:
+                print("  quantized: " + task.name + " [" + String(rows) + "x" + String(cols)
+                    + "] block=" + String(block))
+
             quantize_rows(work, qi, scales_buf, rows, cols)
 
-            # Write I8 weight.
             var we = entries[entry_idx]
-            if not rio.write(1, data_start + we.data_start, qi.bitcast[UInt8](), we.byte_size()):
+            if not rio.write(output_file_idx, data_start + we.data_start, qi.bitcast[UInt8](), we.byte_size()):
                 print("quantize: failed to write " + task.name)
                 return False
             entry_idx += 1
             total_bytes += we.byte_size()
 
-            # Write F32 scales.
             var se = entries[entry_idx]
-            if not rio.write(1, data_start + se.data_start, scales_buf.bitcast[UInt8](), se.byte_size()):
+            if not rio.write(output_file_idx, data_start + se.data_start, scales_buf.bitcast[UInt8](), se.byte_size()):
                 print("quantize: failed to write " + task.name + "_scale")
                 return False
             entry_idx += 1
             total_bytes += se.byte_size()
 
             num_quantized += 1
-            print("  quantized: " + task.name + " [" + String(rows) + "x" + String(cols) + "]")
 
             if task.kind == QUANTIZE:
                 has_gamma = False
 
         elif task.kind == PASSTHROUGH:
-            var meta_opt = header.tensors.get(task.name)
-            if not meta_opt:
+            var result = find_tensor(headers, task.name)
+            if result[0] < 0:
                 continue
-            var meta = meta_opt.value().copy()
+            var shard_idx = result[0]
+            var meta = result[1].copy()
             var byte_size = meta.end - meta.start
 
-            if not rio.read(0, header.data_offset + meta.start, read_buf.bitcast[UInt8](), byte_size):
+            if not rio.read(shard_idx, headers[shard_idx].data_offset + meta.start,
+                    read_buf.bitcast[UInt8](), byte_size):
                 print("quantize: failed to read " + task.name)
                 return False
 
             var pe = entries[entry_idx]
-            if not rio.write(1, data_start + pe.data_start, read_buf.bitcast[UInt8](), byte_size):
+            if not rio.write(output_file_idx, data_start + pe.data_start, read_buf.bitcast[UInt8](), byte_size):
                 print("quantize: failed to write " + task.name)
                 return False
             entry_idx += 1

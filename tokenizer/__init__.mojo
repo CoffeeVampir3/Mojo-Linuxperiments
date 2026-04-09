@@ -4,3 +4,4 @@ from .loader import *
 from .gpt2 import *
 from .deepseek_v3 import *
 from .gpt_oss import *
+from .gemma4 import *

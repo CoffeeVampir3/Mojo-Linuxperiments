@@ -11,17 +11,25 @@ from jsontools.parser import (
     RBRACKET,
     QUOTE,
 )
-from .tokenizer import BPETokenizer, ByteTransformCapability, PreTokenizerCapability, span_to_string
+from .tokenizer import (
+    BPETokenizer, ByteTransformCapability, PreTokenizerCapability,
+    span_to_string, bytes_to_gpt2, gpt2_to_bytes,
+)
 from .bpe import pack_pair_ids
 from .deepseek_v3 import DeepSeekV3ByteTransform, DeepSeekV3PreTokenizer
 from .gpt2 import GPT2ByteTransform, GPT2PreTokenizer, pre_tokenize as gpt2_pre_tokenize
 from .gpt_oss import GptOssByteTransform, GptOssPreTokenizer, pre_tokenize_gpt_oss
+from .gemma4 import (
+    Gemma4ByteTransform, Gemma4PreTokenizer,
+    pre_tokenize_gemma4, gemma4_encode_bytes, gemma4_decode_bytes,
+)
 
 
 comptime TOKENIZER_FLAVOR_UNSUPPORTED = 0
 comptime TOKENIZER_FLAVOR_GPT2 = 1
 comptime TOKENIZER_FLAVOR_DEEPSEEK_V3 = 2
 comptime TOKENIZER_FLAVOR_GPT_OSS = 3
+comptime TOKENIZER_FLAVOR_GEMMA4 = 4
 
 
 struct AutoPreTokenizer(PreTokenizerCapability):
@@ -39,10 +47,29 @@ struct AutoPreTokenizer(PreTokenizerCapability):
             return self.deepseek.pre_tokenize(text)
         if self.flavor == TOKENIZER_FLAVOR_GPT_OSS:
             return pre_tokenize_gpt_oss(text)
+        if self.flavor == TOKENIZER_FLAVOR_GEMMA4:
+            return pre_tokenize_gemma4(text)
 
         var out = List[String]()
         out.append(text.copy())
         return out^
+
+
+struct AutoByteTransform(ByteTransformCapability):
+    var flavor: Int
+
+    def __init__(out self, flavor: Int):
+        self.flavor = flavor
+
+    def encode_bytes(self, data: Span[Byte, _]) -> String:
+        if self.flavor == TOKENIZER_FLAVOR_GEMMA4:
+            return gemma4_encode_bytes(data)
+        return bytes_to_gpt2(data)
+
+    def decode_bytes(self, text: String) -> List[Byte]:
+        if self.flavor == TOKENIZER_FLAVOR_GEMMA4:
+            return gemma4_decode_bytes(text)
+        return gpt2_to_bytes(text)
 
 
 struct ModelOptions(Movable):
@@ -104,7 +131,7 @@ def parse_regex_pattern(mut parser: Parser) raises ParseError -> String:
 
     while True:
         var key = parser.object_key()
-        if key == "Regex":
+        if key == "Regex" or key == "String":
             regex = parser.parse_string()
         else:
             parser.skip_value()
@@ -154,9 +181,13 @@ def parse_pretokenizer_signatures(
     if parser.consume(RBRACE):
         return
 
+    var single_stage = PreTokenizerStageSignature()
+    var found_pretokenizers = False
+
     while True:
         var key = parser.object_key()
         if key == "pretokenizers":
+            found_pretokenizers = True
             if not parser.consume(LBRACKET):
                 raise ParseError("expected '[' for pretokenizers", parser.pos)
             parser.skip_whitespace()
@@ -169,11 +200,30 @@ def parse_pretokenizer_signatures(
                     stages.append(stage^)
                     if not parser.delimited_next(RBRACKET):
                         break
+        elif key == "type":
+            single_stage.stage_type = parser.parse_string()
+        elif key == "behavior":
+            single_stage.behavior = parser.parse_string()
+        elif key == "pattern":
+            single_stage.regex_pattern = parse_regex_pattern(parser)
+        elif key == "use_regex":
+            single_stage.use_regex = parse_optional_bool(parser, single_stage.use_regex)
+        elif key == "add_prefix_space":
+            single_stage.add_prefix_space = parse_optional_bool(
+                parser, single_stage.add_prefix_space
+            )
+        elif key == "individual_digits":
+            single_stage.individual_digits = parse_optional_bool(
+                parser, single_stage.individual_digits
+            )
         else:
             parser.skip_value()
 
         if not parser.delimited_next(RBRACE):
             break
+
+    if not found_pretokenizers and single_stage.stage_type.byte_length() > 0:
+        stages.append(single_stage^)
 
 
 def is_gpt2_pretokenizer_signature(stages: List[PreTokenizerStageSignature]) -> Bool:
@@ -271,6 +321,17 @@ def is_gpt_oss_pretokenizer_signature(stages: List[PreTokenizerStageSignature]) 
     return True
 
 
+def is_gemma4_pretokenizer_signature(stages: List[PreTokenizerStageSignature]) -> Bool:
+    if len(stages) != 1:
+        return False
+    var s0 = stages[0]
+    if s0.stage_type != "Split":
+        return False
+    if s0.behavior != "MergedWithPrevious":
+        return False
+    return True
+
+
 def detect_tokenizer_flavor(path: Path) -> Int:
     var file_bytes: List[Byte]
     try:
@@ -306,6 +367,8 @@ def detect_tokenizer_flavor(path: Path) -> Int:
         return TOKENIZER_FLAVOR_DEEPSEEK_V3
     if is_gpt_oss_pretokenizer_signature(stages):
         return TOKENIZER_FLAVOR_GPT_OSS
+    if is_gemma4_pretokenizer_signature(stages):
+        return TOKENIZER_FLAVOR_GEMMA4
     return TOKENIZER_FLAVOR_UNSUPPORTED
 
 
@@ -535,6 +598,7 @@ def load_tokenizer_with_capabilities[
     path: Path,
     var pretokenizer: pretokenizer_type,
     var byte_transform: byte_transform_type,
+    use_piece_cache: Bool = True,
 ) -> Optional[BPETokenizer[pretokenizer_type, byte_transform_type]]:
     """Load a BPETokenizer from tokenizer.json using injected capabilities."""
     var file_bytes: List[Byte]
@@ -629,27 +693,24 @@ def load_tokenizer_with_capabilities[
         bos_token_id,
         eos_token_id,
         vocab_size,
+        use_piece_cache,
         pretokenizer^,
         byte_transform^,
     )
 
 
-def load_tokenizer(path: Path) -> Optional[BPETokenizer[AutoPreTokenizer, GPT2ByteTransform]]:
+def load_tokenizer(path: Path) -> Optional[BPETokenizer[AutoPreTokenizer, AutoByteTransform]]:
     """Load a BPETokenizer by auto-detecting supported pre-tokenizer semantics."""
     var flavor = detect_tokenizer_flavor(path)
-    if (
-        flavor == TOKENIZER_FLAVOR_GPT2
-        or flavor == TOKENIZER_FLAVOR_DEEPSEEK_V3
-        or flavor == TOKENIZER_FLAVOR_GPT_OSS
-    ):
+    if flavor != TOKENIZER_FLAVOR_UNSUPPORTED:
         return load_tokenizer_with_capabilities(
             path,
             AutoPreTokenizer(flavor),
-            GPT2ByteTransform(),
+            AutoByteTransform(flavor),
+            use_piece_cache=(flavor != TOKENIZER_FLAVOR_GEMMA4),
         )
 
     print("tokenizer: unsupported pre-tokenizer semantics in", path)
-    print("tokenizer: supported flavors are GPT-2, DeepSeek V3, and GPT-OSS only")
     return None
 
 
@@ -679,4 +740,16 @@ def load_gpt_oss_tokenizer(path: Path) -> Optional[
         path,
         GptOssPreTokenizer(),
         GptOssByteTransform(),
+    )
+
+
+def load_gemma4_tokenizer(path: Path) -> Optional[
+    BPETokenizer[Gemma4PreTokenizer, Gemma4ByteTransform]
+]:
+    """Load a BPETokenizer using Gemma 4 tokenizer semantics."""
+    return load_tokenizer_with_capabilities(
+        path,
+        Gemma4PreTokenizer(),
+        Gemma4ByteTransform(),
+        use_piece_cache=False,
     )
