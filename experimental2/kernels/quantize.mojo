@@ -16,6 +16,7 @@ def absmax_quantize_i8[cols: Int](
     Returns the absmax value for the caller to store as needed.
     """
     comptime width = simd_width_of[DType.float32]()
+    debug_assert(cols % simd_width_of[DType.float32]() == 0, "cols must be a multiple of f32 SIMD width")
 
     var vmax = SIMD[DType.float32, width](0)
     var k = 0
@@ -46,6 +47,7 @@ def fixed_quantize_i8[cols: Int](
 ):
     """Quantize f32 buffer to i8 with pre-computed scale (127/S)."""
     comptime width = simd_width_of[DType.float32]()
+    debug_assert(cols % simd_width_of[DType.float32]() == 0, "cols must be a multiple of f32 SIMD width")
     var vinv = SIMD[DType.float32, width](quant_inv)
     comptime lo = SIMD[DType.float32, width](-128.0)
     comptime hi = SIMD[DType.float32, width](127.0)

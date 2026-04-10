@@ -74,6 +74,7 @@ def main():
 
     var tp = model.token_buffer()
     var prompt_len = len(token_ids)
+    model.reset_profile()
 
     # --- Prompt processing (one token at a time, building KV cache) ---
     var t1 = perf_counter_ns()
@@ -117,6 +118,8 @@ def main():
         prefill_ms, "ms |",
         Int(Float64(prompt_len) / (Float64(prefill_ms) / 1000.0)), "t/s",
     )
+    model.report_profile("prompt")
+    model.reset_profile()
 
     # --- Decode ---
     var pos = prompt_len
@@ -144,6 +147,7 @@ def main():
         decode_elapsed_ms, "ms |",
         Int(decode_tps), "t/s",
     )
+    model.report_profile("decode")
 
     # --- Final output ---
     var all_ids = List[Int]()

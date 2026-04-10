@@ -23,6 +23,7 @@ from std.collections import InlineArray
 from numa import NumaArena, NumaInfo
 from notstdcollections import HeapMoveArray
 from threading import BurstPool
+from threading.threading_traits import BurstThreadPool
 from threading.threading_shared import ptr as tptr
 
 from modeling.model_spec import (
@@ -39,7 +40,10 @@ from kernels.kernel_ops import PoolFence, parallel_for, BF16Ptr, rmsnorm
 from kernels.reductions import ring_allreduce, ring_broadcast
 from kernels.kv_rotors import init_rope_tables
 from experimental.linear_borrow_pool import ScratchPool, ScratchLease
-from experimental2.kernels.rmsnorm_fwht_quantize import rmsnorm_fwht_quantize, rmsnorm_gamma_fwht_quantize
+from experimental2.kernels.rmsnorm_fwht_quantize import (
+    rmsnorm_fwht_quantize, rmsnorm_gamma_fwht_quantize,
+    rmsnorm_dual_gamma_fwht_quantize,
+)
 from experimental2.kernels.int8_gemv import int8_gemv
 from experimental2.kernels.float_gemv import float_gemv
 from experimental3.moe import (
@@ -50,6 +54,7 @@ from experimental3.kernels.dense_ffn import (
     fused_gu_gelu_tanh,
     int8_gemv_blocked,
     RouterTopkArgs, router_topk_kernel,
+    I8Ptr, U8Ptr, F32Ptr,
 )
 from experimental3.kernels.sliding_attention import (
     SlidingAttnGroupArgs, sliding_attn_group_kernel,
@@ -100,6 +105,548 @@ struct Gemma4Config:
     comptime LOGIT_SOFTCAP = 30.0
 
 comptime C = Gemma4Config
+
+
+# =============================================================================
+# Forward profiling
+# =============================================================================
+
+
+comptime NUM_FORWARD_PHASES = 21
+
+
+struct PhaseTiming(Copyable, ImplicitlyCopyable):
+    var dispatch_ns: Int
+    var kernel_ns: Int
+    var join_ns: Int
+
+    def __init__(out self):
+        self.dispatch_ns = 0
+        self.kernel_ns = 0
+        self.join_ns = 0
+
+    def __init__(out self, dispatch_ns: Int, kernel_ns: Int, join_ns: Int):
+        self.dispatch_ns = dispatch_ns
+        self.kernel_ns = kernel_ns
+        self.join_ns = join_ns
+
+    @always_inline
+    def total(self) -> Int:
+        return self.dispatch_ns + self.kernel_ns + self.join_ns
+
+    def add(mut self, other: Self):
+        self.dispatch_ns += other.dispatch_ns
+        self.kernel_ns += other.kernel_ns
+        self.join_ns += other.join_ns
+
+    @staticmethod
+    def opaque(total_ns: Int) -> Self:
+        return Self(0, total_ns, 0)
+
+
+@always_inline
+def phase_timing_from_points(
+    dispatch_start_ns: Int,
+    dispatch_end_ns: Int,
+    worker_done_ns: Int,
+    join_start_ns: Int,
+    join_end_ns: Int,
+    active: Bool,
+) -> PhaseTiming:
+    var dispatch_ns = dispatch_end_ns - dispatch_start_ns
+    if dispatch_ns < 0:
+        dispatch_ns = 0
+    if not active:
+        return PhaseTiming(dispatch_ns, 0, 0)
+
+    var kernel_end_ns = worker_done_ns
+    if kernel_end_ns < dispatch_end_ns:
+        kernel_end_ns = dispatch_end_ns
+    var kernel_ns = kernel_end_ns - dispatch_end_ns
+    if kernel_ns < 0:
+        kernel_ns = 0
+
+    var join_base_ns = join_start_ns
+    if kernel_end_ns > join_base_ns:
+        join_base_ns = kernel_end_ns
+    var join_ns = join_end_ns - join_base_ns
+    if join_ns < 0:
+        join_ns = 0
+    return PhaseTiming(dispatch_ns, kernel_ns, join_ns)
+
+
+def finish_single_pool_fence[P: BurstThreadPool](
+    dispatch_start_ns: Int,
+    dispatch_end_ns: Int,
+    var fence: PoolFence[P],
+) -> PhaseTiming:
+    var pool_ptr = fence^.take()
+    if not pool_ptr:
+        return phase_timing_from_points(
+            dispatch_start_ns, dispatch_end_ns,
+            dispatch_end_ns, dispatch_end_ns, dispatch_end_ns, False)
+    pool_ptr[].join()
+    var join_end_ns = Int(perf_counter_ns())
+    return phase_timing_from_points(
+        dispatch_start_ns, dispatch_end_ns,
+        pool_ptr[].last_worker_timestamp(),
+        dispatch_end_ns, join_end_ns, True)
+
+
+@fieldwise_init
+struct PendingRankPhase[tp: Int](Copyable, ImplicitlyCopyable):
+    var dispatch_start_ns: Int
+    var dispatch_end_ns: Int
+    var active: InlineArray[Bool, Self.tp]
+
+
+def finish_pending_rank_phase[tp: Int](
+    pending: PendingRankPhase[tp],
+    pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp],
+    join_start_ns: Int,
+    join_end_ns: Int,
+) -> PhaseTiming:
+    var max_done_ns = 0
+    var any_active = False
+    for r in range(tp):
+        if pending.active[r]:
+            any_active = True
+            var ts = pool_ptrs[r][].last_worker_timestamp()
+            if ts > max_done_ns:
+                max_done_ns = ts
+    return phase_timing_from_points(
+        pending.dispatch_start_ns,
+        pending.dispatch_end_ns,
+        max_done_ns,
+        join_start_ns,
+        join_end_ns,
+        any_active)
+
+
+struct ForwardSample(Copyable, ImplicitlyCopyable):
+    var pos: Int
+    var wall_ns: Int
+    var embed: PhaseTiming
+    var broadcast: PhaseTiming
+    var attn_quantize: PhaseTiming
+    var attn_proj: PhaseTiming
+    var attention: PhaseTiming
+    var o_proj: PhaseTiming
+    var attn_reduce: PhaseTiming
+    var post_attn_norm: PhaseTiming
+    var router_quantize: PhaseTiming
+    var router_proj: PhaseTiming
+    var router_topk: PhaseTiming
+    var expert_dispatch: PhaseTiming
+    var ffn_quantize: PhaseTiming
+    var dense_phase1: PhaseTiming
+    var dense_phase2: PhaseTiming
+    var pre_reduce: PhaseTiming
+    var mlp_reduce: PhaseTiming
+    var post_reduce: PhaseTiming
+    var final_norm: PhaseTiming
+    var lm_head: PhaseTiming
+    var softcap: PhaseTiming
+
+    def __init__(out self, pos: Int):
+        self.pos = pos
+        self.wall_ns = 0
+        self.embed = PhaseTiming()
+        self.broadcast = PhaseTiming()
+        self.attn_quantize = PhaseTiming()
+        self.attn_proj = PhaseTiming()
+        self.attention = PhaseTiming()
+        self.o_proj = PhaseTiming()
+        self.attn_reduce = PhaseTiming()
+        self.post_attn_norm = PhaseTiming()
+        self.router_quantize = PhaseTiming()
+        self.router_proj = PhaseTiming()
+        self.router_topk = PhaseTiming()
+        self.expert_dispatch = PhaseTiming()
+        self.ffn_quantize = PhaseTiming()
+        self.dense_phase1 = PhaseTiming()
+        self.dense_phase2 = PhaseTiming()
+        self.pre_reduce = PhaseTiming()
+        self.mlp_reduce = PhaseTiming()
+        self.post_reduce = PhaseTiming()
+        self.final_norm = PhaseTiming()
+        self.lm_head = PhaseTiming()
+        self.softcap = PhaseTiming()
+
+    def phase(self, idx: Int) -> PhaseTiming:
+        if idx == 0:
+            return self.embed
+        if idx == 1:
+            return self.broadcast
+        if idx == 2:
+            return self.attn_quantize
+        if idx == 3:
+            return self.attn_proj
+        if idx == 4:
+            return self.attention
+        if idx == 5:
+            return self.o_proj
+        if idx == 6:
+            return self.attn_reduce
+        if idx == 7:
+            return self.post_attn_norm
+        if idx == 8:
+            return self.router_quantize
+        if idx == 9:
+            return self.router_proj
+        if idx == 10:
+            return self.router_topk
+        if idx == 11:
+            return self.expert_dispatch
+        if idx == 12:
+            return self.ffn_quantize
+        if idx == 13:
+            return self.dense_phase1
+        if idx == 14:
+            return self.dense_phase2
+        if idx == 15:
+            return self.pre_reduce
+        if idx == 16:
+            return self.mlp_reduce
+        if idx == 17:
+            return self.post_reduce
+        if idx == 18:
+            return self.final_norm
+        if idx == 19:
+            return self.lm_head
+        if idx == 20:
+            return self.softcap
+        return PhaseTiming()
+
+    def phase_sum_ns(self) -> Int:
+        var total = 0
+        for idx in range(NUM_FORWARD_PHASES):
+            total += self.phase(idx).total()
+        return total
+
+    @staticmethod
+    def phase_name(idx: Int) -> String:
+        if idx == 0:
+            return "embed"
+        if idx == 1:
+            return "broadcast"
+        if idx == 2:
+            return "attn_quantize"
+        if idx == 3:
+            return "attn_proj"
+        if idx == 4:
+            return "attention"
+        if idx == 5:
+            return "o_proj"
+        if idx == 6:
+            return "attn_reduce"
+        if idx == 7:
+            return "post_attn_norm"
+        if idx == 8:
+            return "router_quantize"
+        if idx == 9:
+            return "router_proj"
+        if idx == 10:
+            return "router_topk"
+        if idx == 11:
+            return "expert_dispatch"
+        if idx == 12:
+            return "ffn_quantize"
+        if idx == 13:
+            return "dense_phase1"
+        if idx == 14:
+            return "dense_phase2"
+        if idx == 15:
+            return "pre_reduce"
+        if idx == 16:
+            return "mlp_reduce"
+        if idx == 17:
+            return "post_reduce"
+        if idx == 18:
+            return "final_norm"
+        if idx == 19:
+            return "lm_head"
+        if idx == 20:
+            return "softcap"
+        return "unknown"
+
+
+struct NsStats(Copyable, ImplicitlyCopyable):
+    var mean_ns: Int
+    var stddev_ns: Int
+    var p50_ns: Int
+    var p90_ns: Int
+    var p99_ns: Int
+    var max_ns: Int
+
+    def __init__(out self):
+        self.mean_ns = 0
+        self.stddev_ns = 0
+        self.p50_ns = 0
+        self.p90_ns = 0
+        self.p99_ns = 0
+        self.max_ns = 0
+
+
+struct PhaseStats(Copyable, ImplicitlyCopyable):
+    var total: NsStats
+    var dispatch: NsStats
+    var kernel: NsStats
+    var join: NsStats
+
+    def __init__(out self):
+        self.total = NsStats()
+        self.dispatch = NsStats()
+        self.kernel = NsStats()
+        self.join = NsStats()
+
+
+@fieldwise_init
+struct PhaseReportRow(Copyable, ImplicitlyCopyable):
+    var phase_idx: Int
+    var stats: PhaseStats
+
+
+@always_inline
+def percentile_index(count: Int, pct: Int) -> Int:
+    if count <= 1:
+        return 0
+    var idx = (count * pct + 99) // 100 - 1
+    if idx < 0:
+        idx = 0
+    if idx >= count:
+        idx = count - 1
+    return idx
+
+
+def sort_ints(mut vals: List[Int]):
+    for i in range(1, len(vals)):
+        var x = vals[i]
+        var j = i
+        while j > 0 and vals[j - 1] > x:
+            vals[j] = vals[j - 1]
+            j -= 1
+        vals[j] = x
+
+
+def runtime_sqrt(x: Float64) -> Float64:
+    if x <= Float64(0):
+        return Float64(0)
+    var g = x
+    for _ in range(30):
+        g = (g + x / g) * Float64(0.5)
+    return g
+
+
+def ns_stats(values: List[Int]) -> NsStats:
+    var out = NsStats()
+    var n = len(values)
+    if n == 0:
+        return out^
+
+    var sorted = List[Int](capacity=n)
+    var sum = Float64(0)
+    var sum_sq = Float64(0)
+    var max_ns = 0
+    for i in range(n):
+        var v = values[i]
+        sorted.append(v)
+        sum += Float64(v)
+        sum_sq += Float64(v) * Float64(v)
+        if v > max_ns:
+            max_ns = v
+    sort_ints(sorted)
+
+    var mean = sum / Float64(n)
+    var variance = sum_sq / Float64(n) - mean * mean
+    if variance < Float64(0):
+        variance = Float64(0)
+
+    out.mean_ns = Int(mean)
+    out.stddev_ns = Int(runtime_sqrt(variance))
+    out.p50_ns = sorted[percentile_index(n, 50)]
+    out.p90_ns = sorted[percentile_index(n, 90)]
+    out.p99_ns = sorted[percentile_index(n, 99)]
+    out.max_ns = max_ns
+    return out^
+
+
+def phase_stats(dispatch_vals: List[Int], kernel_vals: List[Int], join_vals: List[Int]) -> PhaseStats:
+    var totals = List[Int](capacity=len(dispatch_vals))
+    for i in range(len(dispatch_vals)):
+        totals.append(dispatch_vals[i] + kernel_vals[i] + join_vals[i])
+    var out = PhaseStats()
+    out.total = ns_stats(totals)
+    out.dispatch = ns_stats(dispatch_vals)
+    out.kernel = ns_stats(kernel_vals)
+    out.join = ns_stats(join_vals)
+    return out^
+
+
+def repeat_spaces(count: Int) -> String:
+    var out = ""
+    for _ in range(count):
+        out += " "
+    return out
+
+
+def pad_left(text: String, width: Int) -> String:
+    var n = text.byte_length()
+    if n >= width:
+        return text
+    return repeat_spaces(width - n) + text
+
+
+def pad_right(text: String, width: Int) -> String:
+    var n = text.byte_length()
+    if n >= width:
+        return text
+    return text + repeat_spaces(width - n)
+
+
+def format_ms3(ns: Int) -> String:
+    var x = ns
+    var sign = ""
+    if x < 0:
+        sign = "-"
+        x = -x
+    var whole = x // 1_000_000
+    var frac = (x % 1_000_000) // 1_000
+    var frac_s = String(frac)
+    if frac < 10:
+        frac_s = "00" + frac_s
+    elif frac < 100:
+        frac_s = "0" + frac_s
+    return sign + String(whole) + "." + frac_s
+
+
+def format_pct1(part: Int, total: Int) -> String:
+    if total <= 0:
+        return "0.0%"
+    var tenths = (part * 1000 + total // 2) // total
+    return String(tenths // 10) + "." + String(tenths % 10) + "%"
+
+
+def sort_phase_rows(mut rows: List[PhaseReportRow]):
+    for i in range(1, len(rows)):
+        var x = rows[i]
+        var j = i
+        while j > 0 and rows[j - 1].stats.total.mean_ns < x.stats.total.mean_ns:
+            rows[j] = rows[j - 1]
+            j -= 1
+        rows[j] = x
+
+
+struct ForwardLogger(Movable):
+    var samples: List[ForwardSample]
+
+    def __init__(out self):
+        self.samples = List[ForwardSample]()
+
+    def clear(mut self):
+        self.samples = List[ForwardSample]()
+
+    def record(mut self, sample: ForwardSample):
+        self.samples.append(sample)
+
+    def report(self, label: String):
+        var n = len(self.samples)
+        if n == 0:
+            print(label + ": no profiled forwards")
+            return
+
+        var wall_vals = List[Int](capacity=n)
+        var phase_sum_vals = List[Int](capacity=n)
+        var min_pos = self.samples[0].pos
+        var max_pos = self.samples[0].pos
+        for i in range(n):
+            var s = self.samples[i]
+            wall_vals.append(s.wall_ns)
+            phase_sum_vals.append(s.phase_sum_ns())
+            if s.pos < min_pos:
+                min_pos = s.pos
+            if s.pos > max_pos:
+                max_pos = s.pos
+        var wall = ns_stats(wall_vals)
+        var phase_sum = ns_stats(phase_sum_vals)
+
+        print(label + " forward profile")
+        print("  samples:   " + String(n))
+        print("  positions: " + String(min_pos) + ".." + String(max_pos))
+        print("  wall / token")
+        print("    avg    " + pad_left(format_ms3(wall.mean_ns), 9)
+            + " ms    stddev " + pad_left(format_ms3(wall.stddev_ns), 9) + " ms")
+        print("    p50    " + pad_left(format_ms3(wall.p50_ns), 9)
+            + " ms    p90    " + pad_left(format_ms3(wall.p90_ns), 9) + " ms")
+        print("    p99    " + pad_left(format_ms3(wall.p99_ns), 9)
+            + " ms    max    " + pad_left(format_ms3(wall.max_ns), 9) + " ms")
+        print("  phase-sum / token")
+        print("    avg    " + pad_left(format_ms3(phase_sum.mean_ns), 9)
+            + " ms    overlap-counted " + pad_left(format_pct1(phase_sum.mean_ns, wall.mean_ns), 8) + " of wall")
+        var rows = List[PhaseReportRow](capacity=NUM_FORWARD_PHASES)
+        for phase_idx in range(NUM_FORWARD_PHASES):
+            var dispatch_vals = List[Int](capacity=n)
+            var kernel_vals = List[Int](capacity=n)
+            var join_vals = List[Int](capacity=n)
+            for i in range(n):
+                var t = self.samples[i].phase(phase_idx)
+                dispatch_vals.append(t.dispatch_ns)
+                kernel_vals.append(t.kernel_ns)
+                join_vals.append(t.join_ns)
+            rows.append(PhaseReportRow(phase_idx, phase_stats(dispatch_vals, kernel_vals, join_vals)))
+        sort_phase_rows(rows)
+
+        var omitted = ""
+        var top_summary = ""
+        var shown = 0
+        for i in range(len(rows)):
+            var row = rows[i]
+            var ps = row.stats
+            if ps.total.max_ns < 50_000 and ps.dispatch.p99_ns < 50_000 and ps.join.p99_ns < 50_000:
+                if omitted.byte_length() > 0:
+                    omitted += ", "
+                omitted += ForwardSample.phase_name(row.phase_idx)
+                continue
+            if shown < 5:
+                if top_summary.byte_length() > 0:
+                    top_summary += "  "
+                top_summary += ForwardSample.phase_name(row.phase_idx) + " "
+                top_summary += format_pct1(ps.total.mean_ns, wall.mean_ns)
+                shown += 1
+
+        if top_summary.byte_length() > 0:
+            print("  hot path:  " + top_summary)
+        print("  note: phase timings are local elapsed times; overlapped phases can sum above 100% of wall.")
+
+        print("  phases")
+        print("    "
+            + pad_right("phase", 18)
+            + pad_left("vs wall", 8) + "  "
+            + pad_left("avg", 9) + "  "
+            + pad_left("p99", 9) + "  "
+            + pad_left("max", 9)
+            + " | dispatch avg/p99 | kernel avg/p99 | join avg/p99  [ms]")
+        print("    " + repeat_spaces(18) + "--------  ---------  ---------  --------- | ---------------- | -------------- | ------------")
+
+        for i in range(len(rows)):
+            var row = rows[i]
+            var ps = row.stats
+            if ps.total.max_ns < 50_000 and ps.dispatch.p99_ns < 50_000 and ps.join.p99_ns < 50_000:
+                continue
+            print("    "
+                + pad_right(ForwardSample.phase_name(row.phase_idx), 18)
+                + pad_left(format_pct1(ps.total.mean_ns, wall.mean_ns), 8) + "  "
+                + pad_left(format_ms3(ps.total.mean_ns), 9) + "  "
+                + pad_left(format_ms3(ps.total.p99_ns), 9) + "  "
+                + pad_left(format_ms3(ps.total.max_ns), 9)
+                + " | " + pad_left(format_ms3(ps.dispatch.mean_ns), 8)
+                + "/" + pad_left(format_ms3(ps.dispatch.p99_ns), 8)
+                + " | " + pad_left(format_ms3(ps.kernel.mean_ns), 8)
+                + "/" + pad_left(format_ms3(ps.kernel.p99_ns), 8)
+                + " | " + pad_left(format_ms3(ps.join.mean_ns), 8)
+                + "/" + pad_left(format_ms3(ps.join.p99_ns), 8))
+        if omitted.byte_length() > 0:
+            print("    omitted tiny phases: " + omitted)
 
 
 # =============================================================================
@@ -370,6 +917,9 @@ struct Gemma4Model[tp: Int](WeightIterable):
         comptime ffn_peak = persistent + (
             C.HIDDEN * i8_bytes                       # act_i8_lease
             + C.HIDDEN * f32_bytes                    # act_work_lease
+            + C.HIDDEN * f32_bytes                    # act_work2_lease
+            + C.HIDDEN * i8_bytes                     # expert_act_i8_lease
+            + f32_bytes                               # expert_act_scale_lease
             + C.NUM_EXPERTS * bf16_bytes              # router_logits_lease
             + topk_bytes                              # routing_lease
             + C.TOP_K * C.HIDDEN * bf16_bytes         # expert_out_lease
@@ -521,6 +1071,32 @@ struct Ranks[tp: Int]:
         def dispatch[rank: Int]() -> PoolFence[BurstPool[]]:
             return body[rank](self.view(rank), pool_ptrs[rank][])
         parallel_for[BurstPool[], Self.tp, dispatch]()
+
+    def timed_parallel[body: def[rank: Int](RankView[Self.tp], mut BurstPool[]) capturing -> PoolFence[BurstPool[]]](
+        self, pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp],
+    ) -> PhaseTiming:
+        var ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp](
+            fill=UnsafePointer[BurstPool[], MutAnyOrigin]())
+        var active = InlineArray[Bool, Self.tp](fill=False)
+        var t0 = Int(perf_counter_ns())
+        comptime for rank in range(Self.tp):
+            ptrs[rank] = body[rank](self.view(rank), pool_ptrs[rank][]).take()
+        var t1 = Int(perf_counter_ns())
+        for i in range(Self.tp):
+            if ptrs[i]:
+                active[i] = True
+                ptrs[i][].join()
+        var t2 = Int(perf_counter_ns())
+
+        var max_done_ns = 0
+        var any_active = False
+        for i in range(Self.tp):
+            if active[i]:
+                any_active = True
+                var ts = ptrs[i][].last_worker_timestamp()
+                if ts > max_done_ns:
+                    max_done_ns = ts
+        return phase_timing_from_points(t0, t1, max_done_ns, t1, t2, any_active)
 
     def x_residual_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
         var ptrs = InlineArray[Int, Self.tp](fill=0)
@@ -868,6 +1444,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
     var bases: InlineArray[Int, Self.tp]
     var sliding_v_scales: InlineArray[Float32, C.NUM_SLIDING_LAYERS]
     var full_v_scale: Float32
+    var profile: ForwardLogger
 
     def __init__(out self,
         var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]],
@@ -887,6 +1464,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         self.bases = bases
         self.sliding_v_scales = sliding_v_scales
         self.full_v_scale = full_v_scale
+        self.profile = ForwardLogger()
 
     def make_pool_ptrs(self, pools: HeapMoveArray[BurstPool[]]) -> InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]:
         var ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp](
@@ -1029,6 +1607,12 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         return UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
             unsafe_from_address=self.ranks().view(0).scratch_base())
 
+    def report_profile(self, label: String):
+        self.profile.report(label)
+
+    def reset_profile(mut self):
+        self.profile.clear()
+
     # =========================================================================
     # Forward — decode (seq_len=1), sliding layers only for now
     # =========================================================================
@@ -1041,6 +1625,8 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         comptime EPS = Float32(C.RMS_NORM_EPS)
         comptime seq_len = 1
 
+        var t_forward0 = Int(perf_counter_ns())
+        var sample = ForwardSample(pos)
         var rnks = self.ranks()
         var host = rnks.view(0)
         var mp = self.main_ptrs()
@@ -1048,12 +1634,18 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         var dp = self.dense_ptrs()
 
         # --- Embed ---
-        embed_lookup_scaled(
+        var t_embed0 = Int(perf_counter_ns())
+        var embed_fence = embed_lookup_scaled(
             host.host_weight[M.EMBED](), tokens_ptr,
             host.x_main(seq_len), Float32(C.EMBED_SCALE),
-            self.main_pools[0]).join()
+            self.main_pools[0])
+        var t_embed1 = Int(perf_counter_ns())
+        sample.embed = finish_single_pool_fence(t_embed0, t_embed1, embed_fence^)
+
+        var t_bcast0 = Int(perf_counter_ns())
         ring_broadcast[M.X_MAIN, Self.tp](
             host.x_main(seq_len).ptr, rnks.x_main_ptrs(seq_len), seq_len, mp)
+        sample.broadcast = PhaseTiming.opaque(Int(perf_counter_ns()) - t_bcast0)
 
         var act_scale_lease = self.scratch.borrow[Float32, 1]()
         var post_blk_scale_lease = self.scratch.borrow[Float32, C.DENSE_NUM_BLOCKS]()
@@ -1079,8 +1671,9 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                         rv.x_main(seq_len).ptr, slb + SL.INPUT_NORM.OFFSET,
                         rv.scratch_addr(attn_i8_lease),
                         rv.scratch_addr(attn_work_lease), rv.scratch_addr(attn_scale_lease),
+                        EPS,
                         seq_len, pool)
-                rnks.parallel[do_attn_quantize](mp)
+                sample.attn_quantize.add(rnks.timed_parallel[do_attn_quantize](mp))
 
                 var qkv_lease = self.scratch.borrow[Scalar[DType.bfloat16], SL.QKV_N // Self.tp]()
 
@@ -1094,7 +1687,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                         slb + SL.Q_PROJ_SC.OFFSET,
                         rv.scratch_addr(qkv_lease),
                         seq_len, rv.scratch_addr(attn_scale_lease), pool)
-                rnks.parallel[do_qkv_gemv](mp)
+                sample.attn_proj.add(rnks.timed_parallel[do_qkv_gemv](mp))
 
                 var v_sum_sq = Float32(0)
                 for r in range(Self.tp):
@@ -1143,17 +1736,20 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                         UnsafePointer(to=jobs[0]), NKV)
                     return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                         unsafe_from_address=Int(UnsafePointer(to=pool))))
-                rnks.parallel[do_sliding_attn](mp)
+                sample.attention.add(rnks.timed_parallel[do_sliding_attn](mp))
 
                 @parameter
                 def do_o_proj[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                     var slb = rv.sliding_layer_base(sliding_idx)
                     return int8_gemv_blocked[C.HIDDEN, SL.Q_DIM_LOCAL, C.HEAD_DIM_SLIDING](
-                        rv.scratch_addr(attn_qi_lease), slb + SL.O_PROJ.OFFSET,
-                        rv.scratch_addr(attn_head_sc_lease), slb + SL.O_PROJ_SC.OFFSET,
-                        slb + SL.O_COLSUM_OFF,
-                        rv.x_residual(seq_len).ptr, seq_len, pool)
-                rnks.parallel[do_o_proj](mp)
+                        I8Ptr(unsafe_from_address=rv.scratch_addr(attn_qi_lease)),
+                        U8Ptr(unsafe_from_address=slb + SL.O_PROJ.OFFSET),
+                        F32Ptr(unsafe_from_address=rv.scratch_addr(attn_head_sc_lease)),
+                        F32Ptr(unsafe_from_address=slb + SL.O_PROJ_SC.OFFSET),
+                        F32Ptr(unsafe_from_address=slb + SL.O_COLSUM_OFF),
+                        BF16Ptr(unsafe_from_address=rv.x_residual(seq_len).ptr),
+                        seq_len, pool)
+                sample.o_proj.add(rnks.timed_parallel[do_o_proj](mp))
                 attn_head_sc_lease^.release()
                 attn_qi_lease^.release()
                 qkv_lease^.release()
@@ -1180,8 +1776,9 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                         rv.x_main(seq_len).ptr, flb + FL.INPUT_NORM.OFFSET,
                         rv.scratch_addr(full_attn_i8_lease),
                         rv.scratch_addr(full_attn_work_lease), rv.scratch_addr(full_attn_scale_lease),
+                        EPS,
                         seq_len, pool)
-                rnks.parallel[do_full_attn_quantize](mp)
+                sample.attn_quantize.add(rnks.timed_parallel[do_full_attn_quantize](mp))
 
                 @parameter
                 def do_full_qk_gemv[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
@@ -1193,7 +1790,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                         flb + FL.Q_PROJ_SC.OFFSET,
                         rv.scratch_addr(qk_lease),
                         seq_len, rv.scratch_addr(full_attn_scale_lease), pool)
-                rnks.parallel[do_full_qk_gemv](mp)
+                sample.attn_proj.add(rnks.timed_parallel[do_full_qk_gemv](mp))
                 full_attn_scale_lease^.release()
                 full_attn_work_lease^.release()
                 full_attn_i8_lease^.release()
@@ -1243,25 +1840,30 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                         UnsafePointer(to=jobs[0]), FULL_NKV)
                     return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                         unsafe_from_address=Int(UnsafePointer(to=pool))))
-                rnks.parallel[do_full_attn](mp)
+                sample.attention.add(rnks.timed_parallel[do_full_attn](mp))
 
                 # O projection
                 @parameter
                 def do_full_o_proj[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                     var flb = rv.full_layer_base(full_idx)
                     return int8_gemv_blocked[C.HIDDEN, FULL_Q_LOCAL, C.HEAD_DIM_FULL](
-                        rv.scratch_addr(attn_qi_lease), flb + FL.O_PROJ.OFFSET,
-                        rv.scratch_addr(attn_head_sc_lease), flb + FL.O_PROJ_SC.OFFSET,
-                        flb + FL.O_COLSUM_OFF,
-                        rv.x_residual(seq_len).ptr, seq_len, pool)
-                rnks.parallel[do_full_o_proj](mp)
+                        I8Ptr(unsafe_from_address=rv.scratch_addr(attn_qi_lease)),
+                        U8Ptr(unsafe_from_address=flb + FL.O_PROJ.OFFSET),
+                        F32Ptr(unsafe_from_address=rv.scratch_addr(attn_head_sc_lease)),
+                        F32Ptr(unsafe_from_address=flb + FL.O_PROJ_SC.OFFSET),
+                        F32Ptr(unsafe_from_address=flb + FL.O_COLSUM_OFF),
+                        BF16Ptr(unsafe_from_address=rv.x_residual(seq_len).ptr),
+                        seq_len, pool)
+                sample.o_proj.add(rnks.timed_parallel[do_full_o_proj](mp))
                 attn_head_sc_lease^.release()
                 attn_qi_lease^.release()
                 qk_lease^.release()
 
             # Allreduce + post-attn norm (both layer types)
+            var t_attn_reduce0 = Int(perf_counter_ns())
             ring_allreduce[M.X_RESIDUAL, Self.tp](
                 rnks.x_residual_ptrs(seq_len), seq_len, mp)
+            sample.attn_reduce.add(PhaseTiming.opaque(Int(perf_counter_ns()) - t_attn_reduce0))
 
             @parameter
             def do_post_attn_norm[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
@@ -1274,7 +1876,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 pool.dispatch[PostAttnNormArgs, post_attn_norm_kernel](UnsafePointer(to=args[0]), 1)
                 return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                     unsafe_from_address=Int(UnsafePointer(to=pool))))
-            rnks.parallel[do_post_attn_norm](mp)
+            sample.post_attn_norm.add(rnks.timed_parallel[do_post_attn_norm](mp))
 
             # =============================================================
             # FFN BLOCK (identical for sliding and full layers)
@@ -1282,6 +1884,9 @@ struct Gemma4ButterQuant[tp: Int](Movable):
 
             var act_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.HIDDEN]()
             var act_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
+            var act_work2_lease = self.scratch.borrow[Float32, C.HIDDEN]()
+            var expert_act_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.HIDDEN]()
+            var expert_act_scale_lease = self.scratch.borrow[Float32, 1]()
 
             @parameter
             def do_router_quantize[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
@@ -1291,8 +1896,9 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     rv.x_main(seq_len).ptr, lb + router_scale_off,
                     rv.scratch_addr(act_i8_lease),
                     rv.scratch_addr(act_work_lease), rv.scratch_addr(act_scale_lease),
+                    EPS,
                     seq_len, pool)
-            rnks.parallel[do_router_quantize](mp)
+            sample.router_quantize.add(rnks.timed_parallel[do_router_quantize](mp))
 
             var router_logits_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.NUM_EXPERTS]()
             var routing_lease = self.scratch.borrow[Gemma4TopKResult[C.TOP_K], 1]()
@@ -1310,31 +1916,54 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     lb + router_proj_sc_off,
                     rv.scratch_addr(router_logits_lease),
                     seq_len, rv.scratch_addr(act_scale_lease), pool)
-            rnks.parallel[do_router_gemv](mp)
+            sample.router_proj.add(rnks.timed_parallel[do_router_gemv](mp))
 
             @parameter
             def do_router_topk[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
                 var router_pes_off = FL.ROUTER_PES.OFFSET if is_full else SL.ROUTER_PES.OFFSET
                 var args = InlineArray[RouterTopkArgs, 1](fill=RouterTopkArgs(
-                    rv.scratch_addr(router_logits_lease),
-                    lb + router_pes_off,
+                    BF16Ptr(unsafe_from_address=rv.scratch_addr(router_logits_lease)),
+                    BF16Ptr(unsafe_from_address=lb + router_pes_off),
                     rv.scratch_addr(routing_lease)))
                 pool.dispatch[RouterTopkArgs, router_topk_kernel[C.NUM_EXPERTS, C.TOP_K]](
                     UnsafePointer(to=args[0]), 1)
                 return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                     unsafe_from_address=Int(UnsafePointer(to=pool))))
-            rnks.parallel[do_router_topk](mp)
+            sample.router_topk.add(rnks.timed_parallel[do_router_topk](mp))
 
             var expert_out_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.TOP_K * C.HIDDEN]()
             var local_count_lease = self.scratch.borrow[Int32, 1]()
+
+            # ffn_quantize: one rank-local sweep over x_main produces both
+            # dense (PRE_FFN_NORM γ) and expert (PRE_FFN_NORM_2 γ) quantized
+            # activations. Iterate-once, write-twice — the RMSNorm reduction
+            # and the bf16 load are shared. Runs sequentially on mp before
+            # the expert/dense parallel split.
+            @parameter
+            def do_ffn_quantize[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
+                var pre_ffn_norm_off = FL.PRE_FFN_NORM.OFFSET if is_full else SL.PRE_FFN_NORM.OFFSET
+                var pre_ffn_norm_2_off = FL.PRE_FFN_NORM_2.OFFSET if is_full else SL.PRE_FFN_NORM_2.OFFSET
+                return rmsnorm_dual_gamma_fwht_quantize[C.HIDDEN, C.FWHT_BLK_HIDDEN](
+                    rv.x_main(seq_len).ptr,
+                    lb + pre_ffn_norm_off,
+                    lb + pre_ffn_norm_2_off,
+                    rv.scratch_addr(act_i8_lease),
+                    rv.scratch_addr(expert_act_i8_lease),
+                    rv.scratch_addr(act_work_lease),
+                    rv.scratch_addr(act_work2_lease),
+                    rv.scratch_addr(act_scale_lease),
+                    rv.scratch_addr(expert_act_scale_lease),
+                    EPS,
+                    seq_len, pool)
+            sample.ffn_quantize.add(rnks.timed_parallel[do_ffn_quantize](mp))
 
             @parameter
             def do_expert_dispatch[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
                 var routing = UnsafePointer[Gemma4TopKResult[C.TOP_K], MutAnyOrigin](
                     unsafe_from_address=rv.scratch_addr(routing_lease))[]
-                var pre_ffn_norm_2_off = FL.PRE_FFN_NORM_2.OFFSET if is_full else SL.PRE_FFN_NORM_2.OFFSET
                 var experts_gate_up_off = FL.EXPERTS_GATE_UP.OFFSET if is_full else SL.EXPERTS_GATE_UP.OFFSET
                 var experts_gate_up_sc_off = FL.EXPERTS_GATE_UP_SC.OFFSET if is_full else SL.EXPERTS_GATE_UP_SC.OFFSET
                 var experts_gu_colsum_off = FL.EXPERTS_GU_COLSUM_OFF if is_full else SL.EXPERTS_GU_COLSUM_OFF
@@ -1343,8 +1972,10 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 var experts_down_colsum_off = FL.EXPERTS_DOWN_COLSUM_OFF if is_full else SL.EXPERTS_DOWN_COLSUM_OFF
                 var lc = gemma4_moe_dispatch_local[
                     C.NUM_EXPERTS, C.TOP_K, C.MOE_INTERMEDIATE, C.HIDDEN,
-                    C.FWHT_BLK, C.FWHT_BLK_HIDDEN, Self.tp](
-                    rv.x_main(seq_len).ptr, lb + pre_ffn_norm_2_off, routing,
+                    C.FWHT_BLK, Self.tp](
+                    I8Ptr(unsafe_from_address=rv.scratch_addr(expert_act_i8_lease)),
+                    F32Ptr(unsafe_from_address=rv.scratch_addr(expert_act_scale_lease)),
+                    routing,
                     lb + experts_gate_up_off,
                     C.MOE_GATE_UP_FUSED * C.HIDDEN,
                     lb + experts_gate_up_sc_off,
@@ -1357,37 +1988,40 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     C.HIDDEN * 4,
                     lb + experts_down_colsum_off,
                     C.HIDDEN * C.MOE_NUM_BLOCKS * 4,
-                    UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-                        unsafe_from_address=rv.scratch_addr(expert_out_lease)),
+                    BF16Ptr(unsafe_from_address=rv.scratch_addr(expert_out_lease)),
                     rank, pool)
                 UnsafePointer[Int32, MutAnyOrigin](
                     unsafe_from_address=rv.scratch_addr(local_count_lease))[] = Int32(lc)
                 return PoolFence[BurstPool[]].completed()
+            var t_expert0 = Int(perf_counter_ns())
             rnks.parallel[do_expert_dispatch](ep)
+            var t_expert1 = Int(perf_counter_ns())
+            var expert_active = InlineArray[Bool, Self.tp](fill=False)
+            for r in range(Self.tp):
+                var rv = rnks.view(r)
+                var lc = Int(UnsafePointer[Int32, MutAnyOrigin](
+                    unsafe_from_address=rv.scratch_addr(local_count_lease))[])
+                expert_active[r] = lc > 0
+            var expert_pending = PendingRankPhase[Self.tp](t_expert0, t_expert1, expert_active)
 
             var dense_post_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.INTERMEDIATE]()
 
             @parameter
             def do_dense_phase1[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
-                var pre_ffn_norm_off = FL.PRE_FFN_NORM.OFFSET if is_full else SL.PRE_FFN_NORM.OFFSET
                 var gate_proj_off = FL.GATE_PROJ.OFFSET if is_full else SL.GATE_PROJ.OFFSET
                 var gate_proj_sc_off = FL.GATE_PROJ_SC.OFFSET if is_full else SL.GATE_PROJ_SC.OFFSET
                 var gu_colsum_off = FL.GU_COLSUM_OFF if is_full else SL.GU_COLSUM_OFF
-                return fused_gu_gelu_tanh[C.INTERMEDIATE, C.HIDDEN, C.FWHT_BLK, C.FWHT_BLK_HIDDEN](
-                    rv.x_main(seq_len).ptr, lb + pre_ffn_norm_off,
-                    lb + gate_proj_off,
-                    lb + gate_proj_sc_off,
-                    lb + gu_colsum_off,
-                    rv.scratch_addr(dense_post_i8_lease), rv.scratch_addr(post_blk_scale_lease),
+                return fused_gu_gelu_tanh[C.INTERMEDIATE, C.HIDDEN, C.FWHT_BLK](
+                    I8Ptr(unsafe_from_address=rv.scratch_addr(act_i8_lease)),
+                    F32Ptr(unsafe_from_address=rv.scratch_addr(act_scale_lease)),
+                    U8Ptr(unsafe_from_address=lb + gate_proj_off),
+                    F32Ptr(unsafe_from_address=lb + gate_proj_sc_off),
+                    F32Ptr(unsafe_from_address=lb + gu_colsum_off),
+                    I8Ptr(unsafe_from_address=rv.scratch_addr(dense_post_i8_lease)),
+                    F32Ptr(unsafe_from_address=rv.scratch_addr(post_blk_scale_lease)),
                     seq_len, pool)
-            rnks.parallel[do_dense_phase1](dp)
-
-            @parameter
-            def do_dense_join1[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                pool.join()
-                return PoolFence[BurstPool[]].completed()
-            rnks.parallel[do_dense_join1](dp)
+            sample.dense_phase1.add(rnks.timed_parallel[do_dense_phase1](dp))
 
             var dense_out_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.HIDDEN]()
 
@@ -1398,24 +2032,24 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 var down_proj_sc_off = FL.DOWN_PROJ_SC.OFFSET if is_full else SL.DOWN_PROJ_SC.OFFSET
                 var down_colsum_off = FL.DOWN_COLSUM_OFF if is_full else SL.DOWN_COLSUM_OFF
                 return int8_gemv_blocked[C.HIDDEN, C.INTERMEDIATE, C.FWHT_BLK](
-                    rv.scratch_addr(dense_post_i8_lease),
-                    lb + down_proj_off,
-                    rv.scratch_addr(post_blk_scale_lease),
-                    lb + down_proj_sc_off,
-                    lb + down_colsum_off,
-                    rv.scratch_addr(dense_out_lease), seq_len, pool)
-            rnks.parallel[do_dense_phase2](dp)
+                    I8Ptr(unsafe_from_address=rv.scratch_addr(dense_post_i8_lease)),
+                    U8Ptr(unsafe_from_address=lb + down_proj_off),
+                    F32Ptr(unsafe_from_address=rv.scratch_addr(post_blk_scale_lease)),
+                    F32Ptr(unsafe_from_address=lb + down_proj_sc_off),
+                    F32Ptr(unsafe_from_address=lb + down_colsum_off),
+                    BF16Ptr(unsafe_from_address=rv.scratch_addr(dense_out_lease)),
+                    seq_len, pool)
+            sample.dense_phase2.add(rnks.timed_parallel[do_dense_phase2](dp))
 
-            @parameter
-            def do_join_dense[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                pool.join()
-                return PoolFence[BurstPool[]].completed()
-            rnks.parallel[do_join_dense](dp)
             @parameter
             def do_join_expert[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 pool.join()
                 return PoolFence[BurstPool[]].completed()
+            var t_join_expert0 = Int(perf_counter_ns())
             rnks.parallel[do_join_expert](ep)
+            var t_join_expert1 = Int(perf_counter_ns())
+            sample.expert_dispatch.add(
+                finish_pending_rank_phase[Self.tp](expert_pending, ep, t_join_expert0, t_join_expert1))
 
             var dense_normed_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.HIDDEN]()
 
@@ -1433,10 +2067,12 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 pool.dispatch[PreReduceArgs, pre_reduce_kernel](UnsafePointer(to=args[0]), 1)
                 return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                     unsafe_from_address=Int(UnsafePointer(to=pool))))
-            rnks.parallel[do_pre_reduce](mp)
+            sample.pre_reduce.add(rnks.timed_parallel[do_pre_reduce](mp))
 
+            var t_mlp_reduce0 = Int(perf_counter_ns())
             ring_allreduce[M.X_RESIDUAL, Self.tp](
                 rnks.x_residual_ptrs(seq_len), seq_len, mp)
+            sample.mlp_reduce.add(PhaseTiming.opaque(Int(perf_counter_ns()) - t_mlp_reduce0))
 
             @parameter
             def do_post_reduce[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
@@ -1455,7 +2091,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 pool.dispatch[PostReduceArgs, post_reduce_kernel](UnsafePointer(to=args[0]), 1)
                 return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                     unsafe_from_address=Int(UnsafePointer(to=pool))))
-            rnks.parallel[do_post_reduce](mp)
+            sample.post_reduce.add(rnks.timed_parallel[do_post_reduce](mp))
             dense_normed_lease^.release()
             dense_out_lease^.release()
             dense_post_i8_lease^.release()
@@ -1463,6 +2099,9 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             expert_out_lease^.release()
             routing_lease^.release()
             router_logits_lease^.release()
+            expert_act_scale_lease^.release()
+            expert_act_i8_lease^.release()
+            act_work2_lease^.release()
             act_work_lease^.release()
             act_i8_lease^.release()
 
@@ -1476,13 +2115,23 @@ struct Gemma4ButterQuant[tp: Int](Movable):
 
         # --- Final norm + LM head + softcap ---
         var last_hidden = DynView[M.X_MAIN](host.x_main(seq_len).ptr, 1)
-        rmsnorm(last_hidden, host.host_weight[M.FINAL_NORM](), last_hidden,
-            self.main_pools[0]).join()
+        var t_final0 = Int(perf_counter_ns())
+        var final_fence = rmsnorm(last_hidden, host.host_weight[M.FINAL_NORM](), last_hidden,
+            self.main_pools[0])
+        var t_final1 = Int(perf_counter_ns())
+        sample.final_norm = finish_single_pool_fence(t_final0, t_final1, final_fence^)
         var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
         var logit_view = host.scratch_view[M.LOGITS](logit_lease, 1)
-        float_gemv(last_hidden, host.host_weight[M.EMBED](), logit_view,
-            self.main_pools[0]).join()
+        var t_lm0 = Int(perf_counter_ns())
+        var lm_fence = float_gemv(last_hidden, host.host_weight[M.EMBED](), logit_view,
+            self.main_pools[0])
+        var t_lm1 = Int(perf_counter_ns())
+        sample.lm_head = finish_single_pool_fence(t_lm0, t_lm1, lm_fence^)
+        var t_softcap0 = Int(perf_counter_ns())
         logit_softcap(logit_view)
+        sample.softcap = PhaseTiming.opaque(Int(perf_counter_ns()) - t_softcap0)
+        sample.wall_ns = Int(perf_counter_ns()) - t_forward0
+        self.profile.record(sample)
         return LogitsView[C.VOCAB_SIZE](
             host.scratch_ptr[Scalar[DType.bfloat16]](logit_lease), logit_lease^)
 

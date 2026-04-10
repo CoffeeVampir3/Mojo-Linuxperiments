@@ -141,6 +141,54 @@ def rmsnorm_gamma_fwht_quantize_row[cols: Int, block: Int](
     scale_out[] = absmax_quantize_i8[cols](work, row_qi)
 
 
+def rmsnorm_dual_gamma_fwht_quantize_row[cols: Int, block: Int](
+    row_in: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    gamma_a: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    gamma_b: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    row_qi_a: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    row_qi_b: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    work_a: UnsafePointer[Float32, MutAnyOrigin],
+    work_b: UnsafePointer[Float32, MutAnyOrigin],
+    scale_a: UnsafePointer[Float32, MutAnyOrigin],
+    scale_b: UnsafePointer[Float32, MutAnyOrigin],
+    eps: Float32,
+):
+    """One row, two γ tensors: bf16 -> RMSNorm * (γ_a, γ_b) -> FWHT -> dynamic i8.
+
+    Iterate-once, write-twice: x_main is loaded once, both (x*γ_a) and (x*γ_b)
+    fall out of the same SIMD register pass, and the RMSNorm reduction is shared.
+    The two work buffers diverge from there through independent FWHT + absmax.
+    Two writes, two scales, but only one pass over x and one sqrt.
+    """
+    comptime width = simd_width_of[DType.float32]()
+
+    var vsum = SIMD[DType.float32, width](0)
+    var k = 0
+    while k + width <= cols:
+        var x = (row_in + k).load[width=width]().cast[DType.float32]()
+        var ga = (gamma_a + k).load[width=width]().cast[DType.float32]()
+        var gb = (gamma_b + k).load[width=width]().cast[DType.float32]()
+        vsum = x.fma(x, vsum)
+        (work_a + k).store(x * ga)
+        (work_b + k).store(x * gb)
+        k += width
+
+    var inv_rms = Float32(1.0) / sqrt[DType.float32, 1](vsum.reduce_add() / Float32(cols) + eps)
+    var vinv_rms = SIMD[DType.float32, width](inv_rms)
+    k = 0
+    while k + width <= cols:
+        (work_a + k).store((work_a + k).load[width=width]() * vinv_rms)
+        (work_b + k).store((work_b + k).load[width=width]() * vinv_rms)
+        k += width
+
+    for b in range(cols // block):
+        fwht_block[block](work_a + b * block)
+        fwht_block[block](work_b + b * block)
+
+    scale_a[] = absmax_quantize_i8[cols](work_a, row_qi_a)
+    scale_b[] = absmax_quantize_i8[cols](work_b, row_qi_b)
+
+
 def rmsnorm_fwht_quantize_row[cols: Int, block: Int](
     row_in: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     row_qi: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
@@ -214,6 +262,7 @@ struct RmsNormGammaFwhtArgs(Copyable, ImplicitlyCopyable):
     var qi_ptr: Int
     var work_ptr: Int
     var scale_ptr: Int
+    var eps: Float32
     var start_row: Int
     var end_row: Int
 
@@ -227,7 +276,7 @@ def rmsnorm_gamma_fwht_quantize_worker[cols: Int, block: Int](args: RmsNormGamma
 
     for m in range(args.start_row, args.end_row):
         rmsnorm_gamma_fwht_quantize_row[cols, block](
-            inp + m * cols, gamma, qi + m * cols, work, scales + m, 1e-5,
+            inp + m * cols, gamma, qi + m * cols, work, scales + m, args.eps,
         )
 
 
@@ -239,6 +288,7 @@ def rmsnorm_gamma_fwht_quantize_worker[cols: Int, block: Int](args: RmsNormGamma
 def rmsnorm_gamma_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
     in_ptr: Int, gamma_ptr: Int, qi_ptr: Int, work_ptr: Int,
     scale_ptr: Int,
+    eps: Float32,
     seq_len: Int,
     mut pool: P,
 ) -> PoolFence[P]:
@@ -258,16 +308,103 @@ def rmsnorm_gamma_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
     var jobs = InlineArray[RmsNormGammaFwhtArgs, MAX_POOL_CAPACITY](
-        fill=RmsNormGammaFwhtArgs(0, 0, 0, 0, 0, 0, 0))
+        fill=RmsNormGammaFwhtArgs(0, 0, 0, 0, 0, 0.0, 0, 0))
     for i in range(num_jobs):
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
         jobs[i] = RmsNormGammaFwhtArgs(
             in_ptr, gamma_ptr, qi_ptr,
             work_ptr + i * cols * size_of[Float32](),
-            scale_ptr, start, end)
+            scale_ptr, eps, start, end)
 
     pool.dispatch[RmsNormGammaFwhtArgs, rmsnorm_gamma_fwht_quantize_worker[cols, block]](
+        UnsafePointer(to=jobs[0]), num_jobs)
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))
+    ))
+
+
+@fieldwise_init
+struct RmsNormDualGammaFwhtArgs(Copyable, ImplicitlyCopyable):
+    var in_ptr: Int
+    var gamma_a_ptr: Int
+    var gamma_b_ptr: Int
+    var qi_a_ptr: Int
+    var qi_b_ptr: Int
+    var work_a_ptr: Int
+    var work_b_ptr: Int
+    var scale_a_ptr: Int
+    var scale_b_ptr: Int
+    var eps: Float32
+    var start_row: Int
+    var end_row: Int
+
+
+def rmsnorm_dual_gamma_fwht_quantize_worker[cols: Int, block: Int](
+    args: RmsNormDualGammaFwhtArgs,
+):
+    var inp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.in_ptr)
+    var gamma_a = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.gamma_a_ptr)
+    var gamma_b = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.gamma_b_ptr)
+    var qi_a = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=args.qi_a_ptr)
+    var qi_b = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=args.qi_b_ptr)
+    var work_a = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.work_a_ptr)
+    var work_b = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.work_b_ptr)
+    var scale_a = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.scale_a_ptr)
+    var scale_b = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.scale_b_ptr)
+
+    for m in range(args.start_row, args.end_row):
+        rmsnorm_dual_gamma_fwht_quantize_row[cols, block](
+            inp + m * cols, gamma_a, gamma_b,
+            qi_a + m * cols, qi_b + m * cols,
+            work_a, work_b,
+            scale_a + m, scale_b + m,
+            args.eps,
+        )
+
+
+def rmsnorm_dual_gamma_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
+    in_ptr: Int,
+    gamma_a_ptr: Int,
+    gamma_b_ptr: Int,
+    qi_a_ptr: Int,
+    qi_b_ptr: Int,
+    work_a_ptr: Int,
+    work_b_ptr: Int,
+    scale_a_ptr: Int,
+    scale_b_ptr: Int,
+    eps: Float32,
+    seq_len: Int,
+    mut pool: P,
+) -> PoolFence[P]:
+    """Dispatch dual-γ RMSNorm + FWHT + dynamic-scale quantize.
+
+    Single pass over x_main produces two quantized outputs (one per γ),
+    sharing the load and the RMS reduction. Used by the FFN block to feed
+    both the dense gate_up GEMV and the routed-expert gate_up GEMV from one
+    sweep, eliminating one dispatch round-trip per layer.
+    """
+    if seq_len == 0:
+        return PoolFence[P].completed()
+
+    comptime MAX_POOL_CAPACITY = 128
+    var num_jobs = min(seq_len, pool.get_capacity())
+    var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
+
+    var jobs = InlineArray[RmsNormDualGammaFwhtArgs, MAX_POOL_CAPACITY](
+        fill=RmsNormDualGammaFwhtArgs(0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0, 0))
+    for i in range(num_jobs):
+        var start = i * rows_per_job
+        var end = min(start + rows_per_job, seq_len)
+        jobs[i] = RmsNormDualGammaFwhtArgs(
+            in_ptr, gamma_a_ptr, gamma_b_ptr,
+            qi_a_ptr, qi_b_ptr,
+            work_a_ptr + i * cols * size_of[Float32](),
+            work_b_ptr + i * cols * size_of[Float32](),
+            scale_a_ptr, scale_b_ptr,
+            eps, start, end)
+
+    pool.dispatch[RmsNormDualGammaFwhtArgs, rmsnorm_dual_gamma_fwht_quantize_worker[cols, block]](
         UnsafePointer(to=jobs[0]), num_jobs)
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))
