@@ -1,9 +1,10 @@
 """Gemma 4 attention helpers — Q prep with per-head norm, partial RoPE variant.
 
 Extends experimental2/helpers.mojo prep_q_row with:
-  - Per-head RMS-divide before RoPE (gamma absorbed into projection weights)
+  - Per-head RMS-divide before RoPE
   - Partial RoPE for full-attention layers (128 of 512 dims rotated)
-  - Scale = 1.0 (no inv_sqrt_hd — QK-norms handle scaling)
+  - Runtime q_norm gamma application
+  - Scale = 1.0 (no inv_sqrt_hd — QK norms handle scaling)
 
 The entire pipeline stays in registers: load bf16 → f32 regs → /rms →
 RoPE → FWHT → absmax → quantize → i8 output. No work buffer needed.

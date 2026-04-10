@@ -99,7 +99,6 @@ def prefill_cache[max_seq: Int, head_dim: Int, num_kv_heads: Int, num_q_heads: I
     var v_row = alloc[BF16](head_dim)
     var work = alloc[Float32](head_dim)
     var qi = alloc[Scalar[DType.int8]](head_dim)
-    var quant_inv = Float32(127.0) / v_scale
 
     for pos in range(max_seq):
         for kvh in range(num_kv_heads):
@@ -127,7 +126,6 @@ def prefill_cache[max_seq: Int, head_dim: Int, num_kv_heads: Int, num_q_heads: I
             )
             write_v_head_normed[head_dim](
                 v_row,
-                quant_inv,
                 work,
                 qi,
                 cache,
@@ -297,14 +295,14 @@ def bench_context[
         0,
         current_pos,
         context_len,
-        v_scale,
         Int(group_qi_out),
         Int(group_scales),
+        Float32(1.0),
         eps,
     )
 
     var jobs = InlineArray[SlidingAttnGroupArgs, num_kv_heads](
-        fill=SlidingAttnGroupArgs(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, Float32(0), 0, 0, Float32(0)))
+        fill=SlidingAttnGroupArgs(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, Float32(0), Float32(0)))
     comptime q_group_elems = heads_per_group * head_dim
     comptime bf16_bytes = size_of[BF16]()
     comptime f32_bytes = size_of[Float32]()
@@ -321,9 +319,9 @@ def bench_context[
             kvh,
             current_pos,
             context_len,
-            v_scale,
             Int(dispatch_qi_out) + kvh * q_group_elems,
             Int(dispatch_scales) + kvh * heads_per_group * f32_bytes,
+            Float32(1.0),
             eps,
         )
 

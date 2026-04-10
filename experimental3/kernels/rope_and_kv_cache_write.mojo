@@ -24,13 +24,13 @@ from simd_math import sqrt
 
 
 # ============================================================================
-# Per-head RMS-divide (scale-free — gamma is absorbed into weights)
+# Per-head RMS-divide helper
 # ============================================================================
 
 
 @always_inline
 def rms_divide[head_dim: Int](work: UnsafePointer[Float32, MutAnyOrigin], eps: Float32):
-    """In-place: work[0:head_dim] /= rms(work). No gamma — absorbed offline."""
+    """In-place: work[0:head_dim] /= rms(work). Gamma, if any, is applied by the caller."""
     comptime width = simd_width_of[DType.float32]()
     var vsum = SIMD[DType.float32, width](0)
     var k = 0
@@ -477,14 +477,6 @@ def validate_v_normed[head_dim: Int]():
     var cos_pre = cosine_sim_f64(expected.bitcast[Float64](), kernel_f64.bitcast[Float64](), head_dim)
     print("  pre-quantize cosine (f32 vs f64):            " + String(cos_pre))
 
-    # Fixed-scale quantize + VNNI V cache write
-    var sv = Float32(0)
-    for i in range(head_dim):
-        var a = work[i].__abs__()
-        if a > sv:
-            sv = a
-    sv *= 1.5  # V uses a looser fixed scale
-
     var cache_buf = alloc[UInt8](Cache.TOTAL_BYTES)
     for i in range(Cache.TOTAL_BYTES):
         cache_buf[i] = UInt8(0)
@@ -493,7 +485,7 @@ def validate_v_normed[head_dim: Int]():
     comptime test_pos = 5
     comptime test_head = 0
     write_v_head_normed[head_dim](
-        src, Float32(127.0) / sv, work, qi,
+        src, work, qi,
         cache, test_pos, test_head, Float32(1e-6))
 
     # Read V back from width-packed VNNI layout and verify values match qi_buf
@@ -516,7 +508,7 @@ def validate_v_normed[head_dim: Int]():
     print("  V VNNI roundtrip mismatches:                  " + String(mismatches))
 
     # Dequant round-trip: qi -> inverse FWHT -> compare vs normed original
-    var dq = Float64(sv) / 127.0
+    var dq = Float64(cache.v_scale_ptr(test_head)[test_pos]) / 127.0
     for i in range(head_dim):
         recovered[i] = Float64(Int64(qi[i])) * dq
     scalar_fwht_f64(recovered.bitcast[Float64](), head_dim)

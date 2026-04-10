@@ -3,18 +3,23 @@
 Per quantizable weight:
   1. Gamma absorption (if preceding norm): W'[n,k] = W[n,k] * gamma[k]
   2. FWHT rotation on contraction dimension K per row (block = largest pow2 factor of K, cap 256)
-  3. DC correction for post-nonlinearity weights (block < 256): element 0 of each block *= DC_SCALE
-  4. Per-row symmetric i8 quantization: s[n] = absmax(row)/127
+  3. Per-row symmetric i8 quantization: s[n] = absmax(row)/127
 
 Supports multi-shard checkpoints. The for_each_weight interface uses the
 3-arg signature (prefix, base, target_rank).
+
+The quantizer is panelized rather than whole-tensor buffered: scratch is sized
+for a configurable row panel and reused across weights. Large tensors are
+processed panel-by-panel, and row ranges within a panel are dispatched through
+BurstPool workers when available.
 """
 
-from std.memory import UnsafePointer, memcpy
+from std.memory import UnsafePointer
 from std.memory.unsafe_pointer import alloc
 from std.pathlib import Path
 from std.sys.info import simd_width_of
 from std.time import perf_counter_ns
+from std.math import max, align_up
 
 from safetensors.parser import (
     parse_safetensors_header, SafetensorsHeader, TensorMeta,
@@ -23,6 +28,7 @@ from safetensors.parser import (
 from linux.io_uring import (
     IoRing, ReadOp, WriteOp, Completion, ReadWriteMode, ReadMode, RingError,
 )
+from numa import NumaArena, NumaInfo
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named,
     Quantizable, Gamma, Absorbed,
@@ -31,14 +37,17 @@ from modeling.model_spec import (
 from notstdcollections import HeapMoveArray
 from experimental.hadquant_impl import fwht_row
 from simd_math import roundeven
+from threading import BurstPool
 
 comptime PtrU8 = UnsafePointer[UInt8, MutAnyOrigin]
 comptime PtrF32 = UnsafePointer[Float32, MutAnyOrigin]
 comptime PtrI8 = UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
 comptime WIDTH = simd_width_of[DType.float32]()
-comptime DC_SCALE = Float32(0.5)
 comptime MAX_FWHT_BLOCK = 256
 comptime FULL_O_PROJ_FWHT_BLOCK = 512
+comptime DEFAULT_QUANT_PANEL_ROWS = 2048
+comptime DEFAULT_COPY_CHUNK_BYTES = 16 * 1024 * 1024
+comptime DEFAULT_ARENA_ALIGNMENT = 64
 
 comptime ABSORBED = 0
 comptime GAMMA_QUANTIZE = 1
@@ -74,6 +83,19 @@ struct OutputEntry(Copyable, ImplicitlyCopyable, Movable):
 
     def byte_size(self) -> Int:
         return self.data_end - self.data_start
+
+
+@fieldwise_init
+struct QuantPanelJob(Copyable, ImplicitlyCopyable, Movable):
+    var src_ptr: Int
+    var work_ptr: Int
+    var qi_ptr: Int
+    var scales_ptr: Int
+    var gamma_ptr: Int
+    var cols: Int
+    var row_start: Int
+    var row_count: Int
+    var apply_gamma: Bool
 
 
 # =============================================================================
@@ -148,79 +170,97 @@ def fwht_block_for_weight(name: String, cols: Int) -> Int:
 # =============================================================================
 
 
-def absorb_gamma(work: PtrF32, gamma_buf: PtrF32, rows: Int, cols: Int):
-    for r in range(rows):
-        var row = work + r * cols
-        var k = 0
-        while k + WIDTH <= cols:
-            (row + k).store(
-                (row + k).load[width=WIDTH]() * (gamma_buf + k).load[width=WIDTH]()
-            )
-            k += WIDTH
-        while k < cols:
-            row[k] = row[k] * gamma_buf[k]
-            k += 1
-
-
-def fwht_rotate(work: PtrF32, rows: Int, cols: Int, block: Int):
-    for r in range(rows):
-        if block == 512:
-            fwht_row[DType.float32, 512](work + r * cols, cols)
-        elif block == 256:
-            fwht_row[DType.float32, 256](work + r * cols, cols)
-        elif block == 128:
-            fwht_row[DType.float32, 128](work + r * cols, cols)
-        elif block == 64:
-            fwht_row[DType.float32, 64](work + r * cols, cols)
-        else:
-            fwht_row[DType.float32, 32](work + r * cols, cols)
-
-
-def apply_dc_correction(work: PtrF32, rows: Int, cols: Int, block: Int):
-    """Scale element 0 of each FWHT block by DC_SCALE. Applied to post-nonlinearity
-    weights (down projections) where the DC component is a systematic outlier."""
-    var num_blocks = cols // block
-    for r in range(rows):
-        var row = work + r * cols
-        for b in range(num_blocks):
-            row[b * block] *= DC_SCALE
-
-
-def quantize_rows(work: PtrF32, qi: PtrI8, scales_buf: PtrF32, rows: Int, cols: Int):
+def quantize_panel_rows[block: Int](job: QuantPanelJob):
     comptime lo = SIMD[DType.float32, WIDTH](-128.0)
     comptime hi = SIMD[DType.float32, WIDTH](127.0)
 
-    for r in range(rows):
-        var src = work + r * cols
-        var dst = qi + r * cols
+    var src = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=job.src_ptr)
+    var work = PtrF32(unsafe_from_address=job.work_ptr)
+    var qi = PtrI8(unsafe_from_address=job.qi_ptr)
+    var scales = PtrF32(unsafe_from_address=job.scales_ptr)
+    var gamma = PtrF32(unsafe_from_address=job.gamma_ptr)
+    var cols = job.cols
 
-        var vmax = SIMD[DType.float32, WIDTH](0)
+    for r in range(job.row_start, job.row_start + job.row_count):
+        var src_row = src + r * cols
+        var work_row = work + r * cols
+        var qi_row = qi + r * cols
+
         var k = 0
         while k + WIDTH <= cols:
-            vmax = max(vmax, (src + k).load[width=WIDTH]().__abs__())
+            var x = (src_row + k).load[width=WIDTH]().cast[DType.float32]()
+            if job.apply_gamma:
+                x *= (gamma + k).load[width=WIDTH]()
+            (work_row + k).store(x)
+            k += WIDTH
+        while k < cols:
+            var x = Float32(src_row[k])
+            if job.apply_gamma:
+                x *= gamma[k]
+            work_row[k] = x
+            k += 1
+
+        fwht_row[DType.float32, block](work_row, cols)
+
+        var vmax = SIMD[DType.float32, WIDTH](0)
+        k = 0
+        while k + WIDTH <= cols:
+            vmax = max(vmax, (work_row + k).load[width=WIDTH]().__abs__())
             k += WIDTH
         var amax = vmax.reduce_max()
         while k < cols:
-            var a = src[k]
+            var a = work_row[k]
             if a < Float32(0):
                 a = -a
             if a > amax:
                 amax = a
             k += 1
 
-        scales_buf[r] = amax / Float32(127.0)
+        scales[r] = amax / Float32(127.0)
         var inv = Float32(127.0) / amax if amax > Float32(0) else Float32(0)
         var vinv = SIMD[DType.float32, WIDTH](inv)
 
         k = 0
         while k + WIDTH <= cols:
-            var v = (src + k).load[width=WIDTH]()
-            (dst + k).store(min(max(roundeven(v * vinv), lo), hi).cast[DType.int8]())
+            var v = (work_row + k).load[width=WIDTH]()
+            (qi_row + k).store(min(max(roundeven(v * vinv), lo), hi).cast[DType.int8]())
             k += WIDTH
         while k < cols:
-            var v = roundeven[DType.float32, 1](src[k] * inv)
-            dst[k] = min(max(v, Float32(-128.0)), Float32(127.0)).cast[DType.int8]()
+            var v = roundeven[DType.float32, 1](work_row[k] * inv)
+            qi_row[k] = min(max(v, Float32(-128.0)), Float32(127.0)).cast[DType.int8]()
             k += 1
+
+
+def quantize_panel_dispatch[mask_size: Int, block: Int](
+    src_ptr: Int,
+    work_ptr: Int,
+    qi_ptr: Int,
+    scales_ptr: Int,
+    gamma_ptr: Int,
+    rows: Int,
+    cols: Int,
+    apply_gamma: Bool,
+    mut pool: BurstPool[mask_size],
+):
+    if rows <= 0:
+        return
+    if pool and pool.get_capacity() > 1 and rows > 1:
+        var num_jobs = min(rows, pool.get_capacity())
+        var rows_per_job = (rows + num_jobs - 1) // num_jobs
+        var jobs = alloc[QuantPanelJob](num_jobs)
+        for i in range(num_jobs):
+            var row_start = i * rows_per_job
+            var row_count = min(rows_per_job, rows - row_start)
+            jobs[i] = QuantPanelJob(
+                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr,
+                cols, row_start, row_count, apply_gamma)
+        pool.dispatch[QuantPanelJob, quantize_panel_rows[block]](jobs, num_jobs)
+        pool.join()
+        jobs.free()
+    else:
+        quantize_panel_rows[block](QuantPanelJob(
+            src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr,
+            cols, 0, rows, apply_gamma))
 
 
 def bf16_to_f32(src: PtrU8, dst: PtrF32, count: Int):
@@ -318,15 +358,25 @@ def discover_shards(dir_path: Path) -> List[Path]:
 # =============================================================================
 
 
-def quantize[M: WeightIterable](
+def quantize[M: WeightIterable,
+    panel_rows: Int = DEFAULT_QUANT_PANEL_ROWS,
+    copy_chunk_bytes: Int = DEFAULT_COPY_CHUNK_BYTES,
+    mask_size: Int = 128,
+    arena_alignment: Int = DEFAULT_ARENA_ALIGNMENT,
+](
     source_dir: Path, output_path: Path,
 ) -> Bool:
     """Quantize a multi-shard checkpoint directory to a single output safetensors.
 
     Discovers all model-*.safetensors in source_dir, parses headers, then
     processes each weight according to its trait tags. Per-weight FWHT block
-    is computed from column count. DC correction applied for small blocks.
+    is computed from column count. Quantizable tensors are processed in
+    row panels of `panel_rows`, while passthrough tensors are copied in
+    `copy_chunk_bytes` chunks.
     """
+    comptime assert panel_rows > 0, "panel_rows must be positive"
+    comptime assert copy_chunk_bytes > 0, "copy_chunk_bytes must be positive"
+
     var t0 = Int(perf_counter_ns())
 
     # Discover and parse all source shards.
@@ -365,8 +415,7 @@ def quantize[M: WeightIterable](
     # --- Build output layout ---
     var entries = List[OutputEntry]()
     var offset = 0
-    var max_elements = 0
-    var max_cols = 0
+    var max_quant_cols = 0
 
     for i in range(len(tasks)):
         var task = tasks[i]
@@ -388,10 +437,8 @@ def quantize[M: WeightIterable](
             var scale_bytes = rows * 4
             entries.append(OutputEntry(task.name + "_scale", DType.float32, rows, 1, offset, offset + scale_bytes))
             offset += scale_bytes
-            if rows * cols > max_elements:
-                max_elements = rows * cols
-            if cols > max_cols:
-                max_cols = cols
+            if cols > max_quant_cols:
+                max_quant_cols = cols
 
         elif task.kind == PASSTHROUGH:
             var result = find_tensor(headers, task.name)
@@ -404,8 +451,6 @@ def quantize[M: WeightIterable](
             var cols = rc[1]
             entries.append(OutputEntry(task.name, meta.dtype, rows, cols, offset, offset + byte_size))
             offset += byte_size
-            if byte_size > max_elements:
-                max_elements = byte_size
 
     # --- Write header ---
     var header_bytes = build_header(entries)
@@ -428,12 +473,53 @@ def quantize[M: WeightIterable](
         return False
     print("header: " + String(len(header_bytes)) + " bytes, " + String(len(entries)) + " entries")
 
-    # --- Phase 2: process weights ---
-    var read_buf = alloc[UInt8](max_elements * 2)
-    var work = alloc[Scalar[DType.float32]](max_elements)
-    var qi = alloc[Scalar[DType.int8]](max_elements)
-    var scales_buf = alloc[Scalar[DType.float32]](max_elements)
-    var gamma_buf = alloc[Scalar[DType.float32]](max_cols)
+    # --- Phase 2: panel scratch + worker pool ---
+    var panel_elems = panel_rows * max_quant_cols
+    var quant_panel_bytes = panel_elems * 2
+    var work_elems = panel_elems
+    var qi_elems = panel_elems
+    var scale_rows = panel_rows
+    var gamma_cols = max(1, max_quant_cols)
+
+    # Copy-only and quantization phases are disjoint. Lay out the compute
+    # buffers immediately after the true quant input panel, not after the
+    # larger copy chunk. This lets one arena cover max(copy_peak, quant_peak).
+    var work_off = align_up(quant_panel_bytes, arena_alignment)
+    var work_bytes = work_elems * 4
+    var qi_off = align_up(work_off + work_bytes, arena_alignment)
+    var qi_bytes = qi_elems
+    var scales_off = align_up(qi_off + qi_bytes, arena_alignment)
+    var scales_bytes = scale_rows * 4
+    var gamma_off = align_up(scales_off + scales_bytes, arena_alignment)
+    var gamma_bytes = gamma_cols * 4
+    var quant_peak_bytes = gamma_off + gamma_bytes
+    var scratch_bytes = max(copy_chunk_bytes, quant_peak_bytes)
+
+    var numa = NumaInfo()
+    var node = 0
+    if numa.num_nodes > 0:
+        node = numa.plan_topology(1)[0]
+
+    var arena = NumaArena[alignment=arena_alignment](node, scratch_bytes)
+    if not arena:
+        print("quantize: failed to allocate panel scratch arena")
+        return False
+    _ = arena.prefault()
+
+    var scratch_base = Int(arena.base)
+    var io_buf = PtrU8(unsafe_from_address=scratch_base)
+    var work = PtrF32(unsafe_from_address=scratch_base + work_off)
+    var qi = PtrI8(unsafe_from_address=scratch_base + qi_off)
+    var scales_buf = PtrF32(unsafe_from_address=scratch_base + scales_off)
+    var gamma_buf = PtrF32(unsafe_from_address=scratch_base + gamma_off)
+
+    var pool = BurstPool[mask_size].for_topology(numa, node)
+    if pool and pool.get_capacity() > 1:
+        print("quantize: panel_rows=" + String(panel_rows) + ", workers=" + String(pool.get_capacity())
+            + ", node=" + String(node))
+    else:
+        print("quantize: panel_rows=" + String(panel_rows) + ", running serial panel path")
+
     var has_gamma = False
     var entry_idx = 0
     var total_bytes = 0
@@ -448,10 +534,10 @@ def quantize[M: WeightIterable](
             var meta = result[1].copy()
             var byte_size = meta.end - meta.start
             if not rio.read(shard_idx, headers[shard_idx].data_offset + meta.start,
-                    read_buf.bitcast[UInt8](), byte_size):
+                    io_buf, byte_size):
                 print("quantize: failed to read " + task.name)
                 return False
-            bf16_to_f32(read_buf.bitcast[UInt8](), gamma_buf, meta.shape[0])
+            bf16_to_f32(io_buf, gamma_buf, meta.shape[0])
             has_gamma = True
             print("  absorbed: " + task.name)
 
@@ -462,45 +548,55 @@ def quantize[M: WeightIterable](
             var rc = fold_shape(meta.shape)
             var rows = rc[0]
             var cols = rc[1]
-            var byte_size = meta.end - meta.start
-
-            if not rio.read(shard_idx, headers[shard_idx].data_offset + meta.start,
-                    read_buf.bitcast[UInt8](), byte_size):
-                print("quantize: failed to read " + task.name)
-                return False
-
-            bf16_to_f32(read_buf.bitcast[UInt8](), work, rows * cols)
-
-            if task.kind == GAMMA_QUANTIZE and has_gamma:
-                absorb_gamma(work, gamma_buf, rows, cols)
 
             var block = fwht_block_for_weight(task.name, cols)
-            fwht_rotate(work, rows, cols, block)
-
-            if block < MAX_FWHT_BLOCK:
-                apply_dc_correction(work, rows, cols, block)
-                print("  quantized: " + task.name + " [" + String(rows) + "x" + String(cols)
-                    + "] block=" + String(block) + " DC-corrected")
-            else:
-                print("  quantized: " + task.name + " [" + String(rows) + "x" + String(cols)
-                    + "] block=" + String(block))
-
-            quantize_rows(work, qi, scales_buf, rows, cols)
+            print("  quantized: " + task.name + " [" + String(rows) + "x" + String(cols)
+                + "] block=" + String(block))
 
             var we = entries[entry_idx]
-            if not rio.write(output_file_idx, data_start + we.data_start, qi.bitcast[UInt8](), we.byte_size()):
-                print("quantize: failed to write " + task.name)
-                return False
-            entry_idx += 1
-            total_bytes += we.byte_size()
+            var se = entries[entry_idx + 1]
+            var rows_done = 0
+            while rows_done < rows:
+                var panel = min(panel_rows, rows - rows_done)
+                var panel_bytes = panel * cols * 2
+                var src_off = headers[shard_idx].data_offset + meta.start + rows_done * cols * 2
+                if not rio.read(shard_idx, src_off, io_buf, panel_bytes):
+                    print("quantize: failed to read panel for " + task.name)
+                    return False
 
-            var se = entries[entry_idx]
-            if not rio.write(output_file_idx, data_start + se.data_start, scales_buf.bitcast[UInt8](), se.byte_size()):
-                print("quantize: failed to write " + task.name + "_scale")
-                return False
-            entry_idx += 1
-            total_bytes += se.byte_size()
+                if block == 512:
+                    quantize_panel_dispatch[mask_size, 512](
+                        Int(io_buf), Int(work), Int(qi), Int(scales_buf), Int(gamma_buf),
+                        panel, cols, task.kind == GAMMA_QUANTIZE and has_gamma, pool)
+                elif block == 256:
+                    quantize_panel_dispatch[mask_size, 256](
+                        Int(io_buf), Int(work), Int(qi), Int(scales_buf), Int(gamma_buf),
+                        panel, cols, task.kind == GAMMA_QUANTIZE and has_gamma, pool)
+                elif block == 128:
+                    quantize_panel_dispatch[mask_size, 128](
+                        Int(io_buf), Int(work), Int(qi), Int(scales_buf), Int(gamma_buf),
+                        panel, cols, task.kind == GAMMA_QUANTIZE and has_gamma, pool)
+                elif block == 64:
+                    quantize_panel_dispatch[mask_size, 64](
+                        Int(io_buf), Int(work), Int(qi), Int(scales_buf), Int(gamma_buf),
+                        panel, cols, task.kind == GAMMA_QUANTIZE and has_gamma, pool)
+                else:
+                    quantize_panel_dispatch[mask_size, 32](
+                        Int(io_buf), Int(work), Int(qi), Int(scales_buf), Int(gamma_buf),
+                        panel, cols, task.kind == GAMMA_QUANTIZE and has_gamma, pool)
 
+                var dst_weight_off = data_start + we.data_start + rows_done * cols
+                if not rio.write(output_file_idx, dst_weight_off, qi.bitcast[UInt8](), panel * cols):
+                    print("quantize: failed to write panel for " + task.name)
+                    return False
+                var dst_scale_off = data_start + se.data_start + rows_done * 4
+                if not rio.write(output_file_idx, dst_scale_off, scales_buf.bitcast[UInt8](), panel * 4):
+                    print("quantize: failed to write panel scales for " + task.name)
+                    return False
+                total_bytes += panel * cols + panel * 4
+                rows_done += panel
+
+            entry_idx += 2
             num_quantized += 1
 
             if task.kind == QUANTIZE:
@@ -514,24 +610,20 @@ def quantize[M: WeightIterable](
             var meta = result[1].copy()
             var byte_size = meta.end - meta.start
 
-            if not rio.read(shard_idx, headers[shard_idx].data_offset + meta.start,
-                    read_buf.bitcast[UInt8](), byte_size):
-                print("quantize: failed to read " + task.name)
-                return False
-
             var pe = entries[entry_idx]
-            if not rio.write(output_file_idx, data_start + pe.data_start, read_buf.bitcast[UInt8](), byte_size):
-                print("quantize: failed to write " + task.name)
-                return False
+            var copied = 0
+            while copied < byte_size:
+                var chunk = min(copy_chunk_bytes, byte_size - copied)
+                if not rio.read(shard_idx, headers[shard_idx].data_offset + meta.start + copied, io_buf, chunk):
+                    print("quantize: failed to read " + task.name)
+                    return False
+                if not rio.write(output_file_idx, data_start + pe.data_start + copied, io_buf, chunk):
+                    print("quantize: failed to write " + task.name)
+                    return False
+                copied += chunk
             entry_idx += 1
             total_bytes += byte_size
             print("  passthrough: " + task.name)
-
-    read_buf.free()
-    work.free()
-    qi.free()
-    scales_buf.free()
-    gamma_buf.free()
 
     var elapsed_ms = (Int(perf_counter_ns()) - t0) // 1_000_000
     print("quantize: " + String(num_quantized) + " weights, "

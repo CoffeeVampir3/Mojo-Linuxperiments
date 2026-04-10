@@ -44,19 +44,17 @@ from experimental2.kernels.int8_gemv import int8_gemv
 from experimental2.kernels.float_gemv import float_gemv
 from experimental3.moe import (
     gemma4_moe_dispatch_local, moe_combine,
-    Gemma4ExpertI8Args, gemma4_expert_i8_kernel,
 )
 from experimental3.kv_cache import Gemma4KVCache
 from experimental3.kernels.dense_ffn import (
-    fused_gu_gelu_tanh, FusedGuGeluTanhArgs,
-    int8_gemv_blocked, Int8GemvBlockedArgs,
+    fused_gu_gelu_tanh,
+    int8_gemv_blocked,
     RouterTopkArgs, router_topk_kernel,
 )
 from experimental3.kernels.sliding_attention import (
     SlidingAttnGroupArgs, sliding_attn_group_kernel,
 )
 from experimental3.kernels.full_attention import (
-    FullAttnChunkArgs, full_attn_chunk_kernel, full_attn_reduce,
     FullAttnGroupArgs, full_attn_group_kernel,
 )
 from experimental_gemma.router import Gemma4TopKResult
@@ -102,7 +100,6 @@ struct Gemma4Config:
     comptime LOGIT_SOFTCAP = 30.0
 
 comptime C = Gemma4Config
-comptime DUMP_POS = 5
 
 
 # =============================================================================
@@ -211,16 +208,18 @@ struct SlidingLayer[tp: Int]:
 
 
 struct FullLayer[tp: Int]:
-    # --- Attention bf16: runtime RMSNorm + bf16 GEMV for Q/K (no V — K=V shared) ---
-    comptime Q_PROJ    = PlacedSlot[BF16, RowShard, C.Q_DIM_FULL,  C.HIDDEN, Self.tp, 0,                         "self_attn.q_proj.weight"]
-    comptime K_PROJ    = PlacedSlot[BF16, RowShard, C.KV_DIM_FULL, C.HIDDEN, Self.tp, next_offset[Self.Q_PROJ](), "self_attn.k_proj.weight"]
+    # --- Attention i8: contiguous [Q|K] (no V — K=V shared), then scales ---
+    comptime Q_PROJ    = PlacedSlot[I8, RowShard, C.Q_DIM_FULL,  C.HIDDEN, Self.tp, 0,                            "self_attn.q_proj.weight", IsQuantizable, VnniPacked]
+    comptime K_PROJ    = PlacedSlot[I8, RowShard, C.KV_DIM_FULL, C.HIDDEN, Self.tp, next_offset[Self.Q_PROJ](),    "self_attn.k_proj.weight", IsQuantizable, VnniPacked]
+    comptime Q_PROJ_SC = PlacedSlot[F32, RowShard, C.Q_DIM_FULL, 1,        Self.tp, next_offset[Self.K_PROJ](),    "self_attn.q_proj.weight_scale"]
+    comptime K_PROJ_SC = PlacedSlot[F32, RowShard, C.KV_DIM_FULL, 1,       Self.tp, next_offset[Self.Q_PROJ_SC](), "self_attn.k_proj.weight_scale"]
     # --- O projection ---
-    comptime O_PROJ    = PlacedSlot[I8, ColShard, C.HIDDEN, C.Q_DIM_FULL,  Self.tp, next_offset[Self.K_PROJ](), "self_attn.o_proj.weight", IsQuantizable, VnniPacked]
+    comptime O_PROJ    = PlacedSlot[I8, ColShard, C.HIDDEN, C.Q_DIM_FULL,  Self.tp, next_offset[Self.K_PROJ_SC](), "self_attn.o_proj.weight", IsQuantizable, VnniPacked]
     comptime O_PROJ_SC = PlacedSlot[F32, Replicated, C.HIDDEN, 1,          Self.tp, next_offset[Self.O_PROJ](),    "self_attn.o_proj.weight_scale"]
     # --- Per-head norms (runtime, not absorbed) ---
     comptime Q_NORM     = PlacedSlot[BF16, Replicated, C.HEAD_DIM_FULL, 1, Self.tp, next_offset[Self.O_PROJ_SC](), "self_attn.q_norm.weight"]
     comptime K_NORM     = PlacedSlot[BF16, Replicated, C.HEAD_DIM_FULL, 1, Self.tp, next_offset[Self.Q_NORM](),    "self_attn.k_norm.weight"]
-    # --- Runtime pre-Q/K norm ---
+    # --- Runtime norms ---
     comptime INPUT_NORM = PlacedSlot[BF16, Replicated, C.HIDDEN, 1,        Self.tp, next_offset[Self.K_NORM](),    "input_layernorm.weight"]
     # --- Dense MLP (identical to sliding) ---
     comptime PRE_FFN_NORM = PlacedSlot[BF16, Replicated, C.HIDDEN, 1,            Self.tp, next_offset[Self.INPUT_NORM](),   "pre_feedforward_layernorm.weight"]
@@ -250,7 +249,8 @@ struct FullLayer[tp: Int]:
     # --- Column sums (computed at load time, raw byte offsets) ---
     comptime QK_N = C.Q_DIM_FULL + C.KV_DIM_FULL
     comptime O_NUM_BLOCKS = (C.Q_DIM_FULL // Self.tp) // C.HEAD_DIM_FULL
-    comptime O_COLSUM_OFF   = next_offset[Self.LAYER_SCALAR]()
+    comptime QK_COLSUM_OFF  = next_offset[Self.LAYER_SCALAR]()
+    comptime O_COLSUM_OFF   = Self.QK_COLSUM_OFF + Self.QK_N * 4
     comptime GU_COLSUM_OFF  = Self.O_COLSUM_OFF + C.HIDDEN * Self.O_NUM_BLOCKS * 4
     comptime DOWN_COLSUM_OFF = Self.GU_COLSUM_OFF + C.INTERMEDIATE * 2 * 4
     comptime ROUTER_COLSUM_OFF = Self.DOWN_COLSUM_OFF + C.HIDDEN * C.DENSE_NUM_BLOCKS * 4
@@ -265,10 +265,12 @@ struct FullLayer[tp: Int]:
 
     @staticmethod
     def for_each_weight[func: def[T: Encoding & Shaped & Placed & Named](String, Int, Int) capturing -> None](prefix: String, base: Int):
-        # Logical quantizer order: absorbed norms before the projections they feed.
+        # Logical quantizer order: norms before the projections they feed.
         func[Self.INPUT_NORM](prefix, base, -1)
         func[Self.Q_PROJ](prefix, base, -1)
         func[Self.K_PROJ](prefix, base, -1)
+        func[Self.Q_PROJ_SC](prefix, base, -1)
+        func[Self.K_PROJ_SC](prefix, base, -1)
         func[Self.O_PROJ](prefix, base, -1)
         func[Self.O_PROJ_SC](prefix, base, -1)
         func[Self.Q_NORM](prefix, base, -1)
@@ -315,7 +317,76 @@ struct Gemma4Model[tp: Int](WeightIterable):
     comptime X_RESIDUAL_OFF = byte_count[Self.X_MAIN]()
     comptime X_RESIDUAL = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.HIDDEN, Self.tp]
     comptime SCRATCH_OFF = Self.X_RESIDUAL_OFF + byte_count[Self.X_RESIDUAL]()
-    comptime SCRATCH_CAPACITY = (C.Q_DIM_FULL + C.KV_DIM_FULL) * C.HIDDEN  # largest VNNI pack target (QK full)
+    comptime SCRATCH_CAPACITY = Self.calculate_peak_scratch()
+
+    @staticmethod
+    def calculate_peak_scratch() -> Int:
+        """Peak ScratchPool bytes for the current decode-only forward path.
+
+        `forward_decode` is hard-coded to `seq_len = 1`, so the true scratch
+        requirement is the maximum cumulative borrow footprint across:
+
+        - sliding attention
+        - full attention
+        - FFN/router/expert+dense path
+        - final host logits buffer
+
+        This is separate from loader/packing scratch. The previous value was a
+        stale VNNI-pack target and substantially overestimated the live decode
+        scratch requirement.
+        """
+        comptime bf16_bytes = size_of[Scalar[DType.bfloat16]]()
+        comptime i8_bytes = size_of[Scalar[DType.int8]]()
+        comptime f32_bytes = size_of[Float32]()
+        comptime topk_bytes = size_of[Gemma4TopKResult[C.TOP_K]]()
+
+        comptime persistent = (
+            f32_bytes  # act_scale_lease
+            + C.DENSE_NUM_BLOCKS * f32_bytes  # post_blk_scale_lease
+        )
+
+        comptime sliding_attn_peak = persistent + (
+            C.HIDDEN * i8_bytes                       # attn_i8_lease
+            + C.HIDDEN * f32_bytes                    # attn_work_lease
+            + f32_bytes                               # attn_scale_lease
+            + (SlidingLayer[1].QKV_N // Self.tp) * bf16_bytes
+            + (C.Q_DIM_SLIDING // Self.tp) * i8_bytes
+            + ((C.Q_DIM_SLIDING // Self.tp) // C.HEAD_DIM_SLIDING) * f32_bytes
+        )
+
+        comptime full_attn_phase1 = persistent + (
+            (FullLayer[1].QK_N // Self.tp) * bf16_bytes
+            + C.HIDDEN * i8_bytes
+            + C.HIDDEN * f32_bytes
+            + f32_bytes
+        )
+        comptime full_attn_phase2 = persistent + (
+            (FullLayer[1].QK_N // Self.tp) * bf16_bytes
+            + (C.Q_DIM_FULL // Self.tp) * i8_bytes
+            + ((C.Q_DIM_FULL // Self.tp) // C.HEAD_DIM_FULL) * f32_bytes
+        )
+        comptime full_attn_peak = full_attn_phase1 if full_attn_phase1 > full_attn_phase2 else full_attn_phase2
+
+        comptime ffn_peak = persistent + (
+            C.HIDDEN * i8_bytes                       # act_i8_lease
+            + C.HIDDEN * f32_bytes                    # act_work_lease
+            + C.NUM_EXPERTS * bf16_bytes              # router_logits_lease
+            + topk_bytes                              # routing_lease
+            + C.TOP_K * C.HIDDEN * bf16_bytes         # expert_out_lease
+            + size_of[Int32]()                        # local_count_lease
+            + C.INTERMEDIATE * i8_bytes               # dense_post_i8_lease
+            + C.HIDDEN * bf16_bytes                   # dense_out_lease
+            + C.HIDDEN * bf16_bytes                   # dense_normed_lease
+        )
+
+        comptime layer_peak = (
+            sliding_attn_peak if sliding_attn_peak > full_attn_peak else full_attn_peak
+        )
+        comptime decode_peak = ffn_peak if ffn_peak > layer_peak else layer_peak
+
+        comptime logits_peak = C.VOCAB_SIZE * bf16_bytes
+        comptime final_peak = logits_peak if logits_peak > decode_peak else decode_peak
+        return final_peak
 
     # RoPE tables
     comptime SLIDING_ROPE_HALF = C.HEAD_DIM_SLIDING // 2
@@ -571,53 +642,6 @@ def post_reduce_kernel(args: PostReduceArgs):
         args.layer_scalar, args.eps)
 
 
-struct StateDumper:
-    var fh: FileHandle
-    var active: Bool
-
-    def __init__(out self, path: String, enabled: Bool):
-        if enabled:
-            try:
-                self.fh = FileHandle(path, "w")
-                self.active = True
-                return
-            except:
-                print("StateDumper: failed to open", path)
-        self.fh = FileHandle()
-        self.active = False
-
-    def dump(mut self, ptr: Int, count: Int):
-        if not self.active:
-            return
-        var nbytes = count * 2
-        var raw = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=ptr)
-        var buf = List[UInt8](capacity=nbytes)
-        for i in range(nbytes):
-            buf.append(raw[i])
-        try:
-            self.fh.write_bytes(Span(buf))
-        except:
-            print("StateDumper: write failed")
-
-    def close(mut self):
-        if self.active:
-            try:
-                self.fh.close()
-            except:
-                pass
-            self.active = False
-
-
-@always_inline
-def bf16_has_nan(ptr: Int, count: Int) -> Bool:
-    var p = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=ptr)
-    for i in range(count):
-        var v = Float32(p[i])
-        if v != v:
-            return True
-    return False
-
-
 def comptime_sqrt(x: Float64) -> Float64:
     if x <= Float64(0):
         return Float64(0)
@@ -797,6 +821,8 @@ def init_full_layer(arena_base: Int, layer_base: Int,
     scratch: UnsafePointer[UInt8, MutAnyOrigin]):
     comptime FL = FullLayer[1]
     # Column sums
+    colsum_at(arena_base, layer_base + FL.Q_PROJ.OFFSET, layer_base + FL.QK_COLSUM_OFF,
+        FL.QK_N, C.HIDDEN)
     block_colsum_at(arena_base, layer_base + FL.O_PROJ.OFFSET, layer_base + FL.O_COLSUM_OFF,
         C.HIDDEN, C.Q_DIM_FULL, C.HEAD_DIM_FULL)
     colsum_at(arena_base, layer_base + FL.GATE_PROJ.OFFSET, layer_base + FL.GU_COLSUM_OFF,
@@ -813,6 +839,7 @@ def init_full_layer(arena_base: Int, layer_base: Int,
             layer_base + FL.EXPERTS_DOWN_COLSUM_OFF + e * C.HIDDEN * C.MOE_NUM_BLOCKS * 4,
             C.HIDDEN, C.MOE_INTERMEDIATE, C.FWHT_BLK)
     # VNNI packing
+    pack_at(arena_base, layer_base + FL.Q_PROJ.OFFSET, FL.QK_N, C.HIDDEN, scratch)
     pack_at(arena_base, layer_base + FL.O_PROJ.OFFSET, C.HIDDEN, C.Q_DIM_FULL, scratch)
     pack_at(arena_base, layer_base + FL.GATE_PROJ.OFFSET, C.INTERMEDIATE * 2, C.HIDDEN, scratch)
     pack_at(arena_base, layer_base + FL.DOWN_PROJ.OFFSET, C.HIDDEN, C.INTERMEDIATE, scratch)
@@ -1012,7 +1039,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         comptime SL = Self.SL
         comptime FL = Self.FL
         comptime EPS = Float32(C.RMS_NORM_EPS)
-        comptime DEBUG_NUMERICS = True
         comptime seq_len = 1
 
         var rnks = self.ranks()
@@ -1026,28 +1052,11 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             host.host_weight[M.EMBED](), tokens_ptr,
             host.x_main(seq_len), Float32(C.EMBED_SCALE),
             self.main_pools[0]).join()
-        if DEBUG_NUMERICS and pos == 0:
-            var token_id = Int(UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
-                unsafe_from_address=tokens_ptr)[])
-            var dbg_src = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-                unsafe_from_address=host.host_weight[M.EMBED]().ptr + token_id * C.HIDDEN * 2)
-            var dbg_em = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=host.x_main(seq_len).ptr)
-            print(
-                "debug embed: tok=", token_id,
-                " src[0:4]=", Float32(dbg_src[0]), Float32(dbg_src[1]), Float32(dbg_src[2]), Float32(dbg_src[3]),
-                " x[0:4]=", Float32(dbg_em[0]), Float32(dbg_em[1]), Float32(dbg_em[2]), Float32(dbg_em[3]),
-                " src_nan=", bf16_has_nan(Int(dbg_src), C.HIDDEN),
-                " x_nan=", bf16_has_nan(host.x_main(seq_len).ptr, C.HIDDEN),
-            )
         ring_broadcast[M.X_MAIN, Self.tp](
             host.x_main(seq_len).ptr, rnks.x_main_ptrs(seq_len), seq_len, mp)
 
         var act_scale_lease = self.scratch.borrow[Float32, 1]()
         var post_blk_scale_lease = self.scratch.borrow[Float32, C.DENSE_NUM_BLOCKS]()
-
-        var dumper = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_states.bin", pos == DUMP_POS)
-        if pos == DUMP_POS:
-            dumper.dump(host.x_main(seq_len).ptr, C.HIDDEN)
 
         var sliding_idx = 0
         var full_idx = 0
@@ -1072,10 +1081,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                         rv.scratch_addr(attn_work_lease), rv.scratch_addr(attn_scale_lease),
                         seq_len, pool)
                 rnks.parallel[do_attn_quantize](mp)
-                if DEBUG_NUMERICS and layer_idx == 0:
-                    var dbg_sc = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=host.scratch_addr(attn_scale_lease))[]
-                    var dbg_i8 = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=host.scratch_addr(attn_i8_lease))
-                    print("debug L0 attn_quantize: scale=", dbg_sc, "i8[0:4]=", Int(dbg_i8[0]), Int(dbg_i8[1]), Int(dbg_i8[2]), Int(dbg_i8[3]))
 
                 var qkv_lease = self.scratch.borrow[Scalar[DType.bfloat16], SL.QKV_N // Self.tp]()
 
@@ -1090,10 +1095,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                         rv.scratch_addr(qkv_lease),
                         seq_len, rv.scratch_addr(attn_scale_lease), pool)
                 rnks.parallel[do_qkv_gemv](mp)
-                if layer_idx == 0 and pos == 0:
-                    var qkv_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L0_qkv.bin", True)
-                    qkv_dump.dump(host.scratch_addr(qkv_lease), SL.QKV_N)
-                    qkv_dump.close()
 
                 var v_sum_sq = Float32(0)
                 for r in range(Self.tp):
@@ -1143,25 +1144,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                         unsafe_from_address=Int(UnsafePointer(to=pool))))
                 rnks.parallel[do_sliding_attn](mp)
-                if DEBUG_NUMERICS and layer_idx == 0:
-                    var dbg_hsc = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=host.scratch_addr(attn_head_sc_lease))
-                    var dbg_qi = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=host.scratch_addr(attn_qi_lease))
-                    print("debug L0 attn_out: head_sc[0:4]=", dbg_hsc[0], dbg_hsc[1], dbg_hsc[2], dbg_hsc[3],
-                        "qi[0:4]=", Int(dbg_qi[0]), Int(dbg_qi[1]), Int(dbg_qi[2]), Int(dbg_qi[3]))
-                    var any_nan_sc = False
-                    for hi in range(SL.Q_DIM_LOCAL // C.HEAD_DIM_SLIDING):
-                        var sv = dbg_hsc[hi]
-                        if sv != sv:
-                            any_nan_sc = True
-                    print("debug L0 attn_out: head_scale_nan=", any_nan_sc)
-
-                if layer_idx == 0 and pos == 0:
-                    var ai_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L0_attn_i8.bin", True)
-                    ai_dump.dump(host.scratch_addr(attn_qi_lease), SL.Q_DIM_LOCAL // 2)  # i8 is 1 byte, dump uses count*2
-                    ai_dump.close()
-                    var hs_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L0_attn_headsc.bin", True)
-                    hs_dump.dump(host.scratch_addr(attn_head_sc_lease), (SL.Q_DIM_LOCAL // C.HEAD_DIM_SLIDING) * 2)  # f32 is 4 bytes, dump uses count*2
-                    hs_dump.close()
 
                 @parameter
                 def do_o_proj[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
@@ -1172,10 +1154,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                         slb + SL.O_COLSUM_OFF,
                         rv.x_residual(seq_len).ptr, seq_len, pool)
                 rnks.parallel[do_o_proj](mp)
-                if layer_idx == 0 and pos == 0:
-                    var xr_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L0_xresid.bin", True)
-                    xr_dump.dump(host.x_residual(seq_len).ptr, C.HIDDEN)
-                    xr_dump.close()
                 attn_head_sc_lease^.release()
                 attn_qi_lease^.release()
                 qkv_lease^.release()
@@ -1183,56 +1161,42 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 attn_work_lease^.release()
                 attn_i8_lease^.release()
             else:
-                # Full attention — bf16 Q/K projection silo, quantized cache/O/FFN unchanged
+                # Full attention — int8 Q/K projection, quantized cache/O/FFN unchanged
                 comptime FL = FullLayer[1]
                 comptime FULL_HPG = C.NUM_HEADS // C.NUM_KV_HEADS_FULL
                 comptime FULL_Q_LOCAL = C.Q_DIM_FULL // Self.tp
                 comptime FULL_NKV = C.NUM_KV_HEADS_FULL
                 comptime ROPE_DIMS_FULL = 128
-                var qk_lease = self.scratch.borrow[Scalar[DType.bfloat16], FL.QK_N]()
+                var qk_lease = self.scratch.borrow[Scalar[DType.bfloat16], FL.QK_N // Self.tp]()
 
-                comptime FULL_Q_VIEW = Slot[BF16, Replicated, seq_len, FULL_Q_LOCAL, 1]
-                comptime FULL_K_VIEW = Slot[BF16, Replicated, seq_len, FL.KV_DIM_LOCAL, 1]
-
-                @parameter
-                def do_full_input_norm[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                    var flb = rv.full_layer_base(full_idx)
-                    return rmsnorm(
-                        rv.x_main(seq_len),
-                        Bound[FL.INPUT_NORM](flb + FL.INPUT_NORM.OFFSET),
-                        rv.x_residual(seq_len),
-                        pool, EPS)
-                rnks.parallel[do_full_input_norm](mp)
+                var full_attn_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.HIDDEN]()
+                var full_attn_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
+                var full_attn_scale_lease = self.scratch.borrow[Float32, 1]()
 
                 @parameter
-                def do_q_gemv[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                def do_full_attn_quantize[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                     var flb = rv.full_layer_base(full_idx)
-                    return float_gemv(
-                        rv.x_residual(seq_len),
-                        Bound[FL.Q_PROJ](flb + FL.Q_PROJ.OFFSET),
-                        DynView[FULL_Q_VIEW](rv.scratch_addr(qk_lease), seq_len),
-                        pool)
-                rnks.parallel[do_q_gemv](mp)
+                    return rmsnorm_gamma_fwht_quantize[C.HIDDEN, C.FWHT_BLK_HIDDEN](
+                        rv.x_main(seq_len).ptr, flb + FL.INPUT_NORM.OFFSET,
+                        rv.scratch_addr(full_attn_i8_lease),
+                        rv.scratch_addr(full_attn_work_lease), rv.scratch_addr(full_attn_scale_lease),
+                        seq_len, pool)
+                rnks.parallel[do_full_attn_quantize](mp)
 
                 @parameter
-                def do_k_gemv[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                def do_full_qk_gemv[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                     var flb = rv.full_layer_base(full_idx)
-                    return float_gemv(
-                        rv.x_residual(seq_len),
-                        Bound[FL.K_PROJ](flb + FL.K_PROJ.OFFSET),
-                        DynView[FULL_K_VIEW](rv.scratch_addr(qk_lease) + FULL_Q_LOCAL * 2, seq_len),
-                        pool)
-                rnks.parallel[do_k_gemv](mp)
-                if pos == DUMP_POS and full_idx == 0:
-                    var qk_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L5_full_qk.bin", True)
-                    qk_dump.dump(host.scratch_addr(qk_lease), FULL_Q_LOCAL)
-                    qk_dump.dump(host.scratch_addr(qk_lease) + FULL_Q_LOCAL * 2, FL.KV_DIM_LOCAL)
-                    qk_dump.close()
-                if pos == DUMP_POS and full_idx == 4:
-                    var qk_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L29_full_qk.bin", True)
-                    qk_dump.dump(host.scratch_addr(qk_lease), FULL_Q_LOCAL)
-                    qk_dump.dump(host.scratch_addr(qk_lease) + FULL_Q_LOCAL * 2, FL.KV_DIM_LOCAL)
-                    qk_dump.close()
+                    return int8_gemv[FL.QK_N // Self.tp, C.HIDDEN](
+                        rv.scratch_addr(full_attn_i8_lease),
+                        flb + FL.Q_PROJ.OFFSET,
+                        flb + FL.QK_COLSUM_OFF,
+                        flb + FL.Q_PROJ_SC.OFFSET,
+                        rv.scratch_addr(qk_lease),
+                        seq_len, rv.scratch_addr(full_attn_scale_lease), pool)
+                rnks.parallel[do_full_qk_gemv](mp)
+                full_attn_scale_lease^.release()
+                full_attn_work_lease^.release()
+                full_attn_i8_lease^.release()
 
                 var full_v_sum_sq = Float32(0)
                 for r in range(Self.tp):
@@ -1253,11 +1217,8 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     var qk_base = rv.scratch_addr(qk_lease)
                     var q_base = qk_base
                     var k_base = qk_base + FULL_Q_LOCAL * 2
-                    # cos/sin for full attention use the full RoPE tables
-                    # (compact 64-entry table for partial RoPE)
                     var cos_addr = rv.state_base() + Self.M.FULL_COS_OFF + pos * Self.M.FULL_ROPE_HALF * size_of[Float32]()
                     var sin_addr = rv.state_base() + Self.M.FULL_SIN_OFF + pos * Self.M.FULL_ROPE_HALF * size_of[Float32]()
-                    var context_len = pos + 1
 
                     var flb = rv.full_layer_base(full_idx)
                     var q_norm_addr = flb + FL.Q_NORM.OFFSET
@@ -1271,7 +1232,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                             q_norm_addr, k_norm_addr,
                             cos_addr, sin_addr,
                             rv.full_cache_base(full_idx), g,
-                            pos, context_len,
+                            pos, pos + 1,
                             rv.scratch_addr(attn_qi_lease) + g * FULL_HPG * C.HEAD_DIM_FULL,
                             rv.scratch_addr(attn_head_sc_lease) + g * FULL_HPG * 4,
                             full_v_inv_rms,
@@ -1283,20 +1244,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                         unsafe_from_address=Int(UnsafePointer(to=pool))))
                 rnks.parallel[do_full_attn](mp)
-                if pos == DUMP_POS and full_idx == 0:
-                    var ai_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L5_full_attn_i8.bin", True)
-                    ai_dump.dump(host.scratch_addr(attn_qi_lease), FULL_Q_LOCAL // 2)
-                    ai_dump.close()
-                    var hs_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L5_full_attn_headsc.bin", True)
-                    hs_dump.dump(host.scratch_addr(attn_head_sc_lease), (FULL_Q_LOCAL // C.HEAD_DIM_FULL) * 2)
-                    hs_dump.close()
-                if pos == DUMP_POS and full_idx == 4:
-                    var ai_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L29_full_attn_i8.bin", True)
-                    ai_dump.dump(host.scratch_addr(attn_qi_lease), FULL_Q_LOCAL // 2)
-                    ai_dump.close()
-                    var hs_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L29_full_attn_headsc.bin", True)
-                    hs_dump.dump(host.scratch_addr(attn_head_sc_lease), (FULL_Q_LOCAL // C.HEAD_DIM_FULL) * 2)
-                    hs_dump.close()
 
                 # O projection
                 @parameter
@@ -1308,14 +1255,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                         flb + FL.O_COLSUM_OFF,
                         rv.x_residual(seq_len).ptr, seq_len, pool)
                 rnks.parallel[do_full_o_proj](mp)
-                if pos == DUMP_POS and full_idx == 0:
-                    var xr_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L5_full_xresid.bin", True)
-                    xr_dump.dump(host.x_residual(seq_len).ptr, C.HIDDEN)
-                    xr_dump.close()
-                if pos == DUMP_POS and full_idx == 4:
-                    var xr_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L29_full_xresid.bin", True)
-                    xr_dump.dump(host.x_residual(seq_len).ptr, C.HIDDEN)
-                    xr_dump.close()
                 attn_head_sc_lease^.release()
                 attn_qi_lease^.release()
                 qk_lease^.release()
@@ -1336,8 +1275,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                     unsafe_from_address=Int(UnsafePointer(to=pool))))
             rnks.parallel[do_post_attn_norm](mp)
-            if pos == DUMP_POS:
-                dumper.dump(host.x_main(seq_len).ptr, C.HIDDEN)
 
             # =============================================================
             # FFN BLOCK (identical for sliding and full layers)
@@ -1356,9 +1293,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     rv.scratch_addr(act_work_lease), rv.scratch_addr(act_scale_lease),
                     seq_len, pool)
             rnks.parallel[do_router_quantize](mp)
-            if DEBUG_NUMERICS and layer_idx == 0:
-                var dbg_as = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=host.scratch_addr(act_scale_lease))[]
-                print("debug L0 ffn act_quantize: scale=", dbg_as)
 
             var router_logits_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.NUM_EXPERTS]()
             var routing_lease = self.scratch.borrow[Gemma4TopKResult[C.TOP_K], 1]()
@@ -1391,22 +1325,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                     unsafe_from_address=Int(UnsafePointer(to=pool))))
             rnks.parallel[do_router_topk](mp)
-            if DEBUG_NUMERICS and layer_idx == 0 and pos < 6:
-                var dbg_rt = UnsafePointer[Gemma4TopKResult[C.TOP_K], MutAnyOrigin](
-                    unsafe_from_address=host.scratch_addr(routing_lease))[]
-                print(
-                    "debug L0 routing: pos=", pos,
-                    " e=", dbg_rt.indices[0], dbg_rt.indices[1], dbg_rt.indices[2], dbg_rt.indices[3],
-                        dbg_rt.indices[4], dbg_rt.indices[5], dbg_rt.indices[6], dbg_rt.indices[7],
-                    " w=", dbg_rt.weights[0], dbg_rt.weights[1], dbg_rt.weights[2], dbg_rt.weights[3],
-                        dbg_rt.weights[4], dbg_rt.weights[5], dbg_rt.weights[6], dbg_rt.weights[7],
-                )
-            if pos == DUMP_POS and not is_full and (layer_idx == 3 or layer_idx == 4):
-                var rl_dump = StateDumper(
-                    String("/home/grail/Desktop/Mojo-Linuxperiments/quant_L")
-                    + String(layer_idx) + String("_router_logits.bin"), True)
-                rl_dump.dump(host.scratch_addr(router_logits_lease), C.NUM_EXPERTS)
-                rl_dump.close()
 
             var expert_out_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.TOP_K * C.HIDDEN]()
             var local_count_lease = self.scratch.borrow[Int32, 1]()
@@ -1462,7 +1380,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     lb + gate_proj_sc_off,
                     lb + gu_colsum_off,
                     rv.scratch_addr(dense_post_i8_lease), rv.scratch_addr(post_blk_scale_lease),
-                    seq_len, pool, layer_idx == 0 and pos == 0)
+                    seq_len, pool)
             rnks.parallel[do_dense_phase1](dp)
 
             @parameter
@@ -1470,24 +1388,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 pool.join()
                 return PoolFence[BurstPool[]].completed()
             rnks.parallel[do_dense_join1](dp)
-            if layer_idx == 0 and pos == 0:
-                var dbg_bs = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=host.scratch_addr(post_blk_scale_lease))
-                print("  quant dense blk_scales[0:4]=", dbg_bs[0], dbg_bs[1], dbg_bs[2], dbg_bs[3],
-                      "blk_scales[30:33]=", dbg_bs[30], dbg_bs[31], dbg_bs[32])
-                var slb = host.sliding_layer_base(0)
-                var dsc = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=slb + SL.DOWN_PROJ_SC.OFFSET)
-                print("  quant down_wscale[0:4]=", dsc[0], dsc[1], dsc[2], dsc[3])
-                var di8 = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=host.scratch_addr(dense_post_i8_lease))
-                print("  quant dense_i8[0:8]=", di8[0], di8[1], di8[2], di8[3], di8[4], di8[5], di8[6], di8[7])
-                var dcs = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=slb + SL.DOWN_COLSUM_OFF)
-                print("  quant down_blkcolsum[0:4]=", dcs[0], dcs[1], dcs[2], dcs[3],
-                      "stride_check[2816]=", dcs[2816])
-                var fi8 = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L0_ffn_inter_i8.bin", True)
-                fi8.dump(host.scratch_addr(dense_post_i8_lease), C.INTERMEDIATE // 2)
-                fi8.close()
-                var fbs = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L0_ffn_inter_scales.bin", True)
-                fbs.dump(host.scratch_addr(post_blk_scale_lease), C.DENSE_NUM_BLOCKS * 2)
-                fbs.close()
 
             var dense_out_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.HIDDEN]()
 
@@ -1516,35 +1416,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 pool.join()
                 return PoolFence[BurstPool[]].completed()
             rnks.parallel[do_join_expert](ep)
-            if DEBUG_NUMERICS and layer_idx == 0:
-                var dbg_eo = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=host.scratch_addr(expert_out_lease))
-                var dbg_lc = Int(UnsafePointer[Int32, MutAnyOrigin](unsafe_from_address=host.scratch_addr(local_count_lease))[])
-                for ei in range(dbg_lc):
-                    var ebase = ei * C.HIDDEN
-                    var enan = bf16_has_nan(host.scratch_addr(expert_out_lease) + ebase * 2, C.HIDDEN)
-                    if enan:
-                        var first_nan = -1
-                        for j in range(C.HIDDEN):
-                            var v = Float32(dbg_eo[ebase + j])
-                            if v != v:
-                                first_nan = j
-                                break
-                        print("debug L0 expert", ei, "NaN at dim", first_nan, "/ 2816")
-                    else:
-                        print("debug L0 expert", ei, "clean  e[0:2]=", Float32(dbg_eo[ebase]), Float32(dbg_eo[ebase+1]))
-                var dbg_do = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=host.scratch_addr(dense_out_lease))
-                print("debug L0 ffn dense_out: nan=", bf16_has_nan(host.scratch_addr(dense_out_lease), C.HIDDEN))
-
-            if layer_idx == 0 and pos == 0:
-                var fd = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L0_ffn_dense.bin", True)
-                fd.dump(host.scratch_addr(dense_out_lease), C.HIDDEN)
-                fd.close()
-            if pos == DUMP_POS and not is_full and (layer_idx == 3 or layer_idx == 4):
-                var fd = StateDumper(
-                    String("/home/grail/Desktop/Mojo-Linuxperiments/quant_L")
-                    + String(layer_idx) + String("_ffn_dense.bin"), True)
-                fd.dump(host.scratch_addr(dense_out_lease), C.HIDDEN)
-                fd.close()
 
             var dense_normed_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.HIDDEN]()
 
@@ -1563,32 +1434,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                     unsafe_from_address=Int(UnsafePointer(to=pool))))
             rnks.parallel[do_pre_reduce](mp)
-            if DEBUG_NUMERICS and layer_idx == 0:
-                print("debug L0 ffn pre_reduce: xr_nan=", bf16_has_nan(host.x_residual(seq_len).ptr, C.HIDDEN),
-                    "dn_nan=", bf16_has_nan(host.scratch_addr(dense_normed_lease), C.HIDDEN))
-                var dbg_xr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=host.x_residual(seq_len).ptr)
-                var dbg_dn = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=host.scratch_addr(dense_normed_lease))
-                print("  xr[0:4]=", Float32(dbg_xr[0]), Float32(dbg_xr[1]), Float32(dbg_xr[2]), Float32(dbg_xr[3]),
-                    "dn[0:4]=", Float32(dbg_dn[0]), Float32(dbg_dn[1]), Float32(dbg_dn[2]), Float32(dbg_dn[3]))
-            if layer_idx == 0 and pos == 0:
-                var fdn = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L0_ffn_dense_normed.bin", True)
-                fdn.dump(host.scratch_addr(dense_normed_lease), C.HIDDEN)
-                fdn.close()
-            if layer_idx == 0 and pos == 0:
-                var fm = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L0_ffn_moe.bin", True)
-                fm.dump(host.x_residual(seq_len).ptr, C.HIDDEN)
-                fm.close()
-            if pos == DUMP_POS and not is_full and (layer_idx == 3 or layer_idx == 4):
-                var fdn = StateDumper(
-                    String("/home/grail/Desktop/Mojo-Linuxperiments/quant_L")
-                    + String(layer_idx) + String("_ffn_dense_normed.bin"), True)
-                fdn.dump(host.scratch_addr(dense_normed_lease), C.HIDDEN)
-                fdn.close()
-                var fm = StateDumper(
-                    String("/home/grail/Desktop/Mojo-Linuxperiments/quant_L")
-                    + String(layer_idx) + String("_ffn_moe.bin"), True)
-                fm.dump(host.x_residual(seq_len).ptr, C.HIDDEN)
-                fm.close()
 
             ring_allreduce[M.X_RESIDUAL, Self.tp](
                 rnks.x_residual_ptrs(seq_len), seq_len, mp)
@@ -1611,10 +1456,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                     unsafe_from_address=Int(UnsafePointer(to=pool))))
             rnks.parallel[do_post_reduce](mp)
-            if layer_idx == 0 and pos == 0:
-                var fc = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/quant_L0_ffn_combined.bin", True)
-                fc.dump(host.x_residual(seq_len).ptr, C.HIDDEN)
-                fc.close()
             dense_normed_lease^.release()
             dense_out_lease^.release()
             dense_post_i8_lease^.release()
@@ -1624,17 +1465,12 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             router_logits_lease^.release()
             act_work_lease^.release()
             act_i8_lease^.release()
-            if pos == DUMP_POS:
-                dumper.dump(host.x_main(seq_len).ptr, C.HIDDEN)
 
             if is_full:
                 full_idx += 1
             else:
                 sliding_idx += 1
 
-        # End layer loop
-        if pos == DUMP_POS:
-            dumper.close()
         post_blk_scale_lease^.release()
         act_scale_lease^.release()
 
@@ -1646,8 +1482,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         var logit_view = host.scratch_view[M.LOGITS](logit_lease, 1)
         float_gemv(last_hidden, host.host_weight[M.EMBED](), logit_view,
             self.main_pools[0]).join()
-        if DEBUG_NUMERICS and pos == 0 and bf16_has_nan(logit_view.ptr, C.VOCAB_SIZE):
-            print("debug: NaN in logits before softcap pos=", pos)
         logit_softcap(logit_view)
         return LogitsView[C.VOCAB_SIZE](
             host.scratch_ptr[Scalar[DType.bfloat16]](logit_lease), logit_lease^)

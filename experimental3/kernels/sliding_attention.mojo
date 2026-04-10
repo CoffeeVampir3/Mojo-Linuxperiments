@@ -360,7 +360,7 @@ def validate_single_pass():
             v_data[d] = Scalar[DType.bfloat16](Float32(xorshift64(rng)))
         write_k_head_normed[head_dim](k_data, k_norm, cos_f32, sin_f32, work, qi_buf,
             cache, pos, kv_head, Float32(1e-6))
-        write_v_head_normed[head_dim](v_data, Float32(127.0) / v_scale, work, qi_buf,
+        write_v_head_normed[head_dim](v_data, work, qi_buf,
             cache, pos, kv_head, Float32(1e-6))
         k_data.free()
         v_data.free()

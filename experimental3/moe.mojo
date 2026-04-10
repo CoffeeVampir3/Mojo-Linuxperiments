@@ -119,12 +119,11 @@ def gemma4_expert_i8_kernel[intermediate: Int, hidden: Int, fwht_blk: Int,
     args: Gemma4ExpertI8Args,
 ):
     """Fused int8 expert FFN: on-worker norm+gamma+FWHT+quantize →
-    gate_up GEMV → gelu_tanh → FWHT+DC → down GEMV.
+    gate_up GEMV → gelu_tanh → FWHT → down GEMV.
     All intermediates on the stack."""
     comptime width = simd_width_of[DType.float32]()
     comptime gate_up_dim = 2 * intermediate
     comptime num_blocks = intermediate // fwht_blk
-    comptime DC_SCALE = Float32(1.0)
     comptime hidden_blocks = hidden // hidden_fwht_blk
 
     var x_main = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.x_main_ptr)
@@ -174,14 +173,13 @@ def gemma4_expert_i8_kernel[intermediate: Int, hidden: Int, fwht_blk: Int,
         (work + k).store(gelu_tanh_f32[width](g) * u)
         k += width
 
-    # Phase 3: FWHT + DC correction + per-block quantize
+    # Phase 3: FWHT + per-block quantize
     var qi_buf = InlineArray[Scalar[DType.int8], intermediate](uninitialized=True)
     var qi = UnsafePointer(to=qi_buf).bitcast[Scalar[DType.int8]]()
     var blk_scales = InlineArray[Float32, num_blocks](fill=Float32(0))
     var blk_sc = UnsafePointer(to=blk_scales).bitcast[Float32]()
     for b in range(num_blocks):
         fwht_block[fwht_blk](work + b * fwht_blk)
-        work[b * fwht_blk] *= DC_SCALE
         blk_sc[b] = absmax_quantize_i8[fwht_blk](work + b * fwht_blk, qi + b * fwht_blk)
 
     # Phase 4: down GEMV with per-block scales
@@ -375,7 +373,6 @@ def validate_expert_pipeline():
     comptime gate_up_dim = 1408
     comptime fwht_blk = 64
     comptime num_blocks = intermediate // fwht_blk
-    comptime DC_SCALE = 0.5
 
     var rng = UInt64(0xCAFEDEAD12345678)
 
@@ -394,7 +391,7 @@ def validate_expert_pipeline():
     var routing_weight = Float32(0.15)
     var act_dequant = Float64(act_scale) / 127.0
 
-    # f64 reference: gate_up → gelu_tanh → FWHT+DC+quantize → dequant → down
+    # f64 reference: gate_up → gelu_tanh → FWHT+quantize → dequant → down
     var gu_f64 = alloc[Float64](gate_up_dim)
     for n in range(gate_up_dim):
         var acc = Float64(0)
@@ -409,14 +406,13 @@ def validate_expert_pipeline():
         var e = Float64(exp_f32[1](Float32(-2.0 * inner)))
         activated[i] = 0.5 * g * (1.0 + (1.0 - e) / (1.0 + e)) * gu_f64[intermediate + i]
 
-    # FWHT + DC + per-block quantize round-trip
+    # FWHT + per-block quantize round-trip
     var fwht_buf = alloc[Float64](intermediate)
     for i in range(intermediate):
         fwht_buf[i] = activated[i]
 
     for b in range(num_blocks):
         scalar_fwht_f64(fwht_buf + b * fwht_blk, fwht_blk)
-        fwht_buf[b * fwht_blk] *= DC_SCALE
 
     var qi = alloc[Scalar[DType.int8]](intermediate)
     var bsc = alloc[Float64](num_blocks)
@@ -436,8 +432,7 @@ def validate_expert_pipeline():
     var dequant = alloc[Float64](intermediate)
     for b in range(num_blocks):
         var dq = bsc[b] / 127.0
-        dequant[b * fwht_blk] = Float64(Int(qi[b * fwht_blk])) * dq * (1.0 / DC_SCALE)
-        for j in range(1, fwht_blk):
+        for j in range(fwht_blk):
             dequant[b * fwht_blk + j] = Float64(Int(qi[b * fwht_blk + j])) * dq
     for b in range(num_blocks):
         scalar_fwht_f64(dequant + b * fwht_blk, fwht_blk)
@@ -484,5 +479,5 @@ def validate_expert_pipeline():
 
 def main():
     print("=== Gemma4 MoE expert pipeline validation ===")
-    print("\nSingle expert i8 pipeline (gate_up → gelu_tanh → FWHT+DC → down):")
+    print("\nSingle expert i8 pipeline (gate_up → gelu_tanh → FWHT → down):")
     validate_expert_pipeline()

@@ -1,10 +1,10 @@
 """GELU-tanh + FWHT + dynamic-scale i8 quantization (Gemma 4 MLP domain exit).
 
 Per row: bf16 gate, bf16 up -> f32 GELU_tanh(gate) * up -> block-diagonal FWHT
--> DC correction (element 0 × 0.5) -> per-block absmax -> quantize with dynamic scale.
+-> per-block absmax -> quantize with dynamic scale.
 
-Used as an inline building block by the expert kernel (moe.mojo) and the fused
-dense gate_up kernel (int8_gemv.fused_gu_gelu_tanh). Not dispatched standalone.
+Exports the shared GELU-tanh activation used by the expert and dense FFN
+kernels. Also contains a standalone row helper plus self-validation.
 """
 
 from std.memory import UnsafePointer
@@ -37,7 +37,7 @@ def gelu_tanh_f32[width: Int](x: SIMD[DType.float32, width]) -> SIMD[DType.float
 
 
 # ============================================================================
-# Row kernel — one row: gelu_tanh(gate) * up -> FWHT -> DC -> per-block i8
+# Row kernel — one row: gelu_tanh(gate) * up -> FWHT -> per-block i8
 # ============================================================================
 
 
@@ -54,7 +54,6 @@ def gelu_tanh_fwht_quantize_row[cols: Int, block: Int](
     """
     comptime width = simd_width_of[DType.float32]()
     comptime num_blocks = cols // block
-    comptime DC_SCALE = Float32(0.5)
 
     var k = 0
     while k + width <= cols:
@@ -65,7 +64,6 @@ def gelu_tanh_fwht_quantize_row[cols: Int, block: Int](
 
     for b in range(num_blocks):
         fwht_block[block](work + b * block)
-        work[b * block] *= DC_SCALE
         scale_out[b] = absmax_quantize_i8[block](work + b * block, row_qi + b * block)
 
 
@@ -176,18 +174,16 @@ def validate[cols: Int, block: Int]():
         kernel_f64[i] = Float64(work[i])
     error_stats_f64(expected_f64, kernel_f64, cols, "gelu_tanh*up (f32 kernel vs f64 ref)")
 
-    # FWHT + DC correction + per-block quantize round-trip
+    # FWHT + per-block quantize round-trip
     var qi_blk = alloc[Scalar[DType.int8]](cols)
     var blk_scales = alloc[Float32](num_blocks)
     var work2 = alloc[Float32](cols)
     gelu_tanh_fwht_quantize_row[cols, block](gate_bf16, up_bf16, qi_blk, work2, blk_scales)
 
-    comptime DC_INV = Float64(1.0 / 0.5)
     var recovered_blk = alloc[Scalar[DType.float64]](cols)
     for b in range(num_blocks):
         var dq_b = Float64(blk_scales[b]) / 127.0
-        recovered_blk[b * block] = Float64(Int64(qi_blk[b * block])) * dq_b * DC_INV
-        for j in range(1, block):
+        for j in range(block):
             recovered_blk[b * block + j] = Float64(Int64(qi_blk[b * block + j])) * dq_b
     for b in range(num_blocks):
         scalar_fwht_f64(recovered_blk.bitcast[Float64]() + b * block, block)
@@ -202,7 +198,7 @@ def validate[cols: Int, block: Int]():
     print("  per-block scales: min=" + String(min_scale) + " max=" + String(max_scale)
         + " range=" + String(Float64(max_scale) / Float64(min_scale)) + "x"
         + " (" + String(num_blocks) + " blocks)")
-    error_stats_f64(expected_f64, recovered_blk, cols, "per-block + DC correction round-trip")
+    error_stats_f64(expected_f64, recovered_blk, cols, "per-block round-trip")
 
     gate_bf16.free()
     up_bf16.free()

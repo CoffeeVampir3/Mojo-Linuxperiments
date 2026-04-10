@@ -23,7 +23,7 @@ from experimental3.kernels.sliding_attention import (
     dot_score, score_group, v_agg_group, single_pass_attention, WIDTH,
 )
 from experimental3.kernels.rope_and_kv_cache_write import (
-    write_k_head_normed_partial, write_v_head_normed, write_v_head_with_inv_rms,
+    write_k_head_normed_partial, write_v_head_with_inv_rms,
 )
 from experimental3.helpers import prep_q_row_normed_partial
 from simd_math import exp_f32, sqrt

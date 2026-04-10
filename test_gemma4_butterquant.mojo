@@ -112,11 +112,10 @@ def main():
     var generated = List[Int]()
     generated.append(next_id)
 
-    var prefill_tps = Float64(prompt_len) / (Float64(prefill_ms) / 1000.0)
     print(
         "prompt  |", prompt_len, "tokens |",
         prefill_ms, "ms |",
-        Int(prefill_tps), "t/s",
+        Int(Float64(prompt_len) / (Float64(prefill_ms) / 1000.0)), "t/s",
     )
 
     # --- Decode ---

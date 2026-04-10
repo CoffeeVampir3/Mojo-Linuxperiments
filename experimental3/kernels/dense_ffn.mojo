@@ -1,6 +1,6 @@
 """Dense MLP dispatch kernels for Gemma 4 forward pass.
 
-Phase 1: Fused gate_up GEMV + GELU-tanh + FWHT + DC + per-block quantize.
+Phase 1: Fused gate_up GEMV + GELU-tanh + FWHT + per-block quantize.
 Phase 2: Int8 GEMV with per-block activation scales for down projection.
 Router:  Softmax + top-k dispatch.
 
@@ -24,7 +24,7 @@ from experimental_gemma.router import softmax_topk_renorm, Gemma4TopKResult
 
 
 # ============================================================================
-# Phase 1: Fused gate_up GEMV + GELU-tanh + FWHT + DC + per-block quantize
+# Phase 1: Fused gate_up GEMV + GELU-tanh + FWHT + per-block quantize
 # ============================================================================
 
 
@@ -37,7 +37,6 @@ struct FusedGuGeluTanhArgs(Copyable, ImplicitlyCopyable):
     var wcolsum_ptr: Int
     var qi_ptr: Int
     var blk_scale_ptr: Int
-    var debug: Bool
 
 
 def fused_gu_gelu_tanh_worker[intermediate: Int, K: Int, fwht_blk: Int,
@@ -45,7 +44,7 @@ def fused_gu_gelu_tanh_worker[intermediate: Int, K: Int, fwht_blk: Int,
     args: FusedGuGeluTanhArgs,
 ):
     """Fused: on-worker norm+gamma+FWHT+quantize →
-    gate+up GEMV -> split -> GELU-tanh(gate)*up -> FWHT+DC -> per-block i8.
+    gate+up GEMV -> split -> GELU-tanh(gate)*up -> FWHT -> per-block i8.
 
     Fused weight is [2*intermediate, K]. GEMV produces f32[2*intermediate] on stack.
     gate = [0:intermediate], up = [intermediate:2*intermediate].
@@ -54,7 +53,6 @@ def fused_gu_gelu_tanh_worker[intermediate: Int, K: Int, fwht_blk: Int,
     comptime width = simd_width_of[DType.float32]()
     comptime gate_up_dim = 2 * intermediate
     comptime num_blocks = intermediate // fwht_blk
-    comptime DC_SCALE = Float32(1.0)
     comptime hidden_blocks = K // hidden_fwht_blk
 
     var x_main = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.x_main_ptr)
@@ -95,9 +93,6 @@ def fused_gu_gelu_tanh_worker[intermediate: Int, K: Int, fwht_blk: Int,
         work.bitcast[Scalar[DType.float32]]())
 
     # Phase 2: gelu_tanh(gate) * up → overwrite first half
-    if args.debug:
-        print("  quant dense gate[0:4]=", work[0], work[1], work[2], work[3],
-              "up[0:4]=", work[intermediate], work[intermediate+1], work[intermediate+2], work[intermediate+3])
     var up_f32 = work + intermediate
     k = 0
     while k + width <= intermediate:
@@ -106,15 +101,11 @@ def fused_gu_gelu_tanh_worker[intermediate: Int, K: Int, fwht_blk: Int,
         (work + k).store(gelu_tanh_f32[width](g) * u)
         k += width
 
-    if args.debug:
-        print("  quant dense gelu*up[0:4]=", work[0], work[1], work[2], work[3])
-
-    # Phase 3: FWHT + DC correction + per-block quantize → write to scratch
+    # Phase 3: FWHT + per-block quantize → write to scratch
     var qi_out = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=args.qi_ptr)
     var blk_sc = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.blk_scale_ptr)
     for b in range(num_blocks):
         fwht_block[fwht_blk](work + b * fwht_blk)
-        work[b * fwht_blk] *= DC_SCALE
         blk_sc[b] = absmax_quantize_i8[fwht_blk](work + b * fwht_blk, qi_out + b * fwht_blk)
 
 
@@ -129,9 +120,8 @@ def fused_gu_gelu_tanh[intermediate: Int, K: Int, fwht_blk: Int,
     blk_scale_ptr: Int,
     seq_len: Int,
     mut pool: P,
-    debug: Bool = False,
 ) -> PoolFence[P]:
-    """Dispatch fused gate_up GEMV + GELU-tanh + FWHT + DC + per-block quantize.
+    """Dispatch fused gate_up GEMV + GELU-tanh + FWHT + per-block quantize.
 
     x_main_ptr:     bf16 [seq_len, K] residual stream
     gamma_ptr:      bf16 [K] pre_feedforward_layernorm gamma
@@ -150,7 +140,7 @@ def fused_gu_gelu_tanh[intermediate: Int, K: Int, fwht_blk: Int,
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
     var jobs = InlineArray[FusedGuGeluTanhArgs, MAX_POOL_CAPACITY](
-        fill=FusedGuGeluTanhArgs(0, 0, 0, 0, 0, 0, 0, False))
+        fill=FusedGuGeluTanhArgs(0, 0, 0, 0, 0, 0, 0))
     for i in range(num_jobs):
         var start = i * rows_per_job
         jobs[i] = FusedGuGeluTanhArgs(
@@ -158,10 +148,7 @@ def fused_gu_gelu_tanh[intermediate: Int, K: Int, fwht_blk: Int,
             gamma_ptr,
             wpacked_ptr, wscale_ptr, wcolsum_ptr,
             qi_ptr + start * intermediate,
-            blk_scale_ptr + start * num_blocks * size_of[Float32](),
-            False)
-    if debug:
-        jobs[0].debug = True
+            blk_scale_ptr + start * num_blocks * size_of[Float32]())
 
     pool.dispatch[FusedGuGeluTanhArgs, fused_gu_gelu_tanh_worker[intermediate, K, fwht_blk, hidden_fwht_blk]](
         UnsafePointer(to=jobs[0]), num_jobs)
