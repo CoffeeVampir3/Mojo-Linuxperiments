@@ -89,6 +89,7 @@ struct Gemma4Config:
 
 
 comptime C = Gemma4Config
+comptime DUMP_POS = 5
 
 
 # =============================================================================
@@ -248,6 +249,50 @@ struct FullLayer[tp: Int]:
 # =============================================================================
 # Model spec — weight layout + state layout
 # =============================================================================
+
+
+struct StateDumper:
+    var fh: FileHandle
+    var active: Bool
+
+    def __init__(out self, path: String, enabled: Bool):
+        if enabled:
+            try:
+                self.fh = FileHandle(path, "w")
+                self.active = True
+                return
+            except:
+                print("StateDumper: failed to open", path)
+        self.fh = FileHandle()
+        self.active = False
+
+    def dump(mut self, ptr: Int, count: Int):
+        if not self.active:
+            print("StateDumper: inactive")
+            return
+        var nbytes = count * 2
+        print("StateDumper: dumping", nbytes, "bytes")
+        var raw = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=ptr)
+        var buf = List[UInt8](capacity=nbytes)
+        for i in range(nbytes):
+            buf.append(raw[i])
+        try:
+            self.fh.write_bytes(Span(buf))
+            print("StateDumper: wrote ok")
+        except e:
+            print("StateDumper: write failed:", e)
+
+    def close(mut self):
+        if self.active:
+            print("StateDumper: closing")
+            try:
+                self.fh.close()
+                print("StateDumper: closed ok")
+            except e:
+                print("StateDumper: close failed:", e)
+            self.active = False
+        else:
+            print("StateDumper: close called but inactive")
 
 
 struct Gemma4Model[tp: Int](WeightIterable):
@@ -578,6 +623,9 @@ struct Gemma4[tp: Int](Movable):
             Float32(C.EMBED_SCALE), self.pool).join()
 
         _ = pos
+        var dumper = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/bf16_states.bin", pos == DUMP_POS)
+        if pos == DUMP_POS:
+            dumper.dump(s.x_main(seq_len).ptr, C.HIDDEN)
 
         # --- Layer loop ---
         var sliding_idx = 0
@@ -611,6 +659,8 @@ struct Gemma4[tp: Int](Movable):
             rmsnorm(s.x_residual(seq_len), Bound[M.NORM_W](lb + post_attn_off),
                 s.x_residual(seq_len), self.pool, Float32(C.RMS_NORM_EPS)).join()
             elem_add(s.x_main(seq_len), s.x_residual(seq_len), s.x_main(seq_len))
+            if pos == DUMP_POS:
+                dumper.dump(s.x_main(seq_len).ptr, C.HIDDEN)
 
             # --- Dense MLP path ---
             var pre_ffn_off = Self.FL.PRE_FFN_NORM.OFFSET if is_full else Self.SL.PRE_FFN_NORM.OFFSET
@@ -627,9 +677,22 @@ struct Gemma4[tp: Int](Movable):
             gemm(s.x_residual(seq_len), Bound[M.FFN_UP_W](lb + up_off),
                 s.scratch_view[M.MLP_VIEW](up_lease, seq_len), self.pool).join()
 
+            if pos == 0 and layer_idx == 0:
+                var gp = s.scratch_ptr[Scalar[DType.bfloat16]](gate_lease)
+                var up = s.scratch_ptr[Scalar[DType.bfloat16]](up_lease)
+                print("  bf16 dense gate[0:4]=", Float32(gp[0]), Float32(gp[1]), Float32(gp[2]), Float32(gp[3]),
+                      "up[0:4]=", Float32(up[0]), Float32(up[1]), Float32(up[2]), Float32(up[3]))
+
             gelu_tanh_mul(s.scratch_view[M.MLP_VIEW](gate_lease, seq_len),
                 s.scratch_view[M.MLP_VIEW](up_lease, seq_len),
                 s.scratch_view[M.MLP_VIEW](gate_lease, seq_len))
+
+            if pos == 0 and layer_idx == 0:
+                var gp2 = s.scratch_ptr[Scalar[DType.bfloat16]](gate_lease)
+                print("  bf16 dense gelu*up[0:4]=", Float32(gp2[0]), Float32(gp2[1]), Float32(gp2[2]), Float32(gp2[3]))
+                var fi = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/bf16_L0_ffn_intermediate.bin", True)
+                fi.dump(Int(gp2), C.INTERMEDIATE)
+                fi.close()
 
             up_lease^.release()
 
@@ -639,11 +702,28 @@ struct Gemma4[tp: Int](Movable):
 
             gate_lease^.release()
 
+            if pos == 0 and layer_idx == 0:
+                var fd = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/bf16_L0_ffn_dense.bin", True)
+                fd.dump(s.x_residual(seq_len).ptr, C.HIDDEN)
+                fd.close()
+            if pos == DUMP_POS and not is_full and (layer_idx == 3 or layer_idx == 4):
+                var fd = StateDumper(
+                    String("/home/grail/Desktop/Mojo-Linuxperiments/bf16_L")
+                    + String(layer_idx) + String("_ffn_dense.bin"), True)
+                fd.dump(s.x_residual(seq_len).ptr, C.HIDDEN)
+                fd.close()
+
             # dense_normed = rmsnorm(dense_out, POST_FFN_NORM_1)
             var dense_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * C.HIDDEN]()
             var post_ffn1_off = Self.FL.POST_FFN_NORM_1.OFFSET if is_full else Self.SL.POST_FFN_NORM_1.OFFSET
             rmsnorm(s.x_residual(seq_len), Bound[M.NORM_W](lb + post_ffn1_off),
                 s.scratch_view[M.HIDDEN_VIEW](dense_lease, seq_len), self.pool, Float32(C.RMS_NORM_EPS)).join()
+            if pos == DUMP_POS and not is_full and (layer_idx == 3 or layer_idx == 4):
+                var fdn = StateDumper(
+                    String("/home/grail/Desktop/Mojo-Linuxperiments/bf16_L")
+                    + String(layer_idx) + String("_ffn_dense_normed.bin"), True)
+                fdn.dump(s.scratch_view[M.HIDDEN_VIEW](dense_lease, seq_len).ptr, C.HIDDEN)
+                fdn.close()
 
             # --- MoE path ---
             # Router: rmsnorm with baked scale (contains 1/sqrt(hidden))
@@ -669,7 +749,23 @@ struct Gemma4[tp: Int](Movable):
                 router_logits_ptr,
                 BF16Ptr(unsafe_from_address=lb + per_expert_off))
 
+            if pos == DUMP_POS and not is_full and (layer_idx == 3 or layer_idx == 4):
+                var rl_dump = StateDumper(
+                    String("/home/grail/Desktop/Mojo-Linuxperiments/bf16_L")
+                    + String(layer_idx) + String("_router_logits.bin"), True)
+                rl_dump.dump(Int(UnsafePointer(to=router_logits_buf[0])), C.NUM_EXPERTS)
+                rl_dump.close()
+
             router_lease^.release()
+
+            if pos == 0 and layer_idx == 0:
+                print(
+                    "bf16 L0 routing: pos=", pos,
+                    " e=", routing.indices[0], routing.indices[1], routing.indices[2], routing.indices[3],
+                        routing.indices[4], routing.indices[5], routing.indices[6], routing.indices[7],
+                    " w=", routing.weights[0], routing.weights[1], routing.weights[2], routing.weights[3],
+                        routing.weights[4], routing.weights[5], routing.weights[6], routing.weights[7],
+                )
 
             # MoE FFN: norm → expert dispatch
             var pre_ffn2_off = Self.FL.PRE_FFN_NORM_2.OFFSET if is_full else Self.SL.PRE_FFN_NORM_2.OFFSET
@@ -693,6 +789,17 @@ struct Gemma4[tp: Int](Movable):
 
             expert_buf_lease^.release()
 
+            if pos == 0 and layer_idx == 0:
+                var fm = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/bf16_L0_ffn_moe.bin", True)
+                fm.dump(s.scratch_view[M.HIDDEN_VIEW](moe_lease, seq_len).ptr, C.HIDDEN)
+                fm.close()
+            if pos == DUMP_POS and not is_full and (layer_idx == 3 or layer_idx == 4):
+                var fm = StateDumper(
+                    String("/home/grail/Desktop/Mojo-Linuxperiments/bf16_L")
+                    + String(layer_idx) + String("_ffn_moe.bin"), True)
+                fm.dump(s.scratch_view[M.HIDDEN_VIEW](moe_lease, seq_len).ptr, C.HIDDEN)
+                fm.close()
+
             # moe_normed = rmsnorm(moe_out, POST_FFN_NORM_2)
             var post_ffn2_off = Self.FL.POST_FFN_NORM_2.OFFSET if is_full else Self.SL.POST_FFN_NORM_2.OFFSET
             rmsnorm(s.scratch_view[M.HIDDEN_VIEW](moe_lease, seq_len), Bound[M.NORM_W](lb + post_ffn2_off),
@@ -713,11 +820,16 @@ struct Gemma4[tp: Int](Movable):
                 unsafe_from_address=lb + ls_off)[])
             elem_add(s.x_main(seq_len), s.x_residual(seq_len), s.x_main(seq_len))
             elem_scale(s.x_main(seq_len), layer_scalar)
+            if pos == DUMP_POS:
+                dumper.dump(s.x_main(seq_len).ptr, C.HIDDEN)
 
             if is_full:
                 full_idx += 1
             else:
                 sliding_idx += 1
+
+        if pos == DUMP_POS:
+            dumper.close()
 
         # --- Final norm + LM head ---
         rmsnorm(s.x_main(seq_len), s.host_bind[M.FINAL_NORM](),
@@ -759,6 +871,13 @@ struct Gemma4[tp: Int](Movable):
         gemm(s.x_residual(seq_len), s.sliding_bind[Self.SL.V_PROJ](sliding_idx),
             s.scratch_view[M.KV_SLIDING_VIEW](v, seq_len), self.pool).join()
 
+        if pos == 0 and sliding_idx == 0:
+            var qkv_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/bf16_L0_qkv.bin", True)
+            qkv_dump.dump(s.scratch_view[M.Q_SLIDING_VIEW](q, seq_len).ptr, C.Q_DIM_SLIDING)
+            qkv_dump.dump(s.scratch_view[M.KV_SLIDING_VIEW](k, seq_len).ptr, C.KV_DIM_SLIDING)
+            qkv_dump.dump(s.scratch_view[M.KV_SLIDING_VIEW](v, seq_len).ptr, C.KV_DIM_SLIDING)
+            qkv_dump.close()
+
         # Per-head norms
         rmsnorm_per_head[C.HEAD_DIM_SLIDING, C.NUM_HEADS](
             s.scratch_view[M.Q_SLIDING_VIEW](q, seq_len), s.sliding_bind[Self.SL.Q_NORM](sliding_idx),
@@ -789,10 +908,20 @@ struct Gemma4[tp: Int](Movable):
             s.sliding_k_cache(sliding_idx), s.sliding_v_cache(sliding_idx),
             s.scratch_view[M.Q_SLIDING_VIEW](attn_out, seq_len), pos, self.pool).join()
 
+        if pos == 0 and sliding_idx == 0:
+            var attn_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/bf16_L0_attn.bin", True)
+            attn_dump.dump(s.scratch_view[M.Q_SLIDING_VIEW](attn_out, seq_len).ptr, C.Q_DIM_SLIDING)
+            attn_dump.close()
+
         # O projection → x_residual
         gemm(s.scratch_view[M.Q_SLIDING_VIEW](attn_out, seq_len),
             s.sliding_bind[Self.SL.O_PROJ](sliding_idx),
             s.x_residual(seq_len), self.pool).join()
+
+        if pos == 0 and sliding_idx == 0:
+            var xr_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/bf16_L0_xresid.bin", True)
+            xr_dump.dump(s.x_residual(seq_len).ptr, C.HIDDEN)
+            xr_dump.close()
 
         attn_out^.release()
         q^.release()
@@ -813,6 +942,16 @@ struct Gemma4[tp: Int](Movable):
             s.scratch_view[M.Q_FULL_VIEW](q, seq_len), self.pool).join()
         gemm(s.x_residual(seq_len), s.full_bind[Self.FL.K_PROJ](full_idx),
             s.scratch_view[M.KV_FULL_VIEW](k, seq_len), self.pool).join()
+        if pos == DUMP_POS and full_idx == 0:
+            var qk_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/bf16_L5_full_qk.bin", True)
+            qk_dump.dump(s.scratch_view[M.Q_FULL_VIEW](q, seq_len).ptr, C.Q_DIM_FULL)
+            qk_dump.dump(s.scratch_view[M.KV_FULL_VIEW](k, seq_len).ptr, C.KV_DIM_FULL)
+            qk_dump.close()
+        if pos == DUMP_POS and full_idx == 4:
+            var qk_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/bf16_L29_full_qk.bin", True)
+            qk_dump.dump(s.scratch_view[M.Q_FULL_VIEW](q, seq_len).ptr, C.Q_DIM_FULL)
+            qk_dump.dump(s.scratch_view[M.KV_FULL_VIEW](k, seq_len).ptr, C.KV_DIM_FULL)
+            qk_dump.close()
 
         # K=V sharing: copy K projection output to V scratch before norms diverge
         var kp = s.scratch_ptr[Scalar[DType.bfloat16]](k)
@@ -850,11 +989,27 @@ struct Gemma4[tp: Int](Movable):
             s.scratch_view[M.Q_FULL_VIEW](q, seq_len),
             s.full_k_cache(full_idx), s.full_v_cache(full_idx),
             s.scratch_view[M.Q_FULL_VIEW](attn_out, seq_len), pos, self.pool).join()
+        if pos == DUMP_POS and full_idx == 0:
+            var attn_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/bf16_L5_full_attn.bin", True)
+            attn_dump.dump(s.scratch_view[M.Q_FULL_VIEW](attn_out, seq_len).ptr, C.Q_DIM_FULL)
+            attn_dump.close()
+        if pos == DUMP_POS and full_idx == 4:
+            var attn_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/bf16_L29_full_attn.bin", True)
+            attn_dump.dump(s.scratch_view[M.Q_FULL_VIEW](attn_out, seq_len).ptr, C.Q_DIM_FULL)
+            attn_dump.close()
 
         # O projection → x_residual
         gemm(s.scratch_view[M.Q_FULL_VIEW](attn_out, seq_len),
             s.full_bind[Self.FL.O_PROJ](full_idx),
             s.x_residual(seq_len), self.pool).join()
+        if pos == DUMP_POS and full_idx == 0:
+            var xr_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/bf16_L5_full_xresid.bin", True)
+            xr_dump.dump(s.x_residual(seq_len).ptr, C.HIDDEN)
+            xr_dump.close()
+        if pos == DUMP_POS and full_idx == 4:
+            var xr_dump = StateDumper("/home/grail/Desktop/Mojo-Linuxperiments/bf16_L29_full_xresid.bin", True)
+            xr_dump.dump(s.x_residual(seq_len).ptr, C.HIDDEN)
+            xr_dump.close()
 
         attn_out^.release()
         q^.release()

@@ -38,6 +38,7 @@ comptime PtrI8 = UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
 comptime WIDTH = simd_width_of[DType.float32]()
 comptime DC_SCALE = Float32(0.5)
 comptime MAX_FWHT_BLOCK = 256
+comptime FULL_O_PROJ_FWHT_BLOCK = 512
 
 comptime ABSORBED = 0
 comptime GAMMA_QUANTIZE = 1
@@ -130,6 +131,18 @@ def fwht_block_for_cols(cols: Int) -> Int:
     return block
 
 
+def fwht_block_for_weight(name: String, cols: Int) -> Int:
+    """Per-weight FWHT block selection.
+
+    Gemma4 full-attention O projection is consumed one 512-dim head at a time
+    with one activation scale per head. Its offline rotation must use the same
+    512-wide basis; the generic 256-wide cap is still correct elsewhere.
+    """
+    if cols == 8192 and name.endswith("self_attn.o_proj.weight"):
+        return FULL_O_PROJ_FWHT_BLOCK
+    return fwht_block_for_cols(cols)
+
+
 # =============================================================================
 # Core transforms
 # =============================================================================
@@ -151,7 +164,9 @@ def absorb_gamma(work: PtrF32, gamma_buf: PtrF32, rows: Int, cols: Int):
 
 def fwht_rotate(work: PtrF32, rows: Int, cols: Int, block: Int):
     for r in range(rows):
-        if block == 256:
+        if block == 512:
+            fwht_row[DType.float32, 512](work + r * cols, cols)
+        elif block == 256:
             fwht_row[DType.float32, 256](work + r * cols, cols)
         elif block == 128:
             fwht_row[DType.float32, 128](work + r * cols, cols)
@@ -459,7 +474,7 @@ def quantize[M: WeightIterable](
             if task.kind == GAMMA_QUANTIZE and has_gamma:
                 absorb_gamma(work, gamma_buf, rows, cols)
 
-            var block = fwht_block_for_cols(cols)
+            var block = fwht_block_for_weight(task.name, cols)
             fwht_rotate(work, rows, cols, block)
 
             if block < MAX_FWHT_BLOCK:

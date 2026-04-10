@@ -24,7 +24,7 @@ from experimental2.kernels.rmsnorm_fwht_quantize import fwht_block
 from experimental2.kernels.quantize import absmax_quantize_i8
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
 from experimental3.kernels.rope_and_kv_cache_write import (
-    write_k_head_normed, write_v_head_normed,
+    write_k_head_normed, write_v_head_normed, write_v_head_with_inv_rms,
 )
 from experimental3.helpers import prep_q_row_normed
 from simd_math import exp_f32, sqrt, roundeven
@@ -149,23 +149,23 @@ def single_pass_attention[head_dim: Int, max_seq: Int, num_kv_heads: Int, num_q_
 ):
     """Score Q against K cache, online softmax, V-agg. Single pass over positions.
 
-    Output: f32[head_dim] (in Hadamard domain, before final FWHT).
+    Per-position V scales are folded into exp_scores before u8 quantization,
+    so the VNNI V-agg accumulation is unchanged.
+    Output: f32[head_dim] in FWHT domain.
     """
     comptime Cache = Gemma4KVCache[max_seq, head_dim, num_kv_heads, num_q_heads]
 
     var q_factor = q_scale / (127.0 * 127.0)
     var k_scales = cache.k_scale_ptr(kv_head)
+    var v_scales = cache.v_scale_ptr(kv_head)
     var num_pos_groups = (context_len + WIDTH - 1) // WIDTH
 
-    # Online softmax state
     var running_max = Float32(-1e30)
     var running_sum = Float32(0)
 
-    # V accumulator: f32[head_dim], tracks unnormalized weighted sum
     var v_acc_arr = InlineArray[Float32, head_dim](fill=Float32(0))
     var v_acc = UnsafePointer(to=v_acc_arr).bitcast[Float32]()
 
-    # Score buffer for one position group
     var scores_arr = InlineArray[Float32, WIDTH](fill=Float32(0))
     var scores = UnsafePointer(to=scores_arr).bitcast[Float32]()
 
@@ -173,18 +173,15 @@ def single_pass_attention[head_dim: Int, max_seq: Int, num_kv_heads: Int, num_q_
         var k_pg = cache.k_pg_ptr(kv_head, pg)
         var v_pg = cache.v_pg_ptr(kv_head, pg)
 
-        # Score WIDTH positions
         score_group[head_dim](
             q_i8, k_pg, qi_bias, q_factor,
             k_scales + pg * WIDTH, scores)
 
-        # Mask invalid positions in last group
         var group_start = pg * WIDTH
         for p in range(WIDTH):
             if group_start + p >= context_len:
                 scores[p] = Float32(-1e30)
 
-        # Online softmax: update max, rescale, compute exp
         var group_max = scores.load[width=WIDTH]().reduce_max()
         var new_max = max(running_max, group_max)
 
@@ -197,18 +194,17 @@ def single_pass_attention[head_dim: Int, max_seq: Int, num_kv_heads: Int, num_q_
         running_max = new_max
         var exp_scores = exp_f32[WIDTH](scores.load[width=WIDTH]() - new_max)
 
-        # Mask exp_scores for invalid positions
         for p in range(WIDTH):
             if group_start + p >= context_len:
                 exp_scores[p] = Float32(0)
 
         running_sum += exp_scores.reduce_add()
 
-        # V-agg via VNNI
-        v_agg_group[head_dim](exp_scores, v_pg, v_acc)
+        # Fold per-position V scales into attention weights before V-agg
+        var vs = (v_scales + pg * WIDTH).load[width=WIDTH]()
+        v_agg_group[head_dim](exp_scores * vs, v_pg, v_acc)
 
-    # Finalize: divide by sum, apply V scale (baked into dequant elsewhere)
-    var inv_sum = 1.0 / running_sum
+    var inv_sum = 1.0 / (Float32(127) * running_sum)
     for d in range(0, head_dim, WIDTH):
         (output + d).store((v_acc + d).load[width=WIDTH]() * inv_sum)
 
@@ -223,15 +219,17 @@ struct SlidingAttnGroupArgs(Copyable, ImplicitlyCopyable):
     var q_bf16_ptr: Int
     var k_bf16_ptr: Int
     var v_bf16_ptr: Int
+    var q_norm_ptr: Int        # bf16[head_dim] per-head Q norm gamma
+    var k_norm_ptr: Int        # bf16[head_dim] per-head K norm gamma
     var cos_ptr: Int
     var sin_ptr: Int
     var cache_base: Int
     var kv_head: Int
     var cache_pos: Int
     var context_len: Int
-    var v_scale: Float32
     var qi_out_ptr: Int        # i8[heads_per_group × head_dim] output
     var head_scale_ptr: Int    # f32[heads_per_group] per-head absmax scales
+    var v_inv_rms: Float32
     var eps: Float32
 
 
@@ -259,15 +257,15 @@ def sliding_attn_group_kernel[
     # 1. Write K to cache
     write_k_head_normed[head_dim](
         UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.k_bf16_ptr),
+        UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.k_norm_ptr),
         cos, sin, work, qi_buf,
         cache, args.cache_pos, args.kv_head, args.eps)
 
     # 2. Write V to cache
-    write_v_head_normed[head_dim](
+    write_v_head_with_inv_rms[head_dim](
         UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.v_bf16_ptr),
-        Float32(127.0) / args.v_scale,
         work, qi_buf,
-        cache, args.cache_pos, args.kv_head, args.eps)
+        cache, args.cache_pos, args.kv_head, args.v_inv_rms)
 
     # 3. Process each Q head: score → V-agg → FWHT → quantize to i8
     for qh in range(heads_per_group):
@@ -278,7 +276,9 @@ def sliding_attn_group_kernel[
         var q_i8_arr = InlineArray[Scalar[DType.int8], head_dim](uninitialized=True)
         var q_i8 = UnsafePointer(to=q_i8_arr).bitcast[Scalar[DType.int8]]()
         var result = prep_q_row_normed[head_dim](
-            q_bf16.bitcast[BFloat16](), cos, sin,
+            q_bf16.bitcast[BFloat16](),
+            UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.q_norm_ptr),
+            cos, sin,
             q_i8.bitcast[Int8](), args.eps)
         var qi_bias = result[0]
         var q_scale = result[1]
@@ -289,8 +289,6 @@ def sliding_attn_group_kernel[
             cache, args.kv_head, args.context_len,
             work)
 
-        # FWHT → quantize → i8 output for O projection
-        fwht_block[head_dim](work)
         head_scales[qh] = absmax_quantize_i8[head_dim](work, qi_out + qh * head_dim)
 
 
@@ -343,6 +341,11 @@ def validate_single_pass():
         var angle = xorshift64(rng) * 0.1
         cos_f32[i] = Float32(1.0 - angle * angle * 0.5)
         sin_f32[i] = Float32(angle)
+    var q_norm = alloc[Scalar[DType.bfloat16]](head_dim)
+    var k_norm = alloc[Scalar[DType.bfloat16]](head_dim)
+    for i in range(head_dim):
+        q_norm[i] = Scalar[DType.bfloat16](Float32(1.0))
+        k_norm[i] = Scalar[DType.bfloat16](Float32(1.0))
 
     # Write K and V positions to cache
     var work = alloc[Float32](head_dim)
@@ -355,7 +358,7 @@ def validate_single_pass():
         for d in range(head_dim):
             k_data[d] = Scalar[DType.bfloat16](Float32(xorshift64(rng)))
             v_data[d] = Scalar[DType.bfloat16](Float32(xorshift64(rng)))
-        write_k_head_normed[head_dim](k_data, cos_f32, sin_f32, work, qi_buf,
+        write_k_head_normed[head_dim](k_data, k_norm, cos_f32, sin_f32, work, qi_buf,
             cache, pos, kv_head, Float32(1e-6))
         write_v_head_normed[head_dim](v_data, Float32(127.0) / v_scale, work, qi_buf,
             cache, pos, kv_head, Float32(1e-6))
@@ -369,7 +372,7 @@ def validate_single_pass():
 
     var q_i8 = alloc[Scalar[DType.int8]](head_dim)
     var qr = prep_q_row_normed[head_dim](
-        q_bf16.bitcast[BFloat16](), cos_f32, sin_f32,
+        q_bf16.bitcast[BFloat16](), q_norm, cos_f32, sin_f32,
         q_i8.bitcast[Int8](), Float32(1e-6))
     var qi_bias = qr[0]
     var q_scale = qr[1]
@@ -463,6 +466,8 @@ def validate_single_pass():
     cache_buf.free()
     cos_f32.free()
     sin_f32.free()
+    q_norm.free()
+    k_norm.free()
     work.free()
     qi_buf.free()
     q_bf16.free()

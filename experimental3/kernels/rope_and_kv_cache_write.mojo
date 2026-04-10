@@ -2,7 +2,7 @@
 
 Pipeline:
   K: bf16 -> f32 -> /rms(per-head) -> RoPE -> FWHT -> dynamic quantize -> VNNI scatter
-  V: bf16 -> f32 -> /rms(per-head, no gamma) -> FWHT -> fixed quantize -> VNNI scatter
+  V: bf16 -> f32 -> /rms(no gamma) -> FWHT -> fixed quantize -> VNNI scatter
 
 Uses Gemma4KVCache which stores both K and V in VNNI tile format:
   K: [head][tile_idx][k_slice × TILE_BYTES] — u8 (XOR 0x80) for tdpbsud
@@ -52,6 +52,7 @@ def rms_divide[head_dim: Int](work: UnsafePointer[Float32, MutAnyOrigin], eps: F
 
 def write_k_head_normed[head_dim: Int](
     src_bf16: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    k_norm: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     cos: UnsafePointer[Float32, MutAnyOrigin],
     sin: UnsafePointer[Float32, MutAnyOrigin],
     work: UnsafePointer[Float32, MutAnyOrigin],
@@ -61,11 +62,7 @@ def write_k_head_normed[head_dim: Int](
     head: Int,
     eps: Float32,
 ):
-    """K head for sliding attention: bf16 -> f32 -> /rms -> full RoPE -> FWHT -> cache.
-
-    head_dim=256, all dims rotated. cos/sin tables have head_dim/2 entries.
-    Gamma from k_norm absorbed into projection weight rows.
-    """
+    """K head for sliding attention: bf16 -> f32 -> /rms -> *k_norm -> full RoPE -> FWHT -> cache."""
     comptime width = simd_width_of[DType.float32]()
     comptime half = head_dim // 2
 
@@ -75,6 +72,11 @@ def write_k_head_normed[head_dim: Int](
         k += width
 
     rms_divide[head_dim](work, eps)
+
+    k = 0
+    while k + width <= head_dim:
+        (work + k).store((work + k).load[width=width]() * (k_norm + k).load[width=width]().cast[DType.float32]())
+        k += width
 
     k = 0
     while k + width <= half:
@@ -100,6 +102,7 @@ def write_k_head_normed[head_dim: Int](
 
 def write_k_head_normed_partial[head_dim: Int, rope_dims: Int](
     src_bf16: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    k_norm: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     cos: UnsafePointer[Float32, MutAnyOrigin],
     sin: UnsafePointer[Float32, MutAnyOrigin],
     work: UnsafePointer[Float32, MutAnyOrigin],
@@ -109,10 +112,7 @@ def write_k_head_normed_partial[head_dim: Int, rope_dims: Int](
     head: Int,
     eps: Float32,
 ):
-    """K head for full attention: partial RoPE (128 of 512 dims rotated).
-
-    cos/sin tables have rope_dims/2 entries (compact storage).
-    """
+    """K head for full attention: /rms -> *k_norm -> partial RoPE (128 of 512 dims rotated)."""
     comptime width = simd_width_of[DType.float32]()
     comptime half = head_dim // 2
     comptime rope_half = rope_dims // 2
@@ -123,6 +123,11 @@ def write_k_head_normed_partial[head_dim: Int, rope_dims: Int](
         k += width
 
     rms_divide[head_dim](work, eps)
+
+    k = 0
+    while k + width <= head_dim:
+        (work + k).store((work + k).load[width=width]() * (k_norm + k).load[width=width]().cast[DType.float32]())
+        k += width
 
     k = 0
     while k + width <= rope_half:
@@ -146,9 +151,34 @@ def write_k_head_normed_partial[head_dim: Int, rope_dims: Int](
 # ============================================================================
 
 
+def write_v_head_with_inv_rms[head_dim: Int](
+    src_bf16: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    work: UnsafePointer[Float32, MutAnyOrigin],
+    qi_buf: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    cache: Gemma4KVCache[_, head_dim, _, _],
+    pos: Int,
+    head: Int,
+    inv_rms: Float32,
+):
+    """V head: bf16 -> f32 -> *inv_rms -> FWHT -> dynamic absmax quantize -> VNNI cache."""
+    comptime width = simd_width_of[DType.float32]()
+
+    var k = 0
+    while k + width <= head_dim:
+        (work + k).store(
+            (src_bf16 + k).load[width=width]().cast[DType.float32]() * inv_rms
+        )
+        k += width
+
+    fwht_block[head_dim](work)
+
+    var absmax = absmax_quantize_i8[head_dim](work, qi_buf)
+    cache.write_v(pos, head, qi_buf.bitcast[Int8]())
+    cache.write_v_scale(pos, head, absmax)
+
+
 def write_v_head_normed[head_dim: Int](
     src_bf16: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-    quant_inv: Float32,
     work: UnsafePointer[Float32, MutAnyOrigin],
     qi_buf: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     cache: Gemma4KVCache[_, head_dim, _, _],
@@ -156,11 +186,7 @@ def write_v_head_normed[head_dim: Int](
     head: Int,
     eps: Float32,
 ):
-    """V head: bf16 -> f32 -> /rms (scale-free) -> FWHT -> fixed quantize -> VNNI cache.
-
-    V has no learnable norm scale. quant_inv = 127 / S_V (precomputed).
-    V is scattered into VNNI tile format for direct tileload in V-agg.
-    """
+    """V head: bf16 -> f32 -> /rms -> FWHT -> dynamic absmax quantize -> VNNI cache."""
     comptime width = simd_width_of[DType.float32]()
 
     var k = 0
@@ -170,8 +196,10 @@ def write_v_head_normed[head_dim: Int](
 
     rms_divide[head_dim](work, eps)
     fwht_block[head_dim](work)
-    fixed_quantize_i8[head_dim](work, qi_buf, quant_inv)
+
+    var absmax = absmax_quantize_i8[head_dim](work, qi_buf)
     cache.write_v(pos, head, qi_buf.bitcast[Int8]())
+    cache.write_v_scale(pos, head, absmax)
 
 
 # ============================================================================
@@ -231,6 +259,7 @@ def validate_k_normed[head_dim: Int]():
     var rng = UInt64(0xCAFEBABE12345678)
 
     var src = alloc[Scalar[DType.bfloat16]](head_dim)
+    var k_norm = alloc[Scalar[DType.bfloat16]](head_dim)
     var cos_f32 = alloc[Float32](half)
     var sin_f32 = alloc[Float32](half)
     var expected = alloc[Float64](head_dim)
@@ -239,6 +268,7 @@ def validate_k_normed[head_dim: Int]():
 
     for i in range(head_dim):
         src[i] = Scalar[DType.bfloat16](Float32(xorshift64(rng)))
+        k_norm[i] = Scalar[DType.bfloat16](Float32(1.0))
     for i in range(half):
         var angle = xorshift64(rng) * 0.5
         cos_f32[i] = Float32(1.0 - angle * angle * 0.5)
@@ -269,7 +299,7 @@ def validate_k_normed[head_dim: Int]():
     comptime test_pos = 7
     comptime test_head = 1
     write_k_head_normed[head_dim](
-        src, cos_f32, sin_f32, work, qi,
+        src, k_norm, cos_f32, sin_f32, work, qi,
         cache, test_pos, test_head, Float32(1e-6))
 
     # Pre-quantize accuracy: kernel f32 vs f64 reference
@@ -302,6 +332,7 @@ def validate_k_normed[head_dim: Int]():
     print("  stored scale:                                     " + String(stored_scale))
 
     src.free()
+    k_norm.free()
     cos_f32.free()
     sin_f32.free()
     expected.free()
@@ -322,6 +353,7 @@ def validate_k_partial[head_dim: Int, rope_dims: Int]():
     var rng = UInt64(0xABCD1234DEAD5678)
 
     var src = alloc[Scalar[DType.bfloat16]](head_dim)
+    var k_norm = alloc[Scalar[DType.bfloat16]](head_dim)
     var cos_f32 = alloc[Float32](rope_half)
     var sin_f32 = alloc[Float32](rope_half)
     var expected = alloc[Float64](head_dim)
@@ -330,6 +362,7 @@ def validate_k_partial[head_dim: Int, rope_dims: Int]():
 
     for i in range(head_dim):
         src[i] = Scalar[DType.bfloat16](Float32(xorshift64(rng)))
+        k_norm[i] = Scalar[DType.bfloat16](Float32(1.0))
     for i in range(rope_half):
         var angle = xorshift64(rng) * 0.5
         cos_f32[i] = Float32(1.0 - angle * angle * 0.5)
@@ -363,7 +396,7 @@ def validate_k_partial[head_dim: Int, rope_dims: Int]():
     comptime test_pos = 3
     comptime test_head = 0
     write_k_head_normed_partial[head_dim, rope_dims](
-        src, cos_f32, sin_f32, work, qi,
+        src, k_norm, cos_f32, sin_f32, work, qi,
         cache, test_pos, test_head, Float32(1e-6))
 
     var kernel_f64 = alloc[Float64](head_dim)
@@ -391,6 +424,7 @@ def validate_k_partial[head_dim: Int, rope_dims: Int]():
     print("  round-trip cosine (quant->dequant->invFWHT):  " + String(cos_rt))
 
     src.free()
+    k_norm.free()
     cos_f32.free()
     sin_f32.free()
     expected.free()

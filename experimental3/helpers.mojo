@@ -26,19 +26,15 @@ from experimental2.kernels.rmsnorm_fwht_quantize import fwht_apply, fwht_width
 @always_inline
 def prep_q_row_normed[head_dim: Int](
     q_row: UnsafePointer[BFloat16, MutAnyOrigin],
+    q_norm: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     cos_row: UnsafePointer[Float32, MutAnyOrigin],
     sin_row: UnsafePointer[Float32, MutAnyOrigin],
     qi_out: UnsafePointer[Int8, MutAnyOrigin],
     eps: Float32,
 ) -> Tuple[Float32, Float32]:
-    """Per-head RMS-divide → full RoPE → FWHT → dynamic quantize one Q head.
+    """Per-head: /rms → *q_norm → full RoPE → FWHT → dynamic quantize.
 
-    For sliding attention (head_dim=256, all dims rotated).
-    Gamma from q_norm absorbed into projection weight rows.
-
-    Returns (qi_bias, q_scale) where:
-      qi_bias = 128 * sum(qi) — bias correction for tdpbsud scoring
-      q_scale = absmax — stored in cache for score dequant
+    Returns (qi_bias, q_scale).
     """
     comptime half = head_dim // 2
     comptime fwht_w = fwht_width[DType.float32, head_dim]()
@@ -58,6 +54,10 @@ def prep_q_row_normed[head_dim: Int](
     var inv_rms = 1.0 / sqrt[DType.float32, 1](vsum.reduce_add() / Float32(head_dim) + eps)
     for ri in range(fwht_regs):
         r[ri] *= inv_rms
+
+    # Apply q_norm gamma
+    for ri in range(fwht_regs):
+        r[ri] *= (q_norm + ri * fwht_w).load[width=fwht_w]().cast[DType.float32]()
 
     # Full RoPE: rotate all half-dim pairs
     for ri in range(half_regs):
@@ -99,16 +99,13 @@ def prep_q_row_normed[head_dim: Int](
 @always_inline
 def prep_q_row_normed_partial[head_dim: Int, rope_dims: Int](
     q_row: UnsafePointer[BFloat16, MutAnyOrigin],
+    q_norm: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     cos_row: UnsafePointer[Float32, MutAnyOrigin],
     sin_row: UnsafePointer[Float32, MutAnyOrigin],
     qi_out: UnsafePointer[Int8, MutAnyOrigin],
     eps: Float32,
 ) -> Tuple[Float32, Float32]:
-    """Per-head RMS-divide → partial RoPE → FWHT → dynamic quantize one Q head.
-
-    For full attention (head_dim=512, rope_dims=128). Only rope_dims/2 pairs
-    in each half are rotated. cos/sin tables have rope_dims/2 entries.
-    Remaining dims pass through unchanged.
+    """Per-head: /rms → *q_norm → partial RoPE → FWHT → dynamic quantize.
 
     Returns (qi_bias, q_scale).
     """
@@ -132,6 +129,10 @@ def prep_q_row_normed_partial[head_dim: Int, rope_dims: Int](
     var inv_rms = 1.0 / sqrt[DType.float32, 1](vsum.reduce_add() / Float32(head_dim) + eps)
     for ri in range(fwht_regs):
         r[ri] *= inv_rms
+
+    # Apply q_norm gamma
+    for ri in range(fwht_regs):
+        r[ri] *= (q_norm + ri * fwht_w).load[width=fwht_w]().cast[DType.float32]()
 
     # Partial RoPE: only first rope_regs pairs in each half
     for ri in range(rope_regs):
@@ -219,11 +220,13 @@ def validate_prep_q_normed[head_dim: Int]():
     var rng = UInt64(0xDEADCAFE98765432)
 
     var src = alloc[Scalar[DType.bfloat16]](head_dim)
+    var q_norm = alloc[Scalar[DType.bfloat16]](head_dim)
     var cos_f32 = alloc[Float32](half)
     var sin_f32 = alloc[Float32](half)
 
     for i in range(head_dim):
         src[i] = Scalar[DType.bfloat16](Float32(xorshift64(rng)))
+        q_norm[i] = Scalar[DType.bfloat16](Float32(1.0))
     for i in range(half):
         var angle = xorshift64(rng) * 0.5
         cos_f32[i] = Float32(1.0 - angle * angle * 0.5)
@@ -249,7 +252,7 @@ def validate_prep_q_normed[head_dim: Int]():
     # Kernel
     var qi = alloc[Scalar[DType.int8]](head_dim)
     var result = prep_q_row_normed[head_dim](
-        src.bitcast[BFloat16](), cos_f32, sin_f32, qi.bitcast[Int8](), Float32(1e-6))
+        src.bitcast[BFloat16](), q_norm, cos_f32, sin_f32, qi.bitcast[Int8](), Float32(1e-6))
     var qi_bias = result[0]
     var q_scale = result[1]
 
@@ -291,6 +294,7 @@ def validate_prep_q_normed[head_dim: Int]():
     print("  qi_bias:             " + String(qi_bias) + "  (expected " + String(expected_bias) + ", err=" + String(bias_err) + ")")
 
     src.free()
+    q_norm.free()
     cos_f32.free()
     sin_f32.free()
     expected.free()
@@ -305,11 +309,13 @@ def validate_prep_q_partial[head_dim: Int, rope_dims: Int]():
     var rng = UInt64(0xABCD5678CAFE1234)
 
     var src = alloc[Scalar[DType.bfloat16]](head_dim)
+    var q_norm = alloc[Scalar[DType.bfloat16]](head_dim)
     var cos_f32 = alloc[Float32](rope_half)
     var sin_f32 = alloc[Float32](rope_half)
 
     for i in range(head_dim):
         src[i] = Scalar[DType.bfloat16](Float32(xorshift64(rng)))
+        q_norm[i] = Scalar[DType.bfloat16](Float32(1.0))
     for i in range(rope_half):
         var angle = xorshift64(rng) * 0.5
         cos_f32[i] = Float32(1.0 - angle * angle * 0.5)
@@ -333,7 +339,7 @@ def validate_prep_q_partial[head_dim: Int, rope_dims: Int]():
 
     var qi = alloc[Scalar[DType.int8]](head_dim)
     var result = prep_q_row_normed_partial[head_dim, rope_dims](
-        src.bitcast[BFloat16](), cos_f32, sin_f32, qi.bitcast[Int8](), Float32(1e-6))
+        src.bitcast[BFloat16](), q_norm, cos_f32, sin_f32, qi.bitcast[Int8](), Float32(1e-6))
     var qi_bias = result[0]
     var q_scale = result[1]
 
@@ -371,6 +377,7 @@ def validate_prep_q_partial[head_dim: Int, rope_dims: Int]():
     print("  qi_bias:             " + String(qi_bias) + "  (expected " + String(expected_bias) + ", err=" + String(bias_err) + ")")
 
     src.free()
+    q_norm.free()
     cos_f32.free()
     sin_f32.free()
     expected.free()

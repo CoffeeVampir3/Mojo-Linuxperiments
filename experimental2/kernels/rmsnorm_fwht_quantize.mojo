@@ -104,6 +104,43 @@ def fwht_block[block: Int](buf: UnsafePointer[Float32, MutAnyOrigin]):
 # ============================================================================
 
 
+def rmsnorm_gamma_fwht_quantize_row[cols: Int, block: Int](
+    row_in: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    gamma: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    row_qi: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    work: UnsafePointer[Float32, MutAnyOrigin],
+    scale_out: UnsafePointer[Float32, MutAnyOrigin],
+    eps: Float32,
+):
+    """One row: bf16 -> RMSNorm * gamma -> FWHT -> dynamic i8.
+
+    Gamma is applied during normalization (fused multiply).
+    Computes per-row absmax after FWHT, writes it to scale_out, quantizes.
+    """
+    comptime width = simd_width_of[DType.float32]()
+
+    var vsum = SIMD[DType.float32, width](0)
+    var k = 0
+    while k + width <= cols:
+        var x = (row_in + k).load[width=width]().cast[DType.float32]()
+        var g = (gamma + k).load[width=width]().cast[DType.float32]()
+        vsum = x.fma(x, vsum)
+        (work + k).store(x * g)
+        k += width
+
+    var inv_rms = Float32(1.0) / sqrt[DType.float32, 1](vsum.reduce_add() / Float32(cols) + eps)
+    var vinv_rms = SIMD[DType.float32, width](inv_rms)
+    k = 0
+    while k + width <= cols:
+        (work + k).store((work + k).load[width=width]() * vinv_rms)
+        k += width
+
+    for b in range(cols // block):
+        fwht_block[block](work + b * block)
+
+    scale_out[] = absmax_quantize_i8[cols](work, row_qi)
+
+
 def rmsnorm_fwht_quantize_row[cols: Int, block: Int](
     row_in: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     row_qi: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
@@ -170,9 +207,71 @@ def rmsnorm_fwht_quantize_worker[cols: Int, block: Int](args: RmsNormFwhtArgs):
         )
 
 
+@fieldwise_init
+struct RmsNormGammaFwhtArgs(Copyable, ImplicitlyCopyable):
+    var in_ptr: Int
+    var gamma_ptr: Int
+    var qi_ptr: Int
+    var work_ptr: Int
+    var scale_ptr: Int
+    var start_row: Int
+    var end_row: Int
+
+
+def rmsnorm_gamma_fwht_quantize_worker[cols: Int, block: Int](args: RmsNormGammaFwhtArgs):
+    var inp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.in_ptr)
+    var gamma = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.gamma_ptr)
+    var qi = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=args.qi_ptr)
+    var work = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.work_ptr)
+    var scales = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.scale_ptr)
+
+    for m in range(args.start_row, args.end_row):
+        rmsnorm_gamma_fwht_quantize_row[cols, block](
+            inp + m * cols, gamma, qi + m * cols, work, scales + m, 1e-5,
+        )
+
+
 # ============================================================================
 # Dispatch
 # ============================================================================
+
+
+def rmsnorm_gamma_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
+    in_ptr: Int, gamma_ptr: Int, qi_ptr: Int, work_ptr: Int,
+    scale_ptr: Int,
+    seq_len: Int,
+    mut pool: P,
+) -> PoolFence[P]:
+    """Dispatch RMSNorm * gamma + FWHT + dynamic-scale quantize.
+
+    in_ptr:     bf16 [seq_len, cols]
+    gamma_ptr:  bf16 [cols] — norm gamma, applied during normalization
+    qi_ptr:     i8   [seq_len, cols] output
+    work_ptr:   f32  [cols] scratch per worker
+    scale_ptr:  f32  [seq_len] output — per-row absmax scales for GEMV dequant
+    """
+    if seq_len == 0:
+        return PoolFence[P].completed()
+
+    comptime MAX_POOL_CAPACITY = 128
+    var num_jobs = min(seq_len, pool.get_capacity())
+    var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
+
+    var jobs = InlineArray[RmsNormGammaFwhtArgs, MAX_POOL_CAPACITY](
+        fill=RmsNormGammaFwhtArgs(0, 0, 0, 0, 0, 0, 0))
+    for i in range(num_jobs):
+        var start = i * rows_per_job
+        var end = min(start + rows_per_job, seq_len)
+        jobs[i] = RmsNormGammaFwhtArgs(
+            in_ptr, gamma_ptr, qi_ptr,
+            work_ptr + i * cols * size_of[Float32](),
+            scale_ptr, start, end)
+
+    pool.dispatch[RmsNormGammaFwhtArgs, rmsnorm_gamma_fwht_quantize_worker[cols, block]](
+        UnsafePointer(to=jobs[0]), num_jobs)
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))
+    ))
 
 
 def rmsnorm_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
@@ -206,6 +305,111 @@ def rmsnorm_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
             scale_ptr, start, end)
 
     pool.dispatch[RmsNormFwhtArgs, rmsnorm_fwht_quantize_worker[cols, block]](
+        UnsafePointer(to=jobs[0]), num_jobs)
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))
+    ))
+
+
+# ============================================================================
+# Blocked-scale variant — one absmax scale per FWHT block
+# ============================================================================
+
+
+@always_inline
+def rmsnorm_fwht_quantize_row_blocked[cols: Int, block: Int](
+    row_in: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+    row_qi: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    work: UnsafePointer[Float32, MutAnyOrigin],
+    blk_scale_out: UnsafePointer[Float32, MutAnyOrigin],
+    eps: Float32,
+):
+    """One row: bf16 -> RMSNorm -> FWHT -> dynamic i8 with per-block scales."""
+    comptime width = simd_width_of[DType.float32]()
+    comptime num_blocks = cols // block
+
+    var vsum = SIMD[DType.float32, width](0)
+    var k = 0
+    while k + width <= cols:
+        var x = (row_in + k).load[width=width]().cast[DType.float32]()
+        vsum = x.fma(x, vsum)
+        (work + k).store(x)
+        k += width
+
+    var rms = sqrt[DType.float32, 1](vsum.reduce_add() / Float32(cols) + eps)
+    var inv_rms = Float32(1.0) / rms
+    var vinv_rms = SIMD[DType.float32, width](inv_rms)
+
+    k = 0
+    while k + width <= cols:
+        (work + k).store((work + k).load[width=width]() * vinv_rms)
+        k += width
+
+    for b in range(num_blocks):
+        fwht_block[block](work + b * block)
+        blk_scale_out[b] = absmax_quantize_i8[block](work + b * block, row_qi + b * block)
+
+
+@fieldwise_init
+struct RmsNormFwhtBlockedArgs(Copyable, ImplicitlyCopyable):
+    var in_ptr: Int
+    var qi_ptr: Int
+    var work_ptr: Int
+    var blk_scale_ptr: Int
+    var start_row: Int
+    var end_row: Int
+
+
+def rmsnorm_fwht_quantize_blocked_worker[cols: Int, block: Int](
+    args: RmsNormFwhtBlockedArgs,
+):
+    comptime num_blocks = cols // block
+
+    var inp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.in_ptr)
+    var qi = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=args.qi_ptr)
+    var work = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.work_ptr)
+    var blk_scales = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.blk_scale_ptr)
+
+    for m in range(args.start_row, args.end_row):
+        rmsnorm_fwht_quantize_row_blocked[cols, block](
+            inp + m * cols,
+            qi + m * cols,
+            work,
+            blk_scales + m * num_blocks,
+            1e-5,
+        )
+
+
+def rmsnorm_fwht_quantize_blocked[cols: Int, block: Int, P: BurstThreadPool](
+    in_ptr: Int,
+    qi_ptr: Int,
+    work_ptr: Int,
+    blk_scale_ptr: Int,
+    seq_len: Int,
+    mut pool: P,
+) -> PoolFence[P]:
+    """Dispatch RMSNorm + FWHT + dynamic i8 with one scale per FWHT block."""
+    if seq_len == 0:
+        return PoolFence[P].completed()
+
+    comptime MAX_POOL_CAPACITY = 128
+    var num_jobs = min(seq_len, pool.get_capacity())
+    var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
+
+    var jobs = InlineArray[RmsNormFwhtBlockedArgs, MAX_POOL_CAPACITY](
+        fill=RmsNormFwhtBlockedArgs(0, 0, 0, 0, 0, 0))
+    for i in range(num_jobs):
+        var start = i * rows_per_job
+        var end = min(start + rows_per_job, seq_len)
+        jobs[i] = RmsNormFwhtBlockedArgs(
+            in_ptr,
+            qi_ptr,
+            work_ptr + i * cols * size_of[Float32](),
+            blk_scale_ptr,
+            start,
+            end)
+
+    pool.dispatch[RmsNormFwhtBlockedArgs, rmsnorm_fwht_quantize_blocked_worker[cols, block]](
         UnsafePointer(to=jobs[0]), num_jobs)
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))

@@ -71,23 +71,24 @@ def gemv_row_blocked[N: Int, K: Int, fwht_block_size: Int](
             for blk in range(num_blocks):
                 var i32_acc = InlineArray[SIMD[DType.int32, width], acc_count](
                     fill=SIMD[DType.int32, width](0))
-                for dc in range(VNNI_K_STEP // VNNI_BLK):
-                    var k_pos = blk * fwht_block_size + dc * VNNI_BLK
-                    for p in range(passes_per_subtile):
-                        i32_acc[p] = dot[width](i32_acc[p], act_row,
-                            wpacked + packed_off + p * bytes_per_pass, k_pos)
-                    packed_off += VNNI_TILE_N * VNNI_BLK
-                for dc in range(VNNI_K_STEP // VNNI_BLK):
-                    var k_pos = blk * fwht_block_size + dc * VNNI_BLK
-                    for p in range(passes_per_subtile):
-                        i32_acc[passes_per_subtile + p] = dot[width](
-                            i32_acc[passes_per_subtile + p], act_row,
-                            wpacked + packed_off + p * bytes_per_pass, k_pos)
-                    packed_off += VNNI_TILE_N * VNNI_BLK
+                for ks in range(0, fwht_block_size, VNNI_K_STEP):
+                    for dc in range(VNNI_K_STEP // VNNI_BLK):
+                        var k_pos = blk * fwht_block_size + ks + dc * VNNI_BLK
+                        for p in range(passes_per_subtile):
+                            i32_acc[p] = dot[width](i32_acc[p], act_row,
+                                wpacked + packed_off + p * bytes_per_pass, k_pos)
+                        packed_off += VNNI_TILE_N * VNNI_BLK
+                    for dc in range(VNNI_K_STEP // VNNI_BLK):
+                        var k_pos = blk * fwht_block_size + ks + dc * VNNI_BLK
+                        for p in range(passes_per_subtile):
+                            i32_acc[passes_per_subtile + p] = dot[width](
+                                i32_acc[passes_per_subtile + p], act_row,
+                                wpacked + packed_off + p * bytes_per_pass, k_pos)
+                        packed_off += VNNI_TILE_N * VNNI_BLK
                 var blk_dequant = block_scales[blk] / 127.0
                 for a in range(acc_count):
                     var n_base = nb + ns + a * width
-                    var corrected = i32_acc[a].cast[DType.float32]() - 128.0 * (block_colsums + n_base * num_blocks + blk).load[width=width]()
+                    var corrected = i32_acc[a].cast[DType.float32]() - 128.0 * (block_colsums + blk * N + n_base).load[width=width]()
                     f32_acc[a] += corrected * blk_dequant
             for a in range(acc_count):
                 var n_base = nb + ns + a * width
@@ -101,8 +102,8 @@ def gemv_row_blocked[N: Int, K: Int, fwht_block_size: Int](
 
 @fieldwise_init
 struct Gemma4ExpertI8Args(Copyable, ImplicitlyCopyable):
-    var act_i8_ptr: Int
-    var act_scale: Float32
+    var x_main_ptr: Int
+    var gamma_ptr: Int
     var gate_up_packed_ptr: Int
     var gate_up_wscale_ptr: Int
     var gate_up_colsum_ptr: Int
@@ -113,18 +114,45 @@ struct Gemma4ExpertI8Args(Copyable, ImplicitlyCopyable):
     var routing_weight: Float32
 
 
-def gemma4_expert_i8_kernel[intermediate: Int, hidden: Int, fwht_blk: Int](
+def gemma4_expert_i8_kernel[intermediate: Int, hidden: Int, fwht_blk: Int,
+                            hidden_fwht_blk: Int](
     args: Gemma4ExpertI8Args,
 ):
-    """Fused int8 expert FFN: gate_up GEMV → gelu_tanh → FWHT+DC → down GEMV.
+    """Fused int8 expert FFN: on-worker norm+gamma+FWHT+quantize →
+    gate_up GEMV → gelu_tanh → FWHT+DC → down GEMV.
     All intermediates on the stack."""
     comptime width = simd_width_of[DType.float32]()
     comptime gate_up_dim = 2 * intermediate
     comptime num_blocks = intermediate // fwht_blk
-    comptime DC_SCALE = Float32(0.5)
+    comptime DC_SCALE = Float32(1.0)
+    comptime hidden_blocks = hidden // hidden_fwht_blk
 
-    var act_i8 = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=args.act_i8_ptr)
+    var x_main = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.x_main_ptr)
+    var gamma = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.gamma_ptr)
     var out_ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.output_ptr)
+
+    # Phase 0: RMSNorm(x_main) * gamma → FWHT → quantize i8
+    var act_buf = InlineArray[Float32, hidden](fill=Float32(0))
+    var act_f32 = UnsafePointer(to=act_buf).bitcast[Float32]()
+    var vsum = SIMD[DType.float32, width](0)
+    var k = 0
+    while k + width <= hidden:
+        var x = (x_main + k).load[width=width]().cast[DType.float32]()
+        var g = (gamma + k).load[width=width]().cast[DType.float32]()
+        vsum = x.fma(x, vsum)
+        (act_f32 + k).store(x * g)
+        k += width
+    var inv_rms = 1.0 / sqrt[DType.float32, 1](vsum.reduce_add() / Float32(hidden) + Float32(1e-6))
+    var vinv = SIMD[DType.float32, width](inv_rms)
+    k = 0
+    while k + width <= hidden:
+        (act_f32 + k).store((act_f32 + k).load[width=width]() * vinv)
+        k += width
+    for b in range(hidden_blocks):
+        fwht_block[hidden_fwht_blk](act_f32 + b * hidden_fwht_blk)
+    var act_qi_buf = InlineArray[Scalar[DType.int8], hidden](uninitialized=True)
+    var act_i8 = UnsafePointer(to=act_qi_buf).bitcast[Scalar[DType.int8]]()
+    var act_scale = absmax_quantize_i8[hidden](act_f32, act_i8)
 
     # Phase 1: gate_up GEMV → f32 stack
     var gu_buf = InlineArray[Float32, gate_up_dim](fill=Float32(0))
@@ -132,14 +160,14 @@ def gemma4_expert_i8_kernel[intermediate: Int, hidden: Int, fwht_blk: Int](
     gemv_row[gate_up_dim, hidden, DType.float32](
         act_i8,
         UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=args.gate_up_packed_ptr),
-        args.act_scale / 127.0,
+        act_scale / 127.0,
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.gate_up_wscale_ptr),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.gate_up_colsum_ptr),
         work.bitcast[Scalar[DType.float32]]())
 
     # Phase 2: gelu_tanh(gate) * up → reuse first half
     var up_f32 = work + intermediate
-    var k = 0
+    k = 0
     while k + width <= intermediate:
         var g = (work + k).load[width=width]()
         var u = (up_f32 + k).load[width=width]()
@@ -182,10 +210,10 @@ def gemma4_expert_i8_kernel[intermediate: Int, hidden: Int, fwht_blk: Int](
 
 def gemma4_moe_dispatch_local[
     num_experts: Int, top_k: Int, intermediate: Int, hidden: Int,
-    fwht_blk: Int, tp: Int, P: BurstThreadPool,
+    fwht_blk: Int, hidden_fwht_blk: Int, tp: Int, P: BurstThreadPool,
 ](
-    act_i8_ptr: Int,
-    act_scale: Float32,
+    x_main_ptr: Int,
+    gamma_ptr: Int,
     routing: Gemma4TopKResult[top_k],
     gate_up_base: Int,
     gate_up_stride: Int,
@@ -218,7 +246,7 @@ def gemma4_moe_dispatch_local[
         var local_idx = eid // tp
 
         jobs[local_count] = Gemma4ExpertI8Args(
-            act_i8_ptr, act_scale,
+            x_main_ptr, gamma_ptr,
             gate_up_base + local_idx * gate_up_stride,
             gate_up_sc_base + local_idx * gate_up_sc_stride,
             gate_up_cs_base + local_idx * gate_up_cs_stride,
@@ -231,7 +259,7 @@ def gemma4_moe_dispatch_local[
         local_count += 1
 
     if local_count > 0:
-        pool.dispatch[Gemma4ExpertI8Args, gemma4_expert_i8_kernel[intermediate, hidden, fwht_blk]](
+        pool.dispatch[Gemma4ExpertI8Args, gemma4_expert_i8_kernel[intermediate, hidden, fwht_blk, hidden_fwht_blk]](
             UnsafePointer(to=jobs[0]), local_count)
 
     return local_count

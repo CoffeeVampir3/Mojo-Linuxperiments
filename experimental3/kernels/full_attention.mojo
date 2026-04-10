@@ -23,7 +23,7 @@ from experimental3.kernels.sliding_attention import (
     dot_score, score_group, v_agg_group, single_pass_attention, WIDTH,
 )
 from experimental3.kernels.rope_and_kv_cache_write import (
-    write_k_head_normed_partial, write_v_head_normed,
+    write_k_head_normed_partial, write_v_head_normed, write_v_head_with_inv_rms,
 )
 from experimental3.helpers import prep_q_row_normed_partial
 from simd_math import exp_f32, sqrt
@@ -264,15 +264,17 @@ def full_attn_reduce[head_dim: Int](
 struct FullAttnGroupArgs(Copyable, ImplicitlyCopyable):
     var q_bf16_ptr: Int        # bf16 Q heads for this group
     var k_bf16_ptr: Int        # bf16 K head (also used for V — K=V shared)
+    var q_norm_ptr: Int        # bf16[head_dim] per-head Q norm gamma
+    var k_norm_ptr: Int        # bf16[head_dim] per-head K norm gamma
     var cos_ptr: Int
     var sin_ptr: Int
     var cache_base: Int
     var kv_head: Int
     var cache_pos: Int
     var context_len: Int
-    var v_scale: Float32
     var qi_out_ptr: Int        # i8[heads_per_group × head_dim] output
     var head_scale_ptr: Int    # f32[heads_per_group] per-head scales
+    var v_inv_rms: Float32
     var eps: Float32
 
 
@@ -303,14 +305,15 @@ def full_attn_group_kernel[
 
     # Write K with partial RoPE
     write_k_head_normed_partial[head_dim, rope_dims](
-        k_bf16, cos, sin, work, qi_buf,
+        k_bf16,
+        UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.k_norm_ptr),
+        cos, sin, work, qi_buf,
         cache, args.cache_pos, args.kv_head, args.eps)
 
     # Write V from same K output (no RoPE, scale-free norm only)
-    write_v_head_normed[head_dim](
-        k_bf16, Float32(127.0) / args.v_scale,
-        work, qi_buf,
-        cache, args.cache_pos, args.kv_head, args.eps)
+    write_v_head_with_inv_rms[head_dim](
+        k_bf16, work, qi_buf,
+        cache, args.cache_pos, args.kv_head, args.v_inv_rms)
 
     # Process each Q head
     for qh in range(heads_per_group):
@@ -320,7 +323,9 @@ def full_attn_group_kernel[
         var q_i8_arr = InlineArray[Scalar[DType.int8], head_dim](uninitialized=True)
         var q_i8 = UnsafePointer(to=q_i8_arr).bitcast[Scalar[DType.int8]]()
         var result = prep_q_row_normed_partial[head_dim, rope_dims](
-            q_bf16.bitcast[BFloat16](), cos, sin,
+            q_bf16.bitcast[BFloat16](),
+            UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.q_norm_ptr),
+            cos, sin,
             q_i8.bitcast[Int8](), args.eps)
         var qi_bias = result[0]
         var q_scale = result[1]
@@ -331,7 +336,6 @@ def full_attn_group_kernel[
             cache, args.kv_head, args.context_len,
             work)
 
-        fwht_block[head_dim](work)
         head_scales[qh] = absmax_quantize_i8[head_dim](work, qi_out + qh * head_dim)
 
 

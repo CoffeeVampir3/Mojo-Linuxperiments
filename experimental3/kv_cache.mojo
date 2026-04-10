@@ -48,20 +48,23 @@ struct Gemma4KVCache[max_seq: Int, head_dim: Int, num_kv_heads: Int, num_q_heads
     # Scales
     comptime ACTUAL_Q_HEADS = Self.num_q_heads if Self.num_q_heads > 0 else Self.num_kv_heads
     comptime K_SCALE_BYTES = Self.num_kv_heads * Self.max_seq * size_of[Float32]()
+    comptime V_SCALE_BYTES = Self.num_kv_heads * Self.max_seq * size_of[Float32]()
     comptime Q_SCALE_BYTES = Self.ACTUAL_Q_HEADS * Self.max_seq * size_of[Float32]()
 
-    comptime TOTAL_BYTES = Self.K_TOTAL + Self.V_TOTAL + Self.K_SCALE_BYTES + Self.Q_SCALE_BYTES
+    comptime TOTAL_BYTES = Self.K_TOTAL + Self.V_TOTAL + Self.K_SCALE_BYTES + Self.V_SCALE_BYTES + Self.Q_SCALE_BYTES
 
     var k_base: Int
     var v_base: Int
     var k_scale_base: Int
+    var v_scale_base: Int
     var q_scale_base: Int
 
     def __init__(out self, base: Int):
         self.k_base = base
         self.v_base = base + Self.K_TOTAL
         self.k_scale_base = self.v_base + Self.V_TOTAL
-        self.q_scale_base = self.k_scale_base + Self.K_SCALE_BYTES
+        self.v_scale_base = self.k_scale_base + Self.K_SCALE_BYTES
+        self.q_scale_base = self.v_scale_base + Self.V_SCALE_BYTES
 
     # ================================================================
     # K write — scatter into width-packed VNNI layout
@@ -118,6 +121,11 @@ struct Gemma4KVCache[max_seq: Int, head_dim: Int, num_kv_heads: Int, num_q_heads
             unsafe_from_address=self.k_scale_base + head * Self.max_seq * size_of[Float32]() + pos * size_of[Float32]()
         )[] = scale
 
+    def write_v_scale(self, pos: Int, head: Int, scale: Float32):
+        UnsafePointer[Float32, MutAnyOrigin](
+            unsafe_from_address=self.v_scale_base + head * Self.max_seq * size_of[Float32]() + pos * size_of[Float32]()
+        )[] = scale
+
     # ================================================================
     # Scoring/V-agg access helpers
     # ================================================================
@@ -135,6 +143,10 @@ struct Gemma4KVCache[max_seq: Int, head_dim: Int, num_kv_heads: Int, num_q_heads
     def k_scale_ptr(self, head: Int) -> UnsafePointer[Float32, MutAnyOrigin]:
         return UnsafePointer[Float32, MutAnyOrigin](
             unsafe_from_address=self.k_scale_base + head * Self.max_seq * size_of[Float32]())
+
+    def v_scale_ptr(self, head: Int) -> UnsafePointer[Float32, MutAnyOrigin]:
+        return UnsafePointer[Float32, MutAnyOrigin](
+            unsafe_from_address=self.v_scale_base + head * Self.max_seq * size_of[Float32]())
 
 
 # ============================================================================

@@ -67,6 +67,11 @@ def fill_bf16(ptr: BF16Ptr, count: Int, bias: Int):
         ptr[i] = BF16(Float32(((i * 13 + bias) % 41) - 20) * Float32(0.03125))
 
 
+def fill_ones_bf16(ptr: BF16Ptr, count: Int):
+    for i in range(count):
+        ptr[i] = BF16(Float32(1.0))
+
+
 def fill_rope_tables(cos: UnsafePointer[Float32, MutAnyOrigin], sin: UnsafePointer[Float32, MutAnyOrigin], half_dim: Int):
     for i in range(half_dim):
         var angle = Float32(i + 1) * Float32(0.0025)
@@ -84,6 +89,7 @@ def zero_cache[max_seq: Int, head_dim: Int, num_kv_heads: Int, num_q_heads: Int]
 
 def prefill_cache[max_seq: Int, head_dim: Int, num_kv_heads: Int, num_q_heads: Int](
     cache: Gemma4KVCache[max_seq, head_dim, num_kv_heads, num_q_heads],
+    k_norm: BF16Ptr,
     cos: UnsafePointer[Float32, MutAnyOrigin],
     sin: UnsafePointer[Float32, MutAnyOrigin],
     v_scale: Float32,
@@ -109,6 +115,7 @@ def prefill_cache[max_seq: Int, head_dim: Int, num_kv_heads: Int, num_q_heads: I
 
             write_k_head_normed[head_dim](
                 k_row,
+                k_norm,
                 cos,
                 sin,
                 work,
@@ -250,6 +257,8 @@ def bench_context[
     q_all: BF16Ptr,
     k_all: BF16Ptr,
     v_all: BF16Ptr,
+    q_norm: BF16Ptr,
+    k_norm: BF16Ptr,
     cos: UnsafePointer[Float32, MutAnyOrigin],
     sin: UnsafePointer[Float32, MutAnyOrigin],
     v_scale: Float32,
@@ -265,6 +274,7 @@ def bench_context[
     var q0 = q_all
     var prep = prep_q_row_normed[head_dim](
         q0.bitcast[BFloat16](),
+        q_norm,
         cos,
         sin,
         q_i8.bitcast[Int8](),
@@ -279,6 +289,8 @@ def bench_context[
         Int(q_all),
         Int(k_all),
         Int(v_all),
+        Int(q_norm),
+        Int(k_norm),
         Int(cos),
         Int(sin),
         base_addr,
@@ -292,7 +304,7 @@ def bench_context[
     )
 
     var jobs = InlineArray[SlidingAttnGroupArgs, num_kv_heads](
-        fill=SlidingAttnGroupArgs(0, 0, 0, 0, 0, 0, 0, 0, 0, Float32(0), 0, 0, Float32(0)))
+        fill=SlidingAttnGroupArgs(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, Float32(0), 0, 0, Float32(0)))
     comptime q_group_elems = heads_per_group * head_dim
     comptime bf16_bytes = size_of[BF16]()
     comptime f32_bytes = size_of[Float32]()
@@ -301,6 +313,8 @@ def bench_context[
             Int(q_all) + kvh * q_group_elems * bf16_bytes,
             Int(k_all) + kvh * head_dim * bf16_bytes,
             Int(v_all) + kvh * head_dim * bf16_bytes,
+            Int(q_norm),
+            Int(k_norm),
             Int(cos),
             Int(sin),
             base_addr,
@@ -411,14 +425,18 @@ def main():
     print("=== experimental3 sliding attention microbench ===")
     print("shape: q_heads=16 kv_heads=8 heads_per_group=2 head_dim=256 max_seq=1024")
 
-    prefill_cache[max_seq, head_dim, num_kv_heads, num_q_heads](cache, cos, sin, v_scale, eps)
-
     var q_all = alloc[BF16](num_q_heads * head_dim)
     var k_all = alloc[BF16](num_kv_heads * head_dim)
     var v_all = alloc[BF16](num_kv_heads * head_dim)
+    var q_norm = alloc[BF16](head_dim)
+    var k_norm = alloc[BF16](head_dim)
     fill_bf16(q_all, num_q_heads * head_dim, 3)
     fill_bf16(k_all, num_kv_heads * head_dim, 11)
     fill_bf16(v_all, num_kv_heads * head_dim, 19)
+    fill_ones_bf16(q_norm, head_dim)
+    fill_ones_bf16(k_norm, head_dim)
+
+    prefill_cache[max_seq, head_dim, num_kv_heads, num_q_heads](cache, k_norm, cos, sin, v_scale, eps)
 
     var numa = NumaInfo()
     var topo = numa.plan_topology(1)
@@ -435,6 +453,8 @@ def main():
         q_all,
         k_all,
         v_all,
+        q_norm,
+        k_norm,
         cos,
         sin,
         v_scale,
@@ -450,6 +470,8 @@ def main():
         q_all,
         k_all,
         v_all,
+        q_norm,
+        k_norm,
         cos,
         sin,
         v_scale,
@@ -465,6 +487,8 @@ def main():
         q_all,
         k_all,
         v_all,
+        q_norm,
+        k_norm,
         cos,
         sin,
         v_scale,
@@ -475,6 +499,8 @@ def main():
     q_all.free()
     k_all.free()
     v_all.free()
+    q_norm.free()
+    k_norm.free()
     cos.free()
     sin.free()
     cache_buf.free()
