@@ -183,12 +183,13 @@ struct Int8GemvBlockedArgs(Copyable, ImplicitlyCopyable):
     var wscale: F32Ptr
     var blk_colsum: F32Ptr
     var dst: BF16Ptr
+    var output_scale: Float32
 
 
 def int8_gemv_blocked_worker[N: Int, K: Int, fwht_blk: Int](
     args: Int8GemvBlockedArgs,
 ):
-    """Down GEMV with per-block activation scales. Output bf16[N]."""
+    """Down GEMV with per-block activation scales. Output bf16[N] * output_scale."""
     comptime width = simd_width_of[DType.float32]()
 
     var dst_buf = InlineArray[Float32, N](fill=Float32(0))
@@ -196,9 +197,10 @@ def int8_gemv_blocked_worker[N: Int, K: Int, fwht_blk: Int](
     gemv_row_blocked[N, K, fwht_blk](args.act, args.wpacked, args.blk_scale,
         args.wscale, args.blk_colsum, dp)
 
+    var scale = SIMD[DType.float32, width](args.output_scale)
     var k = 0
     while k + width <= N:
-        (args.dst + k).store((dp + k).load[width=width]().cast[DType.bfloat16]())
+        (args.dst + k).store(((dp + k).load[width=width]() * scale).cast[DType.bfloat16]())
         k += width
 
 
@@ -211,15 +213,17 @@ def int8_gemv_blocked[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
     dst: BF16Ptr,
     seq_len: Int,
     mut pool: P,
+    output_scale: Float32 = Float32(1.0),
 ) -> PoolFence[P]:
     """Dispatch int8 GEMV with per-block activation scales.
 
-    act:        i8 [seq_len, K]
-    wpacked:    VNNI [N, K]
-    blk_scale:  f32 [seq_len, K/fwht_blk] per-block activation scales
-    wscale:     f32 [N] weight scales
-    blk_colsum: f32 [N, K/fwht_blk] per-block column sums
-    dst:        bf16 [seq_len, N] output
+    act:          i8 [seq_len, K]
+    wpacked:      VNNI [N, K]
+    blk_scale:    f32 [seq_len, K/fwht_blk] per-block activation scales
+    wscale:       f32 [N] weight scales
+    blk_colsum:   f32 [N, K/fwht_blk] per-block column sums
+    dst:          bf16 [seq_len, N] output
+    output_scale: scalar applied to f32 result before bf16 cast (default 1.0)
     """
     if seq_len == 0:
         return PoolFence[P].completed()
@@ -230,7 +234,7 @@ def int8_gemv_blocked[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
     var zero_args = Int8GemvBlockedArgs(
-        I8Ptr(), U8Ptr(), F32Ptr(), F32Ptr(), F32Ptr(), BF16Ptr())
+        I8Ptr(), U8Ptr(), F32Ptr(), F32Ptr(), F32Ptr(), BF16Ptr(), Float32(0))
     var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](fill=zero_args)
     for i in range(num_jobs):
         var start = i * rows_per_job
@@ -240,7 +244,8 @@ def int8_gemv_blocked[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
             blk_scale + start * num_blocks,
             wscale,
             blk_colsum,
-            dst + start * N)
+            dst + start * N,
+            output_scale)
 
     pool.dispatch[Int8GemvBlockedArgs, int8_gemv_blocked_worker[N, K, fwht_blk]](
         UnsafePointer(to=jobs[0]), num_jobs)

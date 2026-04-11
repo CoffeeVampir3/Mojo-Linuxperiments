@@ -1,16 +1,21 @@
-"""Gemma 4 int8 MoE — expert kernel, rank-local dispatch, post-reduce combine.
+"""Gemma 4 int8 MoE — phase dispatch helpers, post-reduce combine.
 
 Entry points used by the forward pass:
 
-  gemma4_moe_dispatch_local — filter local experts, dispatch to expert_pool.
-  Returns local_count. Caller owns the join.
+  gemma4_moe_phase1 — filter local experts, build N-tile-sharded
+    fused_gu_gelu_tanh jobs across all of them, single pool.dispatch.
+    Mirrors fused_gu_gelu_tanh's fence-return shape.
+
+  gemma4_moe_phase2 — one int8_gemv_blocked job per local expert, single
+    pool.dispatch. routing weight is passed as output_scale.
 
   moe_combine — post-allreduce: rmsnorm(moe_out) + dense_normed →
   rmsnorm(combined) → residual add → layer_scalar. Called from a dispatched
   kernel wrapper (body threads never compute).
 
 Expert weights are distributed round-robin (expert e on rank e % tp, local
-index e // tp). All memory is rank-local.
+index e // tp). All memory is rank-local. Phase 1 inputs (act_i8/act_scale)
+must be produced by the rank-local rmsnorm_dual_gamma_fwht_quantize.
 """
 
 from std.memory import UnsafePointer
@@ -20,28 +25,19 @@ from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
 
 from kernels.vnni import VNNI_N_STEP, VNNI_K_STEP, VNNI_TILE_N, VNNI_BLK, compute_n_block
+from kernels.kernel_ops import PoolFence
 from simd_math import exp_f32, sqrt, roundeven
-from experimental2.kernels.rmsnorm_fwht_quantize import fwht_block
-from experimental2.kernels.quantize import absmax_quantize_i8
-from experimental2.kernels.int8_gemv import gemv_row, dot
+from experimental2.kernels.int8_gemv import dot
+from experimental3.kernels.dense_ffn import (
+    FusedGuGeluTanhArgs, fused_gu_gelu_tanh_worker,
+    Int8GemvBlockedArgs, int8_gemv_blocked_worker,
+)
 from experimental_gemma.router import Gemma4TopKResult
 
 comptime I8Ptr = UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
 comptime U8Ptr = UnsafePointer[UInt8, MutAnyOrigin]
 comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
 comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-
-
-# ============================================================================
-# GELU-tanh
-# ============================================================================
-
-
-@always_inline
-def gelu_tanh_f32[width: Int](x: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
-    var inner = Float32(0.7978845608028654) * (x + Float32(0.044715) * x * x * x)
-    var sig = 1.0 / (1.0 + exp_f32[width](-2.0 * inner))
-    return 0.5 * x * (1.0 + 2.0 * sig - 1.0)
 
 
 # ============================================================================
@@ -101,96 +97,13 @@ def gemv_row_blocked[N: Int, K: Int, fwht_block_size: Int](
 
 
 # ============================================================================
-# Per-expert kernel — one BurstPool job
+# Phase 1: rank-local multi-expert N-tile-sharded fused gate_up + gelu + fwht + quant
 # ============================================================================
 
 
-@fieldwise_init
-struct Gemma4ExpertI8Args(Copyable, ImplicitlyCopyable):
-    var act_i8: I8Ptr
-    var act_scale: F32Ptr
-    var gate_up_packed: U8Ptr
-    var gate_up_wscale: F32Ptr
-    var gate_up_colsum: F32Ptr
-    var down_packed: U8Ptr
-    var down_wscale: F32Ptr
-    var down_block_colsum: F32Ptr
-    var output: BF16Ptr
-    var routing_weight: Float32
-
-
-def gemma4_expert_i8_kernel[intermediate: Int, hidden: Int, fwht_blk: Int](
-    args: Gemma4ExpertI8Args,
-):
-    """Fused int8 expert FFN: gate_up GEMV → gelu_tanh → FWHT+quantize → down GEMV.
-
-    The hidden-side RMSNorm+γ+FWHT+quantize is hoisted out into a shared
-    rank-local phase (rmsnorm_dual_gamma_fwht_quantize) so that all local
-    experts on a rank consume one pre-quantized activation buffer.
-    All intermediates on the stack.
-    """
-    comptime width = simd_width_of[DType.float32]()
-    comptime gate_up_dim = 2 * intermediate
-    comptime num_blocks = intermediate // fwht_blk
-
-    var dequant = args.act_scale[0] / 127.0
-
-    # Phase 1: gate_up GEMV → f32 stack
-    var gu_buf = InlineArray[Float32, gate_up_dim](fill=Float32(0))
-    var work = UnsafePointer(to=gu_buf).bitcast[Float32]()
-    gemv_row[gate_up_dim, hidden, DType.float32](
-        args.act_i8,
-        args.gate_up_packed,
-        dequant,
-        args.gate_up_wscale,
-        args.gate_up_colsum,
-        work.bitcast[Scalar[DType.float32]]())
-
-    # Phase 2: gelu_tanh(gate) * up → reuse first half
-    var up_f32 = work + intermediate
-    var k = 0
-    while k + width <= intermediate:
-        var g = (work + k).load[width=width]()
-        var u = (up_f32 + k).load[width=width]()
-        (work + k).store(gelu_tanh_f32[width](g) * u)
-        k += width
-
-    # Phase 3: FWHT + per-block quantize
-    var qi_buf = InlineArray[Scalar[DType.int8], intermediate](uninitialized=True)
-    var qi = UnsafePointer(to=qi_buf).bitcast[Scalar[DType.int8]]()
-    var blk_scales = InlineArray[Float32, num_blocks](fill=Float32(0))
-    var blk_sc = UnsafePointer(to=blk_scales).bitcast[Float32]()
-    for b in range(num_blocks):
-        fwht_block[fwht_blk](work + b * fwht_blk)
-        blk_sc[b] = absmax_quantize_i8[fwht_blk](work + b * fwht_blk, qi + b * fwht_blk)
-
-    # Phase 4: down GEMV with per-block scales
-    var down_buf = InlineArray[Float32, hidden](fill=Float32(0))
-    var down_ptr = UnsafePointer(to=down_buf).bitcast[Float32]()
-    gemv_row_blocked[hidden, intermediate, fwht_blk](
-        qi,
-        args.down_packed,
-        blk_sc,
-        args.down_wscale,
-        args.down_block_colsum,
-        down_ptr)
-
-    # Phase 5: routing weight → bf16 output
-    var rw = args.routing_weight
-    k = 0
-    while k + width <= hidden:
-        (args.output + k).store(((down_ptr + k).load[width=width]() * rw).cast[DType.bfloat16]())
-        k += width
-
-
-# ============================================================================
-# Rank-local dispatch — filter, dispatch, join, accumulate
-# ============================================================================
-
-
-def gemma4_moe_dispatch_local[
-    num_experts: Int, top_k: Int, intermediate: Int, hidden: Int,
-    fwht_blk: Int, tp: Int, P: BurstThreadPool,
+def gemma4_moe_phase1[
+    intermediate: Int, hidden: Int, fwht_blk: Int,
+    top_k: Int, tp: Int, P: BurstThreadPool,
 ](
     act_i8: I8Ptr,
     act_scale: F32Ptr,
@@ -201,6 +114,97 @@ def gemma4_moe_dispatch_local[
     gate_up_sc_stride: Int,
     gate_up_cs_base: Int,
     gate_up_cs_stride: Int,
+    expert_qi: I8Ptr,
+    expert_blk_scale: F32Ptr,
+    rank: Int,
+    mut pool: P,
+) -> PoolFence[P]:
+    """Multi-expert phase 1: gate_up + gelu_tanh + FWHT + per-block i8 quantize.
+
+    Iterates routing.indices, filters by `eid % tp == rank`, and for each local
+    expert builds N-tile-sharded `FusedGuGeluTanhArgs` jobs targeting that
+    expert's slot in `expert_qi` / `expert_blk_scale`. One pool.dispatch with
+    `local_count * tiles_per_expert` jobs total. Same fence shape as
+    fused_gu_gelu_tanh — caller joins via timed_parallel or via discard+drain.
+    """
+    comptime n_tiles = intermediate // fwht_blk
+    comptime MAX_POOL_CAPACITY = 128
+
+    var pool_capacity = pool.get_capacity()
+
+    # Count local experts first to decide workers per expert.
+    var local_count = 0
+    var local_slots = InlineArray[Int, top_k](fill=0)
+    for s in range(top_k):
+        var eid = routing.indices[s]
+        if eid % tp == rank:
+            local_slots[local_count] = s
+            local_count += 1
+
+    if local_count == 0:
+        return PoolFence[P].completed()
+
+    # Workers per expert: try to spread the pool across local experts, but cap
+    # by n_tiles (no point making more workers than tiles).
+    var workers_per_expert = pool_capacity // local_count
+    if workers_per_expert < 1:
+        workers_per_expert = 1
+    if workers_per_expert > n_tiles:
+        workers_per_expert = n_tiles
+    var tiles_per_worker = (n_tiles + workers_per_expert - 1) // workers_per_expert
+
+    var zero_args = FusedGuGeluTanhArgs(
+        I8Ptr(), F32Ptr(), U8Ptr(), F32Ptr(), F32Ptr(),
+        I8Ptr(), F32Ptr(), 0, 0, 0)
+    var jobs = InlineArray[FusedGuGeluTanhArgs, MAX_POOL_CAPACITY](fill=zero_args)
+
+    var num_jobs = 0
+    for li in range(local_count):
+        var s = local_slots[li]
+        var eid = routing.indices[s]
+        var local_idx = eid // tp
+
+        var wpacked = U8Ptr(unsafe_from_address=gate_up_base + local_idx * gate_up_stride)
+        var wscale = F32Ptr(unsafe_from_address=gate_up_sc_base + local_idx * gate_up_sc_stride)
+        var wcolsum = F32Ptr(unsafe_from_address=gate_up_cs_base + local_idx * gate_up_cs_stride)
+        var qi_out = expert_qi + li * intermediate
+        var blk_out = expert_blk_scale + li * n_tiles
+
+        for w in range(workers_per_expert):
+            var tile_start = w * tiles_per_worker
+            if tile_start >= n_tiles:
+                break
+            var tile_end = tile_start + tiles_per_worker
+            if tile_end > n_tiles:
+                tile_end = n_tiles
+            var n_start = tile_start * fwht_blk
+            var n_count = (tile_end - tile_start) * fwht_blk
+            jobs[num_jobs] = FusedGuGeluTanhArgs(
+                act_i8, act_scale,
+                wpacked, wscale, wcolsum,
+                qi_out + n_start,
+                blk_out + tile_start,
+                n_start, n_count, 1)
+            num_jobs += 1
+
+    pool.dispatch[FusedGuGeluTanhArgs, fused_gu_gelu_tanh_worker[intermediate, hidden, fwht_blk]](
+        UnsafePointer(to=jobs[0]), num_jobs)
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))))
+
+
+# ============================================================================
+# Phase 2: rank-local per-expert down GEMV with routing weight
+# ============================================================================
+
+
+def gemma4_moe_phase2[
+    hidden: Int, intermediate: Int, fwht_blk: Int,
+    top_k: Int, tp: Int, P: BurstThreadPool,
+](
+    expert_qi: I8Ptr,
+    expert_blk_scale: F32Ptr,
+    routing: Gemma4TopKResult[top_k],
     down_base: Int,
     down_stride: Int,
     down_sc_base: Int,
@@ -210,30 +214,31 @@ def gemma4_moe_dispatch_local[
     expert_out_buf: BF16Ptr,
     rank: Int,
     mut pool: P,
-) -> Int:
-    """Dispatch this rank's local experts. Returns local_count.
+) -> PoolFence[P]:
+    """Multi-expert phase 2: per-local-expert down GEMV with routing weight.
 
-    Caller must have already produced act_i8 / act_scale via the rank-local
-    rmsnorm_dual_gamma_fwht_quantize phase using PRE_FFN_NORM_2 γ.
-    Each weight field is a contiguous array across all experts with its own
-    base and per-expert stride.
+    One job per local expert: int8_gemv_blocked_worker reading the expert's
+    `expert_qi` slot (written by phase 1), with `output_scale = routing.weights[s]`
+    so the routing scale is folded into the bf16 cast for free.
     """
-    var local_count = 0
-    var jobs = InlineArray[Gemma4ExpertI8Args, top_k](uninitialized=True)
+    comptime num_blocks = intermediate // fwht_blk
+    comptime MAX_POOL_CAPACITY = 128
 
+    var zero_args = Int8GemvBlockedArgs(
+        I8Ptr(), U8Ptr(), F32Ptr(), F32Ptr(), F32Ptr(), BF16Ptr(), Float32(0))
+    var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](fill=zero_args)
+
+    var local_count = 0
     for s in range(top_k):
         var eid = routing.indices[s]
         if eid % tp != rank:
             continue
         var local_idx = eid // tp
 
-        jobs[local_count] = Gemma4ExpertI8Args(
-            act_i8,
-            act_scale,
-            U8Ptr(unsafe_from_address=gate_up_base + local_idx * gate_up_stride),
-            F32Ptr(unsafe_from_address=gate_up_sc_base + local_idx * gate_up_sc_stride),
-            F32Ptr(unsafe_from_address=gate_up_cs_base + local_idx * gate_up_cs_stride),
+        jobs[local_count] = Int8GemvBlockedArgs(
+            expert_qi + local_count * intermediate,
             U8Ptr(unsafe_from_address=down_base + local_idx * down_stride),
+            expert_blk_scale + local_count * num_blocks,
             F32Ptr(unsafe_from_address=down_sc_base + local_idx * down_sc_stride),
             F32Ptr(unsafe_from_address=down_bcs_base + local_idx * down_bcs_stride),
             expert_out_buf + local_count * hidden,
@@ -241,11 +246,13 @@ def gemma4_moe_dispatch_local[
         )
         local_count += 1
 
-    if local_count > 0:
-        pool.dispatch[Gemma4ExpertI8Args, gemma4_expert_i8_kernel[intermediate, hidden, fwht_blk]](
-            UnsafePointer(to=jobs[0]), local_count)
+    if local_count == 0:
+        return PoolFence[P].completed()
 
-    return local_count
+    pool.dispatch[Int8GemvBlockedArgs, int8_gemv_blocked_worker[hidden, intermediate, fwht_blk]](
+        UnsafePointer(to=jobs[0]), local_count)
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))))
 
 
 # ============================================================================

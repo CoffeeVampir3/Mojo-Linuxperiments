@@ -47,7 +47,7 @@ from experimental2.kernels.rmsnorm_fwht_quantize import (
 from experimental2.kernels.int8_gemv import int8_gemv
 from experimental2.kernels.float_gemv import float_gemv
 from experimental3.moe import (
-    gemma4_moe_dispatch_local, moe_combine,
+    gemma4_moe_phase1, gemma4_moe_phase2, moe_combine,
 )
 from experimental3.kv_cache import Gemma4KVCache
 from experimental3.kernels.dense_ffn import (
@@ -112,7 +112,7 @@ comptime C = Gemma4Config
 # =============================================================================
 
 
-comptime NUM_FORWARD_PHASES = 21
+comptime NUM_FORWARD_PHASES = 22
 
 
 struct PhaseTiming(Copyable, ImplicitlyCopyable):
@@ -237,9 +237,10 @@ struct ForwardSample(Copyable, ImplicitlyCopyable):
     var router_quantize: PhaseTiming
     var router_proj: PhaseTiming
     var router_topk: PhaseTiming
-    var expert_dispatch: PhaseTiming
     var ffn_quantize: PhaseTiming
+    var expert_phase1: PhaseTiming
     var dense_phase1: PhaseTiming
+    var expert_phase2: PhaseTiming
     var dense_phase2: PhaseTiming
     var pre_reduce: PhaseTiming
     var mlp_reduce: PhaseTiming
@@ -262,9 +263,10 @@ struct ForwardSample(Copyable, ImplicitlyCopyable):
         self.router_quantize = PhaseTiming()
         self.router_proj = PhaseTiming()
         self.router_topk = PhaseTiming()
-        self.expert_dispatch = PhaseTiming()
         self.ffn_quantize = PhaseTiming()
+        self.expert_phase1 = PhaseTiming()
         self.dense_phase1 = PhaseTiming()
+        self.expert_phase2 = PhaseTiming()
         self.dense_phase2 = PhaseTiming()
         self.pre_reduce = PhaseTiming()
         self.mlp_reduce = PhaseTiming()
@@ -297,24 +299,26 @@ struct ForwardSample(Copyable, ImplicitlyCopyable):
         if idx == 10:
             return self.router_topk
         if idx == 11:
-            return self.expert_dispatch
-        if idx == 12:
             return self.ffn_quantize
+        if idx == 12:
+            return self.expert_phase1
         if idx == 13:
             return self.dense_phase1
         if idx == 14:
-            return self.dense_phase2
+            return self.expert_phase2
         if idx == 15:
-            return self.pre_reduce
+            return self.dense_phase2
         if idx == 16:
-            return self.mlp_reduce
+            return self.pre_reduce
         if idx == 17:
-            return self.post_reduce
+            return self.mlp_reduce
         if idx == 18:
-            return self.final_norm
+            return self.post_reduce
         if idx == 19:
-            return self.lm_head
+            return self.final_norm
         if idx == 20:
+            return self.lm_head
+        if idx == 21:
             return self.softcap
         return PhaseTiming()
 
@@ -349,24 +353,26 @@ struct ForwardSample(Copyable, ImplicitlyCopyable):
         if idx == 10:
             return "router_topk"
         if idx == 11:
-            return "expert_dispatch"
-        if idx == 12:
             return "ffn_quantize"
+        if idx == 12:
+            return "expert_phase1"
         if idx == 13:
             return "dense_phase1"
         if idx == 14:
-            return "dense_phase2"
+            return "expert_phase2"
         if idx == 15:
-            return "pre_reduce"
+            return "dense_phase2"
         if idx == 16:
-            return "mlp_reduce"
+            return "pre_reduce"
         if idx == 17:
-            return "post_reduce"
+            return "mlp_reduce"
         if idx == 18:
-            return "final_norm"
+            return "post_reduce"
         if idx == 19:
-            return "lm_head"
+            return "final_norm"
         if idx == 20:
+            return "lm_head"
+        if idx == 21:
             return "softcap"
         return "unknown"
 
@@ -922,6 +928,8 @@ struct Gemma4Model[tp: Int](WeightIterable):
             + f32_bytes                               # expert_act_scale_lease
             + C.NUM_EXPERTS * bf16_bytes              # router_logits_lease
             + topk_bytes                              # routing_lease
+            + C.TOP_K * C.MOE_INTERMEDIATE * i8_bytes # expert_qi_lease
+            + C.TOP_K * C.MOE_NUM_BLOCKS * f32_bytes  # expert_blk_scale_lease
             + C.TOP_K * C.HIDDEN * bf16_bytes         # expert_out_lease
             + size_of[Int32]()                        # local_count_lease
             + C.INTERMEDIATE * i8_bytes               # dense_post_i8_lease
@@ -1932,6 +1940,8 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     unsafe_from_address=Int(UnsafePointer(to=pool))))
             sample.router_topk.add(rnks.timed_parallel[do_router_topk](mp))
 
+            var expert_qi_lease = self.scratch.borrow[Scalar[DType.int8], C.TOP_K * C.MOE_INTERMEDIATE]()
+            var expert_blk_scale_lease = self.scratch.borrow[Float32, C.TOP_K * C.MOE_NUM_BLOCKS]()
             var expert_out_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.TOP_K * C.HIDDEN]()
             var local_count_lease = self.scratch.borrow[Int32, 1]()
 
@@ -1959,20 +1969,28 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     seq_len, pool)
             sample.ffn_quantize.add(rnks.timed_parallel[do_ffn_quantize](mp))
 
+            # Expert phase 1: fired async on ep, drained later by do_join_expert
+            # so it overlaps with dense_phase1 on dp.
             @parameter
-            def do_expert_dispatch[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            def do_expert_phase1[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
                 var routing = UnsafePointer[Gemma4TopKResult[C.TOP_K], MutAnyOrigin](
                     unsafe_from_address=rv.scratch_addr(routing_lease))[]
                 var experts_gate_up_off = FL.EXPERTS_GATE_UP.OFFSET if is_full else SL.EXPERTS_GATE_UP.OFFSET
                 var experts_gate_up_sc_off = FL.EXPERTS_GATE_UP_SC.OFFSET if is_full else SL.EXPERTS_GATE_UP_SC.OFFSET
                 var experts_gu_colsum_off = FL.EXPERTS_GU_COLSUM_OFF if is_full else SL.EXPERTS_GU_COLSUM_OFF
-                var experts_down_off = FL.EXPERTS_DOWN.OFFSET if is_full else SL.EXPERTS_DOWN.OFFSET
-                var experts_down_sc_off = FL.EXPERTS_DOWN_SC.OFFSET if is_full else SL.EXPERTS_DOWN_SC.OFFSET
-                var experts_down_colsum_off = FL.EXPERTS_DOWN_COLSUM_OFF if is_full else SL.EXPERTS_DOWN_COLSUM_OFF
-                var lc = gemma4_moe_dispatch_local[
-                    C.NUM_EXPERTS, C.TOP_K, C.MOE_INTERMEDIATE, C.HIDDEN,
-                    C.FWHT_BLK, Self.tp](
+
+                # Compute and stash local_count for downstream consumers (pre_reduce).
+                var lc = 0
+                for s in range(C.TOP_K):
+                    if routing.indices[s] % Self.tp == rank:
+                        lc += 1
+                UnsafePointer[Int32, MutAnyOrigin](
+                    unsafe_from_address=rv.scratch_addr(local_count_lease))[] = Int32(lc)
+
+                _ = gemma4_moe_phase1[
+                    C.MOE_INTERMEDIATE, C.HIDDEN, C.FWHT_BLK,
+                    C.TOP_K, Self.tp](
                     I8Ptr(unsafe_from_address=rv.scratch_addr(expert_act_i8_lease)),
                     F32Ptr(unsafe_from_address=rv.scratch_addr(expert_act_scale_lease)),
                     routing,
@@ -1982,27 +2000,20 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     C.MOE_GATE_UP_FUSED * 4,
                     lb + experts_gu_colsum_off,
                     C.MOE_GATE_UP_FUSED * 4,
-                    lb + experts_down_off,
-                    C.HIDDEN * C.MOE_INTERMEDIATE,
-                    lb + experts_down_sc_off,
-                    C.HIDDEN * 4,
-                    lb + experts_down_colsum_off,
-                    C.HIDDEN * C.MOE_NUM_BLOCKS * 4,
-                    BF16Ptr(unsafe_from_address=rv.scratch_addr(expert_out_lease)),
-                    rank, pool)
-                UnsafePointer[Int32, MutAnyOrigin](
-                    unsafe_from_address=rv.scratch_addr(local_count_lease))[] = Int32(lc)
+                    I8Ptr(unsafe_from_address=rv.scratch_addr(expert_qi_lease)),
+                    F32Ptr(unsafe_from_address=rv.scratch_addr(expert_blk_scale_lease)),
+                    rank, pool).take()
                 return PoolFence[BurstPool[]].completed()
-            var t_expert0 = Int(perf_counter_ns())
-            rnks.parallel[do_expert_dispatch](ep)
-            var t_expert1 = Int(perf_counter_ns())
-            var expert_active = InlineArray[Bool, Self.tp](fill=False)
+            var t_e1_d0 = Int(perf_counter_ns())
+            rnks.parallel[do_expert_phase1](ep)
+            var t_e1_d1 = Int(perf_counter_ns())
+            var e1_active = InlineArray[Bool, Self.tp](fill=False)
             for r in range(Self.tp):
                 var rv = rnks.view(r)
                 var lc = Int(UnsafePointer[Int32, MutAnyOrigin](
                     unsafe_from_address=rv.scratch_addr(local_count_lease))[])
-                expert_active[r] = lc > 0
-            var expert_pending = PendingRankPhase[Self.tp](t_expert0, t_expert1, expert_active)
+                e1_active[r] = lc > 0
+            var e1_pending = PendingRankPhase[Self.tp](t_e1_d0, t_e1_d1, e1_active)
 
             var dense_post_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.INTERMEDIATE]()
 
@@ -2023,6 +2034,49 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     seq_len, pool)
             sample.dense_phase1.add(rnks.timed_parallel[do_dense_phase1](dp))
 
+            # Drain ep — closes expert phase 1. Workers are usually already done
+            # because dense_phase1 is the longer of the two; the join is just
+            # clearing ep's active_jobs counter so phase 2 can dispatch.
+            @parameter
+            def do_join_expert[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                pool.join()
+                return PoolFence[BurstPool[]].completed()
+            var t_e1_j0 = Int(perf_counter_ns())
+            rnks.parallel[do_join_expert](ep)
+            var t_e1_j1 = Int(perf_counter_ns())
+            sample.expert_phase1.add(
+                finish_pending_rank_phase[Self.tp](e1_pending, ep, t_e1_j0, t_e1_j1))
+
+            # Expert phase 2: per-local-expert down GEMV with routing weight,
+            # fired async on ep so it overlaps with dense_phase2 on dp.
+            @parameter
+            def do_expert_phase2[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
+                var routing = UnsafePointer[Gemma4TopKResult[C.TOP_K], MutAnyOrigin](
+                    unsafe_from_address=rv.scratch_addr(routing_lease))[]
+                var experts_down_off = FL.EXPERTS_DOWN.OFFSET if is_full else SL.EXPERTS_DOWN.OFFSET
+                var experts_down_sc_off = FL.EXPERTS_DOWN_SC.OFFSET if is_full else SL.EXPERTS_DOWN_SC.OFFSET
+                var experts_down_colsum_off = FL.EXPERTS_DOWN_COLSUM_OFF if is_full else SL.EXPERTS_DOWN_COLSUM_OFF
+                _ = gemma4_moe_phase2[
+                    C.HIDDEN, C.MOE_INTERMEDIATE, C.FWHT_BLK,
+                    C.TOP_K, Self.tp](
+                    I8Ptr(unsafe_from_address=rv.scratch_addr(expert_qi_lease)),
+                    F32Ptr(unsafe_from_address=rv.scratch_addr(expert_blk_scale_lease)),
+                    routing,
+                    lb + experts_down_off,
+                    C.HIDDEN * C.MOE_INTERMEDIATE,
+                    lb + experts_down_sc_off,
+                    C.HIDDEN * 4,
+                    lb + experts_down_colsum_off,
+                    C.HIDDEN * C.MOE_NUM_BLOCKS * 4,
+                    BF16Ptr(unsafe_from_address=rv.scratch_addr(expert_out_lease)),
+                    rank, pool).take()
+                return PoolFence[BurstPool[]].completed()
+            var t_e2_d0 = Int(perf_counter_ns())
+            rnks.parallel[do_expert_phase2](ep)
+            var t_e2_d1 = Int(perf_counter_ns())
+            var e2_pending = PendingRankPhase[Self.tp](t_e2_d0, t_e2_d1, e1_active)
+
             var dense_out_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.HIDDEN]()
 
             @parameter
@@ -2041,15 +2095,12 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     seq_len, pool)
             sample.dense_phase2.add(rnks.timed_parallel[do_dense_phase2](dp))
 
-            @parameter
-            def do_join_expert[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                pool.join()
-                return PoolFence[BurstPool[]].completed()
-            var t_join_expert0 = Int(perf_counter_ns())
+            # Drain ep — closes expert phase 2.
+            var t_e2_j0 = Int(perf_counter_ns())
             rnks.parallel[do_join_expert](ep)
-            var t_join_expert1 = Int(perf_counter_ns())
-            sample.expert_dispatch.add(
-                finish_pending_rank_phase[Self.tp](expert_pending, ep, t_join_expert0, t_join_expert1))
+            var t_e2_j1 = Int(perf_counter_ns())
+            sample.expert_phase2.add(
+                finish_pending_rank_phase[Self.tp](e2_pending, ep, t_e2_j0, t_e2_j1))
 
             var dense_normed_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.HIDDEN]()
 
@@ -2097,6 +2148,8 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             dense_post_i8_lease^.release()
             local_count_lease^.release()
             expert_out_lease^.release()
+            expert_blk_scale_lease^.release()
+            expert_qi_lease^.release()
             routing_lease^.release()
             router_logits_lease^.release()
             expert_act_scale_lease^.release()
