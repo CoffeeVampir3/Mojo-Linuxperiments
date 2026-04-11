@@ -16,12 +16,9 @@ hardware VNNI instruction reads contiguous data with no transposition.
 """
 
 from std.memory import UnsafePointer
-from std.memory.unsafe_pointer import alloc
 from std.sys.info import simd_width_of, size_of
-from std.collections import InlineArray
 
 from experimental.amx import VNNI_BLK
-from simd_math import sqrt
 
 
 comptime CACHE_WIDTH = simd_width_of[DType.int32]()
@@ -45,26 +42,24 @@ struct Gemma4KVCache[max_seq: Int, head_dim: Int, num_kv_heads: Int, num_q_heads
     comptime V_HEAD_BYTES = Self.K_POS_GROUPS * Self.V_PG_BYTES
     comptime V_TOTAL = Self.num_kv_heads * Self.V_HEAD_BYTES
 
-    # Scales
-    comptime ACTUAL_Q_HEADS = Self.num_q_heads if Self.num_q_heads > 0 else Self.num_kv_heads
+    # K and V scales are both dynamic per cached position. The V scale is
+    # folded into the W (attention-weight) quantization in v_agg_group, so the
+    # inner loop sees no extra cost — only the W max absorbs both factors.
     comptime K_SCALE_BYTES = Self.num_kv_heads * Self.max_seq * size_of[Float32]()
     comptime V_SCALE_BYTES = Self.num_kv_heads * Self.max_seq * size_of[Float32]()
-    comptime Q_SCALE_BYTES = Self.ACTUAL_Q_HEADS * Self.max_seq * size_of[Float32]()
 
-    comptime TOTAL_BYTES = Self.K_TOTAL + Self.V_TOTAL + Self.K_SCALE_BYTES + Self.V_SCALE_BYTES + Self.Q_SCALE_BYTES
+    comptime TOTAL_BYTES = Self.K_TOTAL + Self.V_TOTAL + Self.K_SCALE_BYTES + Self.V_SCALE_BYTES
 
     var k_base: Int
     var v_base: Int
     var k_scale_base: Int
     var v_scale_base: Int
-    var q_scale_base: Int
 
     def __init__(out self, base: Int):
         self.k_base = base
         self.v_base = base + Self.K_TOTAL
         self.k_scale_base = self.v_base + Self.V_TOTAL
         self.v_scale_base = self.k_scale_base + Self.K_SCALE_BYTES
-        self.q_scale_base = self.v_scale_base + Self.V_SCALE_BYTES
 
     # ================================================================
     # K write — scatter into width-packed VNNI layout
@@ -147,169 +142,3 @@ struct Gemma4KVCache[max_seq: Int, head_dim: Int, num_kv_heads: Int, num_q_heads
     def v_scale_ptr(self, head: Int) -> UnsafePointer[Float32, MutAnyOrigin]:
         return UnsafePointer[Float32, MutAnyOrigin](
             unsafe_from_address=self.v_scale_base + head * Self.max_seq * size_of[Float32]())
-
-
-# ============================================================================
-# Validation
-# ============================================================================
-
-
-def xorshift64(mut state: UInt64) -> Float64:
-    state ^= state << 13
-    state ^= state >> 7
-    state ^= state << 17
-    return Float64(Int64(state & 0xFFFFFF).cast[DType.float64]()) / Float64(0x800000) * 4.0 - 2.0
-
-
-def validate_k_roundtrip[head_dim: Int, num_positions: Int]():
-    """Write K positions, read back via scoring layout, verify XOR and packing."""
-    comptime num_heads = 2
-    comptime max_seq = 128
-    comptime Cache = Gemma4KVCache[max_seq, head_dim, num_heads]
-    comptime WIDTH = Cache.WIDTH
-
-    var cache_buf = alloc[UInt8](Cache.TOTAL_BYTES)
-    for i in range(Cache.TOTAL_BYTES):
-        cache_buf[i] = UInt8(0)
-    var cache = Cache(Int(cache_buf))
-
-    var rng = UInt64(0xFEEDFACE12345678)
-    var golden_i8 = alloc[Scalar[DType.int8]](num_heads * num_positions * head_dim)
-
-    for h in range(num_heads):
-        for pos in range(num_positions):
-            var row = alloc[Scalar[DType.int8]](head_dim)
-            for d in range(head_dim):
-                var val = Scalar[DType.int8](Int8(Int(xorshift64(rng) * 60.0)))
-                row[d] = val
-                golden_i8[h * num_positions * head_dim + pos * head_dim + d] = val
-            cache.write_k(pos, h, row)
-            row.free()
-
-    # Read back: for each position, reconstruct i8 from VNNI layout
-    var mismatches = 0
-    for h in range(num_heads):
-        for pos in range(num_positions):
-            var pos_group = pos // WIDTH
-            var slot = pos % WIDTH
-            var k_pg = cache.k_pg_ptr(h, pos_group)
-
-            for kdg in range(Cache.K_DIM_GROUPS):
-                var base = k_pg + kdg * WIDTH * VNNI_BLK + slot * VNNI_BLK
-                for b in range(VNNI_BLK):
-                    var stored_u8 = base.bitcast[Scalar[DType.uint8]]()[b]
-                    var recovered_i8 = (stored_u8 ^ UInt8(0x80)).cast[DType.int8]()
-                    var expected = golden_i8[h * num_positions * head_dim + pos * head_dim + kdg * VNNI_BLK + b]
-                    if recovered_i8 != expected:
-                        mismatches += 1
-
-    print("  K bytes compared:  " + String(num_heads * num_positions * head_dim))
-    print("  K mismatches:      " + String(mismatches))
-
-    cache_buf.free()
-    golden_i8.free()
-
-
-def validate_v_roundtrip[head_dim: Int, num_positions: Int]():
-    """Write V positions, read back via V-agg layout, verify packing."""
-    comptime num_heads = 2
-    comptime max_seq = 128
-    comptime Cache = Gemma4KVCache[max_seq, head_dim, num_heads]
-    comptime WIDTH = Cache.WIDTH
-
-    var cache_buf = alloc[UInt8](Cache.TOTAL_BYTES)
-    for i in range(Cache.TOTAL_BYTES):
-        cache_buf[i] = UInt8(0)
-    var cache = Cache(Int(cache_buf))
-
-    var rng = UInt64(0xDEADCAFE87654321)
-    var golden = alloc[Scalar[DType.int8]](num_heads * num_positions * head_dim)
-
-    for h in range(num_heads):
-        for pos in range(num_positions):
-            var row = alloc[Scalar[DType.int8]](head_dim)
-            for d in range(head_dim):
-                var val = Scalar[DType.int8](Int8(Int(xorshift64(rng) * 60.0)))
-                row[d] = val
-                golden[h * num_positions * head_dim + pos * head_dim + d] = val
-            cache.write_v(pos, h, row)
-            row.free()
-
-    # Read back: reconstruct from VNNI V layout
-    var mismatches = 0
-    for h in range(num_heads):
-        for pos in range(num_positions):
-            var pos_group = pos // WIDTH
-            var sub_quad = (pos % WIDTH) // VNNI_BLK
-            var vnni_slot = pos % VNNI_BLK
-            var v_pg = cache.v_pg_ptr(h, pos_group)
-
-            for cg in range(Cache.V_CHANNEL_GROUPS):
-                var cg_base = v_pg + cg * Cache.V_CG_BYTES + sub_quad * WIDTH * VNNI_BLK
-                for ci in range(WIDTH):
-                    var got = cg_base[ci * VNNI_BLK + vnni_slot]
-                    var expected = golden[h * num_positions * head_dim + pos * head_dim + cg * WIDTH + ci]
-                    if got != expected:
-                        mismatches += 1
-
-    print("  V bytes compared:  " + String(num_heads * num_positions * head_dim))
-    print("  V mismatches:      " + String(mismatches))
-
-    cache_buf.free()
-    golden.free()
-
-
-def validate_k_scale_roundtrip[head_dim: Int]():
-    comptime num_heads = 2
-    comptime max_seq = 128
-    comptime Cache = Gemma4KVCache[max_seq, head_dim, num_heads]
-
-    var cache_buf = alloc[UInt8](Cache.TOTAL_BYTES)
-    for i in range(Cache.TOTAL_BYTES):
-        cache_buf[i] = UInt8(0)
-    var cache = Cache(Int(cache_buf))
-
-    for h in range(num_heads):
-        for pos in range(16):
-            cache.write_k_scale(pos, h, Float32(pos) * 0.1 + Float32(h) * 10.0)
-
-    var max_err = Float64(0)
-    var scale_mismatches = 0
-    for h in range(num_heads):
-        var sp = cache.k_scale_ptr(h)
-        for pos in range(16):
-            var expected = Float32(pos) * 0.1 + Float32(h) * 10.0
-            var got = sp[pos]
-            var err = Float64((got - expected).__abs__())
-            if err > max_err:
-                max_err = err
-            if err > 1e-7:
-                scale_mismatches += 1
-
-    print("  scales compared: " + String(32))
-    print("  max abs error:   " + String(max_err))
-    print("  mismatches:      " + String(scale_mismatches))
-
-    cache_buf.free()
-
-
-def main():
-    print("=== Gemma4KVCache validation (width=" + String(CACHE_WIDTH) + ") ===")
-
-    print("\nK VNNI roundtrip (head_dim=256, 64 positions, 2 heads):")
-    validate_k_roundtrip[256, 64]()
-
-    print("\nK VNNI roundtrip (head_dim=512, 64 positions, 2 heads):")
-    validate_k_roundtrip[512, 64]()
-
-    print("\nV VNNI roundtrip (head_dim=256, 64 positions, 2 heads):")
-    validate_v_roundtrip[256, 64]()
-
-    print("\nV VNNI roundtrip (head_dim=512, 64 positions, 2 heads):")
-    validate_v_roundtrip[512, 64]()
-
-    print("\nK scale roundtrip (head_dim=256):")
-    validate_k_scale_roundtrip[256]()
-
-    print("\nK scale roundtrip (head_dim=512):")
-    validate_k_scale_roundtrip[512]()

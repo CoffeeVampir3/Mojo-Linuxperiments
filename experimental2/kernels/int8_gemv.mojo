@@ -1,9 +1,8 @@
 from std.memory import UnsafePointer
-from std.sys.info import simd_width_of, size_of, CompilationTarget
+from std.sys.info import simd_width_of, CompilationTarget
 from std.sys import llvm_intrinsic
 from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
-from threading.threading_shared import ptr as tptr
 
 from kernels.kernel_ops import PoolFence
 from kernels.vnni import VNNI_N_STEP, VNNI_K_STEP, VNNI_TILE_N, VNNI_BLK, compute_n_block

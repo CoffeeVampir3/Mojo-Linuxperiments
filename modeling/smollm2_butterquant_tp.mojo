@@ -26,7 +26,7 @@ from threading.threading_shared import ptr as tptr
 
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named, BF16, F32, I8,
-    RowShard, ColShard, Replicated,
+    RowShard, ColShard, Replicated, HOST_RANK,
     IsQuantizable, IsGammaQuantizable, IsAbsorbed,
     Slot, PlacedSlot, Bound, DynView, bind, byte_count,
     WeightIterable,
@@ -317,24 +317,24 @@ struct ButterQuantTPLayer[tp: Int]:
     # Column sums are excluded (computed at load time, not loaded from file).
     @staticmethod
     def for_each_weight[
-        func: def[T: Encoding & Shaped & Placed & Named] (String, Int, Int) capturing -> None,
+        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
     ](prefix: String, base: Int):
-        func[Self.INPUT_NORM](prefix, base, -1)
-        func[Self.Q_PROJ](prefix, base, -1)
-        func[Self.K_PROJ](prefix, base, -1)
-        func[Self.V_PROJ](prefix, base, -1)
-        func[Self.O_PROJ](prefix, base, -1)
-        func[Self.POST_ATTN_NORM](prefix, base, -1)
-        func[Self.GATE_PROJ](prefix, base, -1)
-        func[Self.UP_PROJ](prefix, base, -1)
-        func[Self.DOWN_PROJ](prefix, base, -1)
-        func[Self.Q_ROW_SCALE](prefix, base, -1)
-        func[Self.K_ROW_SCALE](prefix, base, -1)
-        func[Self.V_ROW_SCALE](prefix, base, -1)
-        func[Self.O_ROW_SCALE](prefix, base, -1)
-        func[Self.GATE_ROW_SCALE](prefix, base, -1)
-        func[Self.UP_ROW_SCALE](prefix, base, -1)
-        func[Self.DOWN_ROW_SCALE](prefix, base, -1)
+        func[Self.INPUT_NORM](prefix, base)
+        func[Self.Q_PROJ](prefix, base)
+        func[Self.K_PROJ](prefix, base)
+        func[Self.V_PROJ](prefix, base)
+        func[Self.O_PROJ](prefix, base)
+        func[Self.POST_ATTN_NORM](prefix, base)
+        func[Self.GATE_PROJ](prefix, base)
+        func[Self.UP_PROJ](prefix, base)
+        func[Self.DOWN_PROJ](prefix, base)
+        func[Self.Q_ROW_SCALE](prefix, base)
+        func[Self.K_ROW_SCALE](prefix, base)
+        func[Self.V_ROW_SCALE](prefix, base)
+        func[Self.O_ROW_SCALE](prefix, base)
+        func[Self.GATE_ROW_SCALE](prefix, base)
+        func[Self.UP_ROW_SCALE](prefix, base)
+        func[Self.DOWN_ROW_SCALE](prefix, base)
 
     @staticmethod
     def cache_bytes() -> Int:
@@ -432,19 +432,19 @@ struct ButterQuantTPModel[tp: Int = 1](WeightIterable):
 
     # Host-only weights (host arena only).
     comptime HOST_ONLY_OFF = ((Self.DISTRIBUTED_BYTES + Self.STATE_BYTES + DEFAULT_ALIGNMENT - 1) // DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT
-    comptime FINAL_NORM = PlacedSlot[BF16, Replicated, C.HIDDEN, 1, Self.tp, Self.HOST_ONLY_OFF, "model.norm.weight"]
-    comptime EMBED = PlacedSlot[BF16, Replicated, C.VOCAB_SIZE, C.HIDDEN, Self.tp, next_offset[Self.FINAL_NORM](), "model.embed_tokens.weight"]
+    comptime FINAL_NORM = PlacedSlot[BF16, Replicated, C.HIDDEN, 1, Self.tp, Self.HOST_ONLY_OFF, "model.norm.weight", target_rank=HOST_RANK]
+    comptime EMBED = PlacedSlot[BF16, Replicated, C.VOCAB_SIZE, C.HIDDEN, Self.tp, next_offset[Self.FINAL_NORM](), "model.embed_tokens.weight", target_rank=HOST_RANK]
 
     @staticmethod
     def for_each_weight[
-        func: def[T: Encoding & Shaped & Placed & Named] (String, Int, Int) capturing -> None,
+        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
     ]():
         comptime for i in range(C.NUM_LAYERS):
             var prefix = "model.layers." + String(i) + "."
             var base = Self.LAYERS_OFF + i * Self.LAYER_STRIDE
             Self.LAYER.for_each_weight[func](prefix, base)
-        func[Self.FINAL_NORM]("", 0, 0)
-        func[Self.EMBED]("", 0, 0)
+        func[Self.FINAL_NORM]("", 0)
+        func[Self.EMBED]("", 0)
 
     @staticmethod
     def arena_bytes() -> Int:
@@ -855,7 +855,7 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
         for rank in range(Self.tp):
             arena_bases.append(Int(arenas[rank].base))
 
-        var result = load_safetensors[Self.M](path, arena_bases, host_index=host_rank)
+        var result = load_safetensors[Self.M](path, arena_bases)
         if not result:
             print("butterquant: weight loading failed")
             return None

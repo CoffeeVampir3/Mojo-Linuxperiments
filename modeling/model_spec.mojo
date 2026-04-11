@@ -99,6 +99,7 @@ trait Placed:
     comptime GLOBAL_ROWS: Int
     comptime GLOBAL_COLS: Int
     comptime PACK_FN: PackFn
+    comptime TARGET_RANK: Int
 
 trait Named:
     comptime NAME: StaticString
@@ -158,6 +159,21 @@ comptime ColShard = Shard2D[Keep, Divide]
 comptime Replicated = Shard2D[Keep, Keep]
 
 
+# =============================================================================
+# Placement locality
+#
+# target_rank on a PlacedSlot says where the loader is allowed to write the
+# weight. The default (DISTRIBUTED) means every rank participates: replicated
+# slots get a copy on each rank, sharded slots get their slice. A non-negative
+# target_rank pins the slot to a single rank's arena — used for host-only
+# weights (final norm, embed, lm head) that only one rank ever reads, and for
+# per-expert MoE sharding where the rank is determined by expert ID.
+# =============================================================================
+
+comptime DISTRIBUTED = -1
+comptime HOST_RANK = 0
+
+
 struct Slot[E: Encoding, S: ShardStrategy, rows: Int, cols: Int, tp: Int](
     Encoding, Shaped
 ):
@@ -173,6 +189,7 @@ struct PlacedSlot[
     Tag: WeightTag = IsPassthrough,
     Packing: PackingStrategy = Unpacked,
     Tiling: RowTiled & ColTiled & PanelHeight = Untiled,
+    target_rank: Int = DISTRIBUTED,
 ](
     Encoding, Shaped, Placed, Named, ShardStrategy,
     Quantizable where conforms_to(Tag, Quantizable),
@@ -189,6 +206,7 @@ struct PlacedSlot[
     comptime GLOBAL_COLS = Self.cols
     comptime NAME: StaticString = Self.name
     comptime PACK_FN = Self.Packing.PACK_FN
+    comptime TARGET_RANK = Self.target_rank
 
     @staticmethod
     def shard_rows(r: Int, n: Int) -> Int:
@@ -253,7 +271,7 @@ struct WeightDesc(Copyable):
     var target_rank: Int
 
 def weight_desc[T: Encoding & Shaped & Placed & Named](
-    prefix: String = "", base: Int = 0, target_rank: Int = -1,
+    prefix: String = "", base: Int = 0,
 ) -> WeightDesc:
     comptime is_quantizable = conforms_to(T, Quantizable)
     comptime is_absorbed = conforms_to(T, Absorbed)
@@ -265,14 +283,14 @@ def weight_desc[T: Encoding & Shaped & Placed & Named](
         quantizable=is_quantizable,
         absorbed=is_absorbed,
         pack_fn=T.PACK_FN,
-        target_rank=target_rank,
+        target_rank=T.TARGET_RANK,
     )
 
 
 trait WeightIterable:
     @staticmethod
     def for_each_weight[
-        func: def[T: Encoding & Shaped & Placed & Named] (String, Int, Int) capturing -> None,
+        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
     ](): ...
 
 

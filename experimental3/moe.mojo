@@ -19,14 +19,13 @@ must be produced by the rank-local rmsnorm_dual_gamma_fwht_quantize.
 """
 
 from std.memory import UnsafePointer
-from std.memory.unsafe_pointer import alloc
 from std.sys.info import simd_width_of
 from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
 
 from kernels.vnni import VNNI_N_STEP, VNNI_K_STEP, VNNI_TILE_N, VNNI_BLK, compute_n_block
 from kernels.kernel_ops import PoolFence
-from simd_math import exp_f32, sqrt, roundeven
+from simd_math import sqrt
 from experimental2.kernels.int8_gemv import dot
 from experimental3.kernels.dense_ffn import (
     FusedGuGeluTanhArgs, fused_gu_gelu_tanh_worker,
@@ -327,149 +326,3 @@ def moe_combine[hidden: Int](
         var c = (moe_out + i).load[width=width]().cast[DType.float32]()
         (x_main + i).store(((x + c) * layer_scalar).cast[DType.bfloat16]())
         i += width
-
-
-# ============================================================================
-# Validation
-# ============================================================================
-
-
-def scalar_fwht_f64(buf: UnsafePointer[Float64, MutAnyOrigin], n: Int):
-    var s = 1
-    while s < n:
-        var i = 0
-        while i < n:
-            for j in range(s):
-                var a = buf[i + j]
-                var b = buf[i + j + s]
-                buf[i + j] = a + b
-                buf[i + j + s] = a - b
-            i += s * 2
-        s *= 2
-    var sc = 1.0 / Float64(sqrt[DType.float64, 1](Float64(n)))
-    for i in range(n):
-        buf[i] *= sc
-
-
-def xorshift64(mut state: UInt64) -> Float64:
-    state ^= state << 13
-    state ^= state >> 7
-    state ^= state << 17
-    return Float64(Int64(state & 0xFFFFFF).cast[DType.float64]()) / Float64(0x800000) * 4.0 - 2.0
-
-
-def validate_expert_pipeline():
-    """Validate one expert's full i8 pipeline against scalar f64 reference."""
-    comptime intermediate = 704
-    comptime hidden = 2816
-    comptime gate_up_dim = 1408
-    comptime fwht_blk = 64
-    comptime num_blocks = intermediate // fwht_blk
-
-    var rng = UInt64(0xCAFEDEAD12345678)
-
-    var act_i8 = alloc[Scalar[DType.int8]](hidden)
-    var act_scale = Float32(15.0)
-    for i in range(hidden):
-        act_i8[i] = Scalar[DType.int8](Int8(Int(xorshift64(rng) * 60.0)))
-
-    var gate_up_w = alloc[Float32](gate_up_dim * hidden)
-    var down_w = alloc[Float32](hidden * intermediate)
-    for i in range(gate_up_dim * hidden):
-        gate_up_w[i] = Float32(xorshift64(rng) * 0.01)
-    for i in range(hidden * intermediate):
-        down_w[i] = Float32(xorshift64(rng) * 0.01)
-
-    var routing_weight = Float32(0.15)
-    var act_dequant = Float64(act_scale) / 127.0
-
-    # f64 reference: gate_up → gelu_tanh → FWHT+quantize → dequant → down
-    var gu_f64 = alloc[Float64](gate_up_dim)
-    for n in range(gate_up_dim):
-        var acc = Float64(0)
-        for k in range(hidden):
-            acc += Float64(Int(act_i8[k])) * act_dequant * Float64(gate_up_w[n * hidden + k])
-        gu_f64[n] = acc
-
-    var activated = alloc[Float64](intermediate)
-    for i in range(intermediate):
-        var g = gu_f64[i]
-        var inner = 0.7978845608028654 * (g + 0.044715 * g * g * g)
-        var e = Float64(exp_f32[1](Float32(-2.0 * inner)))
-        activated[i] = 0.5 * g * (1.0 + (1.0 - e) / (1.0 + e)) * gu_f64[intermediate + i]
-
-    # FWHT + per-block quantize round-trip
-    var fwht_buf = alloc[Float64](intermediate)
-    for i in range(intermediate):
-        fwht_buf[i] = activated[i]
-
-    for b in range(num_blocks):
-        scalar_fwht_f64(fwht_buf + b * fwht_blk, fwht_blk)
-
-    var qi = alloc[Scalar[DType.int8]](intermediate)
-    var bsc = alloc[Float64](num_blocks)
-    for b in range(num_blocks):
-        var bmax = Float64(0)
-        for j in range(fwht_blk):
-            var a = fwht_buf[b * fwht_blk + j].__abs__()
-            if a > bmax:
-                bmax = a
-        if bmax < 1e-10:
-            bmax = 1e-10
-        bsc[b] = bmax
-        var inv = 127.0 / bmax
-        for j in range(fwht_blk):
-            qi[b * fwht_blk + j] = Scalar[DType.int8](Int(Float64(roundeven[DType.float64, 1](fwht_buf[b * fwht_blk + j] * inv)).clamp(-128.0, 127.0)))
-
-    var dequant = alloc[Float64](intermediate)
-    for b in range(num_blocks):
-        var dq = bsc[b] / 127.0
-        for j in range(fwht_blk):
-            dequant[b * fwht_blk + j] = Float64(Int(qi[b * fwht_blk + j])) * dq
-    for b in range(num_blocks):
-        scalar_fwht_f64(dequant + b * fwht_blk, fwht_blk)
-
-    # Down matmul
-    var output_quant = alloc[Float64](hidden)
-    var output_exact = alloc[Float64](hidden)
-    for n in range(hidden):
-        var acc_q = Float64(0)
-        var acc_e = Float64(0)
-        for k in range(intermediate):
-            acc_q += dequant[k] * Float64(down_w[n * intermediate + k])
-            acc_e += activated[k] * Float64(down_w[n * intermediate + k])
-        output_quant[n] = acc_q * Float64(routing_weight)
-        output_exact[n] = acc_e * Float64(routing_weight)
-
-    # Report
-    var dot_val = Float64(0)
-    var n_e = Float64(0)
-    var n_q = Float64(0)
-    var sq_err = Float64(0)
-    for i in range(hidden):
-        dot_val += output_exact[i] * output_quant[i]
-        n_e += output_exact[i] * output_exact[i]
-        n_q += output_quant[i] * output_quant[i]
-        sq_err += (output_exact[i] - output_quant[i]) * (output_exact[i] - output_quant[i])
-
-    print("  output RMS:    " + String(Float64(sqrt[DType.float64, 1](n_e / Float64(hidden)))))
-    print("  cosine:        " + String(dot_val / (Float64(sqrt[DType.float64, 1](n_e)) * Float64(sqrt[DType.float64, 1](n_q)))))
-    print("  NRMSE:         " + String(Float64(sqrt[DType.float64, 1](sq_err / n_e))))
-
-    act_i8.free()
-    gate_up_w.free()
-    down_w.free()
-    gu_f64.free()
-    activated.free()
-    fwht_buf.free()
-    qi.free()
-    bsc.free()
-    dequant.free()
-    output_quant.free()
-    output_exact.free()
-
-
-def main():
-    print("=== Gemma4 MoE expert pipeline validation ===")
-    print("\nSingle expert i8 pipeline (gate_up → gelu_tanh → FWHT → down):")
-    validate_expert_pipeline()

@@ -10,24 +10,21 @@ One worker per KV group. Each worker:
 1. Writes K/V for new position to cache
 2. Preps Q heads (per-head norm + RoPE + FWHT + quantize)
 3. Single pass: score → online softmax → V-agg per position group
-4. FWHT on output for O projection quantization
+4. Quantize output for the O projection
 """
 
 from std.memory import UnsafePointer
-from std.memory.unsafe_pointer import alloc
-from std.sys.info import simd_width_of, size_of
 from std.collections import InlineArray
 
 from experimental.amx import VNNI_BLK
 from experimental2.kernels.int8_gemv import vpdpbusd
-from experimental2.kernels.rmsnorm_fwht_quantize import fwht_block
 from experimental2.kernels.quantize import absmax_quantize_i8
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
 from experimental3.kernels.rope_and_kv_cache_write import (
-    write_k_head_normed, write_v_head_normed, write_v_head_with_inv_rms,
+    write_k_head_normed, write_v_head_normed,
 )
 from experimental3.helpers import prep_q_row_normed
-from simd_math import exp_f32, sqrt, roundeven
+from simd_math import exp_f32, roundeven
 
 
 comptime WIDTH = CACHE_WIDTH
@@ -91,24 +88,35 @@ def score_group[head_dim: Int](
 @always_inline
 def v_agg_group[head_dim: Int](
     exp_scores: SIMD[DType.float32, WIDTH],
+    v_scales_pg: UnsafePointer[Float32, MutAnyOrigin],
     v_pg: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     v_acc: UnsafePointer[Float32, MutAnyOrigin],
 ):
     """Accumulate V-agg for WIDTH positions using VNNI.
 
-    Quantizes exp_scores to u8, broadcasts per sub_quad, then vpdpbusd
-    with packed V data. Accumulates into f32 v_acc[head_dim].
+    Pre-multiplies exp_scores by per-position v_scales[pg], then quantizes the
+    product to u8 and broadcasts per sub_quad. The fact that w_max now reflects
+    (exp_score * v_scale) means w_dequant = w_max/255 absorbs both factors,
+    so dynamic per-token V quantization costs only WIDTH loads + WIDTH muls
+    per position group — no extra dequant downstream.
+
+    Masked positions enter with exp_scores[p] = 0, so 0 * v_scale = 0 and
+    they contribute nothing regardless of unwritten cache slots (which are
+    zero-initialized by mmap anyway).
     """
     comptime V_CHANNEL_GROUPS = head_dim // WIDTH
     comptime V_SUB_QUADS = WIDTH // VNNI_BLK
     comptime V_CG_BYTES = V_SUB_QUADS * WIDTH * VNNI_BLK
 
-    # Quantize WIDTH attention weights to u8
-    var w_max = exp_scores.reduce_max()
+    # Fold per-position V scale into the attention weight before u8 quantize.
+    var v_sc = v_scales_pg.load[width=WIDTH]()
+    var w_eff = exp_scores * v_sc
+
+    var w_max = w_eff.reduce_max()
     if w_max < Float32(1e-10):
         return
     var w_scale = 255.0 / w_max
-    var w_u8_wide = roundeven(exp_scores * w_scale).clamp(0.0, 255.0).cast[DType.uint8]()
+    var w_u8_wide = roundeven(w_eff * w_scale).clamp(0.0, 255.0).cast[DType.uint8]()
     var w_dequant = w_max / 255.0
 
     # Split into sub_quads of VNNI_BLK and broadcast each
@@ -149,12 +157,11 @@ def single_pass_attention[head_dim: Int, max_seq: Int, num_kv_heads: Int, num_q_
 ):
     """Score Q against K cache, online softmax, V-agg. Single pass over positions.
 
-    Per-position V scales are folded into exp_scores before u8 quantization,
-    so the VNNI V-agg accumulation is unchanged.
+    V is stored with per-token dynamic absmax scales. v_agg_group folds those
+    scales into the attention-weight u8 quantization, so dequant is one mul
+    at the end (1/(127*sum)) regardless of how many positions there are.
     Output: f32[head_dim] in FWHT domain.
     """
-    comptime Cache = Gemma4KVCache[max_seq, head_dim, num_kv_heads, num_q_heads]
-
     var q_factor = q_scale / (127.0 * 127.0)
     var k_scales = cache.k_scale_ptr(kv_head)
     var v_scales = cache.v_scale_ptr(kv_head)
@@ -199,12 +206,9 @@ def single_pass_attention[head_dim: Int, max_seq: Int, num_kv_heads: Int, num_q_
                 exp_scores[p] = Float32(0)
 
         running_sum += exp_scores.reduce_add()
+        v_agg_group[head_dim](exp_scores, v_scales + pg * WIDTH, v_pg, v_acc)
 
-        # Fold per-position V scales into attention weights before V-agg
-        var vs = (v_scales + pg * WIDTH).load[width=WIDTH]()
-        v_agg_group[head_dim](exp_scores * vs, v_pg, v_acc)
-
-    var inv_sum = 1.0 / (Float32(127) * running_sum)
+    var inv_sum = Float32(1.0) / (Float32(127) * running_sum)
     for d in range(0, head_dim, WIDTH):
         (output + d).store((v_acc + d).load[width=WIDTH]() * inv_sum)
 
@@ -229,7 +233,6 @@ struct SlidingAttnGroupArgs(Copyable, ImplicitlyCopyable):
     var context_len: Int
     var qi_out_ptr: Int        # i8[heads_per_group × head_dim] output
     var head_scale_ptr: Int    # f32[heads_per_group] per-head absmax scales
-    var v_inv_rms: Float32
     var eps: Float32
 
 
@@ -261,11 +264,11 @@ def sliding_attn_group_kernel[
         cos, sin, work, qi_buf,
         cache, args.cache_pos, args.kv_head, args.eps)
 
-    # 2. Write V to cache
-    write_v_head_with_inv_rms[head_dim](
+    # 2. Write V to cache (per-token absmax, scale stored in cache)
+    write_v_head_normed[head_dim](
         UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.v_bf16_ptr),
         work, qi_buf,
-        cache, args.cache_pos, args.kv_head, args.v_inv_rms)
+        cache, args.cache_pos, args.kv_head, args.eps)
 
     # 3. Process each Q head: score → V-agg → FWHT → quantize to i8
     for qh in range(heads_per_group):
@@ -290,195 +293,3 @@ def sliding_attn_group_kernel[
             work)
 
         head_scales[qh] = absmax_quantize_i8[head_dim](work, qi_out + qh * head_dim)
-
-
-# ============================================================================
-# Validation
-# ============================================================================
-
-
-def xorshift64(mut state: UInt64) -> Float64:
-    state ^= state << 13
-    state ^= state >> 7
-    state ^= state << 17
-    return Float64(Int64(state & 0xFFFFFF).cast[DType.float64]()) / Float64(0x800000) * 4.0 - 2.0
-
-
-def cosine_sim_f64(a: UnsafePointer[Float64, MutAnyOrigin], b: UnsafePointer[Float64, MutAnyOrigin], n: Int) -> Float64:
-    var dot = Float64(0)
-    var na = Float64(0)
-    var nb = Float64(0)
-    for i in range(n):
-        dot += a[i] * b[i]
-        na += a[i] * a[i]
-        nb += b[i] * b[i]
-    if na < 1e-30 or nb < 1e-30:
-        return Float64(0)
-    return dot / (Float64(sqrt[DType.float64, 1](na)) * Float64(sqrt[DType.float64, 1](nb)))
-
-
-def validate_single_pass():
-    """Validate single-pass attention: scoring accuracy + V-agg output quality."""
-    comptime head_dim = 256
-    comptime max_seq = 1024
-    comptime num_kv_heads = 2
-    comptime num_q_heads = 4
-    comptime half = head_dim // 2
-    comptime Cache = Gemma4KVCache[max_seq, head_dim, num_kv_heads, num_q_heads]
-    comptime num_positions = 64
-    comptime kv_head = 0
-    var rng = UInt64(0xDEADCAFE12345678)
-
-    var cache_buf = alloc[UInt8](Cache.TOTAL_BYTES)
-    for i in range(Cache.TOTAL_BYTES):
-        cache_buf[i] = UInt8(0)
-    var cache = Cache(Int(cache_buf))
-
-    # RoPE tables
-    var cos_f32 = alloc[Float32](half)
-    var sin_f32 = alloc[Float32](half)
-    for i in range(half):
-        var angle = xorshift64(rng) * 0.1
-        cos_f32[i] = Float32(1.0 - angle * angle * 0.5)
-        sin_f32[i] = Float32(angle)
-    var q_norm = alloc[Scalar[DType.bfloat16]](head_dim)
-    var k_norm = alloc[Scalar[DType.bfloat16]](head_dim)
-    for i in range(head_dim):
-        q_norm[i] = Scalar[DType.bfloat16](Float32(1.0))
-        k_norm[i] = Scalar[DType.bfloat16](Float32(1.0))
-
-    # Write K and V positions to cache
-    var work = alloc[Float32](head_dim)
-    var qi_buf = alloc[Scalar[DType.int8]](head_dim)
-    var v_scale = Float32(5.0)
-
-    for pos in range(num_positions):
-        var k_data = alloc[Scalar[DType.bfloat16]](head_dim)
-        var v_data = alloc[Scalar[DType.bfloat16]](head_dim)
-        for d in range(head_dim):
-            k_data[d] = Scalar[DType.bfloat16](Float32(xorshift64(rng)))
-            v_data[d] = Scalar[DType.bfloat16](Float32(xorshift64(rng)))
-        write_k_head_normed[head_dim](k_data, k_norm, cos_f32, sin_f32, work, qi_buf,
-            cache, pos, kv_head, Float32(1e-6))
-        write_v_head_normed[head_dim](v_data, work, qi_buf,
-            cache, pos, kv_head, Float32(1e-6))
-        k_data.free()
-        v_data.free()
-
-    # Prep Q
-    var q_bf16 = alloc[Scalar[DType.bfloat16]](head_dim)
-    for d in range(head_dim):
-        q_bf16[d] = Scalar[DType.bfloat16](Float32(xorshift64(rng)))
-
-    var q_i8 = alloc[Scalar[DType.int8]](head_dim)
-    var qr = prep_q_row_normed[head_dim](
-        q_bf16.bitcast[BFloat16](), q_norm, cos_f32, sin_f32,
-        q_i8.bitcast[Int8](), Float32(1e-6))
-    var qi_bias = qr[0]
-    var q_scale = qr[1]
-
-    # --- Two-pass reference: score all, softmax, then V-agg ---
-    var q_factor = q_scale / (127.0 * 127.0)
-    var k_scales = cache.k_scale_ptr(kv_head)
-    var ref_scores = alloc[Float32](num_positions)
-
-    var num_pg = (num_positions + WIDTH - 1) // WIDTH
-    for pg in range(num_pg):
-        var scores_buf = alloc[Float32](WIDTH)
-        score_group[head_dim](
-            q_i8, cache.k_pg_ptr(kv_head, pg),
-            qi_bias, q_factor, k_scales + pg * WIDTH, scores_buf)
-        for p in range(WIDTH):
-            if pg * WIDTH + p < num_positions:
-                ref_scores[pg * WIDTH + p] = scores_buf[p]
-        scores_buf.free()
-
-    # Softmax reference
-    var max_s = Float32(-1e30)
-    for i in range(num_positions):
-        if ref_scores[i] > max_s:
-            max_s = ref_scores[i]
-    var sum_e = Float32(0)
-    for i in range(num_positions):
-        ref_scores[i] = Float32(exp_f32[1](ref_scores[i] - max_s))
-        sum_e += ref_scores[i]
-    for i in range(num_positions):
-        ref_scores[i] /= sum_e
-
-    # --- Single-pass kernel ---
-    var kernel_out = alloc[Float32](head_dim)
-    single_pass_attention[head_dim, max_seq, num_kv_heads, num_q_heads](
-        q_i8, qi_bias, q_scale,
-        cache, kv_head, num_positions, kernel_out)
-
-    # --- f32 reference V-agg (read V from cache, multiply by ref softmax weights) ---
-    var ref_out = alloc[Float64](head_dim)
-    for d in range(head_dim):
-        ref_out[d] = Float64(0)
-
-    for pos in range(num_positions):
-        var w = Float64(ref_scores[pos])
-        var pos_group = pos // WIDTH
-        var sub_quad = (pos % WIDTH) // VNNI_BLK
-        var vnni_slot = pos % VNNI_BLK
-        var v_pg = cache.v_pg_ptr(kv_head, pos_group)
-        for cg in range(Cache.V_CHANNEL_GROUPS):
-            var cg_base = v_pg + cg * Cache.V_CG_BYTES + sub_quad * WIDTH * VNNI_BLK
-            for ci in range(WIDTH):
-                var v_val = Float64(Int(cg_base[ci * VNNI_BLK + vnni_slot]))
-                ref_out[cg * WIDTH + ci] += w * v_val
-
-    # Compare kernel output (pre-FWHT) vs f64 reference V-agg
-    var kernel_f64 = alloc[Float64](head_dim)
-    for i in range(head_dim):
-        kernel_f64[i] = Float64(kernel_out[i])
-    var cos_sim = cosine_sim_f64(ref_out.bitcast[Float64](), kernel_f64.bitcast[Float64](), head_dim)
-
-    var max_err = Float64(0)
-    var sum_sq_err = Float64(0)
-    var sum_sq_ref = Float64(0)
-    for i in range(head_dim):
-        var err = (kernel_f64[i] - ref_out[i]).__abs__()
-        if err > max_err:
-            max_err = err
-        sum_sq_err += (kernel_f64[i] - ref_out[i]) * (kernel_f64[i] - ref_out[i])
-        sum_sq_ref += ref_out[i] * ref_out[i]
-    var nrmse = Float64(sqrt[DType.float64, 1](sum_sq_err / sum_sq_ref)) if sum_sq_ref > 0 else Float64(0)
-
-    print("  cosine (kernel vs f64 ref V-agg):  " + String(cos_sim))
-    print("  NRMSE:                             " + String(nrmse))
-    print("  max abs error:                     " + String(max_err))
-    print("  q_scale=" + String(q_scale) + " qi_bias=" + String(qi_bias))
-
-    # Verify FWHT preserves energy
-    var pre_fwht_rms = Float64(0)
-    for d in range(head_dim):
-        pre_fwht_rms += Float64(kernel_out[d]) * Float64(kernel_out[d])
-    pre_fwht_rms = Float64(sqrt[DType.float64, 1](pre_fwht_rms / Float64(head_dim)))
-
-    fwht_block[head_dim](kernel_out)
-    var post_fwht_rms = Float64(0)
-    for d in range(head_dim):
-        post_fwht_rms += Float64(kernel_out[d]) * Float64(kernel_out[d])
-    post_fwht_rms = Float64(sqrt[DType.float64, 1](post_fwht_rms / Float64(head_dim)))
-    print("  FWHT energy ratio:                 " + String(post_fwht_rms / pre_fwht_rms))
-
-    cache_buf.free()
-    cos_f32.free()
-    sin_f32.free()
-    q_norm.free()
-    k_norm.free()
-    work.free()
-    qi_buf.free()
-    q_bf16.free()
-    q_i8.free()
-    ref_scores.free()
-    kernel_out.free()
-    ref_out.free()
-    kernel_f64.free()
-
-
-def main():
-    print("=== sliding_attention validation (single-pass, width=" + String(WIDTH) + ") ===")
-    print("\nSingle-pass scoring + V-agg (head_dim=256, 64 positions):")
-    validate_single_pass()

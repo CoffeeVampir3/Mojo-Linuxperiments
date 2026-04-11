@@ -134,7 +134,6 @@ def load_weights[
 ](
     paths: List[Path],
     arena_bases: List[Int],
-    host_index: Int = 0,
 ) -> Optional[LoadResult]:
     """Load weights from one or more safetensors files into pre-allocated arenas.
 
@@ -153,14 +152,15 @@ def load_weights[
     var distributed_weights = List[WeightDesc]()
 
     @parameter
-    def collect[T: Encoding & Shaped & Placed & Named](prefix: String, base: Int, target_rank: Int):
+    def collect[T: Encoding & Shaped & Placed & Named](prefix: String, base: Int):
         comptime if conforms_to(T, Absorbed):
             pass
         else:
-            if target_rank >= 0:
-                targeted_weights.append(weight_desc[T](prefix, base, target_rank))
+            var desc = weight_desc[T](prefix, base)
+            if desc.target_rank >= 0:
+                targeted_weights.append(desc^)
             else:
-                distributed_weights.append(weight_desc[T](prefix, base, target_rank))
+                distributed_weights.append(desc^)
 
     M.for_each_weight[collect]()
 
@@ -224,9 +224,8 @@ def load_safetensors[
 ](
     path: Path,
     arena_bases: List[Int],
-    host_index: Int = 0,
 ) -> Optional[LoadResult]:
     """Load weights from a single safetensors file."""
     var paths = List[Path]()
     paths.append(path)
-    return load_weights[M, io_depth](paths, arena_bases, host_index)
+    return load_weights[M, io_depth](paths, arena_bases)

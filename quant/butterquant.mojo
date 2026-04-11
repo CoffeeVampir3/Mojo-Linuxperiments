@@ -5,8 +5,8 @@ Per quantizable weight:
   2. FWHT rotation on contraction dimension K per row (block = largest pow2 factor of K, cap 256)
   3. Per-row symmetric i8 quantization: s[n] = absmax(row)/127
 
-Supports multi-shard checkpoints. The for_each_weight interface uses the
-3-arg signature (prefix, base, target_rank).
+Supports multi-shard checkpoints. Uses the model's for_each_weight interface
+to walk every weight and collect a list of quantization tasks.
 
 The quantizer is panelized rather than whole-tensor buffered: scratch is sized
 for a configurable row panel and reused across weights. Large tensors are
@@ -398,7 +398,7 @@ def quantize[M: WeightIterable,
     var tasks = List[WeightTask]()
 
     @parameter
-    def collect[T: Encoding & Shaped & Placed & Named](prefix: String, base: Int, target_rank: Int):
+    def collect[T: Encoding & Shaped & Placed & Named](prefix: String, base: Int):
         var name = prefix + String(T.NAME)
         comptime cols = T.COLS
         comptime if conforms_to(T, Absorbed):

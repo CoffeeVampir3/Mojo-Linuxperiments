@@ -15,7 +15,7 @@ from threading import BurstPool
 
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named, BF16, F32,
-    RowShard, ColShard, Replicated,
+    RowShard, ColShard, Replicated, HOST_RANK, DISTRIBUTED,
     Slot, PlacedSlot, Bound, DynView, CacheView, bind, byte_count,
     WeightIterable,
     next_offset,
@@ -91,19 +91,19 @@ comptime C = DeepSeekV2LiteConfig
 # =============================================================================
 
 
-struct ExpertWeights[tp: Int]:
-    comptime GATE_PROJ = PlacedSlot[BF16, Replicated, C.MOE_INTERMEDIATE, C.HIDDEN, Self.tp, 0, "gate_proj.weight"]
-    comptime UP_PROJ   = PlacedSlot[BF16, Replicated, C.MOE_INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.GATE_PROJ](), "up_proj.weight"]
-    comptime DOWN_PROJ = PlacedSlot[BF16, Replicated, C.HIDDEN, C.MOE_INTERMEDIATE, Self.tp, next_offset[Self.UP_PROJ](), "down_proj.weight"]
+struct ExpertWeights[tp: Int, target_rank: Int = DISTRIBUTED]:
+    comptime GATE_PROJ = PlacedSlot[BF16, Replicated, C.MOE_INTERMEDIATE, C.HIDDEN, Self.tp, 0, "gate_proj.weight", target_rank=Self.target_rank]
+    comptime UP_PROJ   = PlacedSlot[BF16, Replicated, C.MOE_INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.GATE_PROJ](), "up_proj.weight", target_rank=Self.target_rank]
+    comptime DOWN_PROJ = PlacedSlot[BF16, Replicated, C.HIDDEN, C.MOE_INTERMEDIATE, Self.tp, next_offset[Self.UP_PROJ](), "down_proj.weight", target_rank=Self.target_rank]
     comptime STRIDE    = next_offset[Self.DOWN_PROJ]()
 
     @staticmethod
     def for_each_weight[
-        func: def[T: Encoding & Shaped & Placed & Named] (String, Int, Int) capturing -> None,
-    ](prefix: String, base: Int, target_rank: Int):
-        func[Self.GATE_PROJ](prefix, base, target_rank)
-        func[Self.UP_PROJ](prefix, base, target_rank)
-        func[Self.DOWN_PROJ](prefix, base, target_rank)
+        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
+    ](prefix: String, base: Int):
+        func[Self.GATE_PROJ](prefix, base)
+        func[Self.UP_PROJ](prefix, base)
+        func[Self.DOWN_PROJ](prefix, base)
 
 
 # =============================================================================
@@ -134,18 +134,18 @@ struct DenseLayer[tp: Int]:
 
     @staticmethod
     def for_each_weight[
-        func: def[T: Encoding & Shaped & Placed & Named] (String, Int, Int) capturing -> None,
+        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
     ](prefix: String, base: Int):
-        func[Self.Q_PROJ](prefix, base, -1)
-        func[Self.KV_A_PROJ](prefix, base, -1)
-        func[Self.KV_A_NORM](prefix, base, -1)
-        func[Self.KV_B_PROJ](prefix, base, -1)
-        func[Self.O_PROJ](prefix, base, -1)
-        func[Self.INPUT_NORM](prefix, base, -1)
-        func[Self.POST_ATTN_NORM](prefix, base, -1)
-        func[Self.GATE_PROJ](prefix, base, -1)
-        func[Self.UP_PROJ](prefix, base, -1)
-        func[Self.DOWN_PROJ](prefix, base, -1)
+        func[Self.Q_PROJ](prefix, base)
+        func[Self.KV_A_PROJ](prefix, base)
+        func[Self.KV_A_NORM](prefix, base)
+        func[Self.KV_B_PROJ](prefix, base)
+        func[Self.O_PROJ](prefix, base)
+        func[Self.INPUT_NORM](prefix, base)
+        func[Self.POST_ATTN_NORM](prefix, base)
+        func[Self.GATE_PROJ](prefix, base)
+        func[Self.UP_PROJ](prefix, base)
+        func[Self.DOWN_PROJ](prefix, base)
 
     @staticmethod
     def cache_bytes() -> Int:
@@ -173,7 +173,10 @@ struct MoELayer[tp: Int]:
     comptime SHARED_UP   = PlacedSlot[BF16, RowShard, C.SHARED_INTERMEDIATE, C.HIDDEN,             Self.tp, next_offset[Self.SHARED_GATE](),    "mlp.shared_experts.up_proj.weight"]
     comptime SHARED_DOWN = PlacedSlot[BF16, ColShard, C.HIDDEN,             C.SHARED_INTERMEDIATE, Self.tp, next_offset[Self.SHARED_UP](),     "mlp.shared_experts.down_proj.weight"]
 
-    # Routed experts: 64 experts, each with gate/up/down projections
+    # Routed experts: 64 experts, each with gate/up/down projections.
+    # The unsharded EXPERT alias is used for STRIDE/offset arithmetic only;
+    # iteration uses ExpertWeights[Self.tp, e % Self.tp] so each expert's
+    # PlacedSlot carries its own target_rank as a static type parameter.
     comptime EXPERTS_OFF = next_offset[Self.SHARED_DOWN]()
     comptime EXPERT      = ExpertWeights[Self.tp]
     comptime STRIDE      = Self.EXPERTS_OFF + C.N_ROUTED_EXPERTS * Self.EXPERT.STRIDE
@@ -184,23 +187,23 @@ struct MoELayer[tp: Int]:
 
     @staticmethod
     def for_each_weight[
-        func: def[T: Encoding & Shaped & Placed & Named] (String, Int, Int) capturing -> None,
+        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
     ](prefix: String, base: Int):
-        func[Self.Q_PROJ](prefix, base, -1)
-        func[Self.KV_A_PROJ](prefix, base, -1)
-        func[Self.KV_A_NORM](prefix, base, -1)
-        func[Self.KV_B_PROJ](prefix, base, -1)
-        func[Self.O_PROJ](prefix, base, -1)
-        func[Self.INPUT_NORM](prefix, base, -1)
-        func[Self.POST_ATTN_NORM](prefix, base, -1)
-        func[Self.ROUTER](prefix, base, -1)
-        func[Self.SHARED_GATE](prefix, base, -1)
-        func[Self.SHARED_UP](prefix, base, -1)
-        func[Self.SHARED_DOWN](prefix, base, -1)
+        func[Self.Q_PROJ](prefix, base)
+        func[Self.KV_A_PROJ](prefix, base)
+        func[Self.KV_A_NORM](prefix, base)
+        func[Self.KV_B_PROJ](prefix, base)
+        func[Self.O_PROJ](prefix, base)
+        func[Self.INPUT_NORM](prefix, base)
+        func[Self.POST_ATTN_NORM](prefix, base)
+        func[Self.ROUTER](prefix, base)
+        func[Self.SHARED_GATE](prefix, base)
+        func[Self.SHARED_UP](prefix, base)
+        func[Self.SHARED_DOWN](prefix, base)
         comptime for e in range(C.N_ROUTED_EXPERTS):
             var expert_prefix = prefix + "mlp.experts." + String(e) + "."
             var expert_base = base + Self.EXPERTS_OFF + e * Self.EXPERT.STRIDE
-            Self.EXPERT.for_each_weight[func](expert_prefix, expert_base, e % Self.tp)
+            ExpertWeights[Self.tp, e % Self.tp].for_each_weight[func](expert_prefix, expert_base)
 
     @staticmethod
     def cache_bytes() -> Int:
@@ -281,13 +284,13 @@ struct DSV2Model[tp: Int](WeightIterable):
 
     # Host-only weights (host arena only)
     comptime HOST_ONLY_OFF = ((Self.DISTRIBUTED_BYTES + Self.STATE_BYTES + DEFAULT_ALIGNMENT - 1) // DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT
-    comptime FINAL_NORM = PlacedSlot[BF16, Replicated, C.HIDDEN,     1,        Self.tp, Self.HOST_ONLY_OFF,             "model.norm.weight"]
-    comptime EMBED      = PlacedSlot[BF16, Replicated, C.VOCAB_SIZE, C.HIDDEN, Self.tp, next_offset[Self.FINAL_NORM](), "model.embed_tokens.weight"]
-    comptime LM_HEAD    = PlacedSlot[BF16, Replicated, C.VOCAB_SIZE, C.HIDDEN, Self.tp, next_offset[Self.EMBED](),      "lm_head.weight"]
+    comptime FINAL_NORM = PlacedSlot[BF16, Replicated, C.HIDDEN,     1,        Self.tp, Self.HOST_ONLY_OFF,             "model.norm.weight", target_rank=HOST_RANK]
+    comptime EMBED      = PlacedSlot[BF16, Replicated, C.VOCAB_SIZE, C.HIDDEN, Self.tp, next_offset[Self.FINAL_NORM](), "model.embed_tokens.weight", target_rank=HOST_RANK]
+    comptime LM_HEAD    = PlacedSlot[BF16, Replicated, C.VOCAB_SIZE, C.HIDDEN, Self.tp, next_offset[Self.EMBED](),      "lm_head.weight", target_rank=HOST_RANK]
 
     @staticmethod
     def for_each_weight[
-        func: def[T: Encoding & Shaped & Placed & Named] (String, Int, Int) capturing -> None,
+        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
     ]():
         # Layer 0 (dense)
         Self.DENSE.for_each_weight[func]("model.layers.0.", Self.LAYERS_OFF)
@@ -299,9 +302,9 @@ struct DSV2Model[tp: Int](WeightIterable):
             Self.MOE.for_each_weight[func](prefix, base)
 
         # Host-only
-        func[Self.FINAL_NORM]("", 0, 0)
-        func[Self.EMBED]("", 0, 0)
-        func[Self.LM_HEAD]("", 0, 0)
+        func[Self.FINAL_NORM]("", 0)
+        func[Self.EMBED]("", 0)
+        func[Self.LM_HEAD]("", 0)
 
     @staticmethod
     def arena_bytes() -> Int:
@@ -486,7 +489,7 @@ struct DeepSeekV2Lite[tp: Int](Movable):
         for rank in range(Self.tp):
             arena_bases.append(Int(arenas[rank].base))
 
-        var result = load_weights[Self.M](shards, arena_bases, host_index=host_rank)
+        var result = load_weights[Self.M](shards, arena_bases)
         if not result:
             print("weight loading failed")
             return None

@@ -18,7 +18,7 @@ from experimental.linear_borrow_pool import ScratchPool, ScratchLease
 
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named, BF16, F32,
-    RowShard, ColShard, Replicated,
+    RowShard, ColShard, Replicated, HOST_RANK,
     Slot, PlacedSlot, Bound, DynView, CacheView,
     byte_count, bind, WeightIterable, next_offset,
     DEFAULT_ALIGNMENT, LogitsView,
@@ -143,30 +143,30 @@ struct SlidingLayer[tp: Int]:
 
     @staticmethod
     def for_each_weight[
-        func: def[T: Encoding & Shaped & Placed & Named](String, Int, Int) capturing -> None,
+        func: def[T: Encoding & Shaped & Placed & Named](String, Int) capturing -> None,
     ](prefix: String, base: Int):
-        func[Self.Q_PROJ](prefix, base, -1)
-        func[Self.K_PROJ](prefix, base, -1)
-        func[Self.V_PROJ](prefix, base, -1)
-        func[Self.O_PROJ](prefix, base, -1)
-        func[Self.Q_NORM](prefix, base, -1)
-        func[Self.K_NORM](prefix, base, -1)
-        func[Self.INPUT_NORM](prefix, base, -1)
-        func[Self.POST_ATTN_NORM](prefix, base, -1)
-        func[Self.PRE_FFN_NORM](prefix, base, -1)
-        func[Self.PRE_FFN_NORM_2](prefix, base, -1)
-        func[Self.POST_FFN_NORM_1](prefix, base, -1)
-        func[Self.POST_FFN_NORM_2](prefix, base, -1)
-        func[Self.POST_FFN_NORM](prefix, base, -1)
-        func[Self.GATE_PROJ](prefix, base, -1)
-        func[Self.UP_PROJ](prefix, base, -1)
-        func[Self.DOWN_PROJ](prefix, base, -1)
-        func[Self.ROUTER_PROJ](prefix, base, -1)
-        func[Self.ROUTER_SCALE](prefix, base, -1)
-        func[Self.ROUTER_PER_EXPERT_SCALE](prefix, base, -1)
-        func[Self.EXPERTS_GATE_UP](prefix, base, -1)
-        func[Self.EXPERTS_DOWN](prefix, base, -1)
-        func[Self.LAYER_SCALAR](prefix, base, -1)
+        func[Self.Q_PROJ](prefix, base)
+        func[Self.K_PROJ](prefix, base)
+        func[Self.V_PROJ](prefix, base)
+        func[Self.O_PROJ](prefix, base)
+        func[Self.Q_NORM](prefix, base)
+        func[Self.K_NORM](prefix, base)
+        func[Self.INPUT_NORM](prefix, base)
+        func[Self.POST_ATTN_NORM](prefix, base)
+        func[Self.PRE_FFN_NORM](prefix, base)
+        func[Self.PRE_FFN_NORM_2](prefix, base)
+        func[Self.POST_FFN_NORM_1](prefix, base)
+        func[Self.POST_FFN_NORM_2](prefix, base)
+        func[Self.POST_FFN_NORM](prefix, base)
+        func[Self.GATE_PROJ](prefix, base)
+        func[Self.UP_PROJ](prefix, base)
+        func[Self.DOWN_PROJ](prefix, base)
+        func[Self.ROUTER_PROJ](prefix, base)
+        func[Self.ROUTER_SCALE](prefix, base)
+        func[Self.ROUTER_PER_EXPERT_SCALE](prefix, base)
+        func[Self.EXPERTS_GATE_UP](prefix, base)
+        func[Self.EXPERTS_DOWN](prefix, base)
+        func[Self.LAYER_SCALAR](prefix, base)
 
 
 # =============================================================================
@@ -220,29 +220,29 @@ struct FullLayer[tp: Int]:
 
     @staticmethod
     def for_each_weight[
-        func: def[T: Encoding & Shaped & Placed & Named](String, Int, Int) capturing -> None,
+        func: def[T: Encoding & Shaped & Placed & Named](String, Int) capturing -> None,
     ](prefix: String, base: Int):
-        func[Self.Q_PROJ](prefix, base, -1)
-        func[Self.K_PROJ](prefix, base, -1)
-        func[Self.O_PROJ](prefix, base, -1)
-        func[Self.Q_NORM](prefix, base, -1)
-        func[Self.K_NORM](prefix, base, -1)
-        func[Self.INPUT_NORM](prefix, base, -1)
-        func[Self.POST_ATTN_NORM](prefix, base, -1)
-        func[Self.PRE_FFN_NORM](prefix, base, -1)
-        func[Self.PRE_FFN_NORM_2](prefix, base, -1)
-        func[Self.POST_FFN_NORM_1](prefix, base, -1)
-        func[Self.POST_FFN_NORM_2](prefix, base, -1)
-        func[Self.POST_FFN_NORM](prefix, base, -1)
-        func[Self.GATE_PROJ](prefix, base, -1)
-        func[Self.UP_PROJ](prefix, base, -1)
-        func[Self.DOWN_PROJ](prefix, base, -1)
-        func[Self.ROUTER_PROJ](prefix, base, -1)
-        func[Self.ROUTER_SCALE](prefix, base, -1)
-        func[Self.ROUTER_PER_EXPERT_SCALE](prefix, base, -1)
-        func[Self.EXPERTS_GATE_UP](prefix, base, -1)
-        func[Self.EXPERTS_DOWN](prefix, base, -1)
-        func[Self.LAYER_SCALAR](prefix, base, -1)
+        func[Self.Q_PROJ](prefix, base)
+        func[Self.K_PROJ](prefix, base)
+        func[Self.O_PROJ](prefix, base)
+        func[Self.Q_NORM](prefix, base)
+        func[Self.K_NORM](prefix, base)
+        func[Self.INPUT_NORM](prefix, base)
+        func[Self.POST_ATTN_NORM](prefix, base)
+        func[Self.PRE_FFN_NORM](prefix, base)
+        func[Self.PRE_FFN_NORM_2](prefix, base)
+        func[Self.POST_FFN_NORM_1](prefix, base)
+        func[Self.POST_FFN_NORM_2](prefix, base)
+        func[Self.POST_FFN_NORM](prefix, base)
+        func[Self.GATE_PROJ](prefix, base)
+        func[Self.UP_PROJ](prefix, base)
+        func[Self.DOWN_PROJ](prefix, base)
+        func[Self.ROUTER_PROJ](prefix, base)
+        func[Self.ROUTER_SCALE](prefix, base)
+        func[Self.ROUTER_PER_EXPERT_SCALE](prefix, base)
+        func[Self.EXPERTS_GATE_UP](prefix, base)
+        func[Self.EXPERTS_DOWN](prefix, base)
+        func[Self.LAYER_SCALAR](prefix, base)
 
 
 # =============================================================================
@@ -339,12 +339,12 @@ struct Gemma4Model[tp: Int](WeightIterable):
 
     # Host-only weights (after distributed weights + state)
     comptime HOST_ONLY_OFF = ((Self.DISTRIBUTED_BYTES + Self.STATE_BYTES + DEFAULT_ALIGNMENT - 1) // DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT
-    comptime FINAL_NORM    = PlacedSlot[BF16, Replicated, C.HIDDEN,     1,        Self.tp, Self.HOST_ONLY_OFF,             "model.language_model.norm.weight"]
-    comptime EMBED         = PlacedSlot[BF16, Replicated, C.VOCAB_SIZE, C.HIDDEN, Self.tp, next_offset[Self.FINAL_NORM](), "model.language_model.embed_tokens.weight"]
+    comptime FINAL_NORM    = PlacedSlot[BF16, Replicated, C.HIDDEN,     1,        Self.tp, Self.HOST_ONLY_OFF,             "model.language_model.norm.weight", target_rank=HOST_RANK]
+    comptime EMBED         = PlacedSlot[BF16, Replicated, C.VOCAB_SIZE, C.HIDDEN, Self.tp, next_offset[Self.FINAL_NORM](), "model.language_model.embed_tokens.weight", target_rank=HOST_RANK]
 
     @staticmethod
     def for_each_weight[
-        func: def[T: Encoding & Shaped & Placed & Named](String, Int, Int) capturing -> None,
+        func: def[T: Encoding & Shaped & Placed & Named](String, Int) capturing -> None,
     ]():
         var sliding_idx = 0
         var full_idx = 0
@@ -359,8 +359,8 @@ struct Gemma4Model[tp: Int](WeightIterable):
                 Self.SLIDING.for_each_weight[func](prefix, base)
                 sliding_idx += 1
 
-        func[Self.FINAL_NORM]("", 0, -1)
-        func[Self.EMBED]("", 0, -1)
+        func[Self.FINAL_NORM]("", 0)
+        func[Self.EMBED]("", 0)
 
     @staticmethod
     def host_arena_bytes() -> Int:
@@ -542,7 +542,7 @@ struct Gemma4[tp: Int](Movable):
         var arena_bases = List[Int]()
         arena_bases.append(Int(arena.base))
 
-        var result = load_weights[Self.M](shards, arena_bases, host_index=0)
+        var result = load_weights[Self.M](shards, arena_bases)
         if not result:
             print("weight loading failed")
             return None

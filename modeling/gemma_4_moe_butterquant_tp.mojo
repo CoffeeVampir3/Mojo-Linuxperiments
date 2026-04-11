@@ -8,9 +8,11 @@ Weight layout per quantized projection:
   f32 per-row scale
 Column sums and VNNI packing computed at load time.
 
-3 pools per rank: main_pool (all cores), expert_pool (half), dense_pool (half).
-ranks.parallel[body](pool_ptrs) dispatches body to all ranks.
-Body threads never compute — dispatch and return only.
+One pool per rank (main_pool, all cores). Expert and dense FFN phases run
+serially through it — measured experiments showed that overlapping them on
+separate pools just contended for memory bandwidth and produced no wall-time
+gain on a single-NUMA-node memory subsystem.
+Rank bodies never compute — dispatch and return only.
 """
 
 from std.pathlib import Path
@@ -24,24 +26,22 @@ from numa import NumaArena, NumaInfo
 from notstdcollections import HeapMoveArray
 from threading import BurstPool
 from threading.threading_traits import BurstThreadPool
-from threading.threading_shared import ptr as tptr
 
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named, BF16, F32, I8,
-    RowShard, ColShard, Replicated,
-    IsQuantizable, IsPassthrough,
+    RowShard, ColShard, Replicated, HOST_RANK,
+    IsQuantizable,
     Slot, PlacedSlot, Bound, DynView, bind, byte_count,
     WeightIterable, next_offset,
     DEFAULT_ALIGNMENT,
-    Kernel3DTiling, LogitsView,
+    LogitsView,
 )
 from kernels.vnni import VnniPacked
-from kernels.kernel_ops import PoolFence, parallel_for, BF16Ptr, rmsnorm
+from kernels.kernel_ops import PoolFence, BF16Ptr, rmsnorm
 from kernels.reductions import ring_allreduce, ring_broadcast
-from kernels.kv_rotors import init_rope_tables
 from experimental.linear_borrow_pool import ScratchPool, ScratchLease
 from experimental2.kernels.rmsnorm_fwht_quantize import (
-    rmsnorm_fwht_quantize, rmsnorm_gamma_fwht_quantize,
+    rmsnorm_gamma_fwht_quantize,
     rmsnorm_dual_gamma_fwht_quantize,
 )
 from experimental2.kernels.int8_gemv import int8_gemv
@@ -191,36 +191,6 @@ def finish_single_pool_fence[P: BurstThreadPool](
         dispatch_start_ns, dispatch_end_ns,
         pool_ptr[].last_worker_timestamp(),
         dispatch_end_ns, join_end_ns, True)
-
-
-@fieldwise_init
-struct PendingRankPhase[tp: Int](Copyable, ImplicitlyCopyable):
-    var dispatch_start_ns: Int
-    var dispatch_end_ns: Int
-    var active: InlineArray[Bool, Self.tp]
-
-
-def finish_pending_rank_phase[tp: Int](
-    pending: PendingRankPhase[tp],
-    pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp],
-    join_start_ns: Int,
-    join_end_ns: Int,
-) -> PhaseTiming:
-    var max_done_ns = 0
-    var any_active = False
-    for r in range(tp):
-        if pending.active[r]:
-            any_active = True
-            var ts = pool_ptrs[r][].last_worker_timestamp()
-            if ts > max_done_ns:
-                max_done_ns = ts
-    return phase_timing_from_points(
-        pending.dispatch_start_ns,
-        pending.dispatch_end_ns,
-        max_done_ns,
-        join_start_ns,
-        join_end_ns,
-        any_active)
 
 
 struct ForwardSample(Copyable, ImplicitlyCopyable):
@@ -719,40 +689,40 @@ struct SlidingLayer[tp: Int]:
     comptime NUM_KV_LOCAL = C.NUM_KV_HEADS_SLIDING // Self.tp
 
     @staticmethod
-    def for_each_weight[func: def[T: Encoding & Shaped & Placed & Named](String, Int, Int) capturing -> None](prefix: String, base: Int):
+    def for_each_weight[func: def[T: Encoding & Shaped & Placed & Named](String, Int) capturing -> None](prefix: String, base: Int):
         # Logical quantizer order: runtime full-attn input norm first, then the weights it feeds.
-        func[Self.INPUT_NORM](prefix, base, -1)
-        func[Self.Q_PROJ](prefix, base, -1)
-        func[Self.K_PROJ](prefix, base, -1)
-        func[Self.V_PROJ](prefix, base, -1)
-        func[Self.Q_PROJ_SC](prefix, base, -1)
-        func[Self.K_PROJ_SC](prefix, base, -1)
-        func[Self.V_PROJ_SC](prefix, base, -1)
-        func[Self.O_PROJ](prefix, base, -1)
-        func[Self.O_PROJ_SC](prefix, base, -1)
-        func[Self.Q_NORM](prefix, base, -1)
-        func[Self.K_NORM](prefix, base, -1)
-        func[Self.PRE_FFN_NORM](prefix, base, -1)
-        func[Self.GATE_PROJ](prefix, base, -1)
-        func[Self.UP_PROJ](prefix, base, -1)
-        func[Self.GATE_PROJ_SC](prefix, base, -1)
-        func[Self.UP_PROJ_SC](prefix, base, -1)
-        func[Self.DOWN_PROJ](prefix, base, -1)
-        func[Self.DOWN_PROJ_SC](prefix, base, -1)
-        func[Self.ROUTER_SCALE](prefix, base, -1)
-        func[Self.ROUTER_PROJ](prefix, base, -1)
-        func[Self.ROUTER_PROJ_SC](prefix, base, -1)
-        func[Self.ROUTER_PES](prefix, base, -1)
-        func[Self.PRE_FFN_NORM_2](prefix, base, -1)
-        func[Self.EXPERTS_GATE_UP](prefix, base, -1)
-        func[Self.EXPERTS_GATE_UP_SC](prefix, base, -1)
-        func[Self.EXPERTS_DOWN](prefix, base, -1)
-        func[Self.EXPERTS_DOWN_SC](prefix, base, -1)
-        func[Self.POST_ATTN_NORM](prefix, base, -1)
-        func[Self.POST_FFN_NORM_1](prefix, base, -1)
-        func[Self.POST_FFN_NORM_2_RT](prefix, base, -1)
-        func[Self.POST_FFN_NORM](prefix, base, -1)
-        func[Self.LAYER_SCALAR](prefix, base, -1)
+        func[Self.INPUT_NORM](prefix, base)
+        func[Self.Q_PROJ](prefix, base)
+        func[Self.K_PROJ](prefix, base)
+        func[Self.V_PROJ](prefix, base)
+        func[Self.Q_PROJ_SC](prefix, base)
+        func[Self.K_PROJ_SC](prefix, base)
+        func[Self.V_PROJ_SC](prefix, base)
+        func[Self.O_PROJ](prefix, base)
+        func[Self.O_PROJ_SC](prefix, base)
+        func[Self.Q_NORM](prefix, base)
+        func[Self.K_NORM](prefix, base)
+        func[Self.PRE_FFN_NORM](prefix, base)
+        func[Self.GATE_PROJ](prefix, base)
+        func[Self.UP_PROJ](prefix, base)
+        func[Self.GATE_PROJ_SC](prefix, base)
+        func[Self.UP_PROJ_SC](prefix, base)
+        func[Self.DOWN_PROJ](prefix, base)
+        func[Self.DOWN_PROJ_SC](prefix, base)
+        func[Self.ROUTER_SCALE](prefix, base)
+        func[Self.ROUTER_PROJ](prefix, base)
+        func[Self.ROUTER_PROJ_SC](prefix, base)
+        func[Self.ROUTER_PES](prefix, base)
+        func[Self.PRE_FFN_NORM_2](prefix, base)
+        func[Self.EXPERTS_GATE_UP](prefix, base)
+        func[Self.EXPERTS_GATE_UP_SC](prefix, base)
+        func[Self.EXPERTS_DOWN](prefix, base)
+        func[Self.EXPERTS_DOWN_SC](prefix, base)
+        func[Self.POST_ATTN_NORM](prefix, base)
+        func[Self.POST_FFN_NORM_1](prefix, base)
+        func[Self.POST_FFN_NORM_2_RT](prefix, base)
+        func[Self.POST_FFN_NORM](prefix, base)
+        func[Self.LAYER_SCALAR](prefix, base)
 
 
 # =============================================================================
@@ -817,38 +787,38 @@ struct FullLayer[tp: Int]:
     comptime NUM_KV_LOCAL = C.NUM_KV_HEADS_FULL
 
     @staticmethod
-    def for_each_weight[func: def[T: Encoding & Shaped & Placed & Named](String, Int, Int) capturing -> None](prefix: String, base: Int):
+    def for_each_weight[func: def[T: Encoding & Shaped & Placed & Named](String, Int) capturing -> None](prefix: String, base: Int):
         # Logical quantizer order: norms before the projections they feed.
-        func[Self.INPUT_NORM](prefix, base, -1)
-        func[Self.Q_PROJ](prefix, base, -1)
-        func[Self.K_PROJ](prefix, base, -1)
-        func[Self.Q_PROJ_SC](prefix, base, -1)
-        func[Self.K_PROJ_SC](prefix, base, -1)
-        func[Self.O_PROJ](prefix, base, -1)
-        func[Self.O_PROJ_SC](prefix, base, -1)
-        func[Self.Q_NORM](prefix, base, -1)
-        func[Self.K_NORM](prefix, base, -1)
-        func[Self.PRE_FFN_NORM](prefix, base, -1)
-        func[Self.GATE_PROJ](prefix, base, -1)
-        func[Self.UP_PROJ](prefix, base, -1)
-        func[Self.GATE_PROJ_SC](prefix, base, -1)
-        func[Self.UP_PROJ_SC](prefix, base, -1)
-        func[Self.DOWN_PROJ](prefix, base, -1)
-        func[Self.DOWN_PROJ_SC](prefix, base, -1)
-        func[Self.ROUTER_SCALE](prefix, base, -1)
-        func[Self.ROUTER_PROJ](prefix, base, -1)
-        func[Self.ROUTER_PROJ_SC](prefix, base, -1)
-        func[Self.ROUTER_PES](prefix, base, -1)
-        func[Self.PRE_FFN_NORM_2](prefix, base, -1)
-        func[Self.EXPERTS_GATE_UP](prefix, base, -1)
-        func[Self.EXPERTS_GATE_UP_SC](prefix, base, -1)
-        func[Self.EXPERTS_DOWN](prefix, base, -1)
-        func[Self.EXPERTS_DOWN_SC](prefix, base, -1)
-        func[Self.POST_ATTN_NORM](prefix, base, -1)
-        func[Self.POST_FFN_NORM_1](prefix, base, -1)
-        func[Self.POST_FFN_NORM_2_RT](prefix, base, -1)
-        func[Self.POST_FFN_NORM](prefix, base, -1)
-        func[Self.LAYER_SCALAR](prefix, base, -1)
+        func[Self.INPUT_NORM](prefix, base)
+        func[Self.Q_PROJ](prefix, base)
+        func[Self.K_PROJ](prefix, base)
+        func[Self.Q_PROJ_SC](prefix, base)
+        func[Self.K_PROJ_SC](prefix, base)
+        func[Self.O_PROJ](prefix, base)
+        func[Self.O_PROJ_SC](prefix, base)
+        func[Self.Q_NORM](prefix, base)
+        func[Self.K_NORM](prefix, base)
+        func[Self.PRE_FFN_NORM](prefix, base)
+        func[Self.GATE_PROJ](prefix, base)
+        func[Self.UP_PROJ](prefix, base)
+        func[Self.GATE_PROJ_SC](prefix, base)
+        func[Self.UP_PROJ_SC](prefix, base)
+        func[Self.DOWN_PROJ](prefix, base)
+        func[Self.DOWN_PROJ_SC](prefix, base)
+        func[Self.ROUTER_SCALE](prefix, base)
+        func[Self.ROUTER_PROJ](prefix, base)
+        func[Self.ROUTER_PROJ_SC](prefix, base)
+        func[Self.ROUTER_PES](prefix, base)
+        func[Self.PRE_FFN_NORM_2](prefix, base)
+        func[Self.EXPERTS_GATE_UP](prefix, base)
+        func[Self.EXPERTS_GATE_UP_SC](prefix, base)
+        func[Self.EXPERTS_DOWN](prefix, base)
+        func[Self.EXPERTS_DOWN_SC](prefix, base)
+        func[Self.POST_ATTN_NORM](prefix, base)
+        func[Self.POST_FFN_NORM_1](prefix, base)
+        func[Self.POST_FFN_NORM_2_RT](prefix, base)
+        func[Self.POST_FFN_NORM](prefix, base)
+        func[Self.LAYER_SCALAR](prefix, base)
 
 
 # =============================================================================
@@ -972,8 +942,8 @@ struct Gemma4Model[tp: Int](WeightIterable):
 
     # Host-only
     comptime HOST_ONLY_OFF = ((Self.DISTRIBUTED_BYTES + Self.STATE_BYTES + DEFAULT_ALIGNMENT - 1) // DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT
-    comptime FINAL_NORM = PlacedSlot[BF16, Replicated, C.HIDDEN, 1, Self.tp, Self.HOST_ONLY_OFF, "model.language_model.norm.weight"]
-    comptime EMBED = PlacedSlot[BF16, Replicated, C.VOCAB_SIZE, C.HIDDEN, Self.tp, next_offset[Self.FINAL_NORM](), "model.language_model.embed_tokens.weight"]
+    comptime FINAL_NORM = PlacedSlot[BF16, Replicated, C.HIDDEN, 1, Self.tp, Self.HOST_ONLY_OFF, "model.language_model.norm.weight", target_rank=HOST_RANK]
+    comptime EMBED = PlacedSlot[BF16, Replicated, C.VOCAB_SIZE, C.HIDDEN, Self.tp, next_offset[Self.FINAL_NORM](), "model.language_model.embed_tokens.weight", target_rank=HOST_RANK]
     comptime LOGITS = Slot[BF16, Replicated, 1, C.VOCAB_SIZE, Self.tp]
 
     @staticmethod
@@ -985,7 +955,7 @@ struct Gemma4Model[tp: Int](WeightIterable):
         return Self.DISTRIBUTED_BYTES + Self.STATE_BYTES
 
     @staticmethod
-    def for_each_weight[func: def[T: Encoding & Shaped & Placed & Named](String, Int, Int) capturing -> None]():
+    def for_each_weight[func: def[T: Encoding & Shaped & Placed & Named](String, Int) capturing -> None]():
         var sliding_idx = 0
         var full_idx = 0
         comptime for i in range(C.NUM_LAYERS):
@@ -998,8 +968,8 @@ struct Gemma4Model[tp: Int](WeightIterable):
                 var base = Self.SLIDING_OFF + sliding_idx * Self.SLIDING_STRIDE
                 SlidingLayer[1].for_each_weight[func](prefix, base)
                 sliding_idx += 1
-        func[Self.FINAL_NORM]("", 0, -1)
-        func[Self.EMBED]("", 0, -1)
+        func[Self.FINAL_NORM]("", 0)
+        func[Self.EMBED]("", 0)
 
 
 # =============================================================================
@@ -1071,14 +1041,6 @@ struct Ranks[tp: Int]:
 
     def view(self, r: Int) -> RankView[Self.tp]:
         return RankView[Self.tp](self.bases[r])
-
-    def parallel[body: def[rank: Int](RankView[Self.tp], mut BurstPool[]) capturing -> PoolFence[BurstPool[]]](
-        self, pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp],
-    ):
-        @parameter
-        def dispatch[rank: Int]() -> PoolFence[BurstPool[]]:
-            return body[rank](self.view(rank), pool_ptrs[rank][])
-        parallel_for[BurstPool[], Self.tp, dispatch]()
 
     def timed_parallel[body: def[rank: Int](RankView[Self.tp], mut BurstPool[]) capturing -> PoolFence[BurstPool[]]](
         self, pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp],
@@ -1186,25 +1148,6 @@ def pre_reduce_kernel(args: PreReduceArgs):
         (normed + i).store((v * inv_rms * g).cast[DType.bfloat16]())
 
 
-@always_inline
-def bf16_sum_sq[numel: Int](
-    src: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
-) -> Float32:
-    comptime width = simd_width_of[DType.float32]()
-    var sum_sq = SIMD[DType.float32, width](0)
-    var i = 0
-    while i + width <= numel:
-        var v = (src + i).load[width=width]().cast[DType.float32]()
-        sum_sq = v.fma(v, sum_sq)
-        i += width
-    var out = sum_sq.reduce_add()
-    while i < numel:
-        var v = Float32(src[i])
-        out += v * v
-        i += 1
-    return out
-
-
 @fieldwise_init
 struct PostReduceArgs(Copyable, ImplicitlyCopyable):
     var moe_out_ptr: Int
@@ -1301,24 +1244,6 @@ def frobenius_from_quantized[
         var s = Float64(s_ptr[n])
         frob_sq += s * s * row_sq
     return frob_sq
-
-
-def derive_sliding_v_scales[tp: Int](
-    arena_bases: List[Int],
-) -> InlineArray[Float32, C.NUM_SLIDING_LAYERS]:
-    """V is /rms-normed per head before FWHT + cache write.
-
-    After /rms each head has ||x||=sqrt(d_k), so max|FWHT(x)| ≈ C(d_k).
-    Weight norm is irrelevant — /rms normalizes it away.
-    """
-    var cn = Float32(concentration_constant[C.HEAD_DIM_SLIDING]())
-    var scales = InlineArray[Float32, C.NUM_SLIDING_LAYERS](fill=cn)
-    return scales^
-
-
-def derive_full_v_scale() -> Float32:
-    """Full attention V is also /rms-normed per head. Same logic: S_V = C(d_k)."""
-    return Float32(concentration_constant[C.HEAD_DIM_FULL]())
 
 
 # =============================================================================
@@ -1446,32 +1371,20 @@ struct Gemma4ButterQuant[tp: Int](Movable):
 
     var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]]
     var main_pools: HeapMoveArray[BurstPool[]]
-    var expert_pools: HeapMoveArray[BurstPool[]]
-    var dense_pools: HeapMoveArray[BurstPool[]]
     var scratch: ScratchPool
     var bases: InlineArray[Int, Self.tp]
-    var sliding_v_scales: InlineArray[Float32, C.NUM_SLIDING_LAYERS]
-    var full_v_scale: Float32
     var profile: ForwardLogger
 
     def __init__(out self,
         var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]],
         var mp: HeapMoveArray[BurstPool[]],
-        var ep: HeapMoveArray[BurstPool[]],
-        var dp: HeapMoveArray[BurstPool[]],
         var sc: ScratchPool,
         bases: InlineArray[Int, Self.tp],
-        sliding_v_scales: InlineArray[Float32, C.NUM_SLIDING_LAYERS],
-        full_v_scale: Float32,
     ):
         self.arenas = arenas^
         self.main_pools = mp^
-        self.expert_pools = ep^
-        self.dense_pools = dp^
         self.scratch = sc^
         self.bases = bases
-        self.sliding_v_scales = sliding_v_scales
-        self.full_v_scale = full_v_scale
         self.profile = ForwardLogger()
 
     def make_pool_ptrs(self, pools: HeapMoveArray[BurstPool[]]) -> InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]:
@@ -1486,10 +1399,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         return Ranks[Self.tp](self.bases)
     def main_ptrs(self) -> InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]:
         return self.make_pool_ptrs(self.main_pools)
-    def expert_ptrs(self) -> InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]:
-        return self.make_pool_ptrs(self.expert_pools)
-    def dense_ptrs(self) -> InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]:
-        return self.make_pool_ptrs(self.dense_pools)
 
     # =========================================================================
     # Load + init
@@ -1576,38 +1485,27 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         for rank in range(Self.tp):
             arena_bases.append(Int(arenas[rank].base))
 
-        var result = load_weights[Self.M](shards, arena_bases, host_index=host_rank)
+        var result = load_weights[Self.M](shards, arena_bases)
         if not result:
             print("weight loading failed")
             return None
         var loaded = result.take()
         print("loaded", loaded.bytes_loaded // (1024 * 1024), "MB in", loaded.num_ops, "ops")
 
-        # Derive fixed V scales from the unpacked quantized weights before VNNI packing.
-        var sliding_v_scales = derive_sliding_v_scales[Self.tp](arena_bases)
-        var full_v_scale = derive_full_v_scale()
-
         for rank in range(Self.tp):
             _ = arenas[rank].prefault(Self.M.DISTRIBUTED_BYTES, Self.M.STATE_BYTES)
 
         var main_pools = HeapMoveArray[BurstPool[]](Self.tp)
-        var expert_pools = HeapMoveArray[BurstPool[]](Self.tp)
-        var dense_pools = HeapMoveArray[BurstPool[]](Self.tp)
         for rank in range(Self.tp):
             main_pools.push(BurstPool[].for_numa_node(numa, topo[rank]))
-            expert_pools.push(BurstPool[].for_numa_node(numa, topo[rank]))
-            dense_pools.push(BurstPool[].for_numa_node(numa, topo[rank]))
 
         var bases = InlineArray[Int, Self.tp](fill=0)
         for rank in range(Self.tp):
             bases[rank] = Int(arenas[rank].base)
 
         var scratch = ScratchPool(Self.M.SCRATCH_CAPACITY)
-        var model = Self(
-            arenas^, main_pools^, expert_pools^, dense_pools^, scratch^, bases,
-            sliding_v_scales, full_v_scale)
+        var model = Self(arenas^, main_pools^, scratch^, bases)
         model.init_state()
-        print("v scales: sliding[0]=", model.sliding_v_scales[0], " full=", model.full_v_scale)
         print("state initialized")
         return model^
 
@@ -1622,7 +1520,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         self.profile.clear()
 
     # =========================================================================
-    # Forward — decode (seq_len=1), sliding layers only for now
+    # Forward — decode (seq_len=1)
     # =========================================================================
 
 
@@ -1638,8 +1536,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         var rnks = self.ranks()
         var host = rnks.view(0)
         var mp = self.main_ptrs()
-        var ep = self.expert_ptrs()
-        var dp = self.dense_ptrs()
 
         # --- Embed ---
         var t_embed0 = Int(perf_counter_ns())
@@ -1697,16 +1593,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                         seq_len, rv.scratch_addr(attn_scale_lease), pool)
                 sample.attn_proj.add(rnks.timed_parallel[do_qkv_gemv](mp))
 
-                var v_sum_sq = Float32(0)
-                for r in range(Self.tp):
-                    var rv = rnks.view(r)
-                    var qkv_base = rv.scratch_addr(qkv_lease)
-                    var v_base = qkv_base + (SL.Q_DIM_LOCAL + SL.KV_DIM_LOCAL) * 2
-                    v_sum_sq += bf16_sum_sq[SL.KV_DIM_LOCAL](
-                        UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=v_base))
-                var v_inv_rms = 1.0 / sqrt[DType.float32, 1](
-                    v_sum_sq / Float32(C.KV_DIM_SLIDING) + EPS)
-
                 var attn_qi_lease = self.scratch.borrow[Scalar[DType.int8], SL.Q_DIM_LOCAL]()
                 var attn_head_sc_lease = self.scratch.borrow[Float32, SL.Q_DIM_LOCAL // C.HEAD_DIM_SLIDING]()
 
@@ -1724,7 +1610,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     var q_norm_addr = slb + SL.Q_NORM.OFFSET
                     var k_norm_addr = slb + SL.K_NORM.OFFSET
                     var jobs = InlineArray[SlidingAttnGroupArgs, 8](
-                        fill=SlidingAttnGroupArgs(0,0,0,0,0,0,0,0,0,0,0,0,0,Float32(0),Float32(0)))
+                        fill=SlidingAttnGroupArgs(0,0,0,0,0,0,0,0,0,0,0,0,0,Float32(0)))
                     for g in range(NKV):
                         jobs[g] = SlidingAttnGroupArgs(
                             q_base + g * HPG * C.HEAD_DIM_SLIDING * 2,
@@ -1736,7 +1622,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                             cache_pos, context_len,
                             rv.scratch_addr(attn_qi_lease) + g * HPG * C.HEAD_DIM_SLIDING,
                             rv.scratch_addr(attn_head_sc_lease) + g * HPG * 4,
-                            v_inv_rms,
                             EPS)
                     pool.dispatch[SlidingAttnGroupArgs,
                         sliding_attn_group_kernel[C.HEAD_DIM_SLIDING, HPG,
@@ -1803,16 +1688,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 full_attn_work_lease^.release()
                 full_attn_i8_lease^.release()
 
-                var full_v_sum_sq = Float32(0)
-                for r in range(Self.tp):
-                    var rv = rnks.view(r)
-                    var qk_base = rv.scratch_addr(qk_lease)
-                    var k_base = qk_base + FULL_Q_LOCAL * 2
-                    full_v_sum_sq += bf16_sum_sq[FL.KV_DIM_LOCAL](
-                        UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=k_base))
-                var full_v_inv_rms = 1.0 / sqrt[DType.float32, 1](
-                    full_v_sum_sq / Float32(C.KV_DIM_FULL) + EPS)
-
                 # Scoring + V-agg: 2 workers (one per KV group, GQA 8:1)
                 var attn_qi_lease = self.scratch.borrow[Scalar[DType.int8], FULL_Q_LOCAL]()
                 var attn_head_sc_lease = self.scratch.borrow[Float32, FULL_Q_LOCAL // C.HEAD_DIM_FULL]()
@@ -1829,7 +1704,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     var q_norm_addr = flb + FL.Q_NORM.OFFSET
                     var k_norm_addr = flb + FL.K_NORM.OFFSET
                     var jobs = InlineArray[FullAttnGroupArgs, 4](
-                        fill=FullAttnGroupArgs(0,0,0,0,0,0,0,0,0,0,0,0,Float32(0),Float32(0)))
+                        fill=FullAttnGroupArgs(0,0,0,0,0,0,0,0,0,0,0,0,Float32(0)))
                     for g in range(FULL_NKV):
                         jobs[g] = FullAttnGroupArgs(
                             q_base + g * FULL_HPG * C.HEAD_DIM_FULL * 2,
@@ -1840,7 +1715,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                             pos, pos + 1,
                             rv.scratch_addr(attn_qi_lease) + g * FULL_HPG * C.HEAD_DIM_FULL,
                             rv.scratch_addr(attn_head_sc_lease) + g * FULL_HPG * 4,
-                            full_v_inv_rms,
                             EPS)
                     pool.dispatch[FullAttnGroupArgs,
                         full_attn_group_kernel[C.HEAD_DIM_FULL, ROPE_DIMS_FULL, FULL_HPG,
@@ -1969,8 +1843,10 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     seq_len, pool)
             sample.ffn_quantize.add(rnks.timed_parallel[do_ffn_quantize](mp))
 
-            # Expert phase 1: fired async on ep, drained later by do_join_expert
-            # so it overlaps with dense_phase1 on dp.
+            # Expert phase 1: serialized — timed_parallel dispatches and joins
+            # in one shot. Body returns the helper's real fence; no fire-and-
+            # forget, no manual drain. Hypothesis: dense and expert phase 1 are
+            # both memory-bound, so overlap doesn't actually save wall time.
             @parameter
             def do_expert_phase1[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
@@ -1980,7 +1856,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 var experts_gate_up_sc_off = FL.EXPERTS_GATE_UP_SC.OFFSET if is_full else SL.EXPERTS_GATE_UP_SC.OFFSET
                 var experts_gu_colsum_off = FL.EXPERTS_GU_COLSUM_OFF if is_full else SL.EXPERTS_GU_COLSUM_OFF
 
-                # Compute and stash local_count for downstream consumers (pre_reduce).
+                # Stash local_count for downstream consumers (pre_reduce).
                 var lc = 0
                 for s in range(C.TOP_K):
                     if routing.indices[s] % Self.tp == rank:
@@ -1988,7 +1864,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 UnsafePointer[Int32, MutAnyOrigin](
                     unsafe_from_address=rv.scratch_addr(local_count_lease))[] = Int32(lc)
 
-                _ = gemma4_moe_phase1[
+                return gemma4_moe_phase1[
                     C.MOE_INTERMEDIATE, C.HIDDEN, C.FWHT_BLK,
                     C.TOP_K, Self.tp](
                     I8Ptr(unsafe_from_address=rv.scratch_addr(expert_act_i8_lease)),
@@ -2002,18 +1878,8 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     C.MOE_GATE_UP_FUSED * 4,
                     I8Ptr(unsafe_from_address=rv.scratch_addr(expert_qi_lease)),
                     F32Ptr(unsafe_from_address=rv.scratch_addr(expert_blk_scale_lease)),
-                    rank, pool).take()
-                return PoolFence[BurstPool[]].completed()
-            var t_e1_d0 = Int(perf_counter_ns())
-            rnks.parallel[do_expert_phase1](ep)
-            var t_e1_d1 = Int(perf_counter_ns())
-            var e1_active = InlineArray[Bool, Self.tp](fill=False)
-            for r in range(Self.tp):
-                var rv = rnks.view(r)
-                var lc = Int(UnsafePointer[Int32, MutAnyOrigin](
-                    unsafe_from_address=rv.scratch_addr(local_count_lease))[])
-                e1_active[r] = lc > 0
-            var e1_pending = PendingRankPhase[Self.tp](t_e1_d0, t_e1_d1, e1_active)
+                    rank, pool)
+            sample.expert_phase1.add(rnks.timed_parallel[do_expert_phase1](mp))
 
             var dense_post_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.INTERMEDIATE]()
 
@@ -2032,23 +1898,10 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     I8Ptr(unsafe_from_address=rv.scratch_addr(dense_post_i8_lease)),
                     F32Ptr(unsafe_from_address=rv.scratch_addr(post_blk_scale_lease)),
                     seq_len, pool)
-            sample.dense_phase1.add(rnks.timed_parallel[do_dense_phase1](dp))
-
-            # Drain ep — closes expert phase 1. Workers are usually already done
-            # because dense_phase1 is the longer of the two; the join is just
-            # clearing ep's active_jobs counter so phase 2 can dispatch.
-            @parameter
-            def do_join_expert[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                pool.join()
-                return PoolFence[BurstPool[]].completed()
-            var t_e1_j0 = Int(perf_counter_ns())
-            rnks.parallel[do_join_expert](ep)
-            var t_e1_j1 = Int(perf_counter_ns())
-            sample.expert_phase1.add(
-                finish_pending_rank_phase[Self.tp](e1_pending, ep, t_e1_j0, t_e1_j1))
+            sample.dense_phase1.add(rnks.timed_parallel[do_dense_phase1](mp))
 
             # Expert phase 2: per-local-expert down GEMV with routing weight,
-            # fired async on ep so it overlaps with dense_phase2 on dp.
+            # serialized via timed_parallel (same shape as expert_phase1).
             @parameter
             def do_expert_phase2[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
@@ -2057,7 +1910,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 var experts_down_off = FL.EXPERTS_DOWN.OFFSET if is_full else SL.EXPERTS_DOWN.OFFSET
                 var experts_down_sc_off = FL.EXPERTS_DOWN_SC.OFFSET if is_full else SL.EXPERTS_DOWN_SC.OFFSET
                 var experts_down_colsum_off = FL.EXPERTS_DOWN_COLSUM_OFF if is_full else SL.EXPERTS_DOWN_COLSUM_OFF
-                _ = gemma4_moe_phase2[
+                return gemma4_moe_phase2[
                     C.HIDDEN, C.MOE_INTERMEDIATE, C.FWHT_BLK,
                     C.TOP_K, Self.tp](
                     I8Ptr(unsafe_from_address=rv.scratch_addr(expert_qi_lease)),
@@ -2070,12 +1923,8 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     lb + experts_down_colsum_off,
                     C.HIDDEN * C.MOE_NUM_BLOCKS * 4,
                     BF16Ptr(unsafe_from_address=rv.scratch_addr(expert_out_lease)),
-                    rank, pool).take()
-                return PoolFence[BurstPool[]].completed()
-            var t_e2_d0 = Int(perf_counter_ns())
-            rnks.parallel[do_expert_phase2](ep)
-            var t_e2_d1 = Int(perf_counter_ns())
-            var e2_pending = PendingRankPhase[Self.tp](t_e2_d0, t_e2_d1, e1_active)
+                    rank, pool)
+            sample.expert_phase2.add(rnks.timed_parallel[do_expert_phase2](mp))
 
             var dense_out_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.HIDDEN]()
 
@@ -2093,14 +1942,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     F32Ptr(unsafe_from_address=lb + down_colsum_off),
                     BF16Ptr(unsafe_from_address=rv.scratch_addr(dense_out_lease)),
                     seq_len, pool)
-            sample.dense_phase2.add(rnks.timed_parallel[do_dense_phase2](dp))
-
-            # Drain ep — closes expert phase 2.
-            var t_e2_j0 = Int(perf_counter_ns())
-            rnks.parallel[do_join_expert](ep)
-            var t_e2_j1 = Int(perf_counter_ns())
-            sample.expert_phase2.add(
-                finish_pending_rank_phase[Self.tp](e2_pending, ep, t_e2_j0, t_e2_j1))
+            sample.dense_phase2.add(rnks.timed_parallel[do_dense_phase2](mp))
 
             var dense_normed_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.HIDDEN]()
 

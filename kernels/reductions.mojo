@@ -22,10 +22,6 @@ from modeling.model_spec import Encoding, Shaped
 
 comptime AtomicInt32 = Atomic[DType.int32]
 
-# Below this byte threshold, skip pool dispatch and do work inline.
-# Dispatch overhead (~10-20μs) dominates for small tensors.
-comptime SMALL_THRESHOLD = 64 * 1024  # 64KB
-
 # Per-rank completion state for fused allreduce.
 # Each rank's state is at base + rank * 64 (cache-line isolated).
 #   offset 0: remaining workers counter (Int32, atomic)

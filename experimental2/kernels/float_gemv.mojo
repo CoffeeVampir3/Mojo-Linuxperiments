@@ -8,7 +8,6 @@ from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
-from threading.threading_shared import ptr as tptr
 
 from modeling.model_spec import Encoding, Shaped, Bound, DynView
 from kernels.kernel_ops import PoolFence
