@@ -13,8 +13,12 @@ Entry points used by the forward pass:
   rmsnorm(combined) → residual add → layer_scalar. Called from a dispatched
   kernel wrapper (body threads never compute).
 
-Expert weights are distributed round-robin (expert e on rank e % tp, local
-index e // tp). All memory is rank-local. Phase 1 inputs (act_i8/act_scale)
+Expert weights are block-sharded along the expert dimension: rank `r` owns
+experts `[r*EPR, (r+1)*EPR)` where `EPR = num_experts // tp`. Local index
+for expert `e` on its owning rank is `e - rank*EPR`. The flat
+`[num_experts*M, K]` source tensor collapses to a contiguous row range
+per rank, so the loader stores one contiguous slice per rank with no
+strided reads. All memory is rank-local. Phase 1 inputs (act_i8/act_scale)
 must be produced by the rank-local rmsnorm_dual_gamma_fwht_quantize.
 """
 
@@ -102,7 +106,7 @@ def gemv_row_blocked[N: Int, K: Int, fwht_block_size: Int](
 
 def gemma4_moe_phase1[
     intermediate: Int, hidden: Int, fwht_blk: Int,
-    top_k: Int, tp: Int, P: BurstThreadPool,
+    top_k: Int, num_experts: Int, tp: Int, P: BurstThreadPool,
 ](
     act_i8: I8Ptr,
     act_scale: F32Ptr,
@@ -120,23 +124,25 @@ def gemma4_moe_phase1[
 ) -> PoolFence[P]:
     """Multi-expert phase 1: gate_up + gelu_tanh + FWHT + per-block i8 quantize.
 
-    Iterates routing.indices, filters by `eid % tp == rank`, and for each local
-    expert builds N-tile-sharded `FusedGuGeluTanhArgs` jobs targeting that
-    expert's slot in `expert_qi` / `expert_blk_scale`. One pool.dispatch with
-    `local_count * tiles_per_expert` jobs total. Same fence shape as
-    fused_gu_gelu_tanh — caller joins via timed_parallel or via discard+drain.
+    Iterates routing.indices, filters to experts owned by this rank
+    (block sharding: expert e on rank e // EPR, where EPR = num_experts // tp),
+    and for each local expert builds N-tile-sharded `FusedGuGeluTanhArgs` jobs
+    targeting that expert's slot in `expert_qi` / `expert_blk_scale`. One
+    `pool.dispatch` with `local_count * tiles_per_expert` jobs total.
     """
     comptime n_tiles = intermediate // fwht_blk
+    comptime experts_per_rank = num_experts // tp
     comptime MAX_POOL_CAPACITY = 128
 
     var pool_capacity = pool.get_capacity()
+    var expert_base = rank * experts_per_rank
 
     # Count local experts first to decide workers per expert.
     var local_count = 0
     var local_slots = InlineArray[Int, top_k](fill=0)
     for s in range(top_k):
         var eid = routing.indices[s]
-        if eid % tp == rank:
+        if eid >= expert_base and eid < expert_base + experts_per_rank:
             local_slots[local_count] = s
             local_count += 1
 
@@ -161,7 +167,7 @@ def gemma4_moe_phase1[
     for li in range(local_count):
         var s = local_slots[li]
         var eid = routing.indices[s]
-        var local_idx = eid // tp
+        var local_idx = eid - expert_base
 
         var wpacked = U8Ptr(unsafe_from_address=gate_up_base + local_idx * gate_up_stride)
         var wscale = F32Ptr(unsafe_from_address=gate_up_sc_base + local_idx * gate_up_sc_stride)
@@ -199,7 +205,7 @@ def gemma4_moe_phase1[
 
 def gemma4_moe_phase2[
     hidden: Int, intermediate: Int, fwht_blk: Int,
-    top_k: Int, tp: Int, P: BurstThreadPool,
+    top_k: Int, num_experts: Int, tp: Int, P: BurstThreadPool,
 ](
     expert_qi: I8Ptr,
     expert_blk_scale: F32Ptr,
@@ -216,12 +222,15 @@ def gemma4_moe_phase2[
 ) -> PoolFence[P]:
     """Multi-expert phase 2: per-local-expert down GEMV with routing weight.
 
+    Expert ownership matches phase 1 (block sharding on the expert dim).
     One job per local expert: int8_gemv_blocked_worker reading the expert's
     `expert_qi` slot (written by phase 1), with `output_scale = routing.weights[s]`
     so the routing scale is folded into the bf16 cast for free.
     """
     comptime num_blocks = intermediate // fwht_blk
+    comptime experts_per_rank = num_experts // tp
     comptime MAX_POOL_CAPACITY = 128
+    var expert_base = rank * experts_per_rank
 
     var zero_args = Int8GemvBlockedArgs(
         I8Ptr(), U8Ptr(), F32Ptr(), F32Ptr(), F32Ptr(), BF16Ptr(), Float32(0))
@@ -230,9 +239,9 @@ def gemma4_moe_phase2[
     var local_count = 0
     for s in range(top_k):
         var eid = routing.indices[s]
-        if eid % tp != rank:
+        if eid < expert_base or eid >= expert_base + experts_per_rank:
             continue
-        var local_idx = eid // tp
+        var local_idx = eid - expert_base
 
         jobs[local_count] = Int8GemvBlockedArgs(
             expert_qi + local_count * intermediate,

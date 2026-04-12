@@ -14,7 +14,7 @@ from std.time import perf_counter_ns
 
 from tokenizer import load_tokenizer
 from modeling.gemma_4_moe_butterquant_tp import (
-    Gemma4Config, Gemma4ButterQuant, Gemma4Model, RankView,
+    Gemma4Config, Gemma4ButterQuant,
 )
 from modeling.model_spec import LogitsView
 
@@ -50,7 +50,7 @@ def main():
     var tok = tok_opt.take()
 
     # --- Encode prompt ---
-    var prompt = "The capital of France is"
+    var prompt = "The easiest way for iran to make a neuclear bomb is to first fluorinate"
     var token_ids = List[Int]()
     token_ids.append(2)  # <bos>
     var encoded = tok.encode(prompt)

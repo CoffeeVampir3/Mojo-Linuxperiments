@@ -15,6 +15,32 @@ from notstdcollections import HeapMoveArray
 comptime DEFAULT_IO_DEPTH = 2048
 
 
+def discover_shards(dir_path: Path) -> List[Path]:
+    """Enumerate safetensors files in a directory, sorted by name.
+
+    Matches any *.safetensors — this covers multi-shard HF checkpoints
+    (model-00001-of-000NN.safetensors), single-file HF checkpoints
+    (model.safetensors), and single-file quantizer outputs. Callers are
+    expected to point at a directory that only contains the intended
+    checkpoint's tensor files.
+    """
+    var shards = List[Path]()
+    try:
+        for entry in dir_path.listdir():
+            var name = String(entry)
+            if name.endswith(".safetensors"):
+                shards.append(dir_path / name)
+    except:
+        pass
+    for i in range(len(shards)):
+        for j in range(i + 1, len(shards)):
+            if String(shards[j]) < String(shards[i]):
+                var tmp = shards[i]
+                shards[i] = shards[j]
+                shards[j] = tmp
+    return shards^
+
+
 @fieldwise_init
 struct ReadFragment(Copyable):
     var file_idx: Int
@@ -229,3 +255,90 @@ def load_safetensors[
     var paths = List[Path]()
     paths.append(path)
     return load_weights[M, io_depth](paths, arena_bases)
+
+
+def load_weights_from_descs[
+    io_depth: Int = DEFAULT_IO_DEPTH,
+](
+    descs: List[WeightDesc],
+    paths: List[Path],
+    arena_bases: List[Int],
+) -> Optional[LoadResult]:
+    """Runtime variant of load_weights — takes a prebuilt List[WeightDesc].
+
+    Intended for models that build their weight catalog at runtime rather
+    than through the WeightIterable / for_each_weight comptime template.
+    Shares all the io_uring + validation plumbing with load_weights[M];
+    differs only in how the desc list is produced.
+    """
+    var headers = HeapMoveArray[SafetensorsHeader](len(paths))
+    for i in range(len(paths)):
+        var header_opt = parse_safetensors_header(paths[i])
+        if not header_opt:
+            print("failed to parse:", String(paths[i]))
+            return None
+        headers.push(header_opt.take())
+
+    var targeted_weights = List[WeightDesc]()
+    var distributed_weights = List[WeightDesc]()
+    for i in range(len(descs)):
+        var d = descs[i].copy()
+        if d.absorbed:
+            continue
+        if d.target_rank >= 0:
+            targeted_weights.append(d^)
+        else:
+            distributed_weights.append(d^)
+
+    var fragments = List[ReadFragment]()
+    var tp = len(arena_bases)
+
+    var all_ranks = List[Int]()
+    for r in range(tp):
+        all_ranks.append(r)
+
+    for w in targeted_weights:
+        var ranks = List[Int]()
+        ranks.append(w.target_rank % tp)
+        if not resolve_and_emit(w, headers, arena_bases, ranks, fragments):
+            return None
+
+    for w in distributed_weights:
+        if not resolve_and_emit(w, headers, arena_bases, all_ranks, fragments):
+            return None
+
+    var num_fragments = len(fragments)
+    var ops = List[ReadOp[]](capacity=num_fragments)
+    for i in range(num_fragments):
+        var frag = fragments[i].copy()
+        ops.append(ReadOp(
+            file_idx=frag.file_idx,
+            offset=frag.file_offset,
+            length=frag.length,
+            dest=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=frag.dest),
+            id=i,
+        ))
+
+    var ring = IoRing[io_depth]()
+    if not ring:
+        print("io_uring setup failed")
+        return None
+
+    try:
+        _ = ring.register_files(paths)
+    except err:
+        print("register_files failed:", err.error_message())
+        return None
+
+    var bytes_loaded = 0
+
+    @parameter
+    def on_complete(c: Completion):
+        bytes_loaded += Int(c.result)
+
+    var err = process_read_queue[on_complete](ring, ops)
+    if err:
+        print("load error:", err.value().msg)
+        return None
+
+    return LoadResult(bytes_loaded, num_fragments)

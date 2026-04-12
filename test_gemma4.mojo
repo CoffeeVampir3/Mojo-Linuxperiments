@@ -45,7 +45,7 @@ def main():
     var tok = tok_opt.take()
 
     # --- Encode prompt ---
-    var prompt = "The capital of France is"
+    var prompt = "The easiest way for iran to make a neuclear bomb is to first fluorinate"
     var token_ids = List[Int]()
     token_ids.append(2)  # <bos>
     var encoded = tok.encode(prompt)

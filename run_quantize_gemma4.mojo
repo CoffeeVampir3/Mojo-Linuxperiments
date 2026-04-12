@@ -1,8 +1,8 @@
 """Run ButterQuant quantization on Gemma4 26B-A4B."""
 
 from std.pathlib import Path
-from modeling.gemma_4_moe_butterquant_tp import Gemma4Model
-from quant.butterquant import quantize
+from modeling.gemma_4_moe_butterquant_tp import Gemma4ButterQuant
+from quant.butterquant import run_quantizer
 
 
 def main():
@@ -13,7 +13,10 @@ def main():
     print("output: " + String(output))
     print("")
 
-    var ok = quantize[Gemma4Model[1]](source_dir, output)
+    var tasks = Gemma4ButterQuant[1].build_quantizer_tasks()
+    print("quantizer tasks: " + String(len(tasks)))
+
+    var ok = run_quantizer(tasks, source_dir, output)
     if ok:
         print("\nquantization succeeded")
     else:

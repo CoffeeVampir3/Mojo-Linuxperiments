@@ -10,7 +10,7 @@ comptime PackFn = def(
     UnsafePointer[UInt8, MutAnyOrigin],  # src: row-major source
     UnsafePointer[UInt8, MutAnyOrigin],  # dst: packed destination
     Int, Int,                            # rows, cols
-)
+) thin -> None
 
 def pack_noop(
     src: UnsafePointer[UInt8, MutAnyOrigin],
@@ -64,20 +64,26 @@ comptime Untiled = Kernel2DTiling[1, 1]
 # Weight classification
 #
 # Lifecycle traits — a weight tag declares the full pipeline disposition:
-#   Quantizable  : quantized (FWHT + int8), int8+scale in output, loaded, used
-#   Gamma         : quantized with gamma absorption from preceding norm
-#   Passthrough   : copied through quantizer unchanged, loaded, used
-#   Absorbed      : consumed during quantization (gamma source), absent from output
+#   Quantizable      : quantized (FWHT + int8), per-row scale in output
+#   PerBlockQuantizable : quantized (FWHT + int8), per-FWHT-block scale in
+#                        output. Used by the LM head and other consumers that
+#                        want the tighter per-block dynamic range at the cost
+#                        of an 11×-ish larger scale array.
+#   Gamma             : quantized with gamma absorption from preceding norm
+#   Passthrough       : copied through quantizer unchanged, loaded, used
+#   Absorbed          : consumed during quantization (gamma source), absent
 # =============================================================================
 
 trait WeightTag: ...
 trait Quantizable: ...
+trait PerBlockQuantizable: ...
 trait Gamma: ...
 trait Passthrough: ...
 trait Absorbed: ...
 
 struct IsQuantizable(WeightTag, Quantizable): ...
 struct IsGammaQuantizable(WeightTag, Quantizable, Gamma): ...
+struct IsPerBlockQuantizable(WeightTag, PerBlockQuantizable): ...
 struct IsPassthrough(WeightTag, Passthrough): ...
 struct IsAbsorbed(WeightTag, Absorbed): ...
 
@@ -193,6 +199,7 @@ struct PlacedSlot[
 ](
     Encoding, Shaped, Placed, Named, ShardStrategy,
     Quantizable where conforms_to(Tag, Quantizable),
+    PerBlockQuantizable where conforms_to(Tag, PerBlockQuantizable),
     Gamma where conforms_to(Tag, Gamma),
     Passthrough where conforms_to(Tag, Passthrough),
     Absorbed where conforms_to(Tag, Absorbed),
@@ -267,8 +274,13 @@ struct WeightDesc(Copyable):
     var local_cols: Int
     var quantizable: Bool
     var absorbed: Bool
-    var pack_fn: PackFn
     var target_rank: Int
+    # NOTE: no `pack_fn` field. The loader never reads it; packing is done
+    # by model-specific init code (e.g. `init_sliding_layer` / `init_full_layer`
+    # in gemma_4_moe_butterquant_tp.mojo) via explicit `pack_at(...)` calls
+    # after the raw bytes have been loaded. Storing a runtime function
+    # pointer here was both dead code and triggered a Mojo backend codegen
+    # crash (see repro_packfn.mojo) when constructed inline.
 
 def weight_desc[T: Encoding & Shaped & Placed & Named](
     prefix: String = "", base: Int = 0,
@@ -282,7 +294,6 @@ def weight_desc[T: Encoding & Shaped & Placed & Named](
         local_rows=T.ROWS, local_cols=T.COLS,
         quantizable=is_quantizable,
         absorbed=is_absorbed,
-        pack_fn=T.PACK_FN,
         target_rank=T.TARGET_RANK,
     )
 
@@ -292,6 +303,32 @@ trait WeightIterable:
     def for_each_weight[
         func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
     ](): ...
+
+
+# =============================================================================
+# Runtime quantizer task — one work unit per source weight.
+#
+# Replaces the WeightIterable-driven template dispatch in the quantizer.
+# Each task is self-contained: the kind tells the driver which processing
+# path to take, and gamma_src names the norm tensor to absorb into this
+# weight (empty string for no absorption). The old ABSORBED / GAMMA_QUANTIZE
+# two-task handshake is gone — gamma is an explicit edge from consumer to
+# source, loaded lazily by the driver's one-slot cache.
+# =============================================================================
+
+
+struct QuantTag:
+    comptime PASSTHROUGH = 0            # copy source tensor to output unchanged
+    comptime QUANTIZE = 1               # FWHT + per-row i8 quantize
+    comptime GAMMA_QUANTIZE = 2         # same as QUANTIZE, but absorb gamma_src first
+    comptime PER_BLOCK_QUANTIZE = 3     # FWHT + per-FWHT-block i8 quantize
+
+
+@fieldwise_init
+struct QuantizeTask(Copyable, Movable):
+    var kind: Int           # QuantTag.*
+    var src_name: String    # full tensor name in the source safetensors
+    var gamma_src: String   # "" if no absorption; else the norm tensor name
 
 
 trait Dims:

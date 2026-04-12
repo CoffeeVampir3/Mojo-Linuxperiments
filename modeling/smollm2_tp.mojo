@@ -371,11 +371,10 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
 
         var numa = NumaInfo()
         var topo = numa.plan_topology(Self.tp)
-        comptime host_rank = 0
 
         var arenas = HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]](Self.tp)
         for rank in range(Self.tp):
-            var size = Self.M.host_arena_bytes() if rank == host_rank else Self.M.arena_bytes()
+            var size = Self.M.host_arena_bytes() if rank == HOST_RANK else Self.M.arena_bytes()
             var arena = NumaArena[alignment=DEFAULT_ALIGNMENT](topo[rank], size)
             if not arena:
                 print("TP: arena allocation failed for rank", rank, "on node", topo[rank])
