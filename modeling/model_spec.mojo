@@ -317,18 +317,83 @@ trait WeightIterable:
 # =============================================================================
 
 
-struct QuantTag:
-    comptime PASSTHROUGH = 0            # copy source tensor to output unchanged
-    comptime QUANTIZE = 1               # FWHT + per-row i8 quantize
-    comptime GAMMA_QUANTIZE = 2         # same as QUANTIZE, but absorb gamma_src first
-    comptime PER_BLOCK_QUANTIZE = 3     # FWHT + per-FWHT-block i8 quantize
+# --- Quantization scheme variants ---
+
+from std.utils import Variant
+
+
+@fieldwise_init
+struct QuantPassthrough(Copyable, Movable, ImplicitlyCopyable):
+    """Weight copied unchanged at source dtype."""
+    var tag: Int
+    def __init__(out self):
+        self.tag = 0
+
+
+@fieldwise_init
+struct RowQuantized(Copyable, Movable, ImplicitlyCopyable):
+    """FWHT rotation + single absmax scale per row."""
+    var rotation: Int
+
+
+@fieldwise_init
+struct BlockQuantized(Copyable, Movable, ImplicitlyCopyable):
+    """FWHT rotation + per-block absmax scales."""
+    var rotation: Int
+    var scale_blk: Int
+
+
+@fieldwise_init
+struct SmoothBlockQuantized(Copyable, Movable):
+    """Smooth split (sqrt(|gamma|)) + FWHT rotation + per-block absmax scales."""
+    var rotation: Int
+    var scale_blk: Int
+    var smooth_src: String
+
+
+comptime QuantScheme = Variant[
+    QuantPassthrough,
+    RowQuantized,
+    BlockQuantized,
+    SmoothBlockQuantized,
+]
+
+
+def quant_is_quantized(read s: QuantScheme) -> Bool:
+    return not s.isa[QuantPassthrough]()
+
+
+def quant_rotation(read s: QuantScheme) -> Int:
+    if s.isa[RowQuantized]():
+        return s[RowQuantized].rotation
+    elif s.isa[BlockQuantized]():
+        return s[BlockQuantized].rotation
+    elif s.isa[SmoothBlockQuantized]():
+        return s[SmoothBlockQuantized].copy().rotation
+    return 0
+
+
+def quant_scale_blocks(read s: QuantScheme, cols: Int) -> Int:
+    """0 for passthrough, 1 for per-row, cols/blk for per-block."""
+    if s.isa[RowQuantized]():
+        return 1
+    elif s.isa[BlockQuantized]():
+        return cols // s[BlockQuantized].scale_blk
+    elif s.isa[SmoothBlockQuantized]():
+        return cols // s[SmoothBlockQuantized].copy().scale_blk
+    return 0
+
+
+def quant_smooth_source(read s: QuantScheme) -> String:
+    if s.isa[SmoothBlockQuantized]():
+        return s[SmoothBlockQuantized].copy().smooth_src
+    return ""
 
 
 @fieldwise_init
 struct QuantizeTask(Copyable, Movable):
-    var kind: Int           # QuantTag.*
-    var src_name: String    # full tensor name in the source safetensors
-    var gamma_src: String   # "" if no absorption; else the norm tensor name
+    var name: String
+    var scheme: QuantScheme
 
 
 trait Dims:

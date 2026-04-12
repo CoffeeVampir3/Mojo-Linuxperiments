@@ -46,6 +46,7 @@ struct ScaledEmbedArgs(Copyable, ImplicitlyCopyable):
 struct BlockedEmbedArgs(Copyable, ImplicitlyCopyable):
     var table_i8: Int
     var blk_scales: Int
+    var inv_smooth: Int
     var tokens: Int
     var output: Int
     var scale: Float32
@@ -91,18 +92,18 @@ def embed_lookup_scaled_kernel[cols: Int](args: ScaledEmbedArgs):
 
 
 def embed_lookup_blocked_kernel[cols: Int, fwht_blk: Int](args: BlockedEmbedArgs):
-    """out[row] = iFWHT(dequant(table_i8[token[row]])) * scale. F32 compute, bf16 out.
+    """out[row] = iFWHT(dequant(table_i8[token[row]])) * inv_smooth * scale.
 
-    The on-disk table is per-FWHT-block-quantized i8 with scales [VOCAB, num_blocks].
-    To recover the original embedding row, we dequant per block then apply the
-    block-diagonal FWHT a second time (H is orthogonal so H @ H = I, undoing
-    the offline rotation). The result is then scaled by EMBED_SCALE and cast
-    to bf16 — exactly what `embed_lookup_scaled` produces today.
+    The on-disk table stores per-FWHT-block-quantized i8 with sqrt(gamma)
+    smooth factor absorbed (SmoothQuant split). Recovery: dequant per block,
+    iFWHT (H @ H = I), multiply by inv_sqrt_gamma to undo the smooth factor,
+    then scale by EMBED_SCALE.
     """
     comptime width = simd_width_of[DType.float32]()
     comptime num_blocks = cols // fwht_blk
     var table = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=args.table_i8)
     var blk_scales = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.blk_scales)
+    var inv_smooth = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.inv_smooth)
     var tokens = UnsafePointer[Scalar[DType.int32], MutAnyOrigin](unsafe_from_address=args.tokens)
     var dp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.output)
     var sv = args.scale
@@ -134,8 +135,9 @@ def embed_lookup_blocked_kernel[cols: Int, fwht_blk: Int](args: BlockedEmbedArgs
         var out = dp + i * cols
         k = 0
         while k + width <= cols:
-            var v = (work + k).load[width=width]() * vsv
-            (out + k).store(v.cast[DType.bfloat16]())
+            var v = (work + k).load[width=width]()
+            var is_v = (inv_smooth + k).load[width=width]()
+            (out + k).store((v * is_v * vsv).cast[DType.bfloat16]())
             k += width
 
 
@@ -215,15 +217,17 @@ def embed_lookup_blocked[W: Encoding & Shaped, ScT: Encoding & Shaped,
     OutT: Encoding & Shaped, P: BurstThreadPool, fwht_blk: Int](
     table: Bound[W],
     blk_scales: Bound[ScT],
+    inv_smooth: Int,
     tokens: Int,
     output: DynView[OutT],
     scale: Float32,
     mut pool: P,
 ) -> PoolFence[P] where W.DTYPE == DType.int8:
-    """Gather + dequant + iFWHT + scale for the per-block-quantized embed table.
+    """Gather + dequant + iFWHT + smooth correction + scale.
 
-    table:      i8 [VOCAB, HIDDEN] row-major (FWHT'd at quantize time)
+    table:      i8 [VOCAB, HIDDEN] row-major (FWHT'd + smooth-split at quantize time)
     blk_scales: f32 [VOCAB, NUM_BLOCKS] per-FWHT-block weight scales
+    inv_smooth: f32 [HIDDEN] — 1/sqrt(|gamma|), undoes the smooth split
     tokens:     i32 [seq_len] token ids
     output:     bf16 [seq_len, HIDDEN]
     scale:      EMBED_SCALE
@@ -244,7 +248,7 @@ def embed_lookup_blocked[W: Encoding & Shaped, ScT: Encoding & Shaped,
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
         jobs[i] = BlockedEmbedArgs(
-            table.ptr, blk_scales.ptr, tokens, output.ptr, scale, start, end)
+            table.ptr, blk_scales.ptr, inv_smooth, tokens, output.ptr, scale, start, end)
 
     pool.dispatch[BlockedEmbedArgs, embed_lookup_blocked_kernel[W.COLS, fwht_blk]](
         UnsafePointer(to=jobs[0]), num_jobs)

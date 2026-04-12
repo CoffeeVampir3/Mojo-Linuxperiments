@@ -1,4 +1,10 @@
-"""Shared i8 quantization primitives — dynamic absmax and fixed-scale."""
+"""Shared i8 quantization primitives — dynamic absmax and fixed-scale.
+
+Scale conventions:
+  Runtime (absmax_quantize_i8): returns RAW absmax. Dequant: val = qi * absmax / 127.
+  Offline (butterquant):        stores absmax / 127.  Dequant: val = qi * stored_scale.
+  Kernels: act_scale is raw absmax (divided by 127 in kernel), w_scale is absmax/127.
+"""
 
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of

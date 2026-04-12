@@ -8,7 +8,7 @@ of the task list does not matter — gamma absorption is carried per-plan and
 resolved by a one-slot `GammaCache`.
 
 Per quantizable weight:
-  1. Gamma absorption (if plan.gamma_src != ""): row *= gamma[k]
+  1. Smooth/gamma absorption (if scheme has smooth_src): row *= sqrt(|gamma[k]|)
   2. FWHT rotation on the contraction dim per row (block sized by column
      count, capped at MAX_FWHT_BLOCK, plus a full-attn o_proj special case)
   3. Per-row (or per-block) symmetric i8 quantization
@@ -32,11 +32,15 @@ from linux.io_uring import (
     IoRing, ReadOp, WriteOp, Completion, ReadWriteMode, ReadMode, RingError,
 )
 from numa import NumaArena, NumaInfo
-from modeling.model_spec import QuantTag, QuantizeTask
+from modeling.model_spec import (
+    QuantizeTask, QuantScheme,
+    QuantPassthrough, RowQuantized, BlockQuantized, SmoothBlockQuantized,
+    quant_is_quantized, quant_rotation, quant_scale_blocks, quant_smooth_source,
+)
 from modeling.loader import discover_shards
 from notstdcollections import HeapMoveArray
 from experimental.hadquant_impl import fwht_row
-from simd_math import roundeven
+from simd_math import roundeven, sqrt as simd_sqrt
 from threading import BurstPool
 
 comptime PtrU8 = UnsafePointer[UInt8, MutAnyOrigin]
@@ -141,9 +145,15 @@ def fwht_block_for_weight(name: String, cols: Int) -> Int:
     Gemma4 full-attention O projection is consumed one 512-dim head at a time
     with one activation scale per head. Its offline rotation must use the same
     512-wide basis; the generic 256-wide cap is still correct elsewhere.
+
+    The embed table uses 64-wide blocks (matching FWHT_BLK_HIDDEN) for finer
+    per-block scale adaptation — smaller blocks reduce quantization drift in
+    the lm_head output.
     """
     if cols == 8192 and name.endswith("self_attn.o_proj.weight"):
         return FULL_O_PROJ_FWHT_BLOCK
+    if name.endswith("embed_tokens.weight"):
+        return 64
     return fwht_block_for_cols(cols)
 
 
@@ -152,7 +162,13 @@ def fwht_block_for_weight(name: String, cols: Int) -> Int:
 # =============================================================================
 
 
-def quantize_panel_rows[block: Int](job: QuantPanelJob):
+def quantize_panel_rows[block: Int, per_block: Bool](job: QuantPanelJob):
+    """FWHT + absmax i8 quantize, with optional per-column scaling.
+
+    When per_block=False: one absmax scale per row (scales layout: [rows]).
+    When per_block=True:  one absmax per FWHT block (scales layout: [rows, num_blocks]).
+    If job.apply_gamma: multiply each element by gamma_ptr[k] before FWHT.
+    """
     comptime lo = SIMD[DType.float32, WIDTH](-128.0)
     comptime hi = SIMD[DType.float32, WIDTH](127.0)
 
@@ -162,12 +178,16 @@ def quantize_panel_rows[block: Int](job: QuantPanelJob):
     var scales = PtrF32(unsafe_from_address=job.scales_ptr)
     var gamma = PtrF32(unsafe_from_address=job.gamma_ptr)
     var cols = job.cols
+    comptime num_blocks = 1 if not per_block else 0
+    var rt_num_blocks = cols // block if per_block else 1
 
     for r in range(job.row_start, job.row_start + job.row_count):
         var src_row = src + r * cols
         var work_row = work + r * cols
         var qi_row = qi + r * cols
+        var scale_row = scales + (r * rt_num_blocks if per_block else r)
 
+        # Load bf16 → f32, optionally apply per-column scaling
         var k = 0
         while k + WIDTH <= cols:
             var x = (src_row + k).load[width=WIDTH]().cast[DType.float32]()
@@ -182,38 +202,74 @@ def quantize_panel_rows[block: Int](job: QuantPanelJob):
             work_row[k] = x
             k += 1
 
+        # Block-diagonal FWHT
         fwht_row[DType.float32, block](work_row, cols)
 
-        var vmax = SIMD[DType.float32, WIDTH](0)
-        k = 0
-        while k + WIDTH <= cols:
-            vmax = max(vmax, (work_row + k).load[width=WIDTH]().__abs__())
-            k += WIDTH
-        var amax = vmax.reduce_max()
-        while k < cols:
-            var a = work_row[k]
-            if a < Float32(0):
-                a = -a
-            if a > amax:
-                amax = a
-            k += 1
+        # Absmax + quantize — per-row or per-block
+        comptime if per_block:
+            for blk in range(rt_num_blocks):
+                var blk_off = blk * block
+                var blk_work = work_row + blk_off
+                var blk_qi = qi_row + blk_off
 
-        scales[r] = amax / Float32(127.0)
-        var inv = Float32(127.0) / amax if amax > Float32(0) else Float32(0)
-        var vinv = SIMD[DType.float32, WIDTH](inv)
+                var vmax = SIMD[DType.float32, WIDTH](0)
+                var bk = 0
+                while bk + WIDTH <= block:
+                    vmax = max(vmax, (blk_work + bk).load[width=WIDTH]().__abs__())
+                    bk += WIDTH
+                var amax = vmax.reduce_max()
+                while bk < block:
+                    var a = blk_work[bk]
+                    if a < Float32(0):
+                        a = -a
+                    if a > amax:
+                        amax = a
+                    bk += 1
 
-        k = 0
-        while k + WIDTH <= cols:
-            var v = (work_row + k).load[width=WIDTH]()
-            (qi_row + k).store(min(max(roundeven(v * vinv), lo), hi).cast[DType.int8]())
-            k += WIDTH
-        while k < cols:
-            var v = roundeven[DType.float32, 1](work_row[k] * inv)
-            qi_row[k] = min(max(v, Float32(-128.0)), Float32(127.0)).cast[DType.int8]()
-            k += 1
+                scale_row[blk] = amax / Float32(127.0)
+                var inv = Float32(127.0) / amax if amax > Float32(0) else Float32(0)
+                var vinv = SIMD[DType.float32, WIDTH](inv)
+
+                bk = 0
+                while bk + WIDTH <= block:
+                    var v = (blk_work + bk).load[width=WIDTH]()
+                    (blk_qi + bk).store(min(max(roundeven(v * vinv), lo), hi).cast[DType.int8]())
+                    bk += WIDTH
+                while bk < block:
+                    var v = roundeven[DType.float32, 1](blk_work[bk] * inv)
+                    blk_qi[bk] = min(max(v, Float32(-128.0)), Float32(127.0)).cast[DType.int8]()
+                    bk += 1
+        else:
+            var vmax = SIMD[DType.float32, WIDTH](0)
+            k = 0
+            while k + WIDTH <= cols:
+                vmax = max(vmax, (work_row + k).load[width=WIDTH]().__abs__())
+                k += WIDTH
+            var amax = vmax.reduce_max()
+            while k < cols:
+                var a = work_row[k]
+                if a < Float32(0):
+                    a = -a
+                if a > amax:
+                    amax = a
+                k += 1
+
+            scales[r] = amax / Float32(127.0)
+            var inv = Float32(127.0) / amax if amax > Float32(0) else Float32(0)
+            var vinv = SIMD[DType.float32, WIDTH](inv)
+
+            k = 0
+            while k + WIDTH <= cols:
+                var v = (work_row + k).load[width=WIDTH]()
+                (qi_row + k).store(min(max(roundeven(v * vinv), lo), hi).cast[DType.int8]())
+                k += WIDTH
+            while k < cols:
+                var v = roundeven[DType.float32, 1](work_row[k] * inv)
+                qi_row[k] = min(max(v, Float32(-128.0)), Float32(127.0)).cast[DType.int8]()
+                k += 1
 
 
-def quantize_panel_dispatch[mask_size: Int, block: Int](
+def quantize_panel_dispatch[mask_size: Int, block: Int, per_block: Bool](
     src_ptr: Int,
     work_ptr: Int,
     qi_ptr: Int,
@@ -236,112 +292,59 @@ def quantize_panel_dispatch[mask_size: Int, block: Int](
             jobs[i] = QuantPanelJob(
                 src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr,
                 cols, row_start, row_count, apply_gamma)
-        pool.dispatch[QuantPanelJob, quantize_panel_rows[block]](jobs, num_jobs)
+        pool.dispatch[QuantPanelJob, quantize_panel_rows[block, per_block]](jobs, num_jobs)
         pool.join()
         jobs.free()
     else:
-        quantize_panel_rows[block](QuantPanelJob(
+        quantize_panel_rows[block, per_block](QuantPanelJob(
             src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr,
             cols, 0, rows, apply_gamma))
 
 
-def per_block_quantize_panel_rows[block: Int](job: QuantPanelJob):
-    """Block-diagonal FWHT + per-FWHT-block absmax i8 quantize.
-
-    For each row r, splits the FWHT'd row into cols/block contiguous segments
-    and takes one absmax per segment, producing num_blocks scales per row.
-    Output scale layout is [rows, num_blocks] row-major. No gamma path — the
-    LM head's final_norm has no γ.
-    """
-    comptime lo = SIMD[DType.float32, WIDTH](-128.0)
-    comptime hi = SIMD[DType.float32, WIDTH](127.0)
-
-    var src = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=job.src_ptr)
-    var work = PtrF32(unsafe_from_address=job.work_ptr)
-    var qi = PtrI8(unsafe_from_address=job.qi_ptr)
-    var scales = PtrF32(unsafe_from_address=job.scales_ptr)
-    var cols = job.cols
-    var num_blocks = cols // block
-
-    for r in range(job.row_start, job.row_start + job.row_count):
-        var src_row = src + r * cols
-        var work_row = work + r * cols
-        var qi_row = qi + r * cols
-        var scale_row = scales + r * num_blocks
-
-        var k = 0
-        while k + WIDTH <= cols:
-            var x = (src_row + k).load[width=WIDTH]().cast[DType.float32]()
-            (work_row + k).store(x)
-            k += WIDTH
-        while k < cols:
-            work_row[k] = Float32(src_row[k])
-            k += 1
-
-        fwht_row[DType.float32, block](work_row, cols)
-
-        for blk in range(num_blocks):
-            var blk_off = blk * block
-            var blk_work = work_row + blk_off
-            var blk_qi = qi_row + blk_off
-
-            var vmax = SIMD[DType.float32, WIDTH](0)
-            var bk = 0
-            while bk + WIDTH <= block:
-                vmax = max(vmax, (blk_work + bk).load[width=WIDTH]().__abs__())
-                bk += WIDTH
-            var amax = vmax.reduce_max()
-            while bk < block:
-                var a = blk_work[bk]
-                if a < Float32(0):
-                    a = -a
-                if a > amax:
-                    amax = a
-                bk += 1
-
-            scale_row[blk] = amax / Float32(127.0)
-            var inv = Float32(127.0) / amax if amax > Float32(0) else Float32(0)
-            var vinv = SIMD[DType.float32, WIDTH](inv)
-
-            bk = 0
-            while bk + WIDTH <= block:
-                var v = (blk_work + bk).load[width=WIDTH]()
-                (blk_qi + bk).store(min(max(roundeven(v * vinv), lo), hi).cast[DType.int8]())
-                bk += WIDTH
-            while bk < block:
-                var v = roundeven[DType.float32, 1](blk_work[bk] * inv)
-                blk_qi[bk] = min(max(v, Float32(-128.0)), Float32(127.0)).cast[DType.int8]()
-                bk += 1
-
-
-def per_block_quantize_panel_dispatch[mask_size: Int, block: Int](
-    src_ptr: Int,
-    work_ptr: Int,
-    qi_ptr: Int,
-    scales_ptr: Int,
-    rows: Int,
-    cols: Int,
+def run_panel[mask_size: Int](
+    block: Int,
+    per_block: Bool,
+    src_ptr: Int, work_ptr: Int, qi_ptr: Int, scales_ptr: Int, gamma_ptr: Int,
+    rows: Int, cols: Int, apply_gamma: Bool,
     mut pool: BurstPool[mask_size],
 ):
-    if rows <= 0:
-        return
-    if pool and pool.get_capacity() > 1 and rows > 1:
-        var num_jobs = min(rows, pool.get_capacity())
-        var rows_per_job = (rows + num_jobs - 1) // num_jobs
-        var jobs = alloc[QuantPanelJob](num_jobs)
-        for i in range(num_jobs):
-            var row_start = i * rows_per_job
-            var row_count = min(rows_per_job, rows - row_start)
-            jobs[i] = QuantPanelJob(
-                src_ptr, work_ptr, qi_ptr, scales_ptr, 0,
-                cols, row_start, row_count, False)
-        pool.dispatch[QuantPanelJob, per_block_quantize_panel_rows[block]](jobs, num_jobs)
-        pool.join()
-        jobs.free()
+    """Unified dispatch for all quantize panel variants.
+
+    per_block: per-FWHT-block scales (True) or per-row scales (False).
+    apply_gamma: multiply by gamma_ptr per element before FWHT.
+    """
+    if per_block:
+        if block == 512:
+            quantize_panel_dispatch[mask_size, 512, True](
+                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
+        elif block == 256:
+            quantize_panel_dispatch[mask_size, 256, True](
+                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
+        elif block == 128:
+            quantize_panel_dispatch[mask_size, 128, True](
+                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
+        elif block == 64:
+            quantize_panel_dispatch[mask_size, 64, True](
+                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
+        else:
+            quantize_panel_dispatch[mask_size, 32, True](
+                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
     else:
-        per_block_quantize_panel_rows[block](QuantPanelJob(
-            src_ptr, work_ptr, qi_ptr, scales_ptr, 0,
-            cols, 0, rows, False))
+        if block == 512:
+            quantize_panel_dispatch[mask_size, 512, False](
+                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
+        elif block == 256:
+            quantize_panel_dispatch[mask_size, 256, False](
+                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
+        elif block == 128:
+            quantize_panel_dispatch[mask_size, 128, False](
+                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
+        elif block == 64:
+            quantize_panel_dispatch[mask_size, 64, False](
+                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
+        else:
+            quantize_panel_dispatch[mask_size, 32, False](
+                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
 
 
 def bf16_to_f32(src: PtrU8, dst: PtrF32, count: Int):
@@ -423,32 +426,30 @@ def fold_shape(shape: List[Int]) -> Tuple[Int, Int]:
 
 struct PlanKind:
     comptime QUANTIZE = 0
-    comptime PER_BLOCK_QUANTIZE = 1
-    comptime PASSTHROUGH = 2
-    comptime MISSING = 3            # passthrough task whose tensor isn't in source
+    comptime PASSTHROUGH = 1
+    comptime MISSING = 2
 
 
 @fieldwise_init
 struct QuantizePlan(Copyable, Movable):
-    var kind: Int                   # PlanKind.*
+    var kind: Int                   # PlanKind.QUANTIZE / PASSTHROUGH / MISSING
+    var scheme: QuantScheme         # the full scheme (only meaningful when kind=QUANTIZE)
 
     var src_name: String
-    var src_shard: Int              # index into headers, -1 for MISSING
-    var src_start: Int              # file offset of data (header.data_offset + meta.start)
-    var src_bytes: Int              # raw source byte count (bf16 for quant, native for passthrough)
+    var src_shard: Int
+    var src_start: Int
+    var src_bytes: Int
     var src_dtype: DType
 
     var rows: Int
     var cols: Int
-    var block: Int                  # FWHT block, 0 for passthrough
-    var num_blocks: Int             # 1 for row-wise quant, cols/block for per-block, 0 for passthrough
-
-    var gamma_src: String           # "" if no absorption
+    var block: Int                  # FWHT rotation block (from scheme)
+    var num_blocks: Int             # scale blocks per row (from scheme)
 
     # Output layout — offsets relative to data_start
     var weight_out_off: Int
     var weight_out_bytes: Int
-    var scale_out_off: Int          # -1 if not applicable
+    var scale_out_off: Int
     var scale_out_bytes: Int
 
 
@@ -514,59 +515,23 @@ def plan_quantization(
 
     for t_idx in range(len(tasks)):
         var t = tasks[t_idx].copy()
+        var s = t.scheme.copy()
 
-        if t.kind == QuantTag.QUANTIZE or t.kind == QuantTag.GAMMA_QUANTIZE:
-            var located = find_tensor(headers, t.src_name)
+        if quant_is_quantized(s):
+            var located = find_tensor(headers, t.name)
             if located[0] < 0:
-                print("quantize: missing weight " + t.src_name)
+                print("quantize: missing weight " + t.name)
                 return None
             var shard_idx = located[0]
             var meta = located[1].copy()
             var rc = fold_shape(meta.shape)
             var rows = rc[0]
             var cols = rc[1]
-            var block = fwht_block_for_weight(t.src_name, cols)
-            var weight_bytes = rows * cols
-            var scale_bytes = rows * 4
-
-            var weight_off = offset
-            offset += weight_bytes
-            var scale_off = offset
-            offset += scale_bytes
-
-            entries.append(OutputEntry(
-                t.src_name, DType.int8, rows, cols,
-                weight_off, weight_off + weight_bytes))
-            entries.append(OutputEntry(
-                t.src_name + "_scale", DType.float32, rows, 1,
-                scale_off, scale_off + scale_bytes))
-
-            plans.append(QuantizePlan(
-                kind=PlanKind.QUANTIZE,
-                src_name=t.src_name, src_shard=shard_idx,
-                src_start=headers[shard_idx].data_offset + meta.start,
-                src_bytes=weight_bytes * 2,     # bf16 source
-                src_dtype=meta.dtype,
-                rows=rows, cols=cols, block=block, num_blocks=1,
-                gamma_src=t.gamma_src,
-                weight_out_off=weight_off, weight_out_bytes=weight_bytes,
-                scale_out_off=scale_off, scale_out_bytes=scale_bytes,
-            ))
-            if cols > max_quant_cols:
-                max_quant_cols = cols
-
-        elif t.kind == QuantTag.PER_BLOCK_QUANTIZE:
-            var located = find_tensor(headers, t.src_name)
-            if located[0] < 0:
-                print("quantize: missing weight " + t.src_name)
-                return None
-            var shard_idx = located[0]
-            var meta = located[1].copy()
-            var rc = fold_shape(meta.shape)
-            var rows = rc[0]
-            var cols = rc[1]
-            var block = fwht_block_for_weight(t.src_name, cols)
-            var num_blocks = cols // block
+            var rot = quant_rotation(s)
+            var block = rot if rot > 0 else fwht_block_for_cols(cols)
+            var num_blocks = quant_scale_blocks(s, cols)
+            if num_blocks == 0:
+                num_blocks = 1
             var weight_bytes = rows * cols
             var scale_bytes = rows * num_blocks * 4
 
@@ -576,20 +541,20 @@ def plan_quantization(
             offset += scale_bytes
 
             entries.append(OutputEntry(
-                t.src_name, DType.int8, rows, cols,
+                t.name, DType.int8, rows, cols,
                 weight_off, weight_off + weight_bytes))
             entries.append(OutputEntry(
-                t.src_name + "_scale", DType.float32, rows, num_blocks,
+                t.name + "_scale", DType.float32, rows, num_blocks,
                 scale_off, scale_off + scale_bytes))
 
             plans.append(QuantizePlan(
-                kind=PlanKind.PER_BLOCK_QUANTIZE,
-                src_name=t.src_name, src_shard=shard_idx,
+                kind=PlanKind.QUANTIZE,
+                scheme=t.scheme.copy(),
+                src_name=t.name, src_shard=shard_idx,
                 src_start=headers[shard_idx].data_offset + meta.start,
                 src_bytes=weight_bytes * 2,
                 src_dtype=meta.dtype,
                 rows=rows, cols=cols, block=block, num_blocks=num_blocks,
-                gamma_src="",
                 weight_out_off=weight_off, weight_out_bytes=weight_bytes,
                 scale_out_off=scale_off, scale_out_bytes=scale_bytes,
             ))
@@ -598,17 +563,16 @@ def plan_quantization(
             if num_blocks > max_num_blocks:
                 max_num_blocks = num_blocks
 
-        elif t.kind == QuantTag.PASSTHROUGH:
-            var located = find_tensor(headers, t.src_name)
+        else:
+            # Passthrough
+            var located = find_tensor(headers, t.name)
             if located[0] < 0:
-                # Explicit MISSING plan — previously a silent `continue`
-                # mid-loop. Kept as a plan so reports can surface it.
                 plans.append(QuantizePlan(
                     kind=PlanKind.MISSING,
-                    src_name=t.src_name, src_shard=-1, src_start=0,
+                    scheme=t.scheme.copy(),
+                    src_name=t.name, src_shard=-1, src_start=0,
                     src_bytes=0, src_dtype=DType.uint8,
                     rows=0, cols=0, block=0, num_blocks=0,
-                    gamma_src="",
                     weight_out_off=-1, weight_out_bytes=0,
                     scale_out_off=-1, scale_out_bytes=0,
                 ))
@@ -620,15 +584,15 @@ def plan_quantization(
             var weight_off = offset
             offset += byte_size
             entries.append(OutputEntry(
-                t.src_name, meta.dtype, rc[0], rc[1],
+                t.name, meta.dtype, rc[0], rc[1],
                 weight_off, weight_off + byte_size))
             plans.append(QuantizePlan(
                 kind=PlanKind.PASSTHROUGH,
-                src_name=t.src_name, src_shard=shard_idx,
+                scheme=t.scheme.copy(),
+                src_name=t.name, src_shard=shard_idx,
                 src_start=headers[shard_idx].data_offset + meta.start,
                 src_bytes=byte_size, src_dtype=meta.dtype,
                 rows=rc[0], cols=rc[1], block=0, num_blocks=0,
-                gamma_src="",
                 weight_out_off=weight_off, weight_out_bytes=byte_size,
                 scale_out_off=-1, scale_out_bytes=0,
             ))
@@ -641,55 +605,6 @@ def plan_quantization(
 # =============================================================================
 
 
-def run_quant_panel[mask_size: Int](
-    block: Int,
-    src_ptr: Int, work_ptr: Int, qi_ptr: Int, scales_ptr: Int, gamma_ptr: Int,
-    rows: Int, cols: Int, apply_gamma: Bool,
-    mut pool: BurstPool[mask_size],
-):
-    if block == 512:
-        quantize_panel_dispatch[mask_size, 512](
-            src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr,
-            rows, cols, apply_gamma, pool)
-    elif block == 256:
-        quantize_panel_dispatch[mask_size, 256](
-            src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr,
-            rows, cols, apply_gamma, pool)
-    elif block == 128:
-        quantize_panel_dispatch[mask_size, 128](
-            src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr,
-            rows, cols, apply_gamma, pool)
-    elif block == 64:
-        quantize_panel_dispatch[mask_size, 64](
-            src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr,
-            rows, cols, apply_gamma, pool)
-    else:
-        quantize_panel_dispatch[mask_size, 32](
-            src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr,
-            rows, cols, apply_gamma, pool)
-
-
-def run_per_block_panel[mask_size: Int](
-    block: Int,
-    src_ptr: Int, work_ptr: Int, qi_ptr: Int, scales_ptr: Int,
-    rows: Int, cols: Int,
-    mut pool: BurstPool[mask_size],
-):
-    if block == 512:
-        per_block_quantize_panel_dispatch[mask_size, 512](
-            src_ptr, work_ptr, qi_ptr, scales_ptr, rows, cols, pool)
-    elif block == 256:
-        per_block_quantize_panel_dispatch[mask_size, 256](
-            src_ptr, work_ptr, qi_ptr, scales_ptr, rows, cols, pool)
-    elif block == 128:
-        per_block_quantize_panel_dispatch[mask_size, 128](
-            src_ptr, work_ptr, qi_ptr, scales_ptr, rows, cols, pool)
-    elif block == 64:
-        per_block_quantize_panel_dispatch[mask_size, 64](
-            src_ptr, work_ptr, qi_ptr, scales_ptr, rows, cols, pool)
-    else:
-        per_block_quantize_panel_dispatch[mask_size, 32](
-            src_ptr, work_ptr, qi_ptr, scales_ptr, rows, cols, pool)
 
 
 # =============================================================================
@@ -749,11 +664,38 @@ def process_quantize_plan[mask_size: Int](
     ref headers: HeapMoveArray[SafetensorsHeader],
     scratch: PanelScratch, mut pool: BurstPool[mask_size],
 ) -> Bool:
-    var apply_gamma = plan.gamma_src != ""
+    """Unified quantization processor for all QUANTIZE/GAMMA_QUANTIZE/PER_BLOCK/SMOOTH variants.
+
+    Handles gamma loading, optional sqrt transform (smooth split),
+    per-row vs per-block scale output, and panel I/O.
+    """
+    var smooth_src = quant_smooth_source(plan.scheme)
+    var apply_gamma = smooth_src != ""
+    var is_smooth = apply_gamma and plan.num_blocks > 1
+    var per_block = plan.num_blocks > 1
+
     if apply_gamma:
-        if not gamma_cache.ensure(plan.gamma_src, rio, headers, scratch.io_buf):
+        if not gamma_cache.ensure(smooth_src, rio, headers, scratch.io_buf):
+            print("quantize: failed to load gamma/smooth source " + smooth_src)
             return False
 
+    # For smooth split: transform gamma → sqrt(|gamma|) in-place.
+    if is_smooth:
+        comptime w = simd_width_of[DType.float32]()
+        var gp = scratch.gamma
+        var k = 0
+        while k + w <= plan.cols:
+            var v = (gp + k).load[width=w]().__abs__()
+            (gp + k).store(simd_sqrt(v))
+            k += w
+        while k < plan.cols:
+            var v = gp[k]
+            if v < Float32(0):
+                v = -v
+            gp[k] = simd_sqrt(v)
+            k += 1
+
+    var scale_stride = plan.num_blocks * 4
     var rows_done = 0
     while rows_done < plan.rows:
         var panel = min(scratch.panel_rows, plan.rows - rows_done)
@@ -763,8 +705,8 @@ def process_quantize_plan[mask_size: Int](
             print("quantize: failed to read panel for " + plan.src_name)
             return False
 
-        run_quant_panel[mask_size](
-            plan.block,
+        run_panel[mask_size](
+            plan.block, per_block,
             Int(scratch.io_buf), Int(scratch.work), Int(scratch.qi),
             Int(scratch.scales), Int(scratch.gamma),
             panel, plan.cols, apply_gamma, pool)
@@ -773,44 +715,13 @@ def process_quantize_plan[mask_size: Int](
         if not rio.write(output_file_idx, dst_w,
                 scratch.qi.bitcast[UInt8](), panel * plan.cols):
             return False
-        var dst_s = data_start + plan.scale_out_off + rows_done * 4
+        var dst_s = data_start + plan.scale_out_off + rows_done * scale_stride
         if not rio.write(output_file_idx, dst_s,
-                scratch.scales.bitcast[UInt8](), panel * 4):
+                scratch.scales.bitcast[UInt8](), panel * scale_stride):
             return False
         rows_done += panel
     return True
 
-
-def process_per_block_plan[mask_size: Int](
-    plan: QuantizePlan, data_start: Int, output_file_idx: Int,
-    mut rio: RingIO, scratch: PanelScratch,
-    mut pool: BurstPool[mask_size],
-) -> Bool:
-    var rows_done = 0
-    while rows_done < plan.rows:
-        var panel = min(scratch.panel_rows, plan.rows - rows_done)
-        var panel_bytes = panel * plan.cols * 2
-        var src_off = plan.src_start + rows_done * plan.cols * 2
-        if not rio.read(plan.src_shard, src_off, scratch.io_buf, panel_bytes):
-            print("quantize: failed to read panel for " + plan.src_name)
-            return False
-
-        run_per_block_panel[mask_size](
-            plan.block,
-            Int(scratch.io_buf), Int(scratch.work), Int(scratch.qi),
-            Int(scratch.scales),
-            panel, plan.cols, pool)
-
-        var dst_w = data_start + plan.weight_out_off + rows_done * plan.cols
-        if not rio.write(output_file_idx, dst_w,
-                scratch.qi.bitcast[UInt8](), panel * plan.cols):
-            return False
-        var dst_s = data_start + plan.scale_out_off + rows_done * plan.num_blocks * 4
-        if not rio.write(output_file_idx, dst_s,
-                scratch.scales.bitcast[UInt8](), panel * plan.num_blocks * 4):
-            return False
-        rows_done += panel
-    return True
 
 
 def process_passthrough_plan(
@@ -948,23 +859,17 @@ def run_quantizer[
     for p_idx in range(len(bundle.plans)):
         var plan = bundle.plans[p_idx].copy()
         if plan.kind == PlanKind.QUANTIZE:
-            print("  quantized: " + plan.src_name
+            var per_block = plan.num_blocks > 1
+            var smooth_src = quant_smooth_source(plan.scheme)
+            var label = "per-block quantized" if per_block else "quantized"
+            print("  " + label + ": " + plan.src_name
                 + " [" + String(plan.rows) + "x" + String(plan.cols)
                 + "] block=" + String(plan.block)
-                + (" gamma=" + plan.gamma_src if plan.gamma_src != "" else ""))
+                + " num_blocks=" + String(plan.num_blocks)
+                + (" smooth=" + smooth_src if smooth_src != "" else ""))
             if not process_quantize_plan[mask_size](
                     plan, data_start, output_file_idx, rio, gamma_cache,
                     headers, scratch, pool):
-                return False
-            total_bytes += plan.weight_out_bytes + plan.scale_out_bytes
-            num_quantized += 1
-        elif plan.kind == PlanKind.PER_BLOCK_QUANTIZE:
-            print("  per-block quantized: " + plan.src_name
-                + " [" + String(plan.rows) + "x" + String(plan.cols)
-                + "] block=" + String(plan.block)
-                + " num_blocks=" + String(plan.num_blocks))
-            if not process_per_block_plan[mask_size](
-                    plan, data_start, output_file_idx, rio, scratch, pool):
                 return False
             total_bytes += plan.weight_out_bytes + plan.scale_out_bytes
             num_quantized += 1

@@ -34,7 +34,8 @@ from modeling.model_spec import (
     WeightDesc,
     DEFAULT_ALIGNMENT,
     LogitsView,
-    QuantTag, QuantizeTask,
+    QuantizeTask, QuantScheme,
+    QuantPassthrough, RowQuantized, BlockQuantized, SmoothBlockQuantized,
 )
 from kernels.kernel_ops import PoolFence, BF16Ptr, rmsnorm
 from kernels.reductions import ring_allreduce, ring_broadcast
@@ -94,6 +95,7 @@ struct Gemma4Config:
     comptime TOP_K = 8
     comptime FWHT_BLK = 64
     comptime FWHT_BLK_HIDDEN = 256
+    comptime LM_HEAD_FWHT_BLK = 64
     comptime DENSE_NUM_BLOCKS = Self.INTERMEDIATE // Self.FWHT_BLK
     comptime MOE_NUM_BLOCKS = Self.MOE_INTERMEDIATE // Self.FWHT_BLK
     comptime VOCAB_SIZE = 262144
@@ -539,6 +541,8 @@ struct Gemma4ModelLayout(Copyable, ImplicitlyCopyable, Movable):
     var vocab_num_blocks: Int
     var embed_colsum_off: Int
     var embed_colsum_bytes: Int
+    var sqrt_gamma_off: Int       # bf16 [HIDDEN] — sqrt(|final_norm.weight|)
+    var inv_sqrt_gamma_off: Int   # f32  [HIDDEN] — 1/sqrt(|final_norm.weight|)
 
     @always_inline
     def arena_bytes(self) -> Int:
@@ -546,7 +550,7 @@ struct Gemma4ModelLayout(Copyable, ImplicitlyCopyable, Movable):
 
     @always_inline
     def host_arena_bytes(self) -> Int:
-        return self.embed_colsum_off + self.embed_colsum_bytes
+        return self.inv_sqrt_gamma_off + C.HIDDEN * 4
 
 
 def calculate_peak_scratch[tp: Int]() -> Int:
@@ -611,7 +615,7 @@ def calculate_peak_scratch[tp: Int]() -> Int:
     )
     comptime decode_peak = ffn_peak if ffn_peak > layer_peak else layer_peak
 
-    comptime vocab_num_blocks = C.HIDDEN // C.FWHT_BLK_HIDDEN
+    comptime vocab_num_blocks = C.HIDDEN // C.LM_HEAD_FWHT_BLK
     comptime lm_head_peak = (
         C.HIDDEN * i8_bytes
         + vocab_num_blocks * f32_bytes
@@ -714,7 +718,7 @@ def build_gemma4_load_plan[tp: Int]() -> Gemma4LoadPlan:
     # WeightDesc arena_offsets are both absolute (host-only has a single
     # "layer", no per-instance base offset). ----
     var host_only_off = ((distributed_bytes + state_bytes + DEFAULT_ALIGNMENT - 1) // DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT
-    comptime vocab_num_blocks = C.HIDDEN // C.FWHT_BLK_HIDDEN
+    comptime vocab_num_blocks = C.HIDDEN // C.LM_HEAD_FWHT_BLK
     comptime HOST = LayerShard.HOST
     var hb = LayerBuilder(tp, "", 0)
     hb.cursor = host_only_off
@@ -727,6 +731,9 @@ def build_gemma4_load_plan[tp: Int]() -> Gemma4LoadPlan:
     # Per-block colsums for the embed table — reserved scratch, not loaded.
     var embed_colsum_off = hb.colsum(C.VOCAB_SIZE * vocab_num_blocks * 4)
     var embed_colsum_bytes = C.VOCAB_SIZE * vocab_num_blocks * 4
+    # sqrt(|gamma|) and 1/sqrt(|gamma|) for the smooth split — computed at init.
+    var sqrt_gamma_off = embed_colsum_off + embed_colsum_bytes
+    var inv_sqrt_gamma_off = sqrt_gamma_off + C.HIDDEN * 2  # sqrt_gamma is bf16
 
     var layout = Gemma4ModelLayout(
         sliding=sliding_offsets, full=full_offsets,
@@ -749,6 +756,8 @@ def build_gemma4_load_plan[tp: Int]() -> Gemma4LoadPlan:
         vocab_num_blocks=vocab_num_blocks,
         embed_colsum_off=embed_colsum_off,
         embed_colsum_bytes=embed_colsum_bytes,
+        sqrt_gamma_off=sqrt_gamma_off,
+        inv_sqrt_gamma_off=inv_sqrt_gamma_off,
     )
     return Gemma4LoadPlan(layout, descs^)
 
@@ -1294,7 +1303,7 @@ struct RankView[tp: Int](Copyable, Movable):
     comptime FULL_SIN = Slot[F32, Replicated, C.MAX_SEQ_LEN, Self.FULL_ROPE_HALF, Self.tp]
     # Host-only shape aliases (used via embed_table/embed_scale accessors).
     comptime EMBED      = Slot[I8, Replicated, C.VOCAB_SIZE, C.HIDDEN, Self.tp]
-    comptime VOCAB_NUM_BLOCKS = C.HIDDEN // C.FWHT_BLK_HIDDEN
+    comptime VOCAB_NUM_BLOCKS = C.HIDDEN // C.LM_HEAD_FWHT_BLK
     comptime EMBED_SC   = Slot[F32, Replicated, C.VOCAB_SIZE, Self.VOCAB_NUM_BLOCKS, Self.tp]
     comptime FINAL_NORM = Slot[BF16, Replicated, C.HIDDEN, 1, Self.tp]
     comptime LOGITS     = Slot[BF16, Replicated, 1, C.VOCAB_SIZE, Self.tp]
@@ -1719,7 +1728,26 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     base,
                     L.embed_off,
                     L.embed_colsum_off,
-                    C.VOCAB_SIZE, C.HIDDEN, C.FWHT_BLK_HIDDEN)
+                    C.VOCAB_SIZE, C.HIDDEN, C.LM_HEAD_FWHT_BLK)
+
+                # Precompute sqrt(|gamma|) and 1/sqrt(|gamma|) for the smooth split.
+                var gamma_p = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+                    unsafe_from_address=base + L.final_norm_off)
+                var sg = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+                    unsafe_from_address=base + L.sqrt_gamma_off)
+                var isg = UnsafePointer[Float32, MutAnyOrigin](
+                    unsafe_from_address=base + L.inv_sqrt_gamma_off)
+                for k in range(C.HIDDEN):
+                    var gv = Float32(gamma_p[k])
+                    var sign = Float32(1.0)
+                    if gv < 0:
+                        sign = Float32(-1.0)
+                        gv = -gv
+                    if gv < Float32(1e-10):
+                        gv = Float32(1e-10)
+                    var s = sqrt[DType.float32, 1](gv)
+                    sg[k] = Scalar[DType.bfloat16](sign * s)
+                    isg[k] = Float32(1.0) / s
 
             # Bake 1/sqrt(hidden) into router weight scales (one-time).
             comptime inv_sqrt_h = Float32(1.0 / sqrt(Float64(C.HIDDEN)))
@@ -1807,48 +1835,60 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         layers sequentially to keep the output file readable.
         """
         var tasks = List[QuantizeTask]()
-        comptime Q = QuantTag.QUANTIZE
-        comptime P = QuantTag.PASSTHROUGH
-        comptime PBQ = QuantTag.PER_BLOCK_QUANTIZE
+        comptime HB = C.FWHT_BLK_HIDDEN
+        comptime LB = C.LM_HEAD_FWHT_BLK
+
+        var pt = QuantScheme(QuantPassthrough())
+        var row_hb = QuantScheme(RowQuantized(rotation=HB))
 
         for i in range(C.NUM_LAYERS):
             var prefix = "model.language_model.layers." + String(i) + "."
             var is_full = (i + 1) % 6 == 0
 
             # Attention projections
-            tasks.append(QuantizeTask(Q, prefix + "self_attn.q_proj.weight", ""))
-            tasks.append(QuantizeTask(Q, prefix + "self_attn.k_proj.weight", ""))
+            tasks.append(QuantizeTask(prefix + "self_attn.q_proj.weight", row_hb.copy()))
+            tasks.append(QuantizeTask(prefix + "self_attn.k_proj.weight", row_hb.copy()))
             if not is_full:
-                tasks.append(QuantizeTask(Q, prefix + "self_attn.v_proj.weight", ""))
-            tasks.append(QuantizeTask(Q, prefix + "self_attn.o_proj.weight", ""))
+                tasks.append(QuantizeTask(prefix + "self_attn.v_proj.weight", row_hb.copy()))
+            if is_full:
+                tasks.append(QuantizeTask(prefix + "self_attn.o_proj.weight",
+                    QuantScheme(RowQuantized(rotation=512))))
+            else:
+                tasks.append(QuantizeTask(prefix + "self_attn.o_proj.weight", row_hb.copy()))
 
             # Dense MLP
-            tasks.append(QuantizeTask(Q, prefix + "mlp.gate_proj.weight", ""))
-            tasks.append(QuantizeTask(Q, prefix + "mlp.up_proj.weight", ""))
-            tasks.append(QuantizeTask(Q, prefix + "mlp.down_proj.weight", ""))
+            tasks.append(QuantizeTask(prefix + "mlp.gate_proj.weight", row_hb.copy()))
+            tasks.append(QuantizeTask(prefix + "mlp.up_proj.weight", row_hb.copy()))
+            tasks.append(QuantizeTask(prefix + "mlp.down_proj.weight",
+                QuantScheme(RowQuantized(rotation=0))))
 
             # Router + experts
-            tasks.append(QuantizeTask(Q, prefix + "router.proj.weight", ""))
-            tasks.append(QuantizeTask(Q, prefix + "experts.gate_up_proj", ""))
-            tasks.append(QuantizeTask(Q, prefix + "experts.down_proj", ""))
+            tasks.append(QuantizeTask(prefix + "router.proj.weight", row_hb.copy()))
+            tasks.append(QuantizeTask(prefix + "experts.gate_up_proj",
+                QuantScheme(RowQuantized(rotation=0))))
+            tasks.append(QuantizeTask(prefix + "experts.down_proj",
+                QuantScheme(RowQuantized(rotation=0))))
 
-            # Norms + scalars — passthrough bf16
-            tasks.append(QuantizeTask(P, prefix + "input_layernorm.weight", ""))
-            tasks.append(QuantizeTask(P, prefix + "post_attention_layernorm.weight", ""))
-            tasks.append(QuantizeTask(P, prefix + "pre_feedforward_layernorm.weight", ""))
-            tasks.append(QuantizeTask(P, prefix + "pre_feedforward_layernorm_2.weight", ""))
-            tasks.append(QuantizeTask(P, prefix + "post_feedforward_layernorm.weight", ""))
-            tasks.append(QuantizeTask(P, prefix + "post_feedforward_layernorm_1.weight", ""))
-            tasks.append(QuantizeTask(P, prefix + "post_feedforward_layernorm_2.weight", ""))
-            tasks.append(QuantizeTask(P, prefix + "self_attn.q_norm.weight", ""))
-            tasks.append(QuantizeTask(P, prefix + "self_attn.k_norm.weight", ""))
-            tasks.append(QuantizeTask(P, prefix + "router.scale", ""))
-            tasks.append(QuantizeTask(P, prefix + "router.per_expert_scale", ""))
-            tasks.append(QuantizeTask(P, prefix + "layer_scalar", ""))
+            # Norms + scalars — passthrough
+            tasks.append(QuantizeTask(prefix + "input_layernorm.weight", pt.copy()))
+            tasks.append(QuantizeTask(prefix + "post_attention_layernorm.weight", pt.copy()))
+            tasks.append(QuantizeTask(prefix + "pre_feedforward_layernorm.weight", pt.copy()))
+            tasks.append(QuantizeTask(prefix + "pre_feedforward_layernorm_2.weight", pt.copy()))
+            tasks.append(QuantizeTask(prefix + "post_feedforward_layernorm.weight", pt.copy()))
+            tasks.append(QuantizeTask(prefix + "post_feedforward_layernorm_1.weight", pt.copy()))
+            tasks.append(QuantizeTask(prefix + "post_feedforward_layernorm_2.weight", pt.copy()))
+            tasks.append(QuantizeTask(prefix + "self_attn.q_norm.weight", pt.copy()))
+            tasks.append(QuantizeTask(prefix + "self_attn.k_norm.weight", pt.copy()))
+            tasks.append(QuantizeTask(prefix + "router.scale", pt.copy()))
+            tasks.append(QuantizeTask(prefix + "router.per_expert_scale", pt.copy()))
+            tasks.append(QuantizeTask(prefix + "layer_scalar", pt.copy()))
 
         # Host-only
-        tasks.append(QuantizeTask(P,   "model.language_model.norm.weight", ""))
-        tasks.append(QuantizeTask(PBQ, "model.language_model.embed_tokens.weight", ""))
+        tasks.append(QuantizeTask("model.language_model.norm.weight", pt.copy()))
+        tasks.append(QuantizeTask("model.language_model.embed_tokens.weight",
+            QuantScheme(SmoothBlockQuantized(
+                rotation=LB, scale_blk=LB,
+                smooth_src="model.language_model.norm.weight"))))
         return tasks^
 
     def report_profile(self, label: String):
@@ -1887,9 +1927,10 @@ struct Gemma4ButterQuant[tp: Int](Movable):
 
         # --- Embed ---
         var t_embed0 = Int(perf_counter_ns())
-        var embed_fence = embed_lookup_blocked[fwht_blk = C.FWHT_BLK_HIDDEN](
+        var embed_fence = embed_lookup_blocked[fwht_blk = C.LM_HEAD_FWHT_BLK](
             host.embed_table(),
             host.embed_scale(),
+            host.weight_base() + L.inv_sqrt_gamma_off,
             tokens_ptr,
             host.x_main(seq_len), Float32(C.EMBED_SCALE),
             self.main_pools[0])
@@ -2349,9 +2390,9 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         var lm_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
         var t_final0 = Int(perf_counter_ns())
         var final_fence = rmsnorm_gamma_fwht_per_block_quantize[
-            C.HIDDEN, C.FWHT_BLK_HIDDEN](
+            C.HIDDEN, C.LM_HEAD_FWHT_BLK](
             last_hidden_bf16,
-            host.weight_base() + L.final_norm_off,
+            host.weight_base() + L.sqrt_gamma_off,
             host.scratch_addr(lm_act_i8_lease),
             host.scratch_addr(lm_work_lease),
             host.scratch_addr(lm_act_blk_scale_lease),
@@ -2362,7 +2403,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         var logit_view = host.scratch_view[RV.LOGITS](logit_lease, 1)
         var t_lm0 = Int(perf_counter_ns())
         var lm_fence = lm_head_gemv[
-            C.VOCAB_SIZE, C.HIDDEN, C.FWHT_BLK_HIDDEN](
+            C.VOCAB_SIZE, C.HIDDEN, C.LM_HEAD_FWHT_BLK](
             host.scratch_addr(lm_act_i8_lease),
             host.weight_base() + L.embed_off,
             host.scratch_addr(lm_act_blk_scale_lease),
