@@ -344,6 +344,13 @@ struct BlockQuantized(Copyable, Movable, ImplicitlyCopyable):
 
 
 @fieldwise_init
+struct SmoothRowQuantized(Copyable, Movable):
+    """Smooth split (sqrt(|gamma|)) + FWHT rotation + single absmax scale per row."""
+    var rotation: Int
+    var smooth_src: String
+
+
+@fieldwise_init
 struct SmoothBlockQuantized(Copyable, Movable):
     """Smooth split (sqrt(|gamma|)) + FWHT rotation + per-block absmax scales."""
     var rotation: Int
@@ -355,6 +362,7 @@ comptime QuantScheme = Variant[
     QuantPassthrough,
     RowQuantized,
     BlockQuantized,
+    SmoothRowQuantized,
     SmoothBlockQuantized,
 ]
 
@@ -368,6 +376,8 @@ def quant_rotation(read s: QuantScheme) -> Int:
         return s[RowQuantized].rotation
     elif s.isa[BlockQuantized]():
         return s[BlockQuantized].rotation
+    elif s.isa[SmoothRowQuantized]():
+        return s[SmoothRowQuantized].copy().rotation
     elif s.isa[SmoothBlockQuantized]():
         return s[SmoothBlockQuantized].copy().rotation
     return 0
@@ -375,7 +385,7 @@ def quant_rotation(read s: QuantScheme) -> Int:
 
 def quant_scale_blocks(read s: QuantScheme, cols: Int) -> Int:
     """0 for passthrough, 1 for per-row, cols/blk for per-block."""
-    if s.isa[RowQuantized]():
+    if s.isa[RowQuantized]() or s.isa[SmoothRowQuantized]():
         return 1
     elif s.isa[BlockQuantized]():
         return cols // s[BlockQuantized].scale_blk
@@ -385,7 +395,9 @@ def quant_scale_blocks(read s: QuantScheme, cols: Int) -> Int:
 
 
 def quant_smooth_source(read s: QuantScheme) -> String:
-    if s.isa[SmoothBlockQuantized]():
+    if s.isa[SmoothRowQuantized]():
+        return s[SmoothRowQuantized].copy().smooth_src
+    elif s.isa[SmoothBlockQuantized]():
         return s[SmoothBlockQuantized].copy().smooth_src
     return ""
 

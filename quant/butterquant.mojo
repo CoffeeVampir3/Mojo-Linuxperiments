@@ -671,7 +671,7 @@ def process_quantize_plan[mask_size: Int](
     """
     var smooth_src = quant_smooth_source(plan.scheme)
     var apply_gamma = smooth_src != ""
-    var is_smooth = apply_gamma and plan.num_blocks > 1
+    var is_smooth = apply_gamma
     var per_block = plan.num_blocks > 1
 
     if apply_gamma:

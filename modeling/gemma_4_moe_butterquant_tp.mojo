@@ -20,7 +20,8 @@ from modeling.model_spec import (
     DEFAULT_ALIGNMENT,
     LogitsView,
     QuantizeTask, QuantScheme,
-    QuantPassthrough, RowQuantized, BlockQuantized, SmoothBlockQuantized,
+    QuantPassthrough, RowQuantized, BlockQuantized,
+    SmoothRowQuantized, SmoothBlockQuantized,
 )
 from kernels.kernel_ops import PoolFence
 from kernels.reductions import ring_allreduce, ring_broadcast
@@ -52,6 +53,7 @@ from experimental3.kernels.dense_ffn import (
     RouterTopkArgs, router_topk_kernel,
 )
 from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr, BF16Ptr
+from experimental3.gamma import compute_sqrt_gamma, compute_inv_sqrt_gamma
 from experimental3.kernels.sliding_attention import (
     AttnGroupArgs, sliding_attn_group_kernel,
 )
@@ -218,6 +220,10 @@ struct LayerBodyColsums(Copyable, ImplicitlyCopyable, Movable):
     var router_colsum: Int
     var experts_gu_colsum: Int
     var experts_down_colsum: Int
+    # Gamma split: sign-preserving sqrt(|gamma|) computed at init, bf16 [HIDDEN]
+    var input_norm_sqrt_gamma: Int
+    var pre_ffn_norm_sqrt_gamma: Int
+    var router_scale_sqrt_gamma: Int
 
 
 @fieldwise_init
@@ -322,11 +328,17 @@ def emit_layer_colsums[tp: Int](mut b: LayerBuilder) -> LayerBodyColsums:
     var router_colsum       = b.colsum(NE * 4)
     var experts_gu_colsum   = b.colsum(experts_local * GU * 4)
     var experts_down_colsum = b.colsum(experts_local * H * C.MOE_NUM_BLOCKS * 4)
+    var input_norm_sqrt_gamma    = b.colsum(H * 2)
+    var pre_ffn_norm_sqrt_gamma  = b.colsum(H * 2)
+    var router_scale_sqrt_gamma  = b.colsum(H * 2)
     return LayerBodyColsums(
         o_colsum=o_colsum, gu_colsum=gu_colsum, down_colsum=down_colsum,
         router_colsum=router_colsum,
         experts_gu_colsum=experts_gu_colsum,
         experts_down_colsum=experts_down_colsum,
+        input_norm_sqrt_gamma=input_norm_sqrt_gamma,
+        pre_ffn_norm_sqrt_gamma=pre_ffn_norm_sqrt_gamma,
+        router_scale_sqrt_gamma=router_scale_sqrt_gamma,
     )
 
 
@@ -792,6 +804,16 @@ def init_layer_body[tp: Int](arena_base: Int, layer_base: Int,
             layer_base + body.experts_down + e * C.HIDDEN * C.MOE_INTERMEDIATE,
             layer_base + colsums.experts_down_colsum + e * C.HIDDEN * C.MOE_NUM_BLOCKS * 4,
             C.HIDDEN, C.MOE_INTERMEDIATE, C.FWHT_BLK)
+    # Gamma split: precompute sign-preserving sqrt(|gamma|) for each norm.
+    compute_sqrt_gamma[C.HIDDEN](
+        BF16Ptr(unsafe_from_address=arena_base + layer_base + body.input_norm),
+        BF16Ptr(unsafe_from_address=arena_base + layer_base + colsums.input_norm_sqrt_gamma))
+    compute_sqrt_gamma[C.HIDDEN](
+        BF16Ptr(unsafe_from_address=arena_base + layer_base + body.pre_ffn_norm),
+        BF16Ptr(unsafe_from_address=arena_base + layer_base + colsums.pre_ffn_norm_sqrt_gamma))
+    compute_sqrt_gamma[C.HIDDEN](
+        BF16Ptr(unsafe_from_address=arena_base + layer_base + body.router_scale),
+        BF16Ptr(unsafe_from_address=arena_base + layer_base + colsums.router_scale_sqrt_gamma))
     # VNNI packing — colsums above must be done first (pack reorders bytes).
     pack_at(arena_base, layer_base + body.gate_proj,   C.INTERMEDIATE * 2, C.HIDDEN, scratch)
     pack_at(arena_base, layer_base + body.down_proj,   C.HIDDEN, C.INTERMEDIATE,     scratch)
@@ -925,24 +947,13 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     L.embed_colsum_off,
                     C.VOCAB_SIZE, C.HIDDEN, C.LM_HEAD_FWHT_BLK)
 
-                # sqrt(|gamma|) and 1/sqrt(|gamma|) for smooth split
-                var gamma_p = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-                    unsafe_from_address=base + L.final_norm_off)
-                var sg = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-                    unsafe_from_address=base + L.sqrt_gamma_off)
-                var isg = UnsafePointer[Float32, MutAnyOrigin](
-                    unsafe_from_address=base + L.inv_sqrt_gamma_off)
-                for k in range(C.HIDDEN):
-                    var gv = Float32(gamma_p[k])
-                    var sign = Float32(1.0)
-                    if gv < 0:
-                        sign = Float32(-1.0)
-                        gv = -gv
-                    if gv < Float32(1e-10):
-                        gv = Float32(1e-10)
-                    var s = sqrt[DType.float32, 1](gv)
-                    sg[k] = Scalar[DType.bfloat16](sign * s)
-                    isg[k] = Float32(1.0) / s
+                var fn_gamma = BF16Ptr(unsafe_from_address=base + L.final_norm_off)
+                compute_sqrt_gamma[C.HIDDEN](
+                    fn_gamma,
+                    BF16Ptr(unsafe_from_address=base + L.sqrt_gamma_off))
+                compute_inv_sqrt_gamma[C.HIDDEN](
+                    fn_gamma,
+                    F32Ptr(unsafe_from_address=base + L.inv_sqrt_gamma_off))
 
             # Fold 1/sqrt(hidden) into router weight scales
             comptime inv_sqrt_h = Float32(1.0 / sqrt(Float64(C.HIDDEN)))
@@ -1031,25 +1042,36 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             var prefix = "model.language_model.layers." + String(i) + "."
             var is_full = (i + 1) % 6 == 0
 
-            # Attention projections
-            tasks.append(QuantizeTask(prefix + "self_attn.q_proj.weight", row_hb.copy()))
-            tasks.append(QuantizeTask(prefix + "self_attn.k_proj.weight", row_hb.copy()))
+            var smooth_attn = QuantScheme(SmoothRowQuantized(
+                rotation=HB,
+                smooth_src=prefix + "input_layernorm.weight"))
+            var smooth_ffn = QuantScheme(SmoothRowQuantized(
+                rotation=HB,
+                smooth_src=prefix + "pre_feedforward_layernorm.weight"))
+            var smooth_router = QuantScheme(SmoothRowQuantized(
+                rotation=HB,
+                smooth_src=prefix + "router.scale"))
+
+            # Attention projections (split from input_layernorm)
+            tasks.append(QuantizeTask(prefix + "self_attn.q_proj.weight", smooth_attn.copy()))
+            tasks.append(QuantizeTask(prefix + "self_attn.k_proj.weight", smooth_attn.copy()))
             if not is_full:
-                tasks.append(QuantizeTask(prefix + "self_attn.v_proj.weight", row_hb.copy()))
+                tasks.append(QuantizeTask(prefix + "self_attn.v_proj.weight", smooth_attn.copy()))
+            # o_proj: no gamma split (input is attention output, not a norm)
             if is_full:
                 tasks.append(QuantizeTask(prefix + "self_attn.o_proj.weight",
                     QuantScheme(RowQuantized(rotation=512))))
             else:
                 tasks.append(QuantizeTask(prefix + "self_attn.o_proj.weight", row_hb.copy()))
 
-            # Dense MLP
-            tasks.append(QuantizeTask(prefix + "mlp.gate_proj.weight", row_hb.copy()))
-            tasks.append(QuantizeTask(prefix + "mlp.up_proj.weight", row_hb.copy()))
+            # Dense MLP (split from pre_feedforward_layernorm)
+            tasks.append(QuantizeTask(prefix + "mlp.gate_proj.weight", smooth_ffn.copy()))
+            tasks.append(QuantizeTask(prefix + "mlp.up_proj.weight", smooth_ffn.copy()))
             tasks.append(QuantizeTask(prefix + "mlp.down_proj.weight",
                 QuantScheme(RowQuantized(rotation=0))))
 
-            # Router + experts
-            tasks.append(QuantizeTask(prefix + "router.proj.weight", row_hb.copy()))
+            # Router (split from router.scale) + experts (rotation=0, no split)
+            tasks.append(QuantizeTask(prefix + "router.proj.weight", smooth_router.copy()))
             tasks.append(QuantizeTask(prefix + "experts.gate_up_proj",
                 QuantScheme(RowQuantized(rotation=0))))
             tasks.append(QuantizeTask(prefix + "experts.down_proj",
@@ -1149,7 +1171,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 def do_attn_quantize[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                     var slb = rv.sliding_layer_base(sliding_idx)
                     return rmsnorm_gamma_fwht_quantize[C.HIDDEN, C.FWHT_BLK_HIDDEN](
-                        rv.x_main(seq_len).ptr, slb + sl.body.input_norm,
+                        rv.x_main(seq_len).ptr, slb + sl.colsums.input_norm_sqrt_gamma,
                         rv.scratch_addr(attn_i8_lease),
                         rv.scratch_addr(attn_work_lease), rv.scratch_addr(attn_scale_lease),
                         EPS,
@@ -1241,7 +1263,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 def do_full_attn_quantize[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                     var flb = rv.full_layer_base(full_idx)
                     return rmsnorm_gamma_fwht_quantize[C.HIDDEN, C.FWHT_BLK_HIDDEN](
-                        rv.x_main(seq_len).ptr, flb + fl.body.input_norm,
+                        rv.x_main(seq_len).ptr, flb + fl.colsums.input_norm_sqrt_gamma,
                         rv.scratch_addr(full_attn_i8_lease),
                         rv.scratch_addr(full_attn_work_lease), rv.scratch_addr(full_attn_scale_lease),
                         EPS,
@@ -1352,7 +1374,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             def do_router_quantize[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
                 return rmsnorm_gamma_fwht_quantize[C.HIDDEN, C.FWHT_BLK_HIDDEN](
-                    rv.x_main(seq_len).ptr, lb + body.router_scale,
+                    rv.x_main(seq_len).ptr, lb + cs.router_scale_sqrt_gamma,
                     rv.scratch_addr(act_i8_lease),
                     rv.scratch_addr(act_work_lease), rv.scratch_addr(act_scale_lease),
                     EPS,
@@ -1398,7 +1420,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
                 return rmsnorm_dual_gamma_fwht_quantize[C.HIDDEN, C.FWHT_BLK_HIDDEN](
                     rv.x_main(seq_len).ptr,
-                    lb + body.pre_ffn_norm,
+                    lb + cs.pre_ffn_norm_sqrt_gamma,
                     lb + body.pre_ffn_norm_2,
                     rv.scratch_addr(act_i8_lease),
                     rv.scratch_addr(expert_act_i8_lease),
