@@ -16,7 +16,7 @@ from std.sys.info import simd_width_of
 from std.collections import InlineArray
 
 from simd_math import sqrt, quantize_i8
-from experimental2.kernels.rmsnorm_fwht_quantize import fwht_apply, fwht_width
+from experimental3.kernels.fwht import fwht_apply, fwht_width
 
 
 # ============================================================================

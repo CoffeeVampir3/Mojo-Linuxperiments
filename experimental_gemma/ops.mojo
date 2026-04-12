@@ -15,7 +15,7 @@ from threading.threading_traits import BurstThreadPool
 from threading.threading_shared import ptr as tptr
 from modeling.model_spec import Encoding, Shaped, Bound, DynView
 from experimental_gemma.activations import tanh_f32
-from experimental2.kernels.rmsnorm_fwht_quantize import fwht_block
+from experimental3.kernels.fwht import fwht_block
 
 
 # =============================================================================

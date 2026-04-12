@@ -9,7 +9,7 @@ from std.memory.unsafe_pointer import alloc
 from std.sys.info import simd_width_of
 
 from simd_math import exp_f32, sqrt
-from experimental2.kernels.rmsnorm_fwht_quantize import fwht_block
+from experimental3.kernels.fwht import fwht_block
 
 
 @always_inline

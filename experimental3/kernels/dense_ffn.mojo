@@ -14,7 +14,7 @@ from threading.threading_traits import BurstThreadPool
 
 from kernels.kernel_ops import PoolFence
 from experimental2.kernels.int8_gemv import gemv_row
-from experimental2.kernels.rmsnorm_fwht_quantize import fwht_block
+from experimental3.kernels.fwht import fwht_block
 from experimental2.kernels.quantize import absmax_quantize_i8
 from experimental3.kernels.gelu_tanh_fwht_quantize import gelu_tanh_f32
 from experimental3.moe import gemv_row_blocked

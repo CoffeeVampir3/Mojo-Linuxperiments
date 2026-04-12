@@ -13,7 +13,7 @@ from std.sys.info import simd_width_of
 from std.collections import InlineArray
 
 from simd_math import exp_f32, sqrt, roundeven
-from experimental2.kernels.rmsnorm_fwht_quantize import fwht_block
+from experimental3.kernels.fwht import fwht_block
 from experimental2.kernels.quantize import absmax_quantize_i8
 
 

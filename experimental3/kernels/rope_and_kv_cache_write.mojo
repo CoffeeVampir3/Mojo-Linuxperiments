@@ -20,7 +20,7 @@ from std.sys.info import simd_width_of
 
 from experimental.amx import VNNI_BLK
 from experimental3.kv_cache import Gemma4KVCache
-from experimental2.kernels.rmsnorm_fwht_quantize import fwht_block
+from experimental3.kernels.fwht import fwht_block
 from experimental2.kernels.quantize import absmax_quantize_i8
 from simd_math import sqrt
 
