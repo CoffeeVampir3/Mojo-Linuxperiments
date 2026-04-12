@@ -1,19 +1,4 @@
-"""Gemma 4 26B-A4B ButterQuant — int8 MoE with NUMA-aware sparse expert dispatch.
-
-Layout: [25 sliding layers][5 full layers][state][host-only: final_norm, embed]
-State:  [x_main][x_residual][scratch][rope tables][KV caches]
-
-Weight layout per quantized projection:
-  i8 weight (contiguous across fused groups like Q|K|V)
-  f32 per-row scale
-Column sums and VNNI packing computed at load time.
-
-One pool per rank (main_pool, all cores). Expert and dense FFN phases run
-serially through it — measured experiments showed that overlapping them on
-separate pools just contended for memory bandwidth and produced no wall-time
-gain on a single-NUMA-node memory subsystem.
-Rank bodies never compute — dispatch and return only.
-"""
+"""Gemma 4 26B-A4B ButterQuant — int8 MoE, NUMA-aware tensor parallel."""
 
 from std.pathlib import Path
 from std.memory import UnsafePointer, memcpy
@@ -37,7 +22,7 @@ from modeling.model_spec import (
     QuantizeTask, QuantScheme,
     QuantPassthrough, RowQuantized, BlockQuantized, SmoothBlockQuantized,
 )
-from kernels.kernel_ops import PoolFence, BF16Ptr
+from kernels.kernel_ops import PoolFence
 from kernels.reductions import ring_allreduce, ring_broadcast
 from experimental.linear_borrow_pool import ScratchPool, ScratchLease
 from experimental3.kernels.rmsnorm import (
@@ -55,8 +40,8 @@ from experimental3.profiler import (
 from experimental3.init_weights import (
     colsum_at, block_colsum_at, block_colsum_row_major_at, pack_at,
 )
-from experimental2.kernels.int8_gemv import int8_gemv
-from experimental2.kernels.float_gemv import float_gemv
+from experimental3.kernels.int8_gemv import int8_gemv
+from experimental3.kernels.float_gemv import float_gemv
 from experimental3.moe import (
     gemma4_moe_phase1, gemma4_moe_phase2,
 )
@@ -65,13 +50,13 @@ from experimental3.kernels.dense_ffn import (
     fused_gu_gelu_tanh,
     int8_gemv_blocked,
     RouterTopkArgs, router_topk_kernel,
-    I8Ptr, U8Ptr, F32Ptr,
 )
+from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr, BF16Ptr
 from experimental3.kernels.sliding_attention import (
-    SlidingAttnGroupArgs, sliding_attn_group_kernel,
+    AttnGroupArgs, sliding_attn_group_kernel,
 )
 from experimental3.kernels.full_attention import (
-    FullAttnGroupArgs, full_attn_group_kernel,
+    full_attn_group_kernel,
 )
 from experimental3.kernels.lm_head import lm_head_gemv
 from experimental_gemma.router import Gemma4TopKResult
@@ -121,29 +106,11 @@ comptime C = Gemma4Config
 
 
 # =============================================================================
-# Runtime layout — replaces the old PlacedSlot/SlidingLayer[tp]/FullLayer[tp]
-# /Gemma4Model[tp] comptime cascade with plain-Int structs built once at
-# load time and then read by the forward path.
-#
-# Offsets here mirror the old `next_offset` chain byte-for-byte so weights
-# loaded from the same checkpoint land at the same addresses. The cursor
-# helper implements the same semantics: each slot's offset is the raw
-# cursor value at its turn, and the cursor advances to
-# `align_up(offset) + bytes`, so a 2-byte `layer_scalar` naturally leaves
-# the following colsum region unaligned (matching the old colsum chain).
+# Runtime layout
 # =============================================================================
 
 
 struct LayerShard:
-    """Placement kinds a weight catalog entry can express.
-
-    ROW / COL / REPL are Megatron-standard. HOST pins the weight to rank 0
-    (final_norm, embed table, lm_head). Gemma4 stores experts as a flat
-    [NUM_EXPERTS*M, K] tensor, so expert-block sharding (rank r holds
-    experts [r*N/tp, (r+1)*N/tp)) collapses cleanly onto ROW — the flat
-    row range [r*N/tp*M, (r+1)*N/tp*M) is one contiguous slice of the
-    source safetensors. No dedicated EXPERT kind needed.
-    """
     comptime ROW  = 0   # split rows across ranks (local_rows = global_rows // tp)
     comptime COL  = 1   # split cols across ranks (local_cols = global_cols // tp)
     comptime REPL = 2   # full copy on every rank
@@ -152,18 +119,7 @@ struct LayerShard:
 
 @fieldwise_init
 struct LayerBuilder(Movable):
-    """Single source of truth for a layer's weight catalog AND offsets.
-
-    One `emit()` per weight records both (a) the WeightDesc the loader
-    consumes, and (b) the aligned byte offset the forward path reads. The
-    caller collects return values into a named-fields struct
-    (SlidingLayerOffsets / FullLayerOffsets) so forward code can reference
-    them by name without template-indexing into a list.
-
-    Layout math mirrors the old `next_offset` chain: weights are aligned,
-    colsums are packed (no alignment) and start wherever the cursor lands
-    after the last weight — for gemma4 that's 2 bytes past the layer_scalar.
-    """
+    """Builds weight catalog entries and byte offsets in a single pass."""
     var tp: Int
     var cursor: Int
     var layer_prefix: String
@@ -202,49 +158,30 @@ struct LayerBuilder(Movable):
 
     @always_inline
     def colsum(mut self, nbytes: Int) -> Int:
-        """Packed colsum region — no alignment, no WeightDesc.
-
-        Colsums are computed at init time from the already-loaded i8
-        weights; the loader never reads or writes them, so they don't
-        appear in the catalog. The first colsum after `layer_scalar`
-        inherits the unaligned cursor position, matching the old chain.
-        """
+        """Reserve unaligned colsum region (computed at init, not loaded)."""
         var off = self.cursor
         self.cursor += nbytes
         return off
 
-    # ------ typed shortcuts — one call per weight, one line per call ------
-    # Each wraps `emit` with a fixed dtype + quantizable flag so spec functions
-    # read as a schematic list of (name, shape, placement) tuples.
-
     @always_inline
     def q(mut self, mut entries: List[WeightDesc], suffix: String,
           rows: Int, cols: Int, shard: Int) -> Int:
-        """i8 body of a quantized projection (pack_at runs at init time)."""
         return self.emit(entries, suffix, rows, cols, DType.int8, 1, shard, True)
 
     @always_inline
     def f(mut self, mut entries: List[WeightDesc], suffix: String,
           rows: Int, cols: Int, shard: Int) -> Int:
-        """f32 passthrough (per-row or per-block weight scale)."""
         return self.emit(entries, suffix, rows, cols, DType.float32, 4, shard, False)
 
     @always_inline
     def bf(mut self, mut entries: List[WeightDesc], suffix: String,
            rows: Int, cols: Int, shard: Int) -> Int:
-        """bf16 passthrough (norm gamma, router gates, per-expert biases, scalars)."""
         return self.emit(entries, suffix, rows, cols, DType.bfloat16, 2, shard, False)
 
 
 @fieldwise_init
 struct LayerBodyWeights(Copyable, ImplicitlyCopyable, Movable):
-    """Fields identical between sliding and full attention layers.
-
-    Sliding and full diverge only in the attention block; everything from
-    `input_norm` onwards is shared. Both offset structs embed one of these
-    so the forward path can bind a single `body` local per layer instead
-    of branching field-by-field.
-    """
+    """Offsets shared between sliding and full layers."""
     var input_norm: Int
     # Dense MLP
     var pre_ffn_norm: Int
@@ -275,12 +212,6 @@ struct LayerBodyWeights(Copyable, ImplicitlyCopyable, Movable):
 
 @fieldwise_init
 struct LayerBodyColsums(Copyable, ImplicitlyCopyable, Movable):
-    """Column sums whose layout is identical between sliding and full.
-
-    o_colsum is included because both flavors use NUM_HEADS = 16 heads,
-    so the per-rank head count collapses to `NUM_HEADS // tp` regardless
-    of which attention flavor.
-    """
     var o_colsum: Int
     var gu_colsum: Int
     var down_colsum: Int
@@ -291,8 +222,7 @@ struct LayerBodyColsums(Copyable, ImplicitlyCopyable, Movable):
 
 @fieldwise_init
 struct SlidingLayerOffsets(Copyable, ImplicitlyCopyable, Movable):
-    """Sliding-attention layer (Q/K/V row-sharded, O col-sharded)."""
-    # Attention — the only part that differs from full layers.
+    """Sliding-attention layer offsets."""
     var q_proj: Int
     var k_proj: Int
     var v_proj: Int
@@ -303,19 +233,15 @@ struct SlidingLayerOffsets(Copyable, ImplicitlyCopyable, Movable):
     var o_proj_sc: Int
     var q_norm: Int
     var k_norm: Int
-    # Shared fields (input_norm → layer_scalar).
     var body: LayerBodyWeights
-    # Kind-specific colsum: [Q|K|V] contiguously packed.
     var qkv_colsum: Int
-    # Shared colsums (o, gu, down, router, experts_gu, experts_down).
     var colsums: LayerBodyColsums
     var stride: Int
 
 
 @fieldwise_init
 struct FullLayerOffsets(Copyable, ImplicitlyCopyable, Movable):
-    """Full-attention layer (K=V shared, no V projection)."""
-    # Attention — the only part that differs from sliding layers.
+    """Full-attention layer offsets (K=V shared)."""
     var q_proj: Int
     var k_proj: Int
     var q_proj_sc: Int
@@ -324,11 +250,8 @@ struct FullLayerOffsets(Copyable, ImplicitlyCopyable, Movable):
     var o_proj_sc: Int
     var q_norm: Int
     var k_norm: Int
-    # Shared fields.
     var body: LayerBodyWeights
-    # Kind-specific colsum: [Q|K] contiguously packed (no V).
     var qk_colsum: Int
-    # Shared colsums.
     var colsums: LayerBodyColsums
     var stride: Int
 
@@ -336,13 +259,6 @@ struct FullLayerOffsets(Copyable, ImplicitlyCopyable, Movable):
 def emit_layer_body[tp: Int](
     mut b: LayerBuilder, mut entries: List[WeightDesc],
 ) -> LayerBodyWeights:
-    """Emit every weight that's identical between sliding and full layers:
-    input_norm, dense MLP, router, MoE experts, post-block norms, scalar.
-
-    Called from both layer specs in between the attention block (Q/K/V/O
-    projections) and the kind-specific attention colsum, so the cursor
-    order matches the original single-pass layout byte-for-byte.
-    """
     comptime ROW, REPL = LayerShard.ROW, LayerShard.REPL
     comptime H   = C.HIDDEN
     comptime INT = C.INTERMEDIATE
@@ -351,8 +267,6 @@ def emit_layer_body[tp: Int](
     comptime MI  = C.MOE_INTERMEDIATE
 
     var input_norm     = b.bf(entries, "input_layernorm.weight",                H, 1,   REPL)
-    # Dense MLP: currently replicated; Megatron-ish (gate/up ROW, down COL)
-    # would need kernel/allreduce rewiring not yet in place.
     var pre_ffn_norm   = b.bf(entries, "pre_feedforward_layernorm.weight",      H, 1,   REPL)
     var gate_proj      = b.q (entries, "mlp.gate_proj.weight",                  INT, H, REPL)
     var up_proj        = b.q (entries, "mlp.up_proj.weight",                    INT, H, REPL)
@@ -360,21 +274,15 @@ def emit_layer_body[tp: Int](
     var up_proj_sc     = b.f (entries, "mlp.up_proj.weight_scale",              INT, 1, REPL)
     var down_proj      = b.q (entries, "mlp.down_proj.weight",                  H, INT, REPL)
     var down_proj_sc   = b.f (entries, "mlp.down_proj.weight_scale",            H, 1,   REPL)
-    # Router: replicated (every rank reproduces the same top-k).
     var router_scale   = b.bf(entries, "router.scale",                          H, 1,   REPL)
     var router_proj    = b.q (entries, "router.proj.weight",                    NE, H,  REPL)
     var router_proj_sc = b.f (entries, "router.proj.weight_scale",              NE, 1,  REPL)
     var router_pes     = b.bf(entries, "router.per_expert_scale",               NE, 1,  REPL)
-    # MoE experts: block-sharded along the expert dim. The 3D source
-    # `[NUM_EXPERTS, M, K]` flattens to `[NE*M, K]`, so ROW sharding is
-    # exactly a contiguous expert block per rank: rank r holds experts
-    # [r*NE/tp, (r+1)*NE/tp).
     var pre_ffn_norm_2     = b.bf(entries, "pre_feedforward_layernorm_2.weight", H, 1,        REPL)
     var experts_gate_up    = b.q (entries, "experts.gate_up_proj",               NE * GU, H,  ROW)
     var experts_gate_up_sc = b.f (entries, "experts.gate_up_proj_scale",         NE * GU, 1,  ROW)
     var experts_down       = b.q (entries, "experts.down_proj",                  NE * H,  MI, ROW)
     var experts_down_sc    = b.f (entries, "experts.down_proj_scale",            NE * H,  1,  ROW)
-    # Non-absorbable norms + per-layer scalar.
     var post_attn_norm     = b.bf(entries, "post_attention_layernorm.weight",    H, 1, REPL)
     var post_ffn_norm_1    = b.bf(entries, "post_feedforward_layernorm_1.weight", H, 1, REPL)
     var post_ffn_norm_2_rt = b.bf(entries, "post_feedforward_layernorm_2.weight", H, 1, REPL)
@@ -401,13 +309,6 @@ def emit_layer_body[tp: Int](
 
 
 def emit_layer_colsums[tp: Int](mut b: LayerBuilder) -> LayerBodyColsums:
-    """Reserve the shared colsum region (o/gu/down/router/experts_*).
-
-    `o_colsum` size uses `NUM_HEADS // tp` — gemma4 both attention flavors
-    have NUM_HEADS=16, so the per-head count is identical (just Q_DIM and
-    HEAD_DIM differ in compensating directions). The other colsums are
-    size-identical between flavors.
-    """
     comptime H   = C.HIDDEN
     comptime INT = C.INTERMEDIATE
     comptime NE  = C.NUM_EXPERTS
@@ -432,18 +333,12 @@ def emit_layer_colsums[tp: Int](mut b: LayerBuilder) -> LayerBodyColsums:
 def sliding_layer_spec[tp: Int](
     prefix: String, layer_base: Int, mut entries: List[WeightDesc],
 ) -> SlidingLayerOffsets:
-    """One sliding-attention layer (25 of 30 in Gemma4-26B).
-
-    Only the attention block is kind-specific (Q/K/V, O, per-head norms
-    using HEAD_DIM_SLIDING). Everything else runs through `emit_layer_body`
-    / `emit_layer_colsums`.
-    """
     var b = LayerBuilder(tp, prefix, layer_base)
     comptime ROW, COL, REPL = LayerShard.ROW, LayerShard.COL, LayerShard.REPL
     comptime H   = C.HIDDEN
     comptime HDS = C.HEAD_DIM_SLIDING
 
-    # ---- Attention: Q/K/V row-sharded, O col-sharded (Megatron style). ----
+    # Attention
     var q_proj    = b.q (entries, "self_attn.q_proj.weight",        C.Q_DIM_SLIDING,  H,  ROW)
     var k_proj    = b.q (entries, "self_attn.k_proj.weight",        C.KV_DIM_SLIDING, H,  ROW)
     var v_proj    = b.q (entries, "self_attn.v_proj.weight",        C.KV_DIM_SLIDING, H,  ROW)
@@ -455,10 +350,10 @@ def sliding_layer_spec[tp: Int](
     var q_norm    = b.bf(entries, "self_attn.q_norm.weight",        HDS, 1,            REPL)
     var k_norm    = b.bf(entries, "self_attn.k_norm.weight",        HDS, 1,            REPL)
 
-    # ---- Shared body (input_norm → layer_scalar). ----
+    # Shared body
     var body = emit_layer_body[tp](b, entries)
 
-    # ---- Column sums: kind-specific [Q|K|V] packed, then the shared block. ----
+    # Colsums
     comptime qkv_n_loc = (C.Q_DIM_SLIDING + 2 * C.KV_DIM_SLIDING) // tp
     var qkv_colsum = b.colsum(qkv_n_loc * 4)
     var colsums = emit_layer_colsums[tp](b)
@@ -477,17 +372,12 @@ def sliding_layer_spec[tp: Int](
 def full_layer_spec[tp: Int](
     prefix: String, layer_base: Int, mut entries: List[WeightDesc],
 ) -> FullLayerOffsets:
-    """One full-attention layer (5 of 30 in Gemma4-26B).
-
-    Like sliding, but K=V shared (no V projection) and HEAD_DIM_FULL.
-    Body + colsum emission is identical to sliding.
-    """
     var b = LayerBuilder(tp, prefix, layer_base)
     comptime ROW, COL, REPL = LayerShard.ROW, LayerShard.COL, LayerShard.REPL
     comptime H   = C.HIDDEN
     comptime HDF = C.HEAD_DIM_FULL
 
-    # ---- Attention: Q/K row-sharded (no V), O col-sharded. ----
+    # Attention
     var q_proj    = b.q (entries, "self_attn.q_proj.weight",       C.Q_DIM_FULL,  H, ROW)
     var k_proj    = b.q (entries, "self_attn.k_proj.weight",       C.KV_DIM_FULL, H, ROW)
     var q_proj_sc = b.f (entries, "self_attn.q_proj.weight_scale", C.Q_DIM_FULL,  1, ROW)
@@ -497,10 +387,10 @@ def full_layer_spec[tp: Int](
     var q_norm    = b.bf(entries, "self_attn.q_norm.weight",       HDF, 1,          REPL)
     var k_norm    = b.bf(entries, "self_attn.k_norm.weight",       HDF, 1,          REPL)
 
-    # ---- Shared body. ----
+    # Shared body
     var body = emit_layer_body[tp](b, entries)
 
-    # ---- Column sums: kind-specific [Q|K] packed, then the shared block. ----
+    # Colsums
     comptime qk_n_loc = (C.Q_DIM_FULL + C.KV_DIM_FULL) // tp
     var qk_colsum = b.colsum(qk_n_loc * 4)
     var colsums = emit_layer_colsums[tp](b)
@@ -564,9 +454,6 @@ struct Gemma4ModelLayout(Copyable, ImplicitlyCopyable, Movable):
 
 
 def calculate_peak_scratch[tp: Int]() -> Int:
-    """Port of the old comptime Gemma4Model[tp].calculate_peak_scratch —
-    same arithmetic, same peak. Called once at layout-build time.
-    """
     comptime bf16_bytes = size_of[Scalar[DType.bfloat16]]()
     comptime i8_bytes = size_of[Scalar[DType.int8]]()
     comptime f32_bytes = size_of[Float32]()
@@ -637,35 +524,14 @@ def calculate_peak_scratch[tp: Int]() -> Int:
 
 @fieldwise_init
 struct Gemma4LoadPlan(Movable):
-    """Single-pass result from build_gemma4_load_plan: both the whole-model
-    layout (offsets struct) AND the weight catalog (List[WeightDesc]) that
-    the loader consumes, produced from the same emit() calls so they cannot
-    drift.
-    """
     var layout: Gemma4ModelLayout
     var descs: List[WeightDesc]
 
 
 def build_gemma4_load_plan[tp: Int]() -> Gemma4LoadPlan:
-    """Build layout + catalog in one pass.
-
-    For each of the 30 layers, call `sliding_layer_spec` or `full_layer_spec`
-    once with the layer's real `prefix` and absolute `layer_base`. Each
-    spec function is the single source of truth for its layer kind: one
-    `emit()` per weight, one entry in the catalog, one offset in the
-    returned struct. The first sliding call also gives us the canonical
-    SlidingLayerOffsets (identical across all 25 sliding layers) and the
-    sliding stride; same for the first full call.
-
-    Non-loaded regions (colsums, state, rope, KV caches, host-only) are
-    computed after the layer pass, using strides from the first-call
-    offsets.
-    """
     var descs = List[WeightDesc]()
 
-    # Template pass: probe strides and canonical per-layer offsets.
-    # Writes throwaway entries (empty prefix, base=0) into `scratch` —
-    # the real entries come from the second pass with correct names.
+    # Probe strides from a template pass
     var scratch = List[WeightDesc]()
     var sliding_offsets = sliding_layer_spec[tp]("", 0, scratch)
     var full_offsets    = full_layer_spec[tp]("", 0, scratch)
@@ -676,9 +542,7 @@ def build_gemma4_load_plan[tp: Int]() -> Gemma4LoadPlan:
     var full_off          = sliding_off + C.NUM_SLIDING_LAYERS * sliding_stride
     var distributed_bytes = full_off + C.NUM_FULL_LAYERS * full_stride
 
-    # Real pass: emit entries for every layer, in layer-index order, into
-    # the catalog. The offsets we discard (all sliding layers share the
-    # same offsets struct; same for full) — we already captured them above.
+    # Emit catalog entries for all layers
     var sliding_idx = 0
     var full_idx = 0
     for i in range(C.NUM_LAYERS):
@@ -692,7 +556,7 @@ def build_gemma4_load_plan[tp: Int]() -> Gemma4LoadPlan:
             _ = sliding_layer_spec[tp](prefix, base, descs)
             sliding_idx += 1
 
-    # State block layout (bf16 x_main + x_residual, then scratch, rope, KV).
+    # State block layout
     comptime bf16 = size_of[Scalar[DType.bfloat16]]()
     comptime f32  = size_of[Float32]()
     var x_main_off = 0
@@ -722,11 +586,7 @@ def build_gemma4_load_plan[tp: Int]() -> Gemma4LoadPlan:
     var full_cache_off    = sliding_cache_off + C.NUM_SLIDING_LAYERS * sliding_cache_stride
     var state_bytes       = full_cache_off + C.NUM_FULL_LAYERS * full_cache_stride
 
-    # ---- Host-only section: final_norm + tied embed table + embed scales,
-    # all pinned to rank 0. Routed through a LayerBuilder with layer_base=0
-    # and cursor pre-seeded to `host_only_off` so returned offsets AND
-    # WeightDesc arena_offsets are both absolute (host-only has a single
-    # "layer", no per-instance base offset). ----
+    # Host-only section
     var host_only_off = ((distributed_bytes + state_bytes + DEFAULT_ALIGNMENT - 1) // DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT
     comptime vocab_num_blocks = C.HIDDEN // C.LM_HEAD_FWHT_BLK
     comptime HOST = LayerShard.HOST
@@ -738,10 +598,10 @@ def build_gemma4_load_plan[tp: Int]() -> Gemma4LoadPlan:
                                 C.VOCAB_SIZE, C.HIDDEN,    HOST)
     var embed_sc_off   = hb.f (descs, "model.language_model.embed_tokens.weight_scale",
                                 C.VOCAB_SIZE, vocab_num_blocks, HOST)
-    # Per-block colsums for the embed table — reserved scratch, not loaded.
+    # Embed colsums (computed at init)
     var embed_colsum_off = hb.colsum(C.VOCAB_SIZE * vocab_num_blocks * 4)
     var embed_colsum_bytes = C.VOCAB_SIZE * vocab_num_blocks * 4
-    # sqrt(|gamma|) and 1/sqrt(|gamma|) for the smooth split — computed at init.
+    # Smooth-split gamma (computed at init)
     var sqrt_gamma_off = embed_colsum_off + embed_colsum_bytes
     var inv_sqrt_gamma_off = sqrt_gamma_off + C.HIDDEN * 2  # sqrt_gamma is bf16
 
@@ -779,10 +639,7 @@ def build_gemma4_load_plan[tp: Int]() -> Gemma4LoadPlan:
 
 @fieldwise_init
 struct RankView[tp: Int](Copyable, Movable):
-    # Shape-carrying type aliases — the kernels consume Bound[T] / DynView[T]
-    # whose T is Encoding & Shaped, so T only needs DTYPE/ROWS/COLS. These
-    # plain Slot aliases replace the equivalents on the old Gemma4Model[tp]
-    # without carrying any offset state.
+    # Shape aliases for Bound[T] / DynView[T]
     comptime X_MAIN     = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.HIDDEN, Self.tp]
     comptime X_RESIDUAL = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.HIDDEN, Self.tp]
     comptime SLIDING_ROPE_HALF = C.HEAD_DIM_SLIDING // 2
@@ -791,7 +648,7 @@ struct RankView[tp: Int](Copyable, Movable):
     comptime FULL_ROPE_HALF = 64
     comptime FULL_COS = Slot[F32, Replicated, C.MAX_SEQ_LEN, Self.FULL_ROPE_HALF, Self.tp]
     comptime FULL_SIN = Slot[F32, Replicated, C.MAX_SEQ_LEN, Self.FULL_ROPE_HALF, Self.tp]
-    # Host-only shape aliases (used via embed_table/embed_scale accessors).
+    # Host-only shapes
     comptime EMBED      = Slot[I8, Replicated, C.VOCAB_SIZE, C.HIDDEN, Self.tp]
     comptime VOCAB_NUM_BLOCKS = C.HIDDEN // C.LM_HEAD_FWHT_BLK
     comptime EMBED_SC   = Slot[F32, Replicated, C.VOCAB_SIZE, Self.VOCAB_NUM_BLOCKS, Self.tp]
@@ -847,7 +704,7 @@ struct RankView[tp: Int](Copyable, Movable):
     def full_layer_base(self, full_idx: Int) -> Int:
         return self.weight_base() + self.L().full_off + full_idx * self.L().full_stride
 
-    # Host-only accessors — replace the old `host_weight[T]()` template.
+    # Host-only accessors
     def embed_table(self) -> Bound[Self.EMBED]:
         return Bound[Self.EMBED](self.weight_base() + self.L().embed_off)
     def embed_scale(self) -> Bound[Self.EMBED_SC]:
@@ -1060,7 +917,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                         L.sliding, pack_scratch)
                     sliding_idx += 1
 
-            # LM head per-block colsums (host-only, computed once on the host rank).
+            # LM head colsums + smooth-split gamma (host rank only)
             if rank == HOST_RANK:
                 block_colsum_row_major_at(
                     base,
@@ -1068,7 +925,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     L.embed_colsum_off,
                     C.VOCAB_SIZE, C.HIDDEN, C.LM_HEAD_FWHT_BLK)
 
-                # Precompute sqrt(|gamma|) and 1/sqrt(|gamma|) for the smooth split.
+                # sqrt(|gamma|) and 1/sqrt(|gamma|) for smooth split
                 var gamma_p = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
                     unsafe_from_address=base + L.final_norm_off)
                 var sg = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
@@ -1087,7 +944,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     sg[k] = Scalar[DType.bfloat16](sign * s)
                     isg[k] = Float32(1.0) / s
 
-            # Bake 1/sqrt(hidden) into router weight scales (one-time).
+            # Fold 1/sqrt(hidden) into router weight scales
             comptime inv_sqrt_h = Float32(1.0 / sqrt(Float64(C.HIDDEN)))
             sliding_idx = 0
             full_idx = 0
@@ -1114,9 +971,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             return None
         print("found", len(shards), "shard(s)")
 
-        # Build the whole-model runtime layout and weight catalog in one
-        # pass. Single source of truth for offsets + descs — they can't
-        # drift because each sliding/full spec emit produces both.
         var plan = build_gemma4_load_plan[Self.tp]()
 
         var numa = NumaInfo()
@@ -1166,12 +1020,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
 
     @staticmethod
     def build_quantizer_tasks() -> List[QuantizeTask]:
-        """Runtime task list for the butterquant driver.
-
-        Gemma4 uses runtime norms everywhere — no weight absorbs a gamma,
-        so gamma_src is empty for every task. Ordering is free; we walk
-        layers sequentially to keep the output file readable.
-        """
         var tasks = List[QuantizeTask]()
         comptime HB = C.FWHT_BLK_HIDDEN
         comptime LB = C.LM_HEAD_FWHT_BLK
@@ -1338,10 +1186,10 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     var slb = rv.sliding_layer_base(sliding_idx)
                     var q_norm_addr = slb + sl.q_norm
                     var k_norm_addr = slb + sl.k_norm
-                    var jobs = InlineArray[SlidingAttnGroupArgs, 8](
-                        fill=SlidingAttnGroupArgs(0,0,0,0,0,0,0,0,0,0,0,0,0,Float32(0)))
+                    var jobs = InlineArray[AttnGroupArgs, 8](
+                        fill=AttnGroupArgs())
                     for g in range(NKV):
-                        jobs[g] = SlidingAttnGroupArgs(
+                        jobs[g] = AttnGroupArgs(
                             q_base + g * HPG * C.HEAD_DIM_SLIDING * 2,
                             k_base + g * C.HEAD_DIM_SLIDING * 2,
                             v_base + g * C.HEAD_DIM_SLIDING * 2,
@@ -1352,7 +1200,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                             rv.scratch_addr(attn_qi_lease) + g * HPG * C.HEAD_DIM_SLIDING,
                             rv.scratch_addr(attn_head_sc_lease) + g * HPG * 4,
                             EPS)
-                    pool.dispatch[SlidingAttnGroupArgs,
+                    pool.dispatch[AttnGroupArgs,
                         sliding_attn_group_kernel[C.HEAD_DIM_SLIDING, HPG,
                             C.SLIDING_WINDOW, C.NUM_KV_HEADS_SLIDING // Self.tp, C.NUM_HEADS // Self.tp]](
                         UnsafePointer(to=jobs[0]), NKV)
@@ -1379,7 +1227,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 attn_work_lease^.release()
                 attn_i8_lease^.release()
             else:
-                # Full attention — int8 Q/K projection, quantized cache/O/FFN unchanged
+                # Full attention
                 comptime FULL_HPG = C.NUM_HEADS // C.NUM_KV_HEADS_FULL
                 comptime FULL_NKV = C.NUM_KV_HEADS_FULL // Self.tp
                 comptime ROPE_DIMS_FULL = 128
@@ -1415,7 +1263,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 full_attn_work_lease^.release()
                 full_attn_i8_lease^.release()
 
-                # Scoring + V-agg: 2 workers (one per KV group, GQA 8:1)
+                # Scoring + V-agg
                 var attn_qi_lease = self.scratch.borrow[Scalar[DType.int8], Q_DIM_LOCAL_FULL]()
                 var attn_head_sc_lease = self.scratch.borrow[Float32, Q_DIM_LOCAL_FULL // C.HEAD_DIM_FULL]()
 
@@ -1430,12 +1278,13 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     var flb = rv.full_layer_base(full_idx)
                     var q_norm_addr = flb + fl.q_norm
                     var k_norm_addr = flb + fl.k_norm
-                    var jobs = InlineArray[FullAttnGroupArgs, 4](
-                        fill=FullAttnGroupArgs(0,0,0,0,0,0,0,0,0,0,0,0,Float32(0)))
+                    var jobs = InlineArray[AttnGroupArgs, 4](
+                        fill=AttnGroupArgs())
                     for g in range(FULL_NKV):
-                        jobs[g] = FullAttnGroupArgs(
+                        var k_addr = k_base + g * C.HEAD_DIM_FULL * 2
+                        jobs[g] = AttnGroupArgs(
                             q_base + g * FULL_HPG * C.HEAD_DIM_FULL * 2,
-                            k_base + g * C.HEAD_DIM_FULL * 2,
+                            k_addr, k_addr,
                             q_norm_addr, k_norm_addr,
                             cos_addr, sin_addr,
                             rv.full_cache_base(full_idx), g,
@@ -1443,7 +1292,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                             rv.scratch_addr(attn_qi_lease) + g * FULL_HPG * C.HEAD_DIM_FULL,
                             rv.scratch_addr(attn_head_sc_lease) + g * FULL_HPG * 4,
                             EPS)
-                    pool.dispatch[FullAttnGroupArgs,
+                    pool.dispatch[AttnGroupArgs,
                         full_attn_group_kernel[C.HEAD_DIM_FULL, ROPE_DIMS_FULL, FULL_HPG,
                             C.MAX_SEQ_LEN, C.NUM_KV_HEADS_FULL // Self.tp, C.NUM_HEADS // Self.tp]](
                         UnsafePointer(to=jobs[0]), FULL_NKV)
@@ -1468,13 +1317,10 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 attn_qi_lease^.release()
                 qk_lease^.release()
 
-            # Shared-body offset bindings: bound once per layer so the FFN
-            # closures below capture plain `body` / `cs` locals instead of
-            # branching field-by-field inside each closure.
             var body = fl.body if is_full else sl.body
             var cs   = fl.colsums if is_full else sl.colsums
 
-            # Allreduce + post-attn norm (both layer types)
+            # Allreduce + post-attn norm
             var t_attn_reduce0 = Int(perf_counter_ns())
             ring_allreduce[RV.X_RESIDUAL, Self.tp](
                 rnks.x_residual_ptrs(seq_len), seq_len, mp)
@@ -1493,7 +1339,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             sample.post_attn_norm.add(rnks.timed_parallel[do_post_attn_norm](mp))
 
             # =============================================================
-            # FFN BLOCK (identical for sliding and full layers)
+            # FFN BLOCK
             # =============================================================
 
             var act_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.HIDDEN]()
@@ -1546,11 +1392,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             var expert_out_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.TOP_K * C.HIDDEN]()
             var local_count_lease = self.scratch.borrow[Int32, 1]()
 
-            # ffn_quantize: one rank-local sweep over x_main produces both
-            # dense (pre_ffn_norm γ) and expert (pre_ffn_norm_2 γ) quantized
-            # activations. Iterate-once, write-twice — the RMSNorm reduction
-            # and the bf16 load are shared. Runs sequentially on mp before
-            # the expert/dense parallel split.
+            # Dual-gamma quantize: dense + expert activations in one pass
             @parameter
             def do_ffn_quantize[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
@@ -1568,18 +1410,14 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     seq_len, pool)
             sample.ffn_quantize.add(rnks.timed_parallel[do_ffn_quantize](mp))
 
-            # Expert phase 1: serialized — timed_parallel dispatches and joins
-            # in one shot. Body returns the helper's real fence; no fire-and-
-            # forget, no manual drain. Hypothesis: dense and expert phase 1 are
-            # both memory-bound, so overlap doesn't actually save wall time.
+            # Expert phase 1
             @parameter
             def do_expert_phase1[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
                 var routing = UnsafePointer[Gemma4TopKResult[C.TOP_K], MutAnyOrigin](
                     unsafe_from_address=rv.scratch_addr(routing_lease))[]
 
-                # Stash local_count for downstream consumers (pre_reduce).
-                # Block sharding: rank r owns experts [r*EPR, (r+1)*EPR).
+                # Count local experts for this rank
                 comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
                 var expert_base = rank * experts_per_rank
                 var lc = 0
@@ -1623,8 +1461,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     seq_len, pool)
             sample.dense_phase1.add(rnks.timed_parallel[do_dense_phase1](mp))
 
-            # Expert phase 2: per-local-expert down GEMV with routing weight,
-            # serialized via timed_parallel (same shape as expert_phase1).
+            # Expert phase 2
             @parameter
             def do_expert_phase2[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
@@ -1672,8 +1509,8 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     rv.scratch_addr(expert_out_lease), lc,
                     rv.x_residual(seq_len).ptr, rv.scratch_addr(dense_out_lease),
                     lb + body.post_ffn_norm_1,
-                    rv.scratch_addr(dense_normed_lease), C.HIDDEN, EPS))
-                pool.dispatch[PreReduceArgs, pre_reduce_kernel](UnsafePointer(to=args[0]), 1)
+                    rv.scratch_addr(dense_normed_lease), EPS))
+                pool.dispatch[PreReduceArgs, pre_reduce_kernel[C.HIDDEN]](UnsafePointer(to=args[0]), 1)
                 return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                     unsafe_from_address=Int(UnsafePointer(to=pool))))
             sample.pre_reduce.add(rnks.timed_parallel[do_pre_reduce](mp))

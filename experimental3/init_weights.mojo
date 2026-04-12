@@ -1,9 +1,4 @@
-"""Weight initialization primitives — column sums and VNNI packing.
-
-Generic functions for computing column sums (per-row, per-block) from
-i8 weight matrices, and VNNI-packing weights in-place. Used by
-model-specific init code at load time.
-"""
+"""Weight initialization — column sums and VNNI packing."""
 
 from std.memory import UnsafePointer, memcpy
 

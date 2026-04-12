@@ -30,17 +30,13 @@ from threading.threading_traits import BurstThreadPool
 from kernels.vnni import VNNI_N_STEP, VNNI_K_STEP, VNNI_TILE_N, VNNI_BLK, compute_n_block
 from kernels.kernel_ops import PoolFence
 from simd_math import sqrt
-from experimental2.kernels.int8_gemv import dot
+from experimental3.kernels.int8_gemv import dot
 from experimental3.kernels.dense_ffn import (
     FusedGuGeluTanhArgs, fused_gu_gelu_tanh_worker,
     Int8GemvBlockedArgs, int8_gemv_blocked_worker,
 )
 from experimental_gemma.router import Gemma4TopKResult
-
-comptime I8Ptr = UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
-comptime U8Ptr = UnsafePointer[UInt8, MutAnyOrigin]
-comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
+from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr, BF16Ptr
 
 
 # ============================================================================
@@ -57,7 +53,7 @@ def gemv_row_blocked[N: Int, K: Int, fwht_block_size: Int](
     dst: UnsafePointer[Float32, MutAnyOrigin],
 ):
     """GEMV with per-K-block activation scales. Accumulates per block in i32,
-    dequants to f32 per block, applies weight scale at the end."""
+    dequants to f32 per block, then applies per-row weight scale."""
     comptime num_blocks = K // fwht_block_size
     comptime width = simd_width_of[DType.int32]()
     comptime passes_per_subtile = VNNI_TILE_N // width

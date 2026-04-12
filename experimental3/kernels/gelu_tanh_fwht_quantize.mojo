@@ -1,11 +1,4 @@
-"""GELU-tanh + FWHT + dynamic-scale i8 quantization (Gemma 4 MLP domain exit).
-
-Per row: bf16 gate, bf16 up -> f32 GELU_tanh(gate) * up -> block-diagonal FWHT
--> per-block absmax -> quantize with dynamic scale.
-
-Exports the shared GELU-tanh activation used by the expert and dense FFN
-kernels. Also contains a standalone row helper plus self-validation.
-"""
+"""GELU-tanh activation + FWHT + per-block i8 quantization."""
 
 from std.memory import UnsafePointer
 from std.memory.unsafe_pointer import alloc
@@ -14,7 +7,7 @@ from std.collections import InlineArray
 
 from simd_math import exp_f32, sqrt, roundeven
 from experimental3.kernels.fwht import fwht_block
-from experimental2.kernels.quantize import absmax_quantize_i8
+from experimental3.kernels.quantize import absmax_quantize_i8
 
 
 # ============================================================================

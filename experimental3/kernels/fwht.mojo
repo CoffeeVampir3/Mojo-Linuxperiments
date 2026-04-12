@@ -1,8 +1,4 @@
-"""Block-diagonal Fast Walsh-Hadamard Transform (FWHT) primitives.
-
-In-register butterfly FWHT on fixed-size blocks of f32 elements.
-Used by quantization kernels, attention, FFN, and embedding pipelines.
-"""
+"""Block-diagonal FWHT primitives — in-register butterfly on f32 blocks."""
 
 from std.memory import UnsafePointer
 from std.collections import InlineArray

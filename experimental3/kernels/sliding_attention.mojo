@@ -1,24 +1,11 @@
-"""Sliding window decode attention for Gemma 4.
-
-Single-pass kernel: K scoring + online softmax + VNNI V-agg in one streaming
-iteration over position groups. Each position group is WIDTH positions.
-
-K scoring: vpdpbusd(acc, K_u8_packed, Q_i8_broadcast) — K is unsigned first arg.
-V-agg:    vpdpbusd(v_acc, W_u8_broadcast, V_i8_packed) — attention weights quantized to u8.
-
-One worker per KV group. Each worker:
-1. Writes K/V for new position to cache
-2. Preps Q heads (per-head norm + RoPE + FWHT + quantize)
-3. Single pass: score → online softmax → V-agg per position group
-4. Quantize output for the O projection
-"""
+"""Sliding window decode attention — single-pass online softmax with VNNI."""
 
 from std.memory import UnsafePointer
 from std.collections import InlineArray
 
 from experimental.amx import VNNI_BLK
-from experimental2.kernels.int8_gemv import vpdpbusd
-from experimental2.kernels.quantize import absmax_quantize_i8
+from experimental3.kernels.int8_gemv import vpdpbusd
+from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
 from experimental3.kernels.rope_and_kv_cache_write import (
     write_k_head_normed, write_v_head_normed,
@@ -94,15 +81,8 @@ def v_agg_group[head_dim: Int](
 ):
     """Accumulate V-agg for WIDTH positions using VNNI.
 
-    Pre-multiplies exp_scores by per-position v_scales[pg], then quantizes the
-    product to u8 and broadcasts per sub_quad. The fact that w_max now reflects
-    (exp_score * v_scale) means w_dequant = w_max/255 absorbs both factors,
-    so dynamic per-token V quantization costs only WIDTH loads + WIDTH muls
-    per position group — no extra dequant downstream.
-
-    Masked positions enter with exp_scores[p] = 0, so 0 * v_scale = 0 and
-    they contribute nothing regardless of unwritten cache slots (which are
-    zero-initialized by mmap anyway).
+    Folds per-position v_scales into exp_scores before u8 quantization,
+    so w_dequant = w_max/255 absorbs both attention weight and V scale.
     """
     comptime V_CHANNEL_GROUPS = head_dim // WIDTH
     comptime V_SUB_QUADS = WIDTH // VNNI_BLK
@@ -219,27 +199,47 @@ def single_pass_attention[head_dim: Int, max_seq: Int, num_kv_heads: Int, num_q_
 
 
 @fieldwise_init
-struct SlidingAttnGroupArgs(Copyable, ImplicitlyCopyable):
+struct AttnGroupArgs(Copyable, ImplicitlyCopyable):
+    """Shared args for both sliding and full attention group kernels.
+
+    For full attention (K=V shared), set v_bf16_ptr = k_bf16_ptr.
+    """
     var q_bf16_ptr: Int
     var k_bf16_ptr: Int
     var v_bf16_ptr: Int
-    var q_norm_ptr: Int        # bf16[head_dim] per-head Q norm gamma
-    var k_norm_ptr: Int        # bf16[head_dim] per-head K norm gamma
+    var q_norm_ptr: Int
+    var k_norm_ptr: Int
     var cos_ptr: Int
     var sin_ptr: Int
     var cache_base: Int
     var kv_head: Int
     var cache_pos: Int
     var context_len: Int
-    var qi_out_ptr: Int        # i8[heads_per_group × head_dim] output
-    var head_scale_ptr: Int    # f32[heads_per_group] per-head absmax scales
+    var qi_out_ptr: Int
+    var head_scale_ptr: Int
     var eps: Float32
+
+    def __init__(out self):
+        self.q_bf16_ptr = 0
+        self.k_bf16_ptr = 0
+        self.v_bf16_ptr = 0
+        self.q_norm_ptr = 0
+        self.k_norm_ptr = 0
+        self.cos_ptr = 0
+        self.sin_ptr = 0
+        self.cache_base = 0
+        self.kv_head = 0
+        self.cache_pos = 0
+        self.context_len = 0
+        self.qi_out_ptr = 0
+        self.head_scale_ptr = 0
+        self.eps = Float32(0)
 
 
 def sliding_attn_group_kernel[
     head_dim: Int, heads_per_group: Int,
     max_seq: Int, num_kv_heads: Int, num_q_heads: Int,
-](args: SlidingAttnGroupArgs):
+](args: AttnGroupArgs):
     """One KV group: write K/V, prep Q, single-pass attention, FWHT, quantize to i8.
 
     Output: i8[heads_per_group × head_dim] + f32[heads_per_group] per-head scales.

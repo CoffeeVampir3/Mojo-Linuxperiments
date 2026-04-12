@@ -28,18 +28,12 @@ Numerical conventions (standardized):
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 
-from simd_math import sqrt
-from experimental2.kernels.quantize import absmax_quantize_i8
+from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.kernels.fwht import fwht_block
-
-
-# ============================================================================
-# Pointer type aliases
-# ============================================================================
-
-comptime F32Buf = UnsafePointer[Float32, MutAnyOrigin]
-comptime BF16Buf = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
-comptime I8Buf = UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
+from experimental3.common_math import (
+    F32Ptr, BF16Ptr, I8Ptr,
+    rms_reduce_bf16, inv_rms_from_sum_sq, normalize_inplace,
+)
 
 
 # ============================================================================
@@ -48,27 +42,8 @@ comptime I8Buf = UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
 
 
 @always_inline
-def rms_reduce[cols: Int](src: BF16Buf) -> Float32:
-    """Sum of squares reduction over bf16 input. Returns sum(x^2)."""
-    comptime width = simd_width_of[DType.float32]()
-    var vsum = SIMD[DType.float32, width](0)
-    var k = 0
-    while k + width <= cols:
-        var x = (src + k).load[width=width]().cast[DType.float32]()
-        vsum = x.fma(x, vsum)
-        k += width
-    return vsum.reduce_add()
-
-
-@always_inline
-def inv_rms_from_sum_sq(sum_sq: Float32, n: Int, eps: Float32) -> Float32:
-    """Convert sum(x^2) to inverse RMS scalar."""
-    return Float32(1.0) / sqrt[DType.float32, 1](sum_sq / Float32(n) + eps)
-
-
-@always_inline
 def load_and_reduce[cols: Int, has_gamma: Bool](
-    src: BF16Buf, gamma: BF16Buf, work: F32Buf,
+    src: BF16Ptr, gamma: BF16Ptr, work: F32Ptr,
 ) -> Float32:
     """Load bf16 to f32 work buffer, accumulate sum(x^2).
 
@@ -92,9 +67,9 @@ def load_and_reduce[cols: Int, has_gamma: Bool](
 
 @always_inline
 def load_and_reduce_dual[cols: Int](
-    src: BF16Buf,
-    gamma_a: BF16Buf, gamma_b: BF16Buf,
-    work_a: F32Buf, work_b: F32Buf,
+    src: BF16Ptr,
+    gamma_a: BF16Ptr, gamma_b: BF16Ptr,
+    work_a: F32Ptr, work_b: F32Ptr,
 ) -> Float32:
     """Load bf16 to two f32 work buffers with two gammas, shared sum(x^2)."""
     comptime width = simd_width_of[DType.float32]()
@@ -112,18 +87,7 @@ def load_and_reduce_dual[cols: Int](
 
 
 @always_inline
-def normalize_inplace[cols: Int](work: F32Buf, inv_rms: Float32):
-    """Multiply work buffer by scalar inv_rms."""
-    comptime width = simd_width_of[DType.float32]()
-    var vinv = SIMD[DType.float32, width](inv_rms)
-    var k = 0
-    while k + width <= cols:
-        (work + k).store((work + k).load[width=width]() * vinv)
-        k += width
-
-
-@always_inline
-def fwht_rotate[cols: Int, block: Int](work: F32Buf):
+def fwht_rotate[cols: Int, block: Int](work: F32Ptr):
     """Block-diagonal FWHT on f32 work buffer."""
     for b in range(cols // block):
         fwht_block[block](work + b * block)
@@ -131,7 +95,7 @@ def fwht_rotate[cols: Int, block: Int](work: F32Buf):
 
 @always_inline
 def emit_quant[cols: Int, block: Int, per_block: Bool](
-    work: F32Buf, qi: I8Buf, scales: F32Buf,
+    work: F32Ptr, qi: I8Ptr, scales: F32Ptr,
 ):
     """Quantize f32 work buffer to i8.
 
@@ -160,8 +124,8 @@ def emit_quant[cols: Int, block: Int, per_block: Bool](
 @always_inline
 def rmsnorm_fwht_quant_row[cols: Int, block: Int,
     has_gamma: Bool, per_block: Bool](
-    src: BF16Buf, gamma: BF16Buf, qi: I8Buf,
-    work: F32Buf, scales: F32Buf, eps: Float32,
+    src: BF16Ptr, gamma: BF16Ptr, qi: I8Ptr,
+    work: F32Ptr, scales: F32Ptr, eps: Float32,
 ):
     """Load → RMSNorm [* gamma] → FWHT → quantize [per-row | per-block]."""
     var sum_sq = load_and_reduce[cols, has_gamma](src, gamma, work)
@@ -181,11 +145,11 @@ def rmsnorm_fwht_quant_row[cols: Int, block: Int,
 
 @always_inline
 def rmsnorm_dual_gamma_fwht_quant_row[cols: Int, block: Int](
-    src: BF16Buf,
-    gamma_a: BF16Buf, gamma_b: BF16Buf,
-    qi_a: I8Buf, qi_b: I8Buf,
-    work_a: F32Buf, work_b: F32Buf,
-    scale_a: F32Buf, scale_b: F32Buf,
+    src: BF16Ptr,
+    gamma_a: BF16Ptr, gamma_b: BF16Ptr,
+    qi_a: I8Ptr, qi_b: I8Ptr,
+    work_a: F32Ptr, work_b: F32Ptr,
+    scale_a: F32Ptr, scale_b: F32Ptr,
     eps: Float32,
 ):
     """Load → RMSNorm * (gamma_a, gamma_b) → 2x FWHT → 2x per-row i8."""
@@ -212,7 +176,7 @@ def rmsnorm_dual_gamma_fwht_quant_row[cols: Int, block: Int](
 
 @always_inline
 def rmsnorm_bf16_row[cols: Int, has_gamma: Bool, has_residual: Bool](
-    src: BF16Buf, gamma: BF16Buf, dst: BF16Buf, eps: Float32,
+    src: BF16Ptr, gamma: BF16Ptr, dst: BF16Ptr, eps: Float32,
 ):
     """RMSNorm → bf16 output.
 
@@ -221,7 +185,7 @@ def rmsnorm_bf16_row[cols: Int, has_gamma: Bool, has_residual: Bool](
     has_gamma=True, has_residual=True: dst += (src / rms(src)) * gamma.
     """
     comptime width = simd_width_of[DType.float32]()
-    var sum_sq = rms_reduce[cols](src)
+    var sum_sq = rms_reduce_bf16[cols](src)
     var inv = inv_rms_from_sum_sq(sum_sq, cols, eps)
     var vinv = SIMD[DType.float32, width](inv)
     var k = 0

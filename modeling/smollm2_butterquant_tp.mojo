@@ -954,7 +954,7 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                 var sb = rv.scratch_base()
                 return rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
                     rv.x_main(seq_len).ptr, sb + act_i8_off, sb + work_off,
-                    sb + act_scale_lease.offset, seq_len, pool)
+                    sb + act_scale_lease.offset, Float32(C.RMS_NORM_EPS), seq_len, pool)
             ranks.parallel[do_attn_norm]()
 
             var tb = Int(perf_counter_ns())
@@ -1088,7 +1088,7 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
                 var sb = rv.scratch_base()
                 return rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
                     rv.x_main(seq_len).ptr, sb + mlp_i8_off, sb + mlp_work_off,
-                    sb + act_scale_lease.offset, seq_len, pool)
+                    sb + act_scale_lease.offset, Float32(C.RMS_NORM_EPS), seq_len, pool)
             ranks.parallel[do_mlp_norm]()
 
             var th = Int(perf_counter_ns())
@@ -1237,7 +1237,7 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
             var sb = rv.scratch_base()
             return rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
                 rv.x_main(seq_len).ptr, sb + act_i8_off, sb + work_off,
-                sb + act_scale_lease.offset, seq_len, pool)
+                sb + act_scale_lease.offset, Float32(C.RMS_NORM_EPS), seq_len, pool)
         ranks.parallel[do_attn_norm]()
 
         @parameter
@@ -1373,7 +1373,7 @@ struct SmolLM2ButterQuant[tp: Int](Movable):
             var sb = rv.scratch_base()
             return rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
                 rv.x_main(seq_len).ptr, sb + mlp_i8_off, sb + mlp_work_off,
-                sb + act_scale_lease.offset, seq_len, pool)
+                sb + act_scale_lease.offset, Float32(C.RMS_NORM_EPS), seq_len, pool)
         ranks.parallel[do_mlp_norm]()
 
         var post_i8 = self.scratch.borrow[Scalar[DType.int8], C.MAX_SEQ_LEN * GATE_ROWS]()

@@ -27,7 +27,6 @@ from experimental3.kv_cache import Gemma4KVCache
 from experimental3.helpers import prep_q_row_normed, prep_q_row_normed_partial
 from experimental3.kernels.rope_and_kv_cache_write import (
     write_k_head_normed,
-    write_k_head_normed_partial,
     write_v_head_normed,
 )
 from experimental3.kernels.sliding_attention import single_pass_attention, score_group, WIDTH
@@ -793,7 +792,7 @@ def eval_full_case(
                 var cos_row = cos_tab + t * HALF
                 var sin_row = sin_tab + t * HALF
 
-                write_k_head_normed_partial[HD, C.FULL_ROPE_DIMS](
+                write_k_head_normed[HD, C.FULL_ROPE_DIMS](
                     raw_kv, k_norm,
                     cos_row, sin_row,
                     work, qi_buf,

@@ -160,7 +160,7 @@ def main():
 
     rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
         rv.x_main(seq_len).ptr, sb + act_i8_off, sb + work_off,
-        seq_len, s_act, model.pools[0],
+        s_act, Float32(1e-5), seq_len, model.pools[0],
     ).join()
 
     # Gate+up GEMV

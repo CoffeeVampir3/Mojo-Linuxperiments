@@ -1,10 +1,4 @@
-"""Forward-pass profiling infrastructure.
-
-Phase-level timing capture and statistical reporting for decode loops.
-Each ForwardSample records per-phase dispatch/kernel/join breakdowns;
-ForwardLogger aggregates samples and prints a sorted report with
-percentiles.
-"""
+"""Forward-pass profiling — per-phase timing capture and reporting."""
 
 from std.time import perf_counter_ns
 from threading.threading_traits import BurstThreadPool

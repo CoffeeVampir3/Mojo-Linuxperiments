@@ -1,31 +1,4 @@
-"""LM head row-scan GEMV — Gemma 4 tied unembedding.
-
-Memory-bound at decode. The activation is small (HIDDEN bytes, in L1 after the
-fused rmsnorm + FWHT + per-block quantize step). The cost per token is dominated
-by streaming the weight matrix, so we want exactly one byte loaded per
-(output, K position).
-
-Layout:
-  weight:        i8 [VOCAB, HIDDEN]              row-major
-  w_blk_scales:  f32 [VOCAB, NUM_BLOCKS]         row-major (NUM_BLOCKS = HIDDEN/fwht_blk)
-  w_blk_colsums: f32 [VOCAB, NUM_BLOCKS]         row-major
-  act:           i8 [HIDDEN]                     post fused norm+FWHT+quantize
-  act_blk_scales:f32 [NUM_BLOCKS]                per-K-block activation scales
-  dst:           bf16 [VOCAB]                    output logits
-
-No N-tile packing — the activation reuse benefit doesn't apply when the
-activation is already cache-resident, and packing would force a second copy
-of the table (defeats the bandwidth savings).
-
-Per output row n:
-  total = 0
-  for each FWHT block b in 0..NUM_BLOCKS:
-    block_dot = vpdpbusd-accumulate over the b-th K range, reduce to scalar
-    corrected = block_dot - 128 * w_blk_colsums[n, b]
-    dequant   = (act_blk_scales[b] / 127) * w_blk_scales[n, b]
-    total    += corrected * dequant
-  dst[n] = total.cast[bf16]()
-"""
+"""LM head row-scan GEMV — per-block i8 dot product with VNNI."""
 
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
@@ -33,11 +6,8 @@ from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
 
 from kernels.kernel_ops import PoolFence
-from experimental2.kernels.int8_gemv import vpdpbusd
-
-comptime I8Ptr = UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
-comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
+from experimental3.kernels.int8_gemv import vpdpbusd
+from experimental3.common_math import I8Ptr, F32Ptr, BF16Ptr
 
 
 # ============================================================================
@@ -126,9 +96,9 @@ def lm_head_gemv[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
     dst: Int,
     mut pool: P,
 ) -> PoolFence[P]:
-    """LM head GEMV: i8 [N, K] x i8 [K] -> bf16 [N], scheme 3 dequant.
+    """LM head GEMV: i8 [N, K] x i8 [K] -> bf16 [N] with per-block dequant.
 
-    seq_len = 1 (decode). Work is N-split across pool workers.
+    Decode only (seq_len=1). Work is N-split across pool workers.
     """
     comptime MAX_POOL_CAPACITY = 128
     var num_workers = min(N, pool.get_capacity())

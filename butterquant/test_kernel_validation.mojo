@@ -1256,7 +1256,7 @@ def validate_prefill_layer0[tp: Int](
     var quant_attn_scales = alloc[Float32](seq_len)
     rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
         quant_host.x_main(seq_len).ptr, Int(quant_act_i8), Int(quant_attn_work),
-        Int(quant_attn_scales), seq_len, quant.pools[0]).join()
+        Int(quant_attn_scales), Float32(1e-5), seq_len, quant.pools[0]).join()
     dequant_fwht_rows[C.HIDDEN, FWHT_BLOCK](
         quant_attn_norm_f32, quant_act_i8, seq_len, C.HIDDEN, quant_attn_scales)
     print_metrics("attn_norm", metrics_f32_vs_bf16(
@@ -1442,7 +1442,7 @@ def validate_prefill_layer0[tp: Int](
     var quant_post_scales = alloc[Float32](seq_len)
     rmsnorm_fwht_quantize[C.HIDDEN, FWHT_BLOCK](
         quant_host.x_main(seq_len).ptr, Int(quant_mlp_i8), Int(quant_mlp_work),
-        Int(quant_attn_scales), seq_len, quant.pools[0]).join()
+        Int(quant_attn_scales), Float32(1e-5), seq_len, quant.pools[0]).join()
     dequant_fwht_rows[C.HIDDEN, FWHT_BLOCK](
         quant_mlp_norm_f32, quant_mlp_i8, seq_len, C.HIDDEN, quant_attn_scales)
     print_metrics("mlp_norm", metrics_f32_vs_bf16(

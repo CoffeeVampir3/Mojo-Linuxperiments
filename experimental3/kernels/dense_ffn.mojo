@@ -1,11 +1,4 @@
-"""Dense MLP dispatch kernels for Gemma 4 forward pass.
-
-Phase 1: Fused gate_up GEMV + GELU-tanh + FWHT + per-block quantize.
-Phase 2: Int8 GEMV with per-block activation scales for down projection.
-Router:  Softmax + top-k dispatch.
-
-All are BurstPool-dispatched — body threads never compute.
-"""
+"""Dense MLP kernels — fused gate+up GEMV, per-block down GEMV, router top-k."""
 
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
@@ -13,17 +6,13 @@ from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
 
 from kernels.kernel_ops import PoolFence
-from experimental2.kernels.int8_gemv import gemv_row
+from experimental3.kernels.int8_gemv import gemv_row
 from experimental3.kernels.fwht import fwht_block
-from experimental2.kernels.quantize import absmax_quantize_i8
+from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.kernels.gelu_tanh_fwht_quantize import gelu_tanh_f32
 from experimental3.moe import gemv_row_blocked
 from experimental_gemma.router import softmax_topk_renorm, Gemma4TopKResult
-
-comptime I8Ptr = UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
-comptime U8Ptr = UnsafePointer[UInt8, MutAnyOrigin]
-comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
-comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
+from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr, BF16Ptr
 
 
 # ============================================================================
