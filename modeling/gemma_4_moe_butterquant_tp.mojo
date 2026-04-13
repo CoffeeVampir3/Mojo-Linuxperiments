@@ -75,6 +75,8 @@ from modeling.loader import load_weights, discover_shards, load_weights_from_des
 from simd_math import sqrt
 
 
+comptime DUMP_FFN_INPUTS = True
+
 # =============================================================================
 # Config
 # =============================================================================
@@ -1412,6 +1414,17 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                     unsafe_from_address=Int(UnsafePointer(to=pool))))
             sample.post_attn_norm.add(rnks.timed_parallel[do_post_attn_norm](mp))
+
+            @parameter
+            if DUMP_FFN_INPUTS:
+                var dump_path = String("dump_activations/pos_") + String(pos) + "_layer_" + String(layer_idx) + ".bin"
+                var dump_ptr = UnsafePointer[UInt8, MutAnyOrigin](
+                    unsafe_from_address=rnks.x_main_ptrs(seq_len)[0])
+                try:
+                    with open(dump_path, "w") as df:
+                        df.write_bytes(Span[UInt8, MutAnyOrigin](ptr=dump_ptr, length=C.HIDDEN * 2))
+                except:
+                    print("dump failed:", dump_path)
 
             # =============================================================
             # FFN BLOCK
