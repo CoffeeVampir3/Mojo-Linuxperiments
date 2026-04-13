@@ -46,7 +46,7 @@ from experimental3.kernels.float_gemv import float_gemv
 from experimental3.moe import (
     gemma4_moe_phase1, gemma4_moe_phase2,
 )
-from experimental3.kv_cache import Gemma4KVCache
+from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
 from experimental3.kernels.dense_ffn import (
     fused_gu_gelu_tanh,
     int8_gemv_blocked,
@@ -59,6 +59,11 @@ from experimental3.kernels.sliding_attention import (
 )
 from experimental3.kernels.full_attention import (
     full_attn_group_kernel,
+)
+from experimental3.kernels.full_chunked_attention import (
+    ChunkedAttnArgs, chunked_attn_kernel, merge_and_quantize,
+    FullAttnPrepArgs, full_attn_prep_kernel,
+    partial_chunk_bytes, partial_chunk_stride,
 )
 from experimental3.kernels.lm_head import lm_head_gemv
 from experimental_gemma.router import Gemma4TopKResult
@@ -483,10 +488,15 @@ def calculate_peak_scratch[tp: Int]() -> Int:
         + C.HIDDEN * f32_bytes
         + f32_bytes
     )
+    comptime FULL_HPG = C.NUM_HEADS // C.NUM_KV_HEADS_FULL
+    comptime FULL_ATTN_MAX_CHUNKS = 32
     comptime full_attn_phase2 = persistent + (
         qk_n_local * bf16_bytes
         + (C.Q_DIM_FULL // tp) * i8_bytes
         + ((C.Q_DIM_FULL // tp) // C.HEAD_DIM_FULL) * f32_bytes
+        + FULL_HPG * C.HEAD_DIM_FULL * i8_bytes
+        + FULL_HPG * f32_bytes * 2
+        + FULL_ATTN_MAX_CHUNKS * FULL_HPG * (2 + C.HEAD_DIM_FULL) * f32_bytes
     )
     comptime full_attn_peak = (
         full_attn_phase1 if full_attn_phase1 > full_attn_phase2 else full_attn_phase2
@@ -1254,42 +1264,101 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 full_attn_work_lease^.release()
                 full_attn_i8_lease^.release()
 
-                # Scoring + V-agg
+                # Scoring + V-agg (context-parallel chunked)
                 var attn_qi_lease = self.scratch.borrow[Scalar[DType.int8], Q_DIM_LOCAL_FULL]()
                 var attn_head_sc_lease = self.scratch.borrow[Float32, Q_DIM_LOCAL_FULL // C.HEAD_DIM_FULL]()
+                var q_i8_prep_lease = self.scratch.borrow[Scalar[DType.int8], FULL_HPG * C.HEAD_DIM_FULL]()
+                var qi_biases_lease = self.scratch.borrow[Float32, FULL_HPG]()
+                var q_scales_lease = self.scratch.borrow[Float32, FULL_HPG]()
+                comptime FULL_ATTN_MAX_CHUNKS = 32
+                comptime PARTIAL_F32S = FULL_ATTN_MAX_CHUNKS * FULL_HPG * (2 + C.HEAD_DIM_FULL)
+                var partial_lease = self.scratch.borrow[Float32, PARTIAL_F32S]()
 
+                # Phase 1: KV cache write + Q prep (1 job per rank)
                 @parameter
-                def do_full_attn[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                def do_full_attn_prep[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                     var qk_base = rv.scratch_addr(qk_lease)
                     var q_base = qk_base
                     var k_base = qk_base + Q_DIM_LOCAL_FULL * 2
                     var cos_addr = rv.state_base() + L.full_cos_off + pos * RV.FULL_ROPE_HALF * size_of[Float32]()
                     var sin_addr = rv.state_base() + L.full_sin_off + pos * RV.FULL_ROPE_HALF * size_of[Float32]()
-
                     var flb = rv.full_layer_base(full_idx)
-                    var q_norm_addr = flb + fl.q_norm
-                    var k_norm_addr = flb + fl.k_norm
-                    var jobs = InlineArray[AttnGroupArgs, 4](
-                        fill=AttnGroupArgs())
-                    for g in range(FULL_NKV):
-                        var k_addr = k_base + g * C.HEAD_DIM_FULL * 2
-                        jobs[g] = AttnGroupArgs(
-                            q_base + g * FULL_HPG * C.HEAD_DIM_FULL * 2,
-                            k_addr, k_addr,
-                            q_norm_addr, k_norm_addr,
-                            cos_addr, sin_addr,
-                            rv.full_cache_base(full_idx), g,
-                            pos, pos + 1,
-                            rv.scratch_addr(attn_qi_lease) + g * FULL_HPG * C.HEAD_DIM_FULL,
-                            rv.scratch_addr(attn_head_sc_lease) + g * FULL_HPG * 4,
-                            EPS)
-                    pool.dispatch[AttnGroupArgs,
-                        full_attn_group_kernel[C.HEAD_DIM_FULL, ROPE_DIMS_FULL, FULL_HPG,
-                            C.MAX_SEQ_LEN, C.NUM_KV_HEADS_FULL // Self.tp, C.NUM_HEADS // Self.tp]](
-                        UnsafePointer(to=jobs[0]), FULL_NKV)
+                    comptime FULL_NKV_LOCAL = C.NUM_KV_HEADS_FULL // Self.tp
+                    var jobs = InlineArray[FullAttnPrepArgs, 1](fill=FullAttnPrepArgs())
+                    jobs[0] = FullAttnPrepArgs(
+                        q_bf16_base=q_base,
+                        k_bf16_ptr=k_base,
+                        q_norm_ptr=flb + fl.q_norm,
+                        k_norm_ptr=flb + fl.k_norm,
+                        cos_ptr=cos_addr,
+                        sin_ptr=sin_addr,
+                        cache_base=rv.full_cache_base(full_idx),
+                        cache_pos=pos,
+                        kv_head=0,
+                        eps=EPS,
+                        q_i8_out=rv.scratch_addr(q_i8_prep_lease),
+                        qi_biases_out=rv.scratch_addr(qi_biases_lease),
+                        q_scales_out=rv.scratch_addr(q_scales_lease))
+                    pool.dispatch[FullAttnPrepArgs,
+                        full_attn_prep_kernel[C.HEAD_DIM_FULL, ROPE_DIMS_FULL, FULL_HPG,
+                            C.MAX_SEQ_LEN, FULL_NKV_LOCAL, C.NUM_HEADS // Self.tp]](
+                        UnsafePointer(to=jobs[0]), 1)
                     return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                         unsafe_from_address=Int(UnsafePointer(to=pool))))
-                sample.attention.add(rnks.timed_parallel[do_full_attn](mp))
+                sample.attention.add(rnks.timed_parallel[do_full_attn_prep](mp))
+
+                # Phase 2: Chunked scoring (pool.capacity jobs per rank)
+                @parameter
+                def do_full_chunk_attn[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                    var context_len = pos + 1
+                    var num_pg = (context_len + CACHE_WIDTH - 1) // CACHE_WIDTH
+                    var num_chunks = min(Int(pool.capacity), FULL_ATTN_MAX_CHUNKS)
+                    if num_chunks > num_pg:
+                        num_chunks = num_pg
+                    var pgs_per_chunk = (num_pg + num_chunks - 1) // num_chunks
+                    comptime FULL_NKV_LOCAL = C.NUM_KV_HEADS_FULL // Self.tp
+                    var chunk_args = InlineArray[ChunkedAttnArgs, FULL_ATTN_MAX_CHUNKS](
+                        fill=ChunkedAttnArgs())
+                    comptime CHUNK_F32_STRIDE = FULL_HPG * (2 + C.HEAD_DIM_FULL)
+                    for c in range(num_chunks):
+                        var start = c * pgs_per_chunk
+                        var end = min((c + 1) * pgs_per_chunk, num_pg)
+                        chunk_args[c] = ChunkedAttnArgs(
+                            q_i8_base=rv.scratch_addr(q_i8_prep_lease),
+                            qi_biases_base=rv.scratch_addr(qi_biases_lease),
+                            q_scales_base=rv.scratch_addr(q_scales_lease),
+                            cache_base=rv.full_cache_base(full_idx),
+                            kv_head=0,
+                            start_pg=start,
+                            end_pg=end,
+                            partial_out=rv.scratch_addr(partial_lease) + c * CHUNK_F32_STRIDE * 4,
+                            context_len=context_len)
+                    pool.dispatch[ChunkedAttnArgs,
+                        chunked_attn_kernel[C.HEAD_DIM_FULL, C.MAX_SEQ_LEN,
+                            FULL_NKV_LOCAL, C.NUM_HEADS // Self.tp, FULL_HPG]](
+                        UnsafePointer(to=chunk_args[0]), num_chunks)
+                    return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
+                        unsafe_from_address=Int(UnsafePointer(to=pool))))
+                sample.attention.add(rnks.timed_parallel[do_full_chunk_attn](mp))
+
+                # Phase 3: Merge partials + quantize (inline per rank)
+                for rank in range(Self.tp):
+                    var rv = rnks.view(rank)
+                    var context_len = pos + 1
+                    var num_pg = (context_len + CACHE_WIDTH - 1) // CACHE_WIDTH
+                    var num_chunks = min(Int(self.main_pools[rank].capacity), FULL_ATTN_MAX_CHUNKS)
+                    if num_chunks > num_pg:
+                        num_chunks = num_pg
+                    merge_and_quantize[C.HEAD_DIM_FULL, FULL_HPG](
+                        F32Ptr(unsafe_from_address=rv.scratch_addr(partial_lease)),
+                        num_chunks,
+                        I8Ptr(unsafe_from_address=rv.scratch_addr(attn_qi_lease)),
+                        F32Ptr(unsafe_from_address=rv.scratch_addr(attn_head_sc_lease)))
+
+                partial_lease^.release()
+                q_scales_lease^.release()
+                qi_biases_lease^.release()
+                q_i8_prep_lease^.release()
 
                 # O projection
                 @parameter

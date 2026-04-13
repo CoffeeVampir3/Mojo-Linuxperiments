@@ -15,10 +15,9 @@ Data fusion:
     (inherited from v_agg_group — zero extra cost in the inner loop).
 
 Usage:
-  1. Write K/V for the new token into the cache (existing write_k/v helpers).
-  2. Prep all Q heads: prep_q_row_normed_partial → i8 Q + (qi_bias, q_scale).
-  3. Dispatch chunked_attn_kernel to pool — one worker per chunk, all Q heads.
-  4. Join, then call merge_and_quantize on the collected partial states.
+  1. Dispatch full_attn_prep_kernel (1 job) — KV cache write + Q prep.
+  2. Dispatch chunked_attn_kernel to pool — one worker per chunk, all Q heads.
+  3. Join, then call merge_and_quantize on the collected partial states.
 """
 
 from std.memory import UnsafePointer
@@ -28,6 +27,10 @@ from std.sys.info import simd_width_of
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
 from experimental3.kernels.sliding_attention import score_group, v_agg_group
 from experimental3.kernels.quantize import absmax_quantize_i8
+from experimental3.kernels.rope_and_kv_cache_write import (
+    write_k_head_normed, write_v_head_normed,
+)
+from experimental3.helpers import prep_q_row_normed_partial
 from simd_math import exp_f32
 
 
@@ -96,6 +99,97 @@ struct ChunkedAttnArgs(Copyable, ImplicitlyCopyable):
 
 
 # ============================================================================
+# Prep kernel — KV cache write + Q prep (1 job, runs before chunk dispatch)
+# ============================================================================
+
+
+@fieldwise_init
+struct FullAttnPrepArgs(Copyable, ImplicitlyCopyable):
+    """Args for the single-job prep kernel: KV cache write + all-head Q prep."""
+    var q_bf16_base: Int
+    var k_bf16_ptr: Int
+    var q_norm_ptr: Int
+    var k_norm_ptr: Int
+    var cos_ptr: Int
+    var sin_ptr: Int
+    var cache_base: Int
+    var cache_pos: Int
+    var kv_head: Int
+    var eps: Float32
+    var q_i8_out: Int
+    var qi_biases_out: Int
+    var q_scales_out: Int
+
+    def __init__(out self):
+        self.q_bf16_base = 0
+        self.k_bf16_ptr = 0
+        self.q_norm_ptr = 0
+        self.k_norm_ptr = 0
+        self.cos_ptr = 0
+        self.sin_ptr = 0
+        self.cache_base = 0
+        self.cache_pos = 0
+        self.kv_head = 0
+        self.eps = Float32(0)
+        self.q_i8_out = 0
+        self.qi_biases_out = 0
+        self.q_scales_out = 0
+
+
+def full_attn_prep_kernel[
+    head_dim: Int, rope_dims: Int, heads_per_group: Int,
+    max_seq: Int, num_kv_heads: Int, num_q_heads: Int,
+](args: FullAttnPrepArgs):
+    """KV cache write + Q prep for all heads.  Dispatched as 1 job before chunks.
+
+    K=V shared: both K and V cache entries are written from the K projection.
+    Each Q head is normed, partial-RoPE'd, FWHT'd, and quantized to i8.
+    """
+    var cache = Gemma4KVCache[max_seq, head_dim, num_kv_heads, num_q_heads](
+        args.cache_base)
+    var cos = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.cos_ptr)
+    var sin = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.sin_ptr)
+
+    var work_arr = InlineArray[Float32, head_dim](uninitialized=True)
+    var work = UnsafePointer(to=work_arr).bitcast[Float32]()
+    var qi_arr = InlineArray[Scalar[DType.int8], head_dim](uninitialized=True)
+    var qi_buf = UnsafePointer(to=qi_arr).bitcast[Scalar[DType.int8]]()
+
+    write_k_head_normed[head_dim, rope_dims](
+        UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=args.k_bf16_ptr),
+        UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=args.k_norm_ptr),
+        cos, sin, work, qi_buf,
+        cache, args.cache_pos, args.kv_head, args.eps)
+
+    write_v_head_normed[head_dim](
+        UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=args.k_bf16_ptr),
+        work, qi_buf,
+        cache, args.cache_pos, args.kv_head, args.eps)
+
+    var qi_biases = UnsafePointer[Float32, MutAnyOrigin](
+        unsafe_from_address=args.qi_biases_out)
+    var q_scales = UnsafePointer[Float32, MutAnyOrigin](
+        unsafe_from_address=args.q_scales_out)
+
+    for qh in range(heads_per_group):
+        var q_bf16 = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=args.q_bf16_base + qh * head_dim * 2)
+        var q_i8_dst = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](
+            unsafe_from_address=args.q_i8_out + qh * head_dim)
+        var result = prep_q_row_normed_partial[head_dim, rope_dims](
+            q_bf16.bitcast[BFloat16](),
+            UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+                unsafe_from_address=args.q_norm_ptr),
+            cos, sin,
+            q_i8_dst.bitcast[Int8](), args.eps)
+        qi_biases[qh] = result[0]
+        q_scales[qh] = result[1]
+
+
+# ============================================================================
 # Chunk kernel — one context chunk, all Q heads
 # ============================================================================
 
@@ -135,11 +229,11 @@ def chunked_attn_kernel[
     var scores_arr = InlineArray[Float32, WIDTH](uninitialized=True)
     var scores = UnsafePointer(to=scores_arr).bitcast[Float32]()
 
-    # Pre-compute q_factor per head (avoids repeated division in inner loop).
-    comptime Q_DEQUANT = Float32(1.0) / (Float32(127) * Float32(127))
+    # Pre-compute q_factor per head (matches single_pass_attention's division).
+    comptime Q_DENOM = Float32(127) * Float32(127)
     var q_factors = InlineArray[Float32, heads_per_group](uninitialized=True)
     for qh in range(heads_per_group):
-        q_factors[qh] = q_scales[qh] * Q_DEQUANT
+        q_factors[qh] = q_scales[qh] / Q_DENOM
 
     # -----------------------------------------------------------------
     # Main loop — position groups
