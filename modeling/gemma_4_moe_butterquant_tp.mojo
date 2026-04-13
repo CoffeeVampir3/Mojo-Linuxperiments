@@ -32,6 +32,8 @@ from experimental3.kernels.rmsnorm import (
     rmsnorm_gamma_fwht_per_block_quantize,
     PostAttnNormArgs, post_attn_norm_kernel,
     PreReduceArgs, pre_reduce_kernel,
+    ExpertSumArgs, expert_sum_kernel,
+    DenseNormArgs, dense_norm_kernel,
     PostReduceArgs, post_reduce_kernel,
 )
 from experimental3.profiler import (
@@ -266,7 +268,7 @@ struct FullLayerOffsets(Copyable, ImplicitlyCopyable, Movable):
 def emit_layer_body[tp: Int](
     mut b: LayerBuilder, mut entries: List[WeightDesc],
 ) -> LayerBodyWeights:
-    comptime ROW, REPL = LayerShard.ROW, LayerShard.REPL
+    comptime ROW, COL, REPL = LayerShard.ROW, LayerShard.COL, LayerShard.REPL
     comptime H   = C.HIDDEN
     comptime INT = C.INTERMEDIATE
     comptime NE  = C.NUM_EXPERTS
@@ -275,11 +277,11 @@ def emit_layer_body[tp: Int](
 
     var input_norm     = b.bf(entries, "input_layernorm.weight",                H, 1,   REPL)
     var pre_ffn_norm   = b.bf(entries, "pre_feedforward_layernorm.weight",      H, 1,   REPL)
-    var gate_proj      = b.q (entries, "mlp.gate_proj.weight",                  INT, H, REPL)
-    var up_proj        = b.q (entries, "mlp.up_proj.weight",                    INT, H, REPL)
-    var gate_proj_sc   = b.f (entries, "mlp.gate_proj.weight_scale",            INT, 1, REPL)
-    var up_proj_sc     = b.f (entries, "mlp.up_proj.weight_scale",              INT, 1, REPL)
-    var down_proj      = b.q (entries, "mlp.down_proj.weight",                  H, INT, REPL)
+    var gate_proj      = b.q (entries, "mlp.gate_proj.weight",                  INT, H, ROW)
+    var up_proj        = b.q (entries, "mlp.up_proj.weight",                    INT, H, ROW)
+    var gate_proj_sc   = b.f (entries, "mlp.gate_proj.weight_scale",            INT, 1, ROW)
+    var up_proj_sc     = b.f (entries, "mlp.up_proj.weight_scale",              INT, 1, ROW)
+    var down_proj      = b.q (entries, "mlp.down_proj.weight",                  H, INT, COL)
     var down_proj_sc   = b.f (entries, "mlp.down_proj.weight_scale",            H, 1,   REPL)
     var router_scale   = b.bf(entries, "router.scale",                          H, 1,   REPL)
     var router_proj    = b.q (entries, "router.proj.weight",                    NE, H,  REPL)
@@ -322,10 +324,13 @@ def emit_layer_colsums[tp: Int](mut b: LayerBuilder) -> LayerBodyColsums:
     comptime GU  = C.MOE_GATE_UP_FUSED
     comptime o_num_blk     = C.NUM_HEADS // tp
     comptime experts_local = NE // tp
+    comptime INT_LOCAL     = INT // tp
+    comptime DBLK          = C.FWHT_BLK if tp == 1 else 16
+    comptime DOWN_BLK_LOCAL = INT_LOCAL // DBLK
 
     var o_colsum            = b.colsum(H * o_num_blk * 4)
-    var gu_colsum           = b.colsum(INT * 2 * 4)
-    var down_colsum         = b.colsum(H * C.DENSE_NUM_BLOCKS * 4)
+    var gu_colsum           = b.colsum(INT_LOCAL * 2 * 4)
+    var down_colsum         = b.colsum(H * DOWN_BLK_LOCAL * 4)
     var router_colsum       = b.colsum(NE * 4)
     var experts_gu_colsum   = b.colsum(experts_local * GU * 4)
     var experts_down_colsum = b.colsum(experts_local * H * C.MOE_NUM_BLOCKS * 4)
@@ -466,9 +471,12 @@ def calculate_peak_scratch[tp: Int]() -> Int:
     comptime f32_bytes = size_of[Float32]()
     comptime topk_bytes = size_of[Gemma4TopKResult[C.TOP_K]]()
 
+    comptime DENSE_INT_LOCAL = C.INTERMEDIATE // tp
+    comptime DBLK = C.FWHT_BLK if tp == 1 else 16
+    comptime DBLK_LOCAL = DENSE_INT_LOCAL // DBLK
     comptime persistent = (
         f32_bytes                          # act_scale_lease
-        + C.DENSE_NUM_BLOCKS * f32_bytes   # post_blk_scale_lease
+        + DBLK_LOCAL * f32_bytes           # post_blk_scale_lease
     )
 
     comptime qkv_n_local = C.Q_DIM_SLIDING // tp + 2 * (C.KV_DIM_SLIDING // tp)
@@ -514,7 +522,7 @@ def calculate_peak_scratch[tp: Int]() -> Int:
         + C.TOP_K * C.MOE_NUM_BLOCKS * f32_bytes
         + C.TOP_K * C.HIDDEN * bf16_bytes
         + size_of[Int32]()
-        + C.INTERMEDIATE * i8_bytes
+        + DENSE_INT_LOCAL * i8_bytes
         + C.HIDDEN * bf16_bytes
         + C.HIDDEN * bf16_bytes
     )
@@ -789,11 +797,13 @@ def init_layer_body[tp: Int](arena_base: Int, layer_base: Int,
     layers (dense MLP, router, per-rank experts)."""
     comptime experts_local = C.NUM_EXPERTS // tp
     comptime ne_gu_local = experts_local * C.MOE_GATE_UP_FUSED
-    # Dense MLP colsums.
+    comptime INT_LOCAL = C.INTERMEDIATE // tp
+    comptime DBLK = C.FWHT_BLK if tp == 1 else 16
+    # Dense MLP colsums (sharded: gate/up ROW, down COL).
     colsum_at(arena_base, layer_base + body.gate_proj, layer_base + colsums.gu_colsum,
-        C.INTERMEDIATE * 2, C.HIDDEN)
+        INT_LOCAL * 2, C.HIDDEN)
     block_colsum_at(arena_base, layer_base + body.down_proj, layer_base + colsums.down_colsum,
-        C.HIDDEN, C.INTERMEDIATE, C.FWHT_BLK)
+        C.HIDDEN, INT_LOCAL, DBLK)
     # Router + expert colsums.
     colsum_at(arena_base, layer_base + body.router_proj, layer_base + colsums.router_colsum,
         C.NUM_EXPERTS, C.HIDDEN)
@@ -805,8 +815,8 @@ def init_layer_body[tp: Int](arena_base: Int, layer_base: Int,
             layer_base + colsums.experts_down_colsum + e * C.HIDDEN * C.MOE_NUM_BLOCKS * 4,
             C.HIDDEN, C.MOE_INTERMEDIATE, C.FWHT_BLK)
     # VNNI packing — colsums above must be done first (pack reorders bytes).
-    pack_at(arena_base, layer_base + body.gate_proj,   C.INTERMEDIATE * 2, C.HIDDEN, scratch)
-    pack_at(arena_base, layer_base + body.down_proj,   C.HIDDEN, C.INTERMEDIATE,     scratch)
+    pack_at(arena_base, layer_base + body.gate_proj,   INT_LOCAL * 2, C.HIDDEN, scratch)
+    pack_at(arena_base, layer_base + body.down_proj,   C.HIDDEN, INT_LOCAL,     scratch)
     pack_at(arena_base, layer_base + body.router_proj, C.NUM_EXPERTS, C.HIDDEN,      scratch)
     for e in range(experts_local):
         pack_at(arena_base, layer_base + body.experts_gate_up + e * C.MOE_GATE_UP_FUSED * C.HIDDEN,
@@ -1027,6 +1037,10 @@ struct Gemma4ButterQuant[tp: Int](Movable):
 
         var pt = QuantScheme(QuantPassthrough())
         var row_hb = QuantScheme(RowQuantized(rotation=HB))
+        # Channelwise (no rotation). FWHT is applied to the activation at
+        # runtime, not baked into the weight. These weights are TP-safe under
+        # any row/col shard — no block alignment constraint.
+        var row_no_rot = QuantScheme(RowQuantized(rotation=0))
 
         for i in range(C.NUM_LAYERS):
             var prefix = "model.language_model.layers." + String(i) + "."
@@ -1043,18 +1057,16 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             else:
                 tasks.append(QuantizeTask(prefix + "self_attn.o_proj.weight", row_hb.copy()))
 
-            # Dense MLP
+            # Dense MLP — gate/up rotate on K=HIDDEN (unsplit), TP-safe under ROW shard.
+            # down_proj is channelwise (no rotation), TP-safe under COL shard.
             tasks.append(QuantizeTask(prefix + "mlp.gate_proj.weight", row_hb.copy()))
             tasks.append(QuantizeTask(prefix + "mlp.up_proj.weight", row_hb.copy()))
-            tasks.append(QuantizeTask(prefix + "mlp.down_proj.weight",
-                QuantScheme(RowQuantized(rotation=0))))
+            tasks.append(QuantizeTask(prefix + "mlp.down_proj.weight", row_no_rot.copy()))
 
-            # Router + experts
+            # Router + experts — channelwise, no rotation on weights.
             tasks.append(QuantizeTask(prefix + "router.proj.weight", row_hb.copy()))
-            tasks.append(QuantizeTask(prefix + "experts.gate_up_proj",
-                QuantScheme(RowQuantized(rotation=0))))
-            tasks.append(QuantizeTask(prefix + "experts.down_proj",
-                QuantScheme(RowQuantized(rotation=0))))
+            tasks.append(QuantizeTask(prefix + "experts.gate_up_proj", row_no_rot.copy()))
+            tasks.append(QuantizeTask(prefix + "experts.down_proj", row_no_rot.copy()))
 
             # Norms + scalars — passthrough
             tasks.append(QuantizeTask(prefix + "input_layernorm.weight", pt.copy()))
@@ -1130,7 +1142,10 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         sample.broadcast = PhaseTiming.opaque(Int(perf_counter_ns()) - t_bcast0)
 
         var act_scale_lease = self.scratch.borrow[Float32, 1]()
-        var post_blk_scale_lease = self.scratch.borrow[Float32, C.DENSE_NUM_BLOCKS]()
+        comptime DENSE_INT_LOCAL = C.INTERMEDIATE // Self.tp
+        comptime DBLK = C.FWHT_BLK if Self.tp == 1 else 16
+        comptime DBLK_LOCAL = DENSE_INT_LOCAL // DBLK
+        var post_blk_scale_lease = self.scratch.borrow[Float32, DBLK_LOCAL]()
 
         var sliding_idx = 0
         var full_idx = 0
@@ -1505,12 +1520,12 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     rank, pool)
             sample.expert_phase1.add(rnks.timed_parallel[do_expert_phase1](mp))
 
-            var dense_post_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.INTERMEDIATE]()
+            var dense_post_i8_lease = self.scratch.borrow[Scalar[DType.int8], DENSE_INT_LOCAL]()
 
             @parameter
             def do_dense_phase1[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
-                return fused_gu_gelu_tanh[C.INTERMEDIATE, C.HIDDEN, C.FWHT_BLK](
+                return fused_gu_gelu_tanh[DENSE_INT_LOCAL, C.HIDDEN, DBLK](
                     I8Ptr(unsafe_from_address=rv.scratch_addr(act_i8_lease)),
                     F32Ptr(unsafe_from_address=rv.scratch_addr(act_scale_lease)),
                     U8Ptr(unsafe_from_address=lb + body.gate_proj),
@@ -1548,7 +1563,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             @parameter
             def do_dense_phase2[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
-                return int8_gemv_blocked[C.HIDDEN, C.INTERMEDIATE, C.FWHT_BLK](
+                return int8_gemv_blocked[C.HIDDEN, DENSE_INT_LOCAL, DBLK](
                     I8Ptr(unsafe_from_address=rv.scratch_addr(dense_post_i8_lease)),
                     U8Ptr(unsafe_from_address=lb + body.down_proj),
                     F32Ptr(unsafe_from_address=rv.scratch_addr(post_blk_scale_lease)),
@@ -1560,26 +1575,47 @@ struct Gemma4ButterQuant[tp: Int](Movable):
 
             var dense_normed_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.HIDDEN]()
 
+            # Expert sum → x_residual (before expert allreduce)
             @parameter
-            def do_pre_reduce[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
+            def do_expert_sum[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lc = Int(UnsafePointer[Int32, MutAnyOrigin](
                     unsafe_from_address=rv.scratch_addr(local_count_lease))[] )
-                var args = InlineArray[PreReduceArgs, 1](fill=PreReduceArgs(
+                var args = InlineArray[ExpertSumArgs, 1](fill=ExpertSumArgs(
                     rv.scratch_addr(expert_out_lease), lc,
-                    rv.x_residual(seq_len).ptr, rv.scratch_addr(dense_out_lease),
-                    lb + body.post_ffn_norm_1,
-                    rv.scratch_addr(dense_normed_lease), EPS))
-                pool.dispatch[PreReduceArgs, pre_reduce_kernel[C.HIDDEN]](UnsafePointer(to=args[0]), 1)
+                    rv.x_residual(seq_len).ptr))
+                pool.dispatch[ExpertSumArgs, expert_sum_kernel[C.HIDDEN]](UnsafePointer(to=args[0]), 1)
                 return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
                     unsafe_from_address=Int(UnsafePointer(to=pool))))
-            sample.pre_reduce.add(rnks.timed_parallel[do_pre_reduce](mp))
+            sample.pre_reduce.add(rnks.timed_parallel[do_expert_sum](mp))
 
+            # Dense allreduce (partial dense_out → full dense_out)
+            var t_dense_reduce0 = Int(perf_counter_ns())
+            var dense_out_ptrs = InlineArray[Int, Self.tp](fill=0)
+            for r in range(Self.tp):
+                dense_out_ptrs[r] = rnks.view(r).scratch_addr(dense_out_lease)
+            ring_allreduce[RV.X_RESIDUAL, Self.tp](dense_out_ptrs, 1, mp)
+            sample.mlp_reduce.add(PhaseTiming.opaque(Int(perf_counter_ns()) - t_dense_reduce0))
+
+            # Dense norm (after allreduce, dense_out is now the full sum)
+            @parameter
+            def do_dense_norm[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
+                var args = InlineArray[DenseNormArgs, 1](fill=DenseNormArgs(
+                    rv.scratch_addr(dense_out_lease),
+                    lb + body.post_ffn_norm_1,
+                    rv.scratch_addr(dense_normed_lease), EPS))
+                pool.dispatch[DenseNormArgs, dense_norm_kernel[C.HIDDEN]](UnsafePointer(to=args[0]), 1)
+                return PoolFence[BurstPool[]](UnsafePointer[BurstPool[], MutAnyOrigin](
+                    unsafe_from_address=Int(UnsafePointer(to=pool))))
+            sample.pre_reduce.add(rnks.timed_parallel[do_dense_norm](mp))
+
+            # Expert allreduce (expert sum across ranks)
             var t_mlp_reduce0 = Int(perf_counter_ns())
             ring_allreduce[RV.X_RESIDUAL, Self.tp](
                 rnks.x_residual_ptrs(seq_len), seq_len, mp)
             sample.mlp_reduce.add(PhaseTiming.opaque(Int(perf_counter_ns()) - t_mlp_reduce0))
 
+            # Post-reduce: norm experts + combine with dense_normed + residual
             @parameter
             def do_post_reduce[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)

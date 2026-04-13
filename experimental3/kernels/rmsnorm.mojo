@@ -541,6 +541,40 @@ def pre_reduce_kernel[hidden: Int](args: PreReduceArgs):
 
 
 @fieldwise_init
+struct ExpertSumArgs(Copyable, ImplicitlyCopyable):
+    var expert_out_ptr: Int
+    var local_count: Int
+    var dst_ptr: Int
+
+def expert_sum_kernel[hidden: Int](args: ExpertSumArgs):
+    """Accumulate local expert outputs into dst."""
+    comptime width = simd_width_of[DType.float32]()
+    var expert_buf = BF16Ptr(unsafe_from_address=args.expert_out_ptr)
+    var dst = BF16Ptr(unsafe_from_address=args.dst_ptr)
+    for i in range(0, hidden, width):
+        var acc = SIMD[DType.float32, width](0)
+        for e in range(args.local_count):
+            acc += (expert_buf + e * hidden + i).load[width=width]().cast[DType.float32]()
+        (dst + i).store(acc.cast[DType.bfloat16]())
+
+
+@fieldwise_init
+struct DenseNormArgs(Copyable, ImplicitlyCopyable):
+    var src_ptr: Int
+    var norm_w_ptr: Int
+    var dst_ptr: Int
+    var eps: Float32
+
+def dense_norm_kernel[hidden: Int](args: DenseNormArgs):
+    """RMSNorm dense output (no residual add)."""
+    rmsnorm_bf16_row[hidden, True, False](
+        BF16Ptr(unsafe_from_address=args.src_ptr),
+        BF16Ptr(unsafe_from_address=args.norm_w_ptr),
+        BF16Ptr(unsafe_from_address=args.dst_ptr),
+        args.eps)
+
+
+@fieldwise_init
 struct PostReduceArgs(Copyable, ImplicitlyCopyable):
     var moe_out_ptr: Int
     var moe_norm_w_ptr: Int
