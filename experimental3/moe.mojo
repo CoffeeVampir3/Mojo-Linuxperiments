@@ -54,6 +54,12 @@ def gemv_row_blocked[N: Int, K: Int, fwht_block_size: Int](
 ):
     """GEMV with per-K-block activation scales. Accumulates per block in i32,
     dequants to f32 per block, then applies per-row weight scale."""
+    debug_assert(K % fwht_block_size == 0,
+        "gemv_row_blocked: K must be a multiple of fwht_block_size")
+    debug_assert(fwht_block_size >= VNNI_K_STEP,
+        "gemv_row_blocked: fwht_block_size must be >= VNNI_K_STEP (64)")
+    debug_assert(N % VNNI_N_STEP == 0,
+        "gemv_row_blocked: N must be a multiple of VNNI_N_STEP (32)")
     comptime num_blocks = K // fwht_block_size
     comptime width = simd_width_of[DType.int32]()
     comptime passes_per_subtile = VNNI_TILE_N // width

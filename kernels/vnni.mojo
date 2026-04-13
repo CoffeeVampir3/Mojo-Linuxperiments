@@ -65,6 +65,10 @@ def pack_vnni(
     """
     var N = rows
     var K = cols
+    debug_assert(K % VNNI_K_STEP == 0,
+        "pack_vnni: K must be a multiple of VNNI_K_STEP (64)")
+    debug_assert(N % VNNI_N_STEP == 0,
+        "pack_vnni: N must be a multiple of VNNI_N_STEP (32)")
     var n_block = compute_n_block(N, K)
     var k_block = K
     var scratch = InlineArray[SIMD[DType.int32, 16], 16](uninitialized=True)

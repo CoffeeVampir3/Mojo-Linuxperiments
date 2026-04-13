@@ -23,6 +23,8 @@ def block_colsum_at(arena_base: Int, weight_off: Int, colsum_off: Int,
     colsum[blk * rows + n] = sum_{k in block} W_i8[n, k].
     Transposed so consecutive output rows are contiguous per block.
     """
+    debug_assert(cols % block_cols == 0,
+        "block_colsum_at: cols must be a multiple of block_cols")
     var wp = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](
         unsafe_from_address=arena_base + weight_off)
     var cp = UnsafePointer[Float32, MutAnyOrigin](

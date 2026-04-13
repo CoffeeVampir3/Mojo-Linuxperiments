@@ -45,6 +45,10 @@ def fused_gu_gelu_tanh_worker[intermediate: Int, K: Int, fwht_blk: Int](
     Activation must be pre-quantized by caller.
     Fused weight is [2*intermediate, K]: gate = [0:intermediate], up = [intermediate:].
     """
+    debug_assert(intermediate % fwht_blk == 0,
+        "fused_gu_gelu_tanh: intermediate must be a multiple of fwht_blk")
+    debug_assert(K % 64 == 0,
+        "fused_gu_gelu_tanh: K must be a multiple of 64 (VNNI_K_STEP)")
     comptime width = simd_width_of[DType.float32]()
     comptime num_blk_per_row = intermediate // fwht_blk
 

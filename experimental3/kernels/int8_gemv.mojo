@@ -95,6 +95,10 @@ def gemv_row[N: Int, K: Int, OutDType: DType](
 
     Epilogue: (raw_i32 - 128*colsum[n]) * act_sc * weight_scale[n] -> OutDType.
     """
+    debug_assert(K % VNNI_K_STEP == 0,
+        "gemv_row: K must be a multiple of VNNI_K_STEP (64)")
+    debug_assert(N % VNNI_N_STEP == 0,
+        "gemv_row: N must be a multiple of VNNI_N_STEP (32)")
     comptime width = simd_width_of[DType.int32]()
     comptime passes_per_subtile = VNNI_TILE_N // width
     comptime bytes_per_pass = width * VNNI_BLK

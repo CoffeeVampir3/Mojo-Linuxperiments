@@ -23,7 +23,7 @@ comptime TOKENIZER_PATH = "checkpoints/gemma-4-26B-A4B/tokenizer.json"
 comptime MODEL_DIR = "quantized_models"
 comptime VOCAB = Gemma4Config.VOCAB_SIZE
 comptime MAX_NEW_TOKENS = 128
-comptime TP = 4
+comptime TP = 1
 
 
 def greedy_argmax(read view: LogitsView[VOCAB]) -> Tuple[Int, Float32]:

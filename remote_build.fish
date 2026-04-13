@@ -36,4 +36,4 @@ rsync -av \
 echo "✓ Synced to $REMOTE_HOST:$REMOTE_PATH"
 echo "→ Building and running $TARGET on $REMOTE_HOST"
 
-ssh $REMOTE_USER@$REMOTE_HOST "cd $REMOTE_PATH && env MOJO_ENABLE_RUNTIME=0 pixi run mojo build -I . $TARGET && ./$BINARY"
+ssh $REMOTE_USER@$REMOTE_HOST "cd $REMOTE_PATH && env MOJO_ENABLE_RUNTIME=0 pixi run mojo build -I . -D ASSERT=all $TARGET && ./$BINARY"
