@@ -37,37 +37,23 @@ struct Shape[
     comptime PAD_N = Self.N - Self.DATA_N
     comptime PAD_M = Self.M - Self.DATA_M
 
-    @staticmethod
-    def alloc_bytes[elem_bytes: Int]() -> Int:
-        return Self.N * Self.M * elem_bytes
+    comptime ELEMS = Self.N * Self.M
+    comptime DATA_ELEMS = Self.DATA_N * Self.DATA_M
 
     @staticmethod
-    def data_bytes[elem_bytes: Int]() -> Int:
-        return Self.DATA_N * Self.DATA_M * elem_bytes
+    def bytes_for[elem_bytes: Int]() -> Int:
+        """Total bytes required to represent this shape at given element size."""
+        return Self.ELEMS * elem_bytes
 
     @staticmethod
-    def row_stride[elem_bytes: Int]() -> Int:
+    def data_bytes_for[elem_bytes: Int]() -> Int:
+        """Bytes of actual data (no padding) at given element size."""
+        return Self.DATA_ELEMS * elem_bytes
+
+    @staticmethod
+    def row_stride_for[elem_bytes: Int]() -> Int:
+        """Row pitch in bytes (includes padding columns)."""
         return Self.M * elem_bytes
-
-
-# =============================================================================
-# How this replaces current Slot + shard strategy
-# =============================================================================
-
-# Current approach:
-#   comptime RowShard = Shard2D[Divide, Keep]
-#   Slot[I8, RowShard, 2112, 2816, tp=4]
-#     → ROWS = 528, COLS = 2816
-#
-# New approach:
-#   alias GateShape = Shape[2112, 2816, shard_n=True, tp=4]
-#     → N = 528, M = 2816, DATA_N = 528
-#     → alloc_bytes[1]() = 528 * 2816 = 1,486,848
-#
-# With alignment:
-#   alias DownShape = Shape[2816, 2112, shard_m=True, tp=4, align_m=64]
-#     → N = 2816, M = 576, DATA_M = 528
-#     → alloc_bytes[1]() = 2816 * 576 = 1,621,696
 
 
 # =============================================================================
@@ -80,7 +66,7 @@ struct TensorSlot[S: Shape, offset: Int, elem_bytes: Int]:
     comptime DATA_N = Self.S.DATA_N
     comptime DATA_M = Self.S.DATA_M
     comptime OFFSET = Self.offset
-    comptime ALLOC = Self.S.alloc_bytes[Self.elem_bytes]()
+    comptime ALLOC = Self.S.bytes_for[Self.elem_bytes]()
 
     @staticmethod
     def next_offset[alignment: Int = 64]() -> Int:
@@ -104,14 +90,14 @@ def demo_gemma4[tp: Int]():
     print("gate/up [" + String(INT) + ", " + String(H) + "] ROW shard, align_n=32:")
     print("  N=" + String(GateUp.N) + " M=" + String(GateUp.M)
         + " DATA_N=" + String(GateUp.DATA_N)
-        + " alloc_i8=" + String(GateUp.alloc_bytes[1]()) + " bytes")
+        + " i8_bytes=" + String(GateUp.bytes_for[1]()) + " bytes")
 
     # gate/up scale: ROW shard, same N alignment, 1 col
     alias GateUpScale = Shape[INT, 1, shard_n=True, tp=tp, align_n=32]
     print("gate/up_scale [" + String(INT) + ", 1] ROW shard, align_n=32:")
     print("  N=" + String(GateUpScale.N)
         + " DATA_N=" + String(GateUpScale.DATA_N)
-        + " alloc_f32=" + String(GateUpScale.alloc_bytes[4]()) + " bytes")
+        + " f32_bytes=" + String(GateUpScale.bytes_for[4]()) + " bytes")
 
     # down: COL shard (divide M), N=HIDDEN stays full
     # M needs VNNI_K_STEP=64 alignment for the GEMV input
@@ -120,12 +106,12 @@ def demo_gemma4[tp: Int]():
     print("  N=" + String(Down.N) + " M=" + String(Down.M)
         + " DATA_M=" + String(Down.DATA_M)
         + " pad=" + String(Down.PAD_M)
-        + " alloc_i8=" + String(Down.alloc_bytes[1]()) + " bytes")
+        + " i8_bytes=" + String(Down.bytes_for[1]()) + " bytes")
 
     # down scale: replicated [H, 1] — no shard, no align
     alias DownScale = Shape[H, 1]
     print("down_scale [" + String(H) + ", 1] replicated:")
-    print("  alloc_f32=" + String(DownScale.alloc_bytes[4]()) + " bytes")
+    print("  f32_bytes=" + String(DownScale.bytes_for[4]()) + " bytes")
 
     # Colsum for down: per-block [H, K/block] where K is the padded M
     # The shape system gives us Down.M (padded), so block count is automatic
