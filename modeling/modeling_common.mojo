@@ -14,7 +14,7 @@ from modeling.model_spec import (
     I8, F32,
     DEFAULT_ALIGNMENT,
 )
-from experimental.linear_borrow_pool import ScratchLease
+from experimental.linear_borrow_pool import ScratchLease, ScratchPool
 
 
 @always_inline
@@ -54,6 +54,47 @@ def scratch_ptr[T: AnyType](
 ) -> UnsafePointer[T, MutAnyOrigin]:
     return UnsafePointer[T, MutAnyOrigin](
         unsafe_from_address=scratch_base + lease.offset)
+
+
+@explicit_destroy
+struct BorrowedScratchTensor[E: Encoding, rows: Int, cols: Int](Movable):
+    var ptr: UnsafePointer[Scalar[Self.E.DTYPE], MutAnyOrigin]
+    var seq_len: Int
+    var lease: ScratchLease
+
+    def __init__(
+        out self,
+        ptr: UnsafePointer[Scalar[Self.E.DTYPE], MutAnyOrigin],
+        seq_len: Int,
+        var lease: ScratchLease,
+    ):
+        self.ptr = ptr
+        self.seq_len = seq_len
+        self.lease = lease^
+
+    @always_inline
+    def view(self) -> DynamicTensorView[Self.E, Shape[Self.rows, Self.cols]]:
+        return DynamicTensorView[Self.E, Shape[Self.rows, Self.cols]](
+            Int(self.ptr), self.seq_len)
+
+    def release(deinit self):
+        self.lease^.release()
+
+
+@always_inline
+def borrow_scratch_tensor[E: Encoding, rows: Int, cols: Int](
+    mut pool: ScratchPool,
+    scratch_base: Int,
+    seq_len: Int,
+) -> BorrowedScratchTensor[E, rows, cols]:
+    var lease = pool.borrow[Scalar[E.DTYPE], rows * cols]()
+    return BorrowedScratchTensor[E, rows, cols](
+        UnsafePointer[Scalar[E.DTYPE], MutAnyOrigin](
+            unsafe_from_address=scratch_base + lease.offset
+        ),
+        seq_len,
+        lease^,
+    )
 
 
 @fieldwise_init
