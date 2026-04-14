@@ -42,13 +42,6 @@ def greedy_argmax(read view: LogitsView[VOCAB]) -> Tuple[Int, Float32]:
 
 
 def main():
-    # --- Create dump directory ---
-    from std.os import mkdir
-    try:
-        mkdir("dump_activations")
-    except:
-        pass
-
     # --- Load tokenizer ---
     var tok_opt = load_tokenizer(Path(TOKENIZER_PATH))
     if not tok_opt:

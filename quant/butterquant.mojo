@@ -1,17 +1,16 @@
 """ButterQuant offline weight quantizer.
 
-Driver is a plain function over `List[QuantizeTask]`. Callers pass the task
-list they want quantized; each task is self-contained (kind + src_name +
-optional gamma_src). The driver turns tasks into `QuantizePlan`s in one pass,
-writing the output header, then processes each plan independently. Ordering
-of the task list does not matter — gamma absorption is carried per-plan and
-resolved by a one-slot `GammaCache`.
+Driver is a plain function over `List[QuantizeTask]`. Each task pairs a
+weight name with a `QuantOp` — a fully-resolved, flat description of
+what the quantizer should do. The driver turns tasks into `QuantizePlan`s
+in one pass, writes the output header, then processes each plan
+independently. Ordering does not matter — gamma absorption is carried
+per-plan and resolved by a one-slot `GammaCache`.
 
-Per quantizable weight:
-  1. Smooth/gamma absorption (if scheme has smooth_src): row *= sqrt(|gamma[k]|)
-  2. FWHT rotation on the contraction dim per row (block sized by column
-     count, capped at MAX_FWHT_BLOCK, plus a full-attn o_proj special case)
-  3. Per-row (or per-block) symmetric i8 quantization
+Per quantizable weight (governed by its QuantOp):
+  1. Smooth/gamma absorption (if op.smooth_src set): row *= sqrt(|gamma[k]|)
+  2. FWHT rotation (if op.rotate): block-diagonal transform at op.block
+  3. Per-row or per-block symmetric i8 quantization
 
 Panelized — scratch is sized for one row panel at the widest quantizable
 column count and reused across plans.
@@ -32,11 +31,7 @@ from linux.io_uring import (
     IoRing, ReadOp, WriteOp, Completion, ReadWriteMode, ReadMode, RingError,
 )
 from numa import NumaArena, NumaInfo
-from modeling.model_spec import (
-    QuantizeTask, QuantScheme,
-    QuantPassthrough, RowQuantized, BlockQuantized, SmoothBlockQuantized,
-    quant_is_quantized, quant_rotation, quant_scale_blocks, quant_smooth_source,
-)
+from modeling.model_spec import QuantizeTask, QuantOp
 from modeling.loader import discover_shards
 from notstdcollections import HeapMoveArray
 from experimental.hadquant_impl import fwht_row
@@ -47,8 +42,6 @@ comptime PtrU8 = UnsafePointer[UInt8, MutAnyOrigin]
 comptime PtrF32 = UnsafePointer[Float32, MutAnyOrigin]
 comptime PtrI8 = UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
 comptime WIDTH = simd_width_of[DType.float32]()
-comptime MAX_FWHT_BLOCK = 256
-comptime FULL_O_PROJ_FWHT_BLOCK = 512
 comptime DEFAULT_QUANT_PANEL_ROWS = 2048
 comptime DEFAULT_COPY_CHUNK_BYTES = 16 * 1024 * 1024
 comptime DEFAULT_ARENA_ALIGNMENT = 64
@@ -125,45 +118,12 @@ def build_header(entries: List[OutputEntry]) -> List[UInt8]:
 
 
 # =============================================================================
-# FWHT block size computation
-# =============================================================================
-
-
-def fwht_block_for_cols(cols: Int) -> Int:
-    """Largest power-of-2 factor of cols, capped at MAX_FWHT_BLOCK."""
-    var block = 1
-    var c = cols
-    while c % 2 == 0 and block < MAX_FWHT_BLOCK:
-        block *= 2
-        c //= 2
-    return block
-
-
-def fwht_block_for_weight(name: String, cols: Int) -> Int:
-    """Per-weight FWHT block selection.
-
-    Gemma4 full-attention O projection is consumed one 512-dim head at a time
-    with one activation scale per head. Its offline rotation must use the same
-    512-wide basis; the generic 256-wide cap is still correct elsewhere.
-
-    The embed table uses 64-wide blocks (matching FWHT_BLK_HIDDEN) for finer
-    per-block scale adaptation — smaller blocks reduce quantization drift in
-    the lm_head output.
-    """
-    if cols == 8192 and name.endswith("self_attn.o_proj.weight"):
-        return FULL_O_PROJ_FWHT_BLOCK
-    if name.endswith("embed_tokens.weight"):
-        return 64
-    return fwht_block_for_cols(cols)
-
-
-# =============================================================================
 # Core transforms
 # =============================================================================
 
 
-def quantize_panel_rows[block: Int, per_block: Bool](job: QuantPanelJob):
-    """FWHT + absmax i8 quantize, with optional per-column scaling.
+def quantize_panel_rows[block: Int, per_block: Bool, rotate: Bool](job: QuantPanelJob):
+    """[FWHT] + absmax i8 quantize, with optional per-column scaling.
 
     When per_block=False: one absmax scale per row (scales layout: [rows]).
     When per_block=True:  one absmax per FWHT block (scales layout: [rows, num_blocks]).
@@ -202,8 +162,8 @@ def quantize_panel_rows[block: Int, per_block: Bool](job: QuantPanelJob):
             work_row[k] = x
             k += 1
 
-        # Block-diagonal FWHT
-        fwht_row[DType.float32, block](work_row, cols)
+        comptime if rotate:
+            fwht_row[DType.float32, block](work_row, cols)
 
         # Absmax + quantize — per-row or per-block
         comptime if per_block:
@@ -269,7 +229,7 @@ def quantize_panel_rows[block: Int, per_block: Bool](job: QuantPanelJob):
                 k += 1
 
 
-def quantize_panel_dispatch[mask_size: Int, block: Int, per_block: Bool](
+def quantize_panel_dispatch[mask_size: Int, block: Int, per_block: Bool, rotate: Bool](
     src_ptr: Int,
     work_ptr: Int,
     qi_ptr: Int,
@@ -292,59 +252,50 @@ def quantize_panel_dispatch[mask_size: Int, block: Int, per_block: Bool](
             jobs[i] = QuantPanelJob(
                 src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr,
                 cols, row_start, row_count, apply_gamma)
-        pool.dispatch[QuantPanelJob, quantize_panel_rows[block, per_block]](jobs, num_jobs)
+        pool.dispatch[QuantPanelJob, quantize_panel_rows[block, per_block, rotate]](jobs, num_jobs)
         pool.join()
         jobs.free()
     else:
-        quantize_panel_rows[block, per_block](QuantPanelJob(
+        quantize_panel_rows[block, per_block, rotate](QuantPanelJob(
             src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr,
             cols, 0, rows, apply_gamma))
 
 
 def run_panel[mask_size: Int](
-    block: Int,
-    per_block: Bool,
+    op: QuantOp,
     src_ptr: Int, work_ptr: Int, qi_ptr: Int, scales_ptr: Int, gamma_ptr: Int,
-    rows: Int, cols: Int, apply_gamma: Bool,
+    rows: Int, cols: Int,
     mut pool: BurstPool[mask_size],
 ):
-    """Unified dispatch for all quantize panel variants.
+    """Dispatch quantize panel for a resolved QuantOp.
 
-    per_block: per-FWHT-block scales (True) or per-row scales (False).
-    apply_gamma: multiply by gamma_ptr per element before FWHT.
+    Block size cascade is unavoidable (comptime for fwht_block), but
+    per_block/rotate combinations are factored into the inner dispatch.
     """
-    if per_block:
-        if block == 512:
-            quantize_panel_dispatch[mask_size, 512, True](
-                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
-        elif block == 256:
-            quantize_panel_dispatch[mask_size, 256, True](
-                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
-        elif block == 128:
-            quantize_panel_dispatch[mask_size, 128, True](
-                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
-        elif block == 64:
-            quantize_panel_dispatch[mask_size, 64, True](
-                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
+    @parameter
+    def go[b: Int]():
+        if op.per_block and op.rotate:
+            quantize_panel_dispatch[mask_size, b, True, True](
+                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr,
+                rows, cols, op.smooth_src != "", pool)
+        elif op.per_block:
+            quantize_panel_dispatch[mask_size, b, True, False](
+                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr,
+                rows, cols, op.smooth_src != "", pool)
+        elif op.rotate:
+            quantize_panel_dispatch[mask_size, b, False, True](
+                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr,
+                rows, cols, op.smooth_src != "", pool)
         else:
-            quantize_panel_dispatch[mask_size, 32, True](
-                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
-    else:
-        if block == 512:
-            quantize_panel_dispatch[mask_size, 512, False](
-                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
-        elif block == 256:
-            quantize_panel_dispatch[mask_size, 256, False](
-                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
-        elif block == 128:
-            quantize_panel_dispatch[mask_size, 128, False](
-                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
-        elif block == 64:
-            quantize_panel_dispatch[mask_size, 64, False](
-                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
-        else:
-            quantize_panel_dispatch[mask_size, 32, False](
-                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr, rows, cols, apply_gamma, pool)
+            quantize_panel_dispatch[mask_size, b, False, False](
+                src_ptr, work_ptr, qi_ptr, scales_ptr, gamma_ptr,
+                rows, cols, op.smooth_src != "", pool)
+
+    if op.block == 512: go[512]()
+    elif op.block == 256: go[256]()
+    elif op.block == 128: go[128]()
+    elif op.block == 64: go[64]()
+    else: go[32]()
 
 
 def bf16_to_f32(src: PtrU8, dst: PtrF32, count: Int):
@@ -433,7 +384,7 @@ struct PlanKind:
 @fieldwise_init
 struct QuantizePlan(Copyable, Movable):
     var kind: Int                   # PlanKind.QUANTIZE / PASSTHROUGH / MISSING
-    var scheme: QuantScheme         # the full scheme (only meaningful when kind=QUANTIZE)
+    var op: QuantOp                 # resolved operation (meaningful when kind=QUANTIZE)
 
     var src_name: String
     var src_shard: Int
@@ -443,8 +394,8 @@ struct QuantizePlan(Copyable, Movable):
 
     var rows: Int
     var cols: Int
-    var block: Int                  # FWHT rotation block (from scheme)
-    var num_blocks: Int             # scale blocks per row (from scheme)
+    var block: Int                  # FWHT rotation block (from op)
+    var num_blocks: Int             # scale entries per row (from op + cols)
 
     # Output layout — offsets relative to data_start
     var weight_out_off: Int
@@ -512,12 +463,14 @@ def plan_quantization(
     var offset = 0
     var max_quant_cols = 0
     var max_num_blocks = 1
+    var passthrough_op = QuantOp(quantize=False, rotate=False, block=0,
+                                 per_block=False, smooth_src="")
 
     for t_idx in range(len(tasks)):
         var t = tasks[t_idx].copy()
-        var s = t.scheme.copy()
+        var op = t.op
 
-        if quant_is_quantized(s):
+        if op.quantize:
             var located = find_tensor(headers, t.name)
             if located[0] < 0:
                 print("quantize: missing weight " + t.name)
@@ -527,11 +480,8 @@ def plan_quantization(
             var rc = fold_shape(meta.shape)
             var rows = rc[0]
             var cols = rc[1]
-            var rot = quant_rotation(s)
-            var block = rot if rot > 0 else fwht_block_for_cols(cols)
-            var num_blocks = quant_scale_blocks(s, cols)
-            if num_blocks == 0:
-                num_blocks = 1
+            var block = op.block if op.rotate else 32
+            var num_blocks = cols // op.block if op.per_block else 1
             var weight_bytes = rows * cols
             var scale_bytes = rows * num_blocks * 4
 
@@ -549,7 +499,7 @@ def plan_quantization(
 
             plans.append(QuantizePlan(
                 kind=PlanKind.QUANTIZE,
-                scheme=t.scheme.copy(),
+                op=op,
                 src_name=t.name, src_shard=shard_idx,
                 src_start=headers[shard_idx].data_offset + meta.start,
                 src_bytes=weight_bytes * 2,
@@ -569,7 +519,7 @@ def plan_quantization(
             if located[0] < 0:
                 plans.append(QuantizePlan(
                     kind=PlanKind.MISSING,
-                    scheme=t.scheme.copy(),
+                    op=passthrough_op,
                     src_name=t.name, src_shard=-1, src_start=0,
                     src_bytes=0, src_dtype=DType.uint8,
                     rows=0, cols=0, block=0, num_blocks=0,
@@ -588,7 +538,7 @@ def plan_quantization(
                 weight_off, weight_off + byte_size))
             plans.append(QuantizePlan(
                 kind=PlanKind.PASSTHROUGH,
-                scheme=t.scheme.copy(),
+                op=passthrough_op,
                 src_name=t.name, src_shard=shard_idx,
                 src_start=headers[shard_idx].data_offset + meta.start,
                 src_bytes=byte_size, src_dtype=meta.dtype,
@@ -598,13 +548,6 @@ def plan_quantization(
             ))
 
     return PlanBundle(plans^, entries^, max_quant_cols, max_num_blocks)
-
-
-# =============================================================================
-# Block-size dispatch — one cascade per kernel family, called once per plan
-# =============================================================================
-
-
 
 
 # =============================================================================
@@ -664,23 +607,20 @@ def process_quantize_plan[mask_size: Int](
     ref headers: HeapMoveArray[SafetensorsHeader],
     scratch: PanelScratch, mut pool: BurstPool[mask_size],
 ) -> Bool:
-    """Unified quantization processor for all QUANTIZE/GAMMA_QUANTIZE/PER_BLOCK/SMOOTH variants.
+    """Quantization processor driven by the plan's QuantOp.
 
     Handles gamma loading, optional sqrt transform (smooth split),
     per-row vs per-block scale output, and panel I/O.
     """
-    var smooth_src = quant_smooth_source(plan.scheme)
-    var apply_gamma = smooth_src != ""
-    var is_smooth = apply_gamma
-    var per_block = plan.num_blocks > 1
+    var op = plan.op
+    var has_smooth = op.smooth_src != ""
 
-    if apply_gamma:
-        if not gamma_cache.ensure(smooth_src, rio, headers, scratch.io_buf):
-            print("quantize: failed to load gamma/smooth source " + smooth_src)
+    if has_smooth:
+        if not gamma_cache.ensure(op.smooth_src, rio, headers, scratch.io_buf):
+            print("quantize: failed to load gamma/smooth source " + op.smooth_src)
             return False
 
-    # For smooth split: transform gamma → sqrt(|gamma|) in-place.
-    if is_smooth:
+        # Smooth split: transform gamma -> sqrt(|gamma|) in-place.
         comptime w = simd_width_of[DType.float32]()
         var gp = scratch.gamma
         var k = 0
@@ -706,10 +646,10 @@ def process_quantize_plan[mask_size: Int](
             return False
 
         run_panel[mask_size](
-            plan.block, per_block,
+            op,
             Int(scratch.io_buf), Int(scratch.work), Int(scratch.qi),
             Int(scratch.scales), Int(scratch.gamma),
-            panel, plan.cols, apply_gamma, pool)
+            panel, plan.cols, pool)
 
         var dst_w = data_start + plan.weight_out_off + rows_done * plan.cols
         if not rio.write(output_file_idx, dst_w,
@@ -859,14 +799,14 @@ def run_quantizer[
     for p_idx in range(len(bundle.plans)):
         var plan = bundle.plans[p_idx].copy()
         if plan.kind == PlanKind.QUANTIZE:
-            var per_block = plan.num_blocks > 1
-            var smooth_src = quant_smooth_source(plan.scheme)
-            var label = "per-block quantized" if per_block else "quantized"
+            var op = plan.op
+            var label = "channelwise" if not op.rotate else (
+                "per-block rotated" if op.per_block else "rotated")
             print("  " + label + ": " + plan.src_name
                 + " [" + String(plan.rows) + "x" + String(plan.cols)
                 + "] block=" + String(plan.block)
                 + " num_blocks=" + String(plan.num_blocks)
-                + (" smooth=" + smooth_src if smooth_src != "" else ""))
+                + (" smooth=" + op.smooth_src if op.smooth_src != "" else ""))
             if not process_quantize_plan[mask_size](
                     plan, data_start, output_file_idx, rio, gamma_cache,
                     headers, scratch, pool):

@@ -34,14 +34,16 @@ struct FusedGuGeluTanhArgs(Copyable, ImplicitlyCopyable):
     var row_count: Int
 
 
-def fused_gu_gelu_tanh_worker[intermediate: Int, K: Int, fwht_blk: Int](
+def fused_gu_gelu_tanh_worker[intermediate: Int, K: Int, fwht_blk: Int,
+    fwht: Bool = True](
     args: FusedGuGeluTanhArgs,
 ):
-    """N-tiled gate+up GEMV -> GELU-tanh -> FWHT -> per-block i8.
+    """N-tiled gate+up GEMV -> GELU-tanh -> [FWHT] -> per-block i8.
 
     Processes row_count activation rows, each over N-range [n_start, n_start + n_count).
     Tiles the N-range in fwht_blk-sized chunks. Each tile does:
-      gate GEMV[fwht_blk, K] + up GEMV[fwht_blk, K] -> gelu_tanh -> FWHT -> i8.
+      gate GEMV[fwht_blk, K] + up GEMV[fwht_blk, K] -> gelu_tanh -> [FWHT] -> i8.
+    When fwht=False, skips the FWHT rotation (channelwise quantization).
     Activation must be pre-quantized by caller.
     Fused weight is [2*intermediate, K]: gate = [0:intermediate], up = [intermediate:].
     """
@@ -89,7 +91,8 @@ def fused_gu_gelu_tanh_worker[intermediate: Int, K: Int, fwht_blk: Int](
                 (gate + k).store(gelu_tanh_f32[width](g) * u)
                 k += width
 
-            fwht_block[fwht_blk](gate)
+            comptime if fwht:
+                fwht_block[fwht_blk](gate)
             blk_row[local_n // fwht_blk] = absmax_quantize_i8[fwht_blk](
                 gate, qi_row + local_n)
 
@@ -97,7 +100,7 @@ def fused_gu_gelu_tanh_worker[intermediate: Int, K: Int, fwht_blk: Int](
 
 
 def fused_gu_gelu_tanh[intermediate: Int, K: Int, fwht_blk: Int,
-                       P: BurstThreadPool](
+                       P: BurstThreadPool, fwht: Bool = True](
     act_i8: I8Ptr,
     act_scale: F32Ptr,
     wpacked: U8Ptr,
@@ -108,9 +111,10 @@ def fused_gu_gelu_tanh[intermediate: Int, K: Int, fwht_blk: Int,
     seq_len: Int,
     mut pool: P,
 ) -> PoolFence[P]:
-    """Dispatch gate_up GEMV + GELU-tanh + FWHT + per-block quantize.
+    """Dispatch gate_up GEMV + GELU-tanh + [FWHT] + per-block quantize.
 
     Activation must be pre-quantized by caller (rmsnorm_gamma_fwht_quantize).
+    When fwht=False, skips FWHT rotation (channelwise per-block quantization).
     For seq_len=1 (decode): parallelizes across the output dimension N.
     For seq_len>1 (prompt): parallelizes across sequence rows.
     """
@@ -140,7 +144,7 @@ def fused_gu_gelu_tanh[intermediate: Int, K: Int, fwht_blk: Int,
                 qi_out + n_start,
                 blk_scale + tile_start,
                 n_start, n_count, 1)
-        pool.dispatch[FusedGuGeluTanhArgs, fused_gu_gelu_tanh_worker[intermediate, K, fwht_blk]](
+        pool.dispatch[FusedGuGeluTanhArgs, fused_gu_gelu_tanh_worker[intermediate, K, fwht_blk, fwht]](
             UnsafePointer(to=jobs[0]), num_workers)
     else:
         var num_workers = min(seq_len, pool.get_capacity())
@@ -155,7 +159,7 @@ def fused_gu_gelu_tanh[intermediate: Int, K: Int, fwht_blk: Int,
                 qi_out + row_start * intermediate,
                 blk_scale + row_start * num_blk_per_row,
                 0, intermediate, row_count)
-        pool.dispatch[FusedGuGeluTanhArgs, fused_gu_gelu_tanh_worker[intermediate, K, fwht_blk]](
+        pool.dispatch[FusedGuGeluTanhArgs, fused_gu_gelu_tanh_worker[intermediate, K, fwht_blk, fwht]](
             UnsafePointer(to=jobs[0]), num_workers)
 
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](

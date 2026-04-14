@@ -106,13 +106,16 @@ def emit_reads(
             file_idx=file_idx, file_offset=file_off, dest=dest, length=local_bytes,
         ))
     else:
-        var col_start = rank * desc.local_cols
-        var local_row_bytes = desc.local_cols * desc.element_bytes
+        var file_cols = desc.data_cols
+        var stride_cols = desc.local_cols
+        var col_start = rank * file_cols
+        var file_row_bytes = file_cols * desc.element_bytes
+        var stride_bytes = stride_cols * desc.element_bytes
         for r in range(desc.local_rows):
             var src = file_data_start + (r * desc.global_cols + col_start) * desc.element_bytes
-            var dst = dest + r * local_row_bytes
+            var dst = dest + r * stride_bytes
             ops.append(ReadFragment(
-                file_idx=file_idx, file_offset=src, dest=dst, length=local_row_bytes,
+                file_idx=file_idx, file_offset=src, dest=dst, length=file_row_bytes,
             ))
 
 

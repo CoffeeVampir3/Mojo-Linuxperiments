@@ -131,6 +131,69 @@ struct I8(Encoding):
     comptime ELEMENT_BYTES = 1
 
 
+# =============================================================================
+# Shape — single source of truth for tensor geometry under TP
+#
+# Encodes global dimensions, sharding, alignment, and tp degree. All derived
+# quantities (local dims, data dims, padding, byte counts) are comptime.
+# Downstream code (LayerBuilder, loader, kernels) reads from Shape instead
+# of recomputing dimensions independently.
+# =============================================================================
+
+def _align_up(val: Int, a: Int) -> Int:
+    return ((val + a - 1) // a) * a
+
+trait ShapeLike:
+    comptime GLOBAL_N: Int
+    comptime GLOBAL_M: Int
+    comptime DATA_N: Int
+    comptime DATA_M: Int
+    comptime N: Int
+    comptime M: Int
+    comptime ELEMS: Int
+
+    @staticmethod
+    def bytes_for[elem_bytes: Int]() -> Int: ...
+    @staticmethod
+    def row_bytes_for[elem_bytes: Int]() -> Int: ...
+    @staticmethod
+    def col_bytes_for[elem_bytes: Int]() -> Int: ...
+
+struct Shape[
+    global_n: Int, global_m: Int,
+    shard_n: Bool = False, shard_m: Bool = False,
+    tp: Int = 1,
+    align_n: Int = 1, align_m: Int = 1,
+](ShapeLike):
+    comptime GLOBAL_N = Self.global_n
+    comptime GLOBAL_M = Self.global_m
+    comptime DATA_N = Self.global_n // Self.tp if Self.shard_n else Self.global_n
+    comptime DATA_M = Self.global_m // Self.tp if Self.shard_m else Self.global_m
+    comptime N = _align_up(Self.DATA_N, Self.align_n)
+    comptime M = _align_up(Self.DATA_M, Self.align_m)
+    comptime PAD_N = Self.N - Self.DATA_N
+    comptime PAD_M = Self.M - Self.DATA_M
+    comptime ELEMS = Self.N * Self.M
+
+    @staticmethod
+    def bytes_for[elem_bytes: Int]() -> Int:
+        return Self.ELEMS * elem_bytes
+
+    @staticmethod
+    def row_bytes_for[elem_bytes: Int]() -> Int:
+        """Bytes for one row: M elements."""
+        return Self.M * elem_bytes
+
+    @staticmethod
+    def col_bytes_for[elem_bytes: Int]() -> Int:
+        """Bytes for one column: N elements."""
+        return Self.N * elem_bytes
+
+
+# =============================================================================
+# Legacy DimStrategy / ShardStrategy — used by SmolLM2 PlacedSlot chain
+# =============================================================================
+
 trait DimStrategy:
     @staticmethod
     def local(d: Int, tp: Int) -> Int: ...
@@ -272,15 +335,11 @@ struct WeightDesc(Copyable):
     var global_cols: Int
     var local_rows: Int
     var local_cols: Int
+    var data_rows: Int
+    var data_cols: Int
     var quantizable: Bool
     var absorbed: Bool
     var target_rank: Int
-    # NOTE: no `pack_fn` field. The loader never reads it; packing is done
-    # by model-specific init code (e.g. `init_sliding_layer` / `init_full_layer`
-    # in gemma_4_moe_butterquant_tp.mojo) via explicit `pack_at(...)` calls
-    # after the raw bytes have been loaded. Storing a runtime function
-    # pointer here was both dead code and triggered a Mojo backend codegen
-    # crash (see repro_packfn.mojo) when constructed inline.
 
 def weight_desc[T: Encoding & Shaped & Placed & Named](
     prefix: String = "", base: Int = 0,
@@ -292,6 +351,7 @@ def weight_desc[T: Encoding & Shaped & Placed & Named](
         dtype=T.DTYPE, element_bytes=T.ELEMENT_BYTES,
         global_rows=T.GLOBAL_ROWS, global_cols=T.GLOBAL_COLS,
         local_rows=T.ROWS, local_cols=T.COLS,
+        data_rows=T.ROWS, data_cols=T.COLS,
         quantizable=is_quantizable,
         absorbed=is_absorbed,
         target_rank=T.TARGET_RANK,
@@ -317,95 +377,103 @@ trait WeightIterable:
 # =============================================================================
 
 
-# --- Quantization scheme variants ---
-
-from std.utils import Variant
+# --- QuantOp: flat operational struct consumed by the quantizer core ---
 
 
 @fieldwise_init
-struct QuantPassthrough(Copyable, Movable, ImplicitlyCopyable):
+struct QuantOp(Copyable, Movable, ImplicitlyCopyable):
+    """Fully-resolved quantization operation.
+
+    Flat, no variant dispatch. The quantizer core works exclusively
+    with this. num_blocks is derived at plan time from block and cols.
+    """
+    var quantize: Bool     # False = passthrough (copy raw bytes)
+    var rotate: Bool       # apply FWHT?
+    var block: Int         # FWHT block size (0 when not rotating)
+    var per_block: Bool    # per-block scales vs per-row
+    var smooth_src: String # "" = no smooth absorption
+
+
+# --- Quantization trait: the extensibility contract ---
+
+
+trait Quantization:
+    def to_op(self) -> QuantOp: ...
+
+
+struct NoQuant(Quantization, Copyable, ImplicitlyCopyable):
     """Weight copied unchanged at source dtype."""
-    var tag: Int
+
     def __init__(out self):
-        self.tag = 0
+        pass
+
+    def to_op(self) -> QuantOp:
+        return QuantOp(quantize=False, rotate=False, block=0,
+                       per_block=False, smooth_src="")
 
 
-@fieldwise_init
-struct RowQuantized(Copyable, Movable, ImplicitlyCopyable):
-    """FWHT rotation + single absmax scale per row."""
-    var rotation: Int
+struct Rotated(Quantization, Copyable, ImplicitlyCopyable):
+    """FWHT rotation + per-row absmax i8."""
+    var block: Int
+
+    def __init__(out self, block: Int):
+        debug_assert(block > 0 and (block & (block - 1)) == 0,
+            "Rotated: block must be a positive power of 2")
+        self.block = block
+
+    def to_op(self) -> QuantOp:
+        return QuantOp(quantize=True, rotate=True, block=self.block,
+                       per_block=False, smooth_src="")
 
 
-@fieldwise_init
-struct BlockQuantized(Copyable, Movable, ImplicitlyCopyable):
-    """FWHT rotation + per-block absmax scales."""
-    var rotation: Int
-    var scale_blk: Int
+struct RotatedPerBlock(Quantization, Copyable, ImplicitlyCopyable):
+    """FWHT rotation + per-block absmax i8. Scale granularity = rotation block."""
+    var block: Int
+
+    def __init__(out self, block: Int):
+        debug_assert(block > 0 and (block & (block - 1)) == 0,
+            "RotatedPerBlock: block must be a positive power of 2")
+        self.block = block
+
+    def to_op(self) -> QuantOp:
+        return QuantOp(quantize=True, rotate=True, block=self.block,
+                       per_block=True, smooth_src="")
 
 
-@fieldwise_init
-struct SmoothRowQuantized(Copyable, Movable):
-    """Smooth split (sqrt(|gamma|)) + FWHT rotation + single absmax scale per row."""
-    var rotation: Int
-    var smooth_src: String
+struct Channelwise(Quantization, Copyable, ImplicitlyCopyable):
+    """No rotation, per-row absmax i8. For pre-rotated activations."""
+
+    def __init__(out self):
+        pass
+
+    def to_op(self) -> QuantOp:
+        return QuantOp(quantize=True, rotate=False, block=0,
+                       per_block=False, smooth_src="")
 
 
-@fieldwise_init
-struct SmoothBlockQuantized(Copyable, Movable):
-    """Smooth split (sqrt(|gamma|)) + FWHT rotation + per-block absmax scales."""
-    var rotation: Int
-    var scale_blk: Int
-    var smooth_src: String
+struct SmoothPerBlock(Quantization, Copyable, Movable):
+    """Gamma absorption + FWHT rotation + per-block absmax i8."""
+    var block: Int
+    var src: String
+
+    def __init__(out self, block: Int, src: String):
+        debug_assert(block > 0 and (block & (block - 1)) == 0,
+            "SmoothPerBlock: block must be a positive power of 2")
+        self.block = block
+        self.src = src
+
+    def to_op(self) -> QuantOp:
+        return QuantOp(quantize=True, rotate=True, block=self.block,
+                       per_block=True, smooth_src=self.src)
 
 
-comptime QuantScheme = Variant[
-    QuantPassthrough,
-    RowQuantized,
-    BlockQuantized,
-    SmoothRowQuantized,
-    SmoothBlockQuantized,
-]
-
-
-def quant_is_quantized(read s: QuantScheme) -> Bool:
-    return not s.isa[QuantPassthrough]()
-
-
-def quant_rotation(read s: QuantScheme) -> Int:
-    if s.isa[RowQuantized]():
-        return s[RowQuantized].rotation
-    elif s.isa[BlockQuantized]():
-        return s[BlockQuantized].rotation
-    elif s.isa[SmoothRowQuantized]():
-        return s[SmoothRowQuantized].copy().rotation
-    elif s.isa[SmoothBlockQuantized]():
-        return s[SmoothBlockQuantized].copy().rotation
-    return 0
-
-
-def quant_scale_blocks(read s: QuantScheme, cols: Int) -> Int:
-    """0 for passthrough, 1 for per-row, cols/blk for per-block."""
-    if s.isa[RowQuantized]() or s.isa[SmoothRowQuantized]():
-        return 1
-    elif s.isa[BlockQuantized]():
-        return cols // s[BlockQuantized].scale_blk
-    elif s.isa[SmoothBlockQuantized]():
-        return cols // s[SmoothBlockQuantized].copy().scale_blk
-    return 0
-
-
-def quant_smooth_source(read s: QuantScheme) -> String:
-    if s.isa[SmoothRowQuantized]():
-        return s[SmoothRowQuantized].copy().smooth_src
-    elif s.isa[SmoothBlockQuantized]():
-        return s[SmoothBlockQuantized].copy().smooth_src
-    return ""
+# --- QuantizeTask: pairs a weight name with its resolved operation ---
 
 
 @fieldwise_init
 struct QuantizeTask(Copyable, Movable):
     var name: String
-    var scheme: QuantScheme
+    var op: QuantOp
 
 
 trait Dims:
