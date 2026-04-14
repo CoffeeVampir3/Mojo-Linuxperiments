@@ -5,7 +5,7 @@ from std.os.atomic import Atomic
 comptime AtomicInt32 = Atomic[DType.int32]
 
 # Single-pointer ABI: worker passes pointer to NUMA-local mailbox data area.
-comptime KernelFn = def (Int) -> None
+comptime KernelFn = def(Int) thin -> None
 
 # Mailbox data area: 256 bytes (32 Int slots), stored inline in each worker's
 # mailbox on the worker's NUMA node. Dispatch copies the caller's args struct
@@ -21,7 +21,7 @@ comptime MAILBOX_DATA_BYTES = 256
 
 def typed_trampoline[
     Args: Copyable & ImplicitlyCopyable,
-    kernel: def (Args) -> None,
+    kernel: def(Args) thin -> None,
 ](data_ptr: Int):
     """Reconstruct Args from mailbox data pointer, call kernel.
 

@@ -291,8 +291,8 @@ def simd_spaces[w: Int](block: SIMD[DType.uint8, w]) -> SIMD[DType.bool, w]:
 
 @always_inline
 def skip_while_matching[
-    scalar_pred: def(Byte) -> Bool,
-    simd_pred: def[w: Int](SIMD[DType.uint8, w]) -> SIMD[DType.bool, w],
+    scalar_pred: def(Byte) thin -> Bool,
+    simd_pred: def[w: Int](SIMD[DType.uint8, w]) thin -> SIMD[DType.bool, w],
     width: Int = PRETOKENIZE_SIMD_WIDTH,
 ](data: Span[Byte, _], pos: Int, n: Int) -> Int:
     var i = pos
@@ -313,7 +313,7 @@ def skip_while_matching[
 
 @always_inline
 def consume_codepoint_run[
-    pred: def(UInt32, UnicodeContext) -> Bool,
+    pred: def(UInt32, UnicodeContext) thin -> Bool,
 ](data: Span[Byte, _], start: Int, n: Int, ctx: UnicodeContext) -> Int:
     var i = start
     while i < n:

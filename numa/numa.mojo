@@ -18,7 +18,7 @@ def read_sysfs(path: String) raises -> String:
 
 def parse_cpulist(cpulist: String) raises -> List[Int]:
     var cpus = List[Int]()
-    if len(cpulist) == 0:
+    if cpulist.byte_length() == 0:
         return cpus^
     var parts = cpulist.split(",")
     for part in parts:
@@ -36,7 +36,7 @@ def parse_distances(s: String) raises -> List[Int]:
     var distances = List[Int]()
     var parts = s.split(" ")
     for part in parts:
-        if len(part) > 0:
+        if part.byte_length() > 0:
             distances.append(atol(String(part)))
     return distances^
 
@@ -52,7 +52,7 @@ def parse_meminfo(path: String, field: String) raises -> Int:
             if key_pos == -1:
                 continue
             var bytes = line.as_bytes()
-            var value_start = key_pos + len(field)
+            var value_start = key_pos + field.byte_length()
 
             while value_start < len(bytes):
                 var b = bytes[value_start]
@@ -119,7 +119,7 @@ struct NumaInfo:
             self.isolated_cpus = parse_cpulist(
                 read_sysfs("/sys/devices/system/cpu/isolated"))
             var online_str = read_sysfs("/sys/devices/system/node/online")
-            if len(online_str) == 0:
+            if online_str.byte_length() == 0:
                 return
             var node_ids = parse_cpulist(online_str)
             for node_id in node_ids:

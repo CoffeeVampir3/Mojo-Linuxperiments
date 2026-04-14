@@ -152,10 +152,11 @@ def match_literal_at[lit: StringLiteral](
     pos: Int,
     length: Int,
 ) -> Bool:
-    if pos + len(lit) > length:
-        return False
     comptime bytes = StringSlice(lit).as_bytes()
-    comptime for i in range(len(lit)):
+    comptime lit_len = len(bytes)
+    if pos + lit_len > length:
+        return False
+    comptime for i in range(lit_len):
         if ptr[pos + i] != bytes[i]:
             return False
     return True
@@ -196,8 +197,8 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
         return False
 
     def skip_while_simd[
-        pred_scalar: def(Byte) -> Bool,
-        pred_simd: def[width: Int](SIMD[DType.uint8, width]) -> SIMD[DType.bool, width],
+        pred_scalar: def(Byte) thin -> Bool,
+        pred_simd: def[width: Int](SIMD[DType.uint8, width]) thin -> SIMD[DType.bool, width],
     ](mut self) -> Int:
         var start = self.pos
         var ptr = self.data.unsafe_ptr()
@@ -220,9 +221,10 @@ struct Parser[origin: Origin, simd_width: Int = 16]:
         return self.skip_while_simd[is_digit, simd_digits]()
 
     def try_consume[lit: StringLiteral](mut self) -> Bool:
+        comptime lit_len = len(StringSlice(lit).as_bytes())
         if not match_literal_at[lit](self.data.unsafe_ptr(), self.pos, len(self.data)):
             return False
-        self.pos += len(lit)
+        self.pos += lit_len
         return True
 
     def delimited_next(mut self, close: Byte) raises ParseError -> Bool:

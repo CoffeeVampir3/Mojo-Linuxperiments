@@ -308,7 +308,7 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
     # ----------------------------------------------------------------
 
     def dispatch[Args: Copyable & ImplicitlyCopyable,
-        kernel: def (Args) -> None, origin: MutOrigin](
+        kernel: def(Args) thin -> None, origin: MutOrigin](
         mut self, args: UnsafePointer[Args, origin], num_jobs: Int = -1):
         """Typed dispatch: copy args[i] into mailbox[i], invoke kernel via trampoline."""
         comptime assert size_of[Args]() <= MAILBOX_DATA_BYTES, "args exceed mailbox capacity"

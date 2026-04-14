@@ -313,7 +313,7 @@ def emit_body[tp: Int](mut b: LayerBuilder, mut e: List[WeightDesc]) -> BodyRefs
     comptime NE = C.NUM_EXPERTS
     comptime GU = C.MOE_GATE_UP_FUSED
     comptime MI = C.MOE_INTERMEDIATE
-    alias S = Gemma4Shapes[tp]
+    comptime S = Gemma4Shapes[tp]
     comptime o_num_blk = C.NUM_HEADS // tp
     comptime experts_local = NE // tp
 
@@ -461,7 +461,7 @@ def calculate_peak_scratch[tp: Int]() -> Int:
     comptime i8 = 1
     comptime f32 = 4
     comptime topk_bytes = size_of[Gemma4TopKResult[C.TOP_K]]()
-    alias S = Gemma4Shapes[tp]
+    comptime S = Gemma4Shapes[tp]
 
     comptime persistent = f32 + S.DOWN_NUM_BLK * f32
 
@@ -626,7 +626,7 @@ def build_gemma4_plan[tp: Int]() -> Gemma4LoadPlan[tp]:
 
 def init_layer_body_colsums[tp: Int](arena_base: Int, layer_off: Int, body: BodyRefs[tp]):
     comptime experts_local = C.NUM_EXPERTS // tp
-    alias S = Gemma4Shapes[tp]
+    comptime S = Gemma4Shapes[tp]
     colsum_at(arena_base, layer_off + body.gate_proj.offset, layer_off + body.gu_colsum,
         S.DENSE_INT_LOCAL * 2, C.HIDDEN)
     block_colsum_at(arena_base, layer_off + body.down_proj.offset, layer_off + body.down_colsum,
@@ -645,7 +645,7 @@ def init_layer_body_colsums[tp: Int](arena_base: Int, layer_off: Int, body: Body
 def init_layer_body_pack[tp: Int](arena_base: Int, layer_off: Int, body: BodyRefs[tp],
     scratch: UnsafePointer[UInt8, MutAnyOrigin]):
     comptime experts_local = C.NUM_EXPERTS // tp
-    alias S = Gemma4Shapes[tp]
+    comptime S = Gemma4Shapes[tp]
     pack_at(arena_base, layer_off + body.gate_proj.offset, S.DENSE_INT_LOCAL * 2, C.HIDDEN, scratch)
     pack_at(arena_base, layer_off + body.down_proj.offset, C.HIDDEN, S.DOWN_K, scratch)
     pack_at(arena_base, layer_off + body.router_proj.offset, C.NUM_EXPERTS, C.HIDDEN, scratch)

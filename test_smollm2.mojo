@@ -75,7 +75,7 @@ He was named to the 2022 class of ACM Fellows"""
 
     # --- Load model (parametric TP=3) ---
     var t0 = perf_counter_ns()
-    var model_opt = SmolLM2TP[3].load(Path(MODEL_PATH))
+    var model_opt = SmolLM2TP[1].load(Path(MODEL_PATH))
     if not model_opt:
         return
     var model = model_opt.take()
