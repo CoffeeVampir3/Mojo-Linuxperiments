@@ -14,6 +14,8 @@ Data fusion:
   - Per-position V scale folded into attention-weight u8 quantization
     (inherited from v_agg_group — zero extra cost in the inner loop).
 
+Dispatch wrappers at the bottom: full_attn_prep_dispatch, chunked_attn_dispatch.
+
 Usage:
   1. Dispatch full_attn_prep_kernel (1 job) — KV cache write + Q prep.
   2. Dispatch chunked_attn_kernel to pool — one worker per chunk, all Q heads.
@@ -22,6 +24,9 @@ Usage:
 
 from std.memory import UnsafePointer
 from std.collections import InlineArray
+
+from kernels.kernel_ops import PoolFence
+from threading.threading_traits import BurstThreadPool
 from std.sys.info import simd_width_of
 
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
@@ -369,3 +374,76 @@ def merge_and_quantize[head_dim: Int, heads_per_group: Int](
         # --- Quantize to i8 ---
         head_scales[qh] = absmax_quantize_i8[head_dim](
             merged_ptr, qi_out + qh * head_dim)
+
+
+# ============================================================================
+# Dispatch wrappers
+# ============================================================================
+
+
+def full_attn_prep_dispatch[
+    head_dim: Int, rope_dims: Int, heads_per_group: Int,
+    max_seq: Int, num_kv_heads: Int, num_q_heads: Int, P: BurstThreadPool,
+](
+    q_bf16_base: Int, k_bf16_ptr: Int,
+    q_norm_ptr: Int, k_norm_ptr: Int,
+    cos_ptr: Int, sin_ptr: Int,
+    cache_base: Int, cache_pos: Int, kv_head: Int,
+    eps: Float32,
+    q_i8_out: Int, qi_biases_out: Int, q_scales_out: Int,
+    mut pool: P,
+) -> PoolFence[P]:
+    var args = FullAttnPrepArgs(
+        q_bf16_base=q_bf16_base, k_bf16_ptr=k_bf16_ptr,
+        q_norm_ptr=q_norm_ptr, k_norm_ptr=k_norm_ptr,
+        cos_ptr=cos_ptr, sin_ptr=sin_ptr,
+        cache_base=cache_base, cache_pos=cache_pos, kv_head=kv_head,
+        eps=eps,
+        q_i8_out=q_i8_out, qi_biases_out=qi_biases_out, q_scales_out=q_scales_out)
+    pool.dispatch[FullAttnPrepArgs,
+        full_attn_prep_kernel[head_dim, rope_dims, heads_per_group,
+            max_seq, num_kv_heads, num_q_heads]](
+        UnsafePointer(to=args), 1)
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))))
+
+
+comptime MAX_CHUNKS = 32
+
+
+def chunked_attn_dispatch[
+    head_dim: Int, max_seq: Int,
+    num_kv_heads: Int, num_q_heads: Int, heads_per_group: Int,
+    P: BurstThreadPool,
+](
+    q_i8_base: Int, qi_biases_base: Int, q_scales_base: Int,
+    cache_base: Int, kv_head: Int,
+    context_len: Int, pool_capacity: Int,
+    partial_out_base: Int,
+    mut pool: P,
+) -> PoolFence[P]:
+    var num_pg = (context_len + CACHE_WIDTH - 1) // CACHE_WIDTH
+    var num_chunks = min(pool_capacity, MAX_CHUNKS)
+    if num_chunks > num_pg:
+        num_chunks = num_pg
+    var pgs_per_chunk = (num_pg + num_chunks - 1) // num_chunks
+    comptime CHUNK_F32_STRIDE = heads_per_group * (2 + head_dim)
+    var chunk_args = InlineArray[ChunkedAttnArgs, MAX_CHUNKS](fill=ChunkedAttnArgs())
+    for c in range(num_chunks):
+        var start = c * pgs_per_chunk
+        var end = min((c + 1) * pgs_per_chunk, num_pg)
+        chunk_args[c] = ChunkedAttnArgs(
+            q_i8_base=q_i8_base,
+            qi_biases_base=qi_biases_base,
+            q_scales_base=q_scales_base,
+            cache_base=cache_base,
+            kv_head=kv_head,
+            start_pg=start,
+            end_pg=end,
+            partial_out=partial_out_base + c * CHUNK_F32_STRIDE * 4,
+            context_len=context_len)
+    pool.dispatch[ChunkedAttnArgs,
+        chunked_attn_kernel[head_dim, max_seq, num_kv_heads, num_q_heads, heads_per_group]](
+        UnsafePointer(to=chunk_args[0]), num_chunks)
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))))

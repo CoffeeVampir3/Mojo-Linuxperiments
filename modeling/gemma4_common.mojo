@@ -1,9 +1,7 @@
 """Gemma 4 shared infrastructure — config, layout builder, typed view helpers."""
 
 from modeling.model_spec import (
-    Encoding, Shaped, BF16, F32,
     HOST_RANK, DISTRIBUTED,
-    Mat, Bound, DynView, CacheView,
     ShapeLike, WeightDesc,
     DEFAULT_ALIGNMENT,
 )
@@ -162,28 +160,3 @@ struct LayerBuilder(Movable):
     def bf(mut self, mut entries: List[WeightDesc], suffix: String,
            rows: Int, cols: Int, shard: Int) -> Int:
         return self.emit(entries, suffix, rows, cols, DType.bfloat16, 2, shard, False)
-
-
-# =============================================================================
-# Typed view helpers — eliminate Mat alias boilerplate
-# =============================================================================
-
-
-@always_inline
-def bound_mat[E: Encoding, S: ShapeLike](addr: Int) -> Bound[Mat[E, S.N, S.M]]:
-    return Bound[Mat[E, S.N, S.M]](addr)
-
-
-@always_inline
-def bound_vec[E: Encoding, dim: Int](addr: Int) -> Bound[Mat[E, dim, 1]]:
-    return Bound[Mat[E, dim, 1]](addr)
-
-
-@always_inline
-def dyn_mat[E: Encoding, rows: Int, cols: Int](addr: Int, seq_len: Int) -> DynView[Mat[E, rows, cols]]:
-    return DynView[Mat[E, rows, cols]](addr, seq_len)
-
-
-@always_inline
-def cache_mat[E: Encoding, rows: Int, cols: Int](addr: Int) -> CacheView[Mat[E, rows, cols]]:
-    return CacheView[Mat[E, rows, cols]](addr)

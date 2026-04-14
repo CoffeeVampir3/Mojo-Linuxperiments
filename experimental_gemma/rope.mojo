@@ -9,7 +9,6 @@ tables store only the 64 active half-dim entries, and the untouched
 channels are skipped by a partial RoPE apply wrapper.
 """
 
-from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 
 from modeling.model_spec import Encoding, Shaped, Bound, DynView
@@ -29,8 +28,8 @@ def init_sliding_rope_tables[CosT: Encoding & Shaped, SinT: Encoding & Shaped](
     comptime assert CosT.ROWS == SinT.ROWS, "rope init: cos/sin rows mismatch"
     comptime assert CosT.COLS == SinT.COLS, "rope init: cos/sin cols mismatch"
 
-    var cp = UnsafePointer[Scalar[DType.float32], MutAnyOrigin](unsafe_from_address=cos_buf.ptr)
-    var sp = UnsafePointer[Scalar[DType.float32], MutAnyOrigin](unsafe_from_address=sin_buf.ptr)
+    var cp = cos_buf.as_ptr[DType.float32]()
+    var sp = sin_buf.as_ptr[DType.float32]()
     comptime half = CosT.COLS
     comptime head_dim = half * 2
     comptime f64w = simd_width_of[DType.float64]()
@@ -65,8 +64,8 @@ def init_full_rope_tables[CosT: Encoding & Shaped, SinT: Encoding & Shaped](
     comptime assert CosT.COLS == SinT.COLS, "rope init: cos/sin cols mismatch"
     comptime assert CosT.COLS == 64, "full rope init: tables must store only the 64 active half-dim entries"
 
-    var cp = UnsafePointer[Scalar[DType.float32], MutAnyOrigin](unsafe_from_address=cos_buf.ptr)
-    var sp = UnsafePointer[Scalar[DType.float32], MutAnyOrigin](unsafe_from_address=sin_buf.ptr)
+    var cp = cos_buf.as_ptr[DType.float32]()
+    var sp = sin_buf.as_ptr[DType.float32]()
     comptime half = CosT.COLS
     comptime head_dim = 512
     comptime f64w = simd_width_of[DType.float64]()

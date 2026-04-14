@@ -266,3 +266,13 @@ def router_topk_kernel[num_experts: Int, k: Int](args: RouterTopkArgs):
     var result = softmax_topk_renorm[num_experts, k](
         args.logits, args.per_expert_scale)
     UnsafePointer[Gemma4TopKResult[k], MutAnyOrigin](unsafe_from_address=args.result_ptr)[] = result
+
+
+def router_topk_dispatch[num_experts: Int, k: Int, P: BurstThreadPool](
+    logits: BF16Ptr, per_expert_scale: BF16Ptr, result_ptr: Int, mut pool: P,
+) -> PoolFence[P]:
+    var args = RouterTopkArgs(logits, per_expert_scale, result_ptr)
+    pool.dispatch[RouterTopkArgs, router_topk_kernel[num_experts, k]](
+        UnsafePointer(to=args), 1)
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))))

@@ -6,7 +6,6 @@ Gemma4 uses GELU with tanh approximation (not SiLU/SwiGLU):
 The fused gelu_tanh_mul computes: dst = gelu_tanh(gate) * up
 """
 
-from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 
 from modeling.model_spec import Encoding, Shaped, DynView
@@ -44,9 +43,9 @@ def gelu_tanh_mul[GT: Encoding & Shaped, UT: Encoding & Shaped, DstT: Encoding &
     if seq_len == 0:
         return
 
-    var gp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=gate.ptr)
-    var up_ = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=up.ptr)
-    var dp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=dst.ptr)
+    var gp = gate.as_ptr[DType.bfloat16]()
+    var up_ = up.as_ptr[DType.bfloat16]()
+    var dp = dst.as_ptr[DType.bfloat16]()
     comptime cols = GT.COLS
     comptime width = simd_width_of[DType.float32]()
 

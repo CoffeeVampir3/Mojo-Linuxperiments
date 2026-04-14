@@ -21,7 +21,6 @@ from std.collections import InlineArray
 
 from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY, BF16Ptr
 from threading.threading_traits import BurstThreadPool
-from threading.threading_shared import ptr as tptr
 from modeling.model_spec import Encoding, Shaped, DynView, CacheView
 from simd_math import exp_f32
 
@@ -156,10 +155,10 @@ def local_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
     var num_jobs = min(total_items, pool.get_capacity())
     var items_per_job = (total_items + num_jobs - 1) // num_jobs
 
-    var qpp = tptr[Scalar[DType.bfloat16]](q.ptr)
-    var opp = tptr[Scalar[DType.bfloat16]](output.ptr)
-    var kpp = tptr[Scalar[DType.bfloat16]](k_cache.ptr)
-    var vpp = tptr[Scalar[DType.bfloat16]](v_cache.ptr)
+    var qpp = q.as_ptr[DType.bfloat16]()
+    var opp = output.as_ptr[DType.bfloat16]()
+    var kpp = k_cache.as_ptr[DType.bfloat16]()
+    var vpp = v_cache.as_ptr[DType.bfloat16]()
     var jobs = InlineArray[AttentionHeadArgs, MAX_POOL_CAPACITY](uninitialized=True)
     for i in range(num_jobs):
         var start = i * items_per_job
@@ -284,10 +283,10 @@ def global_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
     var num_jobs = min(total_items, pool.get_capacity())
     var items_per_job = (total_items + num_jobs - 1) // num_jobs
 
-    var qpp = tptr[Scalar[DType.bfloat16]](q.ptr)
-    var opp = tptr[Scalar[DType.bfloat16]](output.ptr)
-    var kpp = tptr[Scalar[DType.bfloat16]](k_cache.ptr)
-    var vpp = tptr[Scalar[DType.bfloat16]](v_cache.ptr)
+    var qpp = q.as_ptr[DType.bfloat16]()
+    var opp = output.as_ptr[DType.bfloat16]()
+    var kpp = k_cache.as_ptr[DType.bfloat16]()
+    var vpp = v_cache.as_ptr[DType.bfloat16]()
     var jobs = InlineArray[AttentionHeadArgs, MAX_POOL_CAPACITY](uninitialized=True)
     for i in range(num_jobs):
         var start = i * items_per_job

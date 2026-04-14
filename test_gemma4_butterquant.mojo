@@ -13,7 +13,7 @@ from std.pathlib import Path
 from std.time import perf_counter_ns
 
 from tokenizer import load_tokenizer
-from modeling.gemma_4_moe_butterquant_tp import (
+from modeling.gemma_4_moe_butterquant_tp_new import (
     Gemma4Config, Gemma4ButterQuant,
 )
 from modeling.model_spec import LogitsView

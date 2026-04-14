@@ -2,7 +2,7 @@
 decode tokens greedily. Reports load time, per-token forward time,
 and the final generated sequence.
 
-Uses the parametric SmolLM2TP with TP=1."""
+Uses the topology-bound SmolLM2TPNew with TP=3."""
 
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
@@ -10,7 +10,7 @@ from std.pathlib import Path
 from std.time import perf_counter_ns
 
 from tokenizer import load_tokenizer
-from modeling.smollm2_tp import SmolLM2Config, SmolLM2TP
+from modeling.smollm2_tp_new import SmolLM2Config, SmolLM2TPNew
 from modeling.model_spec import LogitsView
 from modeling.model_spec import BF16
 
@@ -73,9 +73,9 @@ He was named to the 2022 class of ACM Fellows"""
         print("", token_ids[i], end="")
     print()
 
-    # --- Load model (parametric TP=1) ---
+    # --- Load model (parametric TP=3) ---
     var t0 = perf_counter_ns()
-    var model_opt = SmolLM2TP[BF16, 1].load(Path(MODEL_PATH))
+    var model_opt = SmolLM2TPNew[3].load(Path(MODEL_PATH))
     if not model_opt:
         return
     var model = model_opt.take()

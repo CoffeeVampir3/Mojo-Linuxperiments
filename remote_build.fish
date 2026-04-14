@@ -3,7 +3,7 @@
 set REMOTE_USER blackroot
 set REMOTE_HOST 192.168.50.93
 set REMOTE_PATH /home/blackroot/Desktop/linuxperiments
-set DEFAULT_TARGET test_gemma4_butterquant.mojo
+set DEFAULT_TARGET test_smollm2.mojo
 
 if test (count $argv) -gt 0
     set TARGET $argv[1]

@@ -65,10 +65,6 @@ comptime Untiled = Kernel2DTiling[1, 1]
 #
 # Lifecycle traits — a weight tag declares the full pipeline disposition:
 #   Quantizable      : quantized (FWHT + int8), per-row scale in output
-#   PerBlockQuantizable : quantized (FWHT + int8), per-FWHT-block scale in
-#                        output. Used by the LM head and other consumers that
-#                        want the tighter per-block dynamic range at the cost
-#                        of an 11×-ish larger scale array.
 #   Gamma             : quantized with gamma absorption from preceding norm
 #   Passthrough       : copied through quantizer unchanged, loaded, used
 #   Absorbed          : consumed during quantization (gamma source), absent
@@ -76,14 +72,12 @@ comptime Untiled = Kernel2DTiling[1, 1]
 
 trait WeightTag: ...
 trait Quantizable: ...
-trait PerBlockQuantizable: ...
 trait Gamma: ...
 trait Passthrough: ...
 trait Absorbed: ...
 
 struct IsQuantizable(WeightTag, Quantizable): ...
 struct IsGammaQuantizable(WeightTag, Quantizable, Gamma): ...
-struct IsPerBlockQuantizable(WeightTag, PerBlockQuantizable): ...
 struct IsPassthrough(WeightTag, Passthrough): ...
 struct IsAbsorbed(WeightTag, Absorbed): ...
 
@@ -116,10 +110,6 @@ trait Dynamic:
 
 struct BF16(Encoding):
     comptime DTYPE = DType.bfloat16
-    comptime ELEMENT_BYTES = 2
-
-struct F16(Encoding):
-    comptime DTYPE = DType.float16
     comptime ELEMENT_BYTES = 2
 
 struct F32(Encoding):
@@ -278,7 +268,6 @@ struct PlacedSlot[
 ](
     Encoding, Shaped, Placed, Named, ShardStrategy,
     Quantizable where conforms_to(Tag, Quantizable),
-    PerBlockQuantizable where conforms_to(Tag, PerBlockQuantizable),
     Gamma where conforms_to(Tag, Gamma),
     Passthrough where conforms_to(Tag, Passthrough),
     Absorbed where conforms_to(Tag, Absorbed),
@@ -310,6 +299,12 @@ struct Bound[T: Encoding & Shaped](Encoding, Shaped):
     comptime COLS = Self.T.COLS
     var ptr: Int
 
+    @always_inline
+    def as_ptr[dtype: DType = Self.DTYPE](self) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
+        return rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+            UnsafePointer[Scalar[Self.DTYPE], MutAnyOrigin](
+                unsafe_from_address=self.ptr))
+
 @fieldwise_init
 struct DynView[T: Encoding & Shaped](Encoding, Shaped, Dynamic):
     comptime DTYPE = Self.T.DTYPE
@@ -319,6 +314,12 @@ struct DynView[T: Encoding & Shaped](Encoding, Shaped, Dynamic):
     var ptr: Int
     var seq_len: Int
 
+    @always_inline
+    def as_ptr[dtype: DType = Self.DTYPE](self) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
+        return rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+            UnsafePointer[Scalar[Self.DTYPE], MutAnyOrigin](
+                unsafe_from_address=self.ptr))
+
 @fieldwise_init
 struct CacheView[T: Encoding & Shaped](Encoding, Shaped):
     comptime DTYPE = Self.T.DTYPE
@@ -326,6 +327,12 @@ struct CacheView[T: Encoding & Shaped](Encoding, Shaped):
     comptime ROWS = Self.T.ROWS
     comptime COLS = Self.T.COLS
     var ptr: Int
+
+    @always_inline
+    def as_ptr[dtype: DType = Self.DTYPE](self) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
+        return rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+            UnsafePointer[Scalar[Self.DTYPE], MutAnyOrigin](
+                unsafe_from_address=self.ptr))
 
 def bind[T: Encoding & Shaped & Placed & Named](base: Int) -> Bound[T]:
     return Bound[T](base + T.OFFSET)
@@ -439,31 +446,6 @@ struct Rotated(Quantization, Copyable, ImplicitlyCopyable):
 
     def to_op(self) -> QuantOp:
         return QuantOp(quantize=True, rotate=True, block=self.block,
-                       per_block=False, smooth_src="")
-
-
-struct RotatedPerBlock(Quantization, Copyable, ImplicitlyCopyable):
-    """FWHT rotation + per-block absmax i8. Scale granularity = rotation block."""
-    var block: Int
-
-    def __init__(out self, block: Int):
-        debug_assert(block > 0 and (block & (block - 1)) == 0,
-            "RotatedPerBlock: block must be a positive power of 2")
-        self.block = block
-
-    def to_op(self) -> QuantOp:
-        return QuantOp(quantize=True, rotate=True, block=self.block,
-                       per_block=True, smooth_src="")
-
-
-struct Channelwise(Quantization, Copyable, ImplicitlyCopyable):
-    """No rotation, per-row absmax i8. For pre-rotated activations."""
-
-    def __init__(out self):
-        pass
-
-    def to_op(self) -> QuantOp:
-        return QuantOp(quantize=True, rotate=False, block=0,
                        per_block=False, smooth_src="")
 
 

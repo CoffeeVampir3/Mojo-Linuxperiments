@@ -165,8 +165,8 @@ def scaled_add[SrcT: Encoding & Shaped, DstT: Encoding & Shaped,
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
-    var sp = tptr[Scalar[DType.bfloat16]](src.ptr)
-    var dp = tptr[Scalar[DType.bfloat16]](dst.ptr)
+    var sp = src.as_ptr[DType.bfloat16]()
+    var dp = dst.as_ptr[DType.bfloat16]()
     var jobs = InlineArray[ScaledAddArgs, MAX_POOL_CAPACITY](uninitialized=True)
     for i in range(num_jobs):
         var start = i * rows_per_job
@@ -197,9 +197,9 @@ def embed_lookup_scaled[W: Encoding & Shaped, OutT: Encoding & Shaped,
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
-    var tp = tptr[Scalar[DType.bfloat16]](table.ptr)
+    var tp = table.as_ptr[DType.bfloat16]()
     var tkp = tptr[Scalar[DType.int32]](tokens)
-    var op = tptr[Scalar[DType.bfloat16]](output.ptr)
+    var op = output.as_ptr[DType.bfloat16]()
     var jobs = InlineArray[ScaledEmbedArgs, MAX_POOL_CAPACITY](uninitialized=True)
     for i in range(num_jobs):
         var start = i * rows_per_job
@@ -257,25 +257,23 @@ def embed_lookup_blocked[W: Encoding & Shaped, ScT: Encoding & Shaped,
     ))
 
 
-def elem_scale[T: Encoding & Shaped](dst: DynView[T], scale: Float32):
+def elem_scale[T: Encoding & Shaped](dst: DynView[T], scale: Float32) where T.DTYPE == DType.bfloat16:
     """In-place scalar multiply: dst *= scale. F32 compute, bf16 I/O."""
-    comptime assert T.DTYPE == DType.bfloat16, "elem_scale: must be bf16"
     comptime width = simd_width_of[DType.float32]()
     var sv = SIMD[DType.float32, width](scale)
-    var dp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=dst.ptr)
+    var dp = dst.as_ptr[DType.bfloat16]()
     for i in range(0, dst.seq_len * T.COLS, width):
         var v = (dp + i).load[width=width]().cast[DType.float32]()
         (dp + i).store((v * sv).cast[DType.bfloat16]())
 
 
-def logit_softcap[T: Encoding & Shaped](dst: DynView[T]):
+def logit_softcap[T: Encoding & Shaped](dst: DynView[T]) where T.DTYPE == DType.bfloat16:
     """In-place logit softcapping: dst = tanh(dst / 30) * 30."""
-    comptime assert T.DTYPE == DType.bfloat16, "logit_softcap: must be bf16"
     comptime width = simd_width_of[DType.float32]()
     comptime cap = Float32(30.0)
     comptime inv_cap = Float32(1.0) / cap
 
-    var dp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=dst.ptr)
+    var dp = dst.as_ptr[DType.bfloat16]()
     for i in range(0, dst.seq_len * T.COLS, width):
         var v = (dp + i).load[width=width]().cast[DType.float32]()
         var capped = tanh_f32(v * inv_cap) * cap

@@ -348,9 +348,9 @@ def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped,
         unsafe_from_address=Int(UnsafePointer(to=pool))
     ))
 
-    var ip = tptr[Scalar[DType.bfloat16]](input.ptr)
-    var wp = tptr[Scalar[DType.bfloat16]](weight.ptr)
-    var op = tptr[Scalar[DType.bfloat16]](output.ptr)
+    var ip = input.as_ptr[DType.bfloat16]()
+    var wp = weight.as_ptr[DType.bfloat16]()
+    var op = output.as_ptr[DType.bfloat16]()
     var jobs = InlineArray[GemmArgs, MAX_POOL_CAPACITY](uninitialized=True)
 
     if seq_len < pool.get_capacity():
@@ -402,9 +402,9 @@ def rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shape
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
-    var ip = tptr[Scalar[DType.bfloat16]](input.ptr)
-    var wp = tptr[Scalar[DType.bfloat16]](weight.ptr)
-    var op = tptr[Scalar[DType.bfloat16]](output.ptr)
+    var ip = input.as_ptr[DType.bfloat16]()
+    var wp = weight.as_ptr[DType.bfloat16]()
+    var op = output.as_ptr[DType.bfloat16]()
     var jobs = InlineArray[RMSNormArgs, MAX_POOL_CAPACITY](uninitialized=True)
     for i in range(num_jobs):
         var start = i * rows_per_job
@@ -434,9 +434,9 @@ def embed_lookup[W: Encoding & Shaped, OutT: Encoding & Shaped,
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
-    var tp = tptr[Scalar[DType.bfloat16]](table.ptr)
+    var tp = table.as_ptr[DType.bfloat16]()
     var tkp = tptr[Scalar[DType.int32]](tokens)
-    var op = tptr[Scalar[DType.bfloat16]](output.ptr)
+    var op = output.as_ptr[DType.bfloat16]()
     var jobs = InlineArray[EmbedArgs, MAX_POOL_CAPACITY](uninitialized=True)
     for i in range(num_jobs):
         var start = i * rows_per_job
@@ -465,15 +465,9 @@ def silu_mul[GT: Encoding & Shaped, UT: Encoding & Shaped, DstT: Encoding & Shap
     if seq_len == 0:
         return
 
-    var gp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-        unsafe_from_address=gate.ptr
-    )
-    var up_ = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-        unsafe_from_address=up.ptr
-    )
-    var dp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-        unsafe_from_address=dst.ptr
-    )
+    var gp = gate.as_ptr[DType.bfloat16]()
+    var up_ = up.as_ptr[DType.bfloat16]()
+    var dp = dst.as_ptr[DType.bfloat16]()
     comptime cols = GT.COLS
     comptime width = simd_width_of[DType.float32]()
 
@@ -499,15 +493,9 @@ def elem_add[AT: Encoding & Shaped, BT: Encoding & Shaped, DstT: Encoding & Shap
     if seq_len == 0:
         return
 
-    var ap = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-        unsafe_from_address=a.ptr
-    )
-    var bp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-        unsafe_from_address=b.ptr
-    )
-    var dp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-        unsafe_from_address=dst.ptr
-    )
+    var ap = a.as_ptr[DType.bfloat16]()
+    var bp = b.as_ptr[DType.bfloat16]()
+    var dp = dst.as_ptr[DType.bfloat16]()
     comptime width = simd_width_of[DType.float32]()
 
     for i in range(0, seq_len * AT.COLS, width):
@@ -531,12 +519,8 @@ def kv_cache_write[SrcT: Encoding & Shaped, CT: Encoding & Shaped](
     debug_assert(pos >= 0 and pos + seq_len <= CT.ROWS,
         "kv_write: position range exceeds cache capacity")
 
-    var sp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-        unsafe_from_address=src.ptr
-    )
-    var cp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-        unsafe_from_address=cache.ptr
-    )
+    var sp = src.as_ptr[DType.bfloat16]()
+    var cp = cache.as_ptr[DType.bfloat16]()
     comptime cols = SrcT.COLS
     comptime width = simd_width_of[DType.bfloat16]()
 
@@ -575,10 +559,10 @@ def attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
     var num_jobs = min(num_kv_heads, pool.get_capacity())
     var groups_per_job = (num_kv_heads + num_jobs - 1) // num_jobs
 
-    var qpp = tptr[Scalar[DType.bfloat16]](q.ptr)
-    var opp = tptr[Scalar[DType.bfloat16]](output.ptr)
-    var kpp = tptr[Scalar[DType.bfloat16]](k_cache.ptr)
-    var vpp = tptr[Scalar[DType.bfloat16]](v_cache.ptr)
+    var qpp = q.as_ptr[DType.bfloat16]()
+    var opp = output.as_ptr[DType.bfloat16]()
+    var kpp = k_cache.as_ptr[DType.bfloat16]()
+    var vpp = v_cache.as_ptr[DType.bfloat16]()
     var jobs = InlineArray[GQAArgs, MAX_POOL_CAPACITY](uninitialized=True)
     for i in range(num_jobs):
         var start = i * groups_per_job

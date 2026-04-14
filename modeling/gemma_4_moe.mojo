@@ -1,39 +1,40 @@
-"""Gemma 4 26B-A4B — bf16 reference model.
+"""Gemma 4 26B-A4B — bf16 model, atomic layout primitives.
 
-Text decoder weights only (vision/audio encoder weights ignored).
-
-Layout: [25 sliding layers][5 full layers][state][host-only: final_norm, embed]
-State:  [sliding KV caches][full KV caches][x_main][x_residual][scratch][rope tables]
+Architecture, storage shapes, family products, topology, emit, build,
+load, init, and forward — all bound directly from topology with no
+RankView or legacy layout bags.
 """
 
 from std.pathlib import Path
 from std.memory import UnsafePointer
-from std.sys.info import simd_width_of, size_of
+from std.sys.info import simd_width_of
 from simd_math import sqrt
+
 from numa import NumaArena, NumaInfo
 from threading import BurstPool
 from experimental.linear_borrow_pool import ScratchPool, ScratchLease
 
 from modeling.model_spec import (
-    Encoding, Shaped, BF16, F32,
-    Mat, Bound, DynView, CacheView,
-    Shape, WeightDesc,
+    Encoding, BF16, F32,
+    Shape, ShapeLike, Mat, DynView, CacheView, WeightDesc,
     DEFAULT_ALIGNMENT, LogitsView,
 )
 from modeling.gemma4_common import (
-    Gemma4BaseConfig, LayerShard, LayerBuilder,
-    bound_mat, bound_vec, dyn_mat, cache_mat,
-    is_full_layer,
+    Gemma4BaseConfig, LayerShard, LayerBuilder, is_full_layer,
+)
+from modeling.modeling_common import (
+    SlotOffset, Repeated, SectionBuilder, align_up,
+    StaticTensorView, DynamicTensorView,
+    static_tensor_view, dynamic_tensor_view,
+    borrow_scratch_tensor, scratch_tensor_view, scratch_ptr,
 )
 from modeling.loader import discover_shards, load_weights_from_descs
-
 from kernels.kernel_ops import (
     gemm, rmsnorm, elem_add, kv_cache_write,
     gemv_kernel, GemmArgs,
     BF16Ptr,
 )
 from kernels.kv_rotors import rope
-from threading.threading_shared import ptr as tptr
 
 from experimental_gemma.activations import gelu_tanh_mul
 from experimental_gemma.norms import rmsnorm_no_scale, rmsnorm_per_head
@@ -44,420 +45,412 @@ from experimental_gemma.attention import local_attention, global_attention
 from experimental_gemma.ops import embed_lookup_scaled, logit_softcap, elem_scale
 
 
-# =============================================================================
-# Config
-# =============================================================================
-
-
 comptime Gemma4Config = Gemma4BaseConfig
 comptime C = Gemma4Config
 comptime EMBED_SCALE = sqrt[DType.float32, 1](C.HIDDEN)
 
 
 # =============================================================================
-# Per-TP shape aliases
+# Storage shapes
 # =============================================================================
 
 
 struct Gemma4Shapes[tp: Int]:
-    comptime GateUp    = Shape[C.INTERMEDIATE, C.HIDDEN, shard_n=True, tp=Self.tp]
-    comptime Down      = Shape[C.HIDDEN, C.INTERMEDIATE, shard_m=True, tp=Self.tp]
-
-    comptime SlidingQ  = Shape[C.Q_DIM_SLIDING, C.HIDDEN, shard_n=True, tp=Self.tp]
-    comptime SlidingKV = Shape[C.KV_DIM_SLIDING, C.HIDDEN, shard_n=True, tp=Self.tp]
-    comptime SlidingO  = Shape[C.HIDDEN, C.Q_DIM_SLIDING, shard_m=True, tp=Self.tp]
-
-    comptime FullQ     = Shape[C.Q_DIM_FULL, C.HIDDEN, shard_n=True, tp=Self.tp]
-    comptime FullK     = Shape[C.KV_DIM_FULL, C.HIDDEN, shard_n=True, tp=Self.tp]
-    comptime FullO     = Shape[C.HIDDEN, C.Q_DIM_FULL, shard_m=True, tp=Self.tp]
-
+    comptime GateUp      = Shape[C.INTERMEDIATE, C.HIDDEN, shard_n=True, tp=Self.tp]
+    comptime Down        = Shape[C.HIDDEN, C.INTERMEDIATE, shard_m=True, tp=Self.tp]
+    comptime SlidingQ    = Shape[C.Q_DIM_SLIDING, C.HIDDEN, shard_n=True, tp=Self.tp]
+    comptime SlidingKV   = Shape[C.KV_DIM_SLIDING, C.HIDDEN, shard_n=True, tp=Self.tp]
+    comptime SlidingO    = Shape[C.HIDDEN, C.Q_DIM_SLIDING, shard_m=True, tp=Self.tp]
+    comptime FullQ       = Shape[C.Q_DIM_FULL, C.HIDDEN, shard_n=True, tp=Self.tp]
+    comptime FullK       = Shape[C.KV_DIM_FULL, C.HIDDEN, shard_n=True, tp=Self.tp]
+    comptime FullO       = Shape[C.HIDDEN, C.Q_DIM_FULL, shard_m=True, tp=Self.tp]
     comptime ExpertsGateUp = Shape[C.NUM_EXPERTS * C.MOE_GATE_UP_FUSED, C.HIDDEN, shard_n=True, tp=Self.tp]
     comptime ExpertsDown   = Shape[C.NUM_EXPERTS * C.HIDDEN, C.MOE_INTERMEDIATE, shard_n=True, tp=Self.tp]
 
 
 # =============================================================================
-# Runtime layout
+# Family products — typed refs, no stride, no views
 # =============================================================================
 
 
 @fieldwise_init
-struct LayerBodyWeights(Copyable, ImplicitlyCopyable, Movable):
-    var input_norm: Int
-    var post_attn_norm: Int
-    var pre_ffn_norm: Int
-    var pre_ffn_norm_2: Int
-    var post_ffn_norm_1: Int
-    var post_ffn_norm_2: Int
-    var post_ffn_norm: Int
-    var gate_proj: Int
-    var up_proj: Int
-    var down_proj: Int
-    var router_proj: Int
-    var router_scale: Int
-    var router_pes: Int
-    var experts_gate_up: Int
-    var experts_down: Int
-    var layer_scalar: Int
+struct SlidingAttnRefs[tp: Int](Copyable, ImplicitlyCopyable):
+    comptime S = Gemma4Shapes[Self.tp]
+    var q_proj: SlotOffset[BF16, Self.S.SlidingQ]
+    var k_proj: SlotOffset[BF16, Self.S.SlidingKV]
+    var v_proj: SlotOffset[BF16, Self.S.SlidingKV]
+    var o_proj: SlotOffset[BF16, Self.S.SlidingO]
+    var q_norm: SlotOffset[BF16, Shape[C.HEAD_DIM_SLIDING, 1]]
+    var k_norm: SlotOffset[BF16, Shape[C.HEAD_DIM_SLIDING, 1]]
 
 
 @fieldwise_init
-struct SlidingLayerOffsets(Copyable, ImplicitlyCopyable, Movable):
-    var q_proj: Int
-    var k_proj: Int
-    var v_proj: Int
-    var o_proj: Int
-    var q_norm: Int
-    var k_norm: Int
-    var body: LayerBodyWeights
-    var stride: Int
+struct FullAttnRefs[tp: Int](Copyable, ImplicitlyCopyable):
+    comptime S = Gemma4Shapes[Self.tp]
+    var q_proj: SlotOffset[BF16, Self.S.FullQ]
+    var k_proj: SlotOffset[BF16, Self.S.FullK]
+    var o_proj: SlotOffset[BF16, Self.S.FullO]
+    var q_norm: SlotOffset[BF16, Shape[C.HEAD_DIM_FULL, 1]]
+    var k_norm: SlotOffset[BF16, Shape[C.HEAD_DIM_FULL, 1]]
 
 
 @fieldwise_init
-struct FullLayerOffsets(Copyable, ImplicitlyCopyable, Movable):
-    var q_proj: Int
-    var k_proj: Int
-    var o_proj: Int
-    var q_norm: Int
-    var k_norm: Int
-    var body: LayerBodyWeights
-    var stride: Int
+struct BodyRefs[tp: Int](Copyable, ImplicitlyCopyable):
+    comptime S = Gemma4Shapes[Self.tp]
+    var input_norm:      SlotOffset[BF16, Shape[C.HIDDEN, 1]]
+    var post_attn_norm:  SlotOffset[BF16, Shape[C.HIDDEN, 1]]
+    var pre_ffn_norm:    SlotOffset[BF16, Shape[C.HIDDEN, 1]]
+    var pre_ffn_norm_2:  SlotOffset[BF16, Shape[C.HIDDEN, 1]]
+    var post_ffn_norm_1: SlotOffset[BF16, Shape[C.HIDDEN, 1]]
+    var post_ffn_norm_2: SlotOffset[BF16, Shape[C.HIDDEN, 1]]
+    var post_ffn_norm:   SlotOffset[BF16, Shape[C.HIDDEN, 1]]
+    var gate_proj:       SlotOffset[BF16, Self.S.GateUp]
+    var up_proj:         SlotOffset[BF16, Self.S.GateUp]
+    var down_proj:       SlotOffset[BF16, Self.S.Down]
+    var router_proj:     SlotOffset[BF16, Shape[C.NUM_EXPERTS, C.HIDDEN]]
+    var router_scale:    SlotOffset[BF16, Shape[C.HIDDEN, 1]]
+    var router_pes:      SlotOffset[BF16, Shape[C.NUM_EXPERTS, 1]]
+    var experts_gate_up: SlotOffset[BF16, Self.S.ExpertsGateUp]
+    var experts_down:    SlotOffset[BF16, Self.S.ExpertsDown]
+    var layer_scalar:    SlotOffset[BF16, Shape[1, 1]]
 
 
-def emit_layer_body[tp: Int](
-    mut b: LayerBuilder, mut entries: List[WeightDesc],
-) -> LayerBodyWeights:
-    comptime REPL = LayerShard.REPL
-    comptime H   = C.HIDDEN
-    comptime NE  = C.NUM_EXPERTS
-    comptime S = Gemma4Shapes[tp]
-
-    var input_norm      = b.bf(entries, "input_layernorm.weight",               H, 1, REPL)
-    var post_attn_norm  = b.bf(entries, "post_attention_layernorm.weight",      H, 1, REPL)
-    var pre_ffn_norm    = b.bf(entries, "pre_feedforward_layernorm.weight",     H, 1, REPL)
-    var pre_ffn_norm_2  = b.bf(entries, "pre_feedforward_layernorm_2.weight",   H, 1, REPL)
-    var post_ffn_norm_1 = b.bf(entries, "post_feedforward_layernorm_1.weight",  H, 1, REPL)
-    var post_ffn_norm_2 = b.bf(entries, "post_feedforward_layernorm_2.weight",  H, 1, REPL)
-    var post_ffn_norm   = b.bf(entries, "post_feedforward_layernorm.weight",    H, 1, REPL)
-    var gate_proj       = b.bfs[S.GateUp](entries, "mlp.gate_proj.weight")
-    var up_proj         = b.bfs[S.GateUp](entries, "mlp.up_proj.weight")
-    var down_proj       = b.bfs[S.Down](entries, "mlp.down_proj.weight")
-    var router_proj     = b.bf(entries, "router.proj.weight",      NE, H, REPL)
-    var router_scale    = b.bf(entries, "router.scale",            H,  1, REPL)
-    var router_pes      = b.bf(entries, "router.per_expert_scale", NE, 1, REPL)
-    var experts_gate_up = b.bfs[S.ExpertsGateUp](entries, "experts.gate_up_proj")
-    var experts_down    = b.bfs[S.ExpertsDown](entries, "experts.down_proj")
-    var layer_scalar    = b.bf(entries, "layer_scalar",            1,  1, REPL)
-
-    return LayerBodyWeights(
-        input_norm=input_norm, post_attn_norm=post_attn_norm,
-        pre_ffn_norm=pre_ffn_norm, pre_ffn_norm_2=pre_ffn_norm_2,
-        post_ffn_norm_1=post_ffn_norm_1, post_ffn_norm_2=post_ffn_norm_2,
-        post_ffn_norm=post_ffn_norm,
-        gate_proj=gate_proj, up_proj=up_proj, down_proj=down_proj,
-        router_proj=router_proj, router_scale=router_scale, router_pes=router_pes,
-        experts_gate_up=experts_gate_up, experts_down=experts_down,
-        layer_scalar=layer_scalar,
-    )
+@fieldwise_init
+struct SlidingLayerRefs[tp: Int](Copyable, ImplicitlyCopyable):
+    var attn: SlidingAttnRefs[Self.tp]
+    var body: BodyRefs[Self.tp]
 
 
-def sliding_layer_spec[tp: Int](
-    prefix: String, layer_base: Int, mut entries: List[WeightDesc],
-) -> SlidingLayerOffsets:
-    var b = LayerBuilder(tp, prefix, layer_base)
-    comptime REPL = LayerShard.REPL
-    comptime S = Gemma4Shapes[tp]
-
-    var q_proj = b.bfs[S.SlidingQ](entries, "self_attn.q_proj.weight")
-    var k_proj = b.bfs[S.SlidingKV](entries, "self_attn.k_proj.weight")
-    var v_proj = b.bfs[S.SlidingKV](entries, "self_attn.v_proj.weight")
-    var o_proj = b.bfs[S.SlidingO](entries, "self_attn.o_proj.weight")
-    var q_norm = b.bf(entries, "self_attn.q_norm.weight", C.HEAD_DIM_SLIDING, 1, REPL)
-    var k_norm = b.bf(entries, "self_attn.k_norm.weight", C.HEAD_DIM_SLIDING, 1, REPL)
-    var body = emit_layer_body[tp](b, entries)
-
-    return SlidingLayerOffsets(
-        q_proj=q_proj, k_proj=k_proj, v_proj=v_proj, o_proj=o_proj,
-        q_norm=q_norm, k_norm=k_norm,
-        body=body, stride=b.cursor,
-    )
-
-
-def full_layer_spec[tp: Int](
-    prefix: String, layer_base: Int, mut entries: List[WeightDesc],
-) -> FullLayerOffsets:
-    var b = LayerBuilder(tp, prefix, layer_base)
-    comptime REPL = LayerShard.REPL
-    comptime S = Gemma4Shapes[tp]
-
-    var q_proj = b.bfs[S.FullQ](entries, "self_attn.q_proj.weight")
-    var k_proj = b.bfs[S.FullK](entries, "self_attn.k_proj.weight")
-    var o_proj = b.bfs[S.FullO](entries, "self_attn.o_proj.weight")
-    var q_norm = b.bf(entries, "self_attn.q_norm.weight", C.HEAD_DIM_FULL, 1, REPL)
-    var k_norm = b.bf(entries, "self_attn.k_norm.weight", C.HEAD_DIM_FULL, 1, REPL)
-    var body = emit_layer_body[tp](b, entries)
-
-    return FullLayerOffsets(
-        q_proj=q_proj, k_proj=k_proj, o_proj=o_proj,
-        q_norm=q_norm, k_norm=k_norm,
-        body=body, stride=b.cursor,
-    )
+@fieldwise_init
+struct FullLayerRefs[tp: Int](Copyable, ImplicitlyCopyable):
+    var attn: FullAttnRefs[Self.tp]
+    var body: BodyRefs[Self.tp]
 
 
 # =============================================================================
-# Whole-model runtime layout
+# State + host families
 # =============================================================================
 
 
 @fieldwise_init
-struct Gemma4ModelLayout(Copyable, ImplicitlyCopyable, Movable):
-    var sliding: SlidingLayerOffsets
-    var full: FullLayerOffsets
-    var sliding_off: Int
-    var sliding_stride: Int
-    var full_off: Int
-    var full_stride: Int
+struct SlidingKVSlots(Copyable, ImplicitlyCopyable):
+    var k: SlotOffset[BF16, Shape[C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]]
+    var v: SlotOffset[BF16, Shape[C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]]
+
+
+@fieldwise_init
+struct FullKVSlots(Copyable, ImplicitlyCopyable):
+    var k: SlotOffset[BF16, Shape[C.MAX_SEQ_LEN, C.KV_DIM_FULL]]
+    var v: SlotOffset[BF16, Shape[C.MAX_SEQ_LEN, C.KV_DIM_FULL]]
+
+
+@fieldwise_init
+struct RopeSlots[half: Int](Copyable, ImplicitlyCopyable):
+    var cos: SlotOffset[F32, Shape[C.MAX_SEQ_LEN, Self.half]]
+    var sin: SlotOffset[F32, Shape[C.MAX_SEQ_LEN, Self.half]]
+
+
+@fieldwise_init
+struct ActivationSlots(Copyable, ImplicitlyCopyable):
+    var x_main:     SlotOffset[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]
+    var x_residual: SlotOffset[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]
+
+
+@fieldwise_init
+struct HostSlots(Copyable, ImplicitlyCopyable):
+    var final_norm: SlotOffset[BF16, Shape[C.HIDDEN, 1]]
+    var embed:      SlotOffset[BF16, Shape[C.VOCAB_SIZE, C.HIDDEN]]
+
+
+# =============================================================================
+# Topology
+# =============================================================================
+
+
+@fieldwise_init
+struct Gemma4Topology[tp: Int](Copyable, ImplicitlyCopyable):
+    var arena_base: Int
+    var sliding: Repeated[SlidingLayerRefs[Self.tp]]
+    var full: Repeated[FullLayerRefs[Self.tp]]
     var distributed_bytes: Int
-    var sliding_kv_off: Int
-    var sliding_kv_stride: Int
-    var full_kv_off: Int
-    var full_kv_stride: Int
-    var x_main_off: Int
-    var x_residual_off: Int
+
+    var sliding_kv: Repeated[SlidingKVSlots]
+    var full_kv: Repeated[FullKVSlots]
+    var activations: ActivationSlots
     var scratch_off: Int
     var scratch_capacity: Int
-    var sliding_cos_off: Int
-    var sliding_sin_off: Int
-    var full_cos_off: Int
-    var full_sin_off: Int
+    var sliding_rope: RopeSlots[C.HEAD_DIM_SLIDING // 2]
+    var full_rope: RopeSlots[64]
     var state_bytes: Int
-    var host_only_off: Int
-    var final_norm_off: Int
-    var embed_off: Int
 
-    @always_inline
+    var host: HostSlots
+    var host_bytes: Int
+
+    def bind(self, base: Int) -> Self:
+        var t = self
+        t.arena_base = base
+        return t
+
     def arena_bytes(self) -> Int:
         return self.distributed_bytes + self.state_bytes
 
-    @always_inline
     def host_arena_bytes(self) -> Int:
-        return self.embed_off + C.VOCAB_SIZE * C.HIDDEN * BF16.ELEMENT_BYTES
+        return self.host_bytes
+
+    @always_inline
+    def sliding_base(self, idx: Int) -> Int:
+        return self.arena_base + self.sliding.off + idx * self.sliding.stride
+
+    @always_inline
+    def full_base(self, idx: Int) -> Int:
+        return self.arena_base + self.full.off + idx * self.full.stride
+
+    @always_inline
+    def state_base(self) -> Int:
+        return self.arena_base + self.distributed_bytes
+
+    @always_inline
+    def scratch_base(self) -> Int:
+        return self.state_base() + self.scratch_off
+
+    @always_inline
+    def scratch_addr(self, read lease: ScratchLease) -> Int:
+        return self.scratch_base() + lease.offset
+
+    @always_inline
+    def x_main(self, seq_len: Int) -> DynamicTensorView[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]:
+        return dynamic_tensor_view(self.state_base(), self.activations.x_main, seq_len)
+
+    @always_inline
+    def x_residual(self, seq_len: Int) -> DynamicTensorView[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]:
+        return dynamic_tensor_view(self.state_base(), self.activations.x_residual, seq_len)
+
+    @always_inline
+    def sliding_k_cache(self, sliding_idx: Int) -> CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]]:
+        var kb = self.sliding_kv.base(self.state_base(), sliding_idx)
+        return CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]](
+            kb + self.sliding_kv.proto.k.offset)
+
+    @always_inline
+    def sliding_v_cache(self, sliding_idx: Int) -> CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]]:
+        var kb = self.sliding_kv.base(self.state_base(), sliding_idx)
+        return CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]](
+            kb + self.sliding_kv.proto.v.offset)
+
+    @always_inline
+    def full_k_cache(self, full_idx: Int) -> CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_FULL]]:
+        var kb = self.full_kv.base(self.state_base(), full_idx)
+        return CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_FULL]](
+            kb + self.full_kv.proto.k.offset)
+
+    @always_inline
+    def full_v_cache(self, full_idx: Int) -> CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_FULL]]:
+        var kb = self.full_kv.base(self.state_base(), full_idx)
+        return CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_FULL]](
+            kb + self.full_kv.proto.v.offset)
 
 
-@fieldwise_init
-struct Gemma4LoadPlan(Movable):
-    var layout: Gemma4ModelLayout
-    var descs: List[WeightDesc]
+# =============================================================================
+# Emit
+# =============================================================================
+
+
+def emit_body[tp: Int](mut b: LayerBuilder, mut e: List[WeightDesc]) -> BodyRefs[tp]:
+    comptime S = Gemma4Shapes[tp]
+    comptime R = LayerShard.REPL
+    comptime H = C.HIDDEN
+    comptime NE = C.NUM_EXPERTS
+    return BodyRefs[tp](
+        input_norm      = SlotOffset[BF16, Shape[H, 1]](b.bf(e, "input_layernorm.weight", H, 1, R)),
+        post_attn_norm  = SlotOffset[BF16, Shape[H, 1]](b.bf(e, "post_attention_layernorm.weight", H, 1, R)),
+        pre_ffn_norm    = SlotOffset[BF16, Shape[H, 1]](b.bf(e, "pre_feedforward_layernorm.weight", H, 1, R)),
+        pre_ffn_norm_2  = SlotOffset[BF16, Shape[H, 1]](b.bf(e, "pre_feedforward_layernorm_2.weight", H, 1, R)),
+        post_ffn_norm_1 = SlotOffset[BF16, Shape[H, 1]](b.bf(e, "post_feedforward_layernorm_1.weight", H, 1, R)),
+        post_ffn_norm_2 = SlotOffset[BF16, Shape[H, 1]](b.bf(e, "post_feedforward_layernorm_2.weight", H, 1, R)),
+        post_ffn_norm   = SlotOffset[BF16, Shape[H, 1]](b.bf(e, "post_feedforward_layernorm.weight", H, 1, R)),
+        gate_proj       = SlotOffset[BF16, S.GateUp](b.bfs[S.GateUp](e, "mlp.gate_proj.weight")),
+        up_proj         = SlotOffset[BF16, S.GateUp](b.bfs[S.GateUp](e, "mlp.up_proj.weight")),
+        down_proj       = SlotOffset[BF16, S.Down](b.bfs[S.Down](e, "mlp.down_proj.weight")),
+        router_proj     = SlotOffset[BF16, Shape[NE, H]](b.bf(e, "router.proj.weight", NE, H, R)),
+        router_scale    = SlotOffset[BF16, Shape[H, 1]](b.bf(e, "router.scale", H, 1, R)),
+        router_pes      = SlotOffset[BF16, Shape[NE, 1]](b.bf(e, "router.per_expert_scale", NE, 1, R)),
+        experts_gate_up = SlotOffset[BF16, S.ExpertsGateUp](b.bfs[S.ExpertsGateUp](e, "experts.gate_up_proj")),
+        experts_down    = SlotOffset[BF16, S.ExpertsDown](b.bfs[S.ExpertsDown](e, "experts.down_proj")),
+        layer_scalar    = SlotOffset[BF16, Shape[1, 1]](b.bf(e, "layer_scalar", 1, 1, R)),
+    )
+
+
+def emit_sliding[tp: Int](
+    prefix: String, layer_base: Int, mut e: List[WeightDesc],
+) -> Tuple[SlidingLayerRefs[tp], Int]:
+    var b = LayerBuilder(tp, prefix, layer_base)
+    comptime S = Gemma4Shapes[tp]
+    comptime R = LayerShard.REPL
+    var attn = SlidingAttnRefs[tp](
+        q_proj = SlotOffset[BF16, S.SlidingQ](b.bfs[S.SlidingQ](e, "self_attn.q_proj.weight")),
+        k_proj = SlotOffset[BF16, S.SlidingKV](b.bfs[S.SlidingKV](e, "self_attn.k_proj.weight")),
+        v_proj = SlotOffset[BF16, S.SlidingKV](b.bfs[S.SlidingKV](e, "self_attn.v_proj.weight")),
+        o_proj = SlotOffset[BF16, S.SlidingO](b.bfs[S.SlidingO](e, "self_attn.o_proj.weight")),
+        q_norm = SlotOffset[BF16, Shape[C.HEAD_DIM_SLIDING, 1]](b.bf(e, "self_attn.q_norm.weight", C.HEAD_DIM_SLIDING, 1, R)),
+        k_norm = SlotOffset[BF16, Shape[C.HEAD_DIM_SLIDING, 1]](b.bf(e, "self_attn.k_norm.weight", C.HEAD_DIM_SLIDING, 1, R)),
+    )
+    return (SlidingLayerRefs[tp](attn=attn, body=emit_body[tp](b, e)), b.cursor)
+
+
+def emit_full[tp: Int](
+    prefix: String, layer_base: Int, mut e: List[WeightDesc],
+) -> Tuple[FullLayerRefs[tp], Int]:
+    var b = LayerBuilder(tp, prefix, layer_base)
+    comptime S = Gemma4Shapes[tp]
+    comptime R = LayerShard.REPL
+    var attn = FullAttnRefs[tp](
+        q_proj = SlotOffset[BF16, S.FullQ](b.bfs[S.FullQ](e, "self_attn.q_proj.weight")),
+        k_proj = SlotOffset[BF16, S.FullK](b.bfs[S.FullK](e, "self_attn.k_proj.weight")),
+        o_proj = SlotOffset[BF16, S.FullO](b.bfs[S.FullO](e, "self_attn.o_proj.weight")),
+        q_norm = SlotOffset[BF16, Shape[C.HEAD_DIM_FULL, 1]](b.bf(e, "self_attn.q_norm.weight", C.HEAD_DIM_FULL, 1, R)),
+        k_norm = SlotOffset[BF16, Shape[C.HEAD_DIM_FULL, 1]](b.bf(e, "self_attn.k_norm.weight", C.HEAD_DIM_FULL, 1, R)),
+    )
+    return (FullLayerRefs[tp](attn=attn, body=emit_body[tp](b, e)), b.cursor)
+
+
+# =============================================================================
+# Scratch budget
+# =============================================================================
 
 
 def calculate_peak_scratch[tp: Int]() -> Int:
     comptime bf16 = BF16.ELEMENT_BYTES
-    comptime S = C.MAX_SEQ_LEN
-    comptime Sh = Gemma4Shapes[tp]
+    comptime seq = C.MAX_SEQ_LEN
+    comptime S = Gemma4Shapes[tp]
 
-    comptime full_attn_borrows = (
-        S * Sh.FullQ.N * bf16 +
-        S * Sh.FullK.N * bf16 +
-        S * Sh.FullK.N * bf16 +
-        S * Sh.FullQ.N * bf16
+    # Match the actual live set in forward:
+    # q+k+v are live together, then k/v are released before attn_out is borrowed.
+    comptime full_q = seq * S.FullQ.N * bf16
+    comptime full_kv = seq * S.FullK.N * bf16
+    comptime full_attn = (
+        full_q + full_kv + full_kv
+        if full_q + full_kv + full_kv > full_q + full_q
+        else full_q + full_q
     )
-    comptime sliding_attn_borrows = (
-        S * Sh.SlidingQ.N * bf16 +
-        S * Sh.SlidingKV.N * bf16 +
-        S * Sh.SlidingKV.N * bf16 +
-        S * Sh.SlidingQ.N * bf16
+    comptime sliding_q = seq * S.SlidingQ.N * bf16
+    comptime sliding_kv = seq * S.SlidingKV.N * bf16
+    comptime sliding_attn = (
+        sliding_q + sliding_kv + sliding_kv
+        if sliding_q + sliding_kv + sliding_kv > sliding_q + sliding_q
+        else sliding_q + sliding_q
     )
-    comptime ffn_borrows_dense = S * Sh.GateUp.N * bf16 * 2
-    comptime ffn_borrows_moe = (
-        S * C.HIDDEN * bf16 +
-        S * C.HIDDEN * bf16 +
-        C.TOP_K * C.HIDDEN * bf16
-    )
-    comptime ffn_peak = ffn_borrows_dense if ffn_borrows_dense > ffn_borrows_moe else ffn_borrows_moe
-    comptime attn_peak = full_attn_borrows if full_attn_borrows > sliding_attn_borrows else sliding_attn_borrows
+    comptime ffn_dense = seq * S.GateUp.N * bf16 * 2
+    comptime ffn_moe = seq * C.HIDDEN * bf16 * 2 + C.TOP_K * C.HIDDEN * bf16
+    comptime ffn_peak = ffn_dense if ffn_dense > ffn_moe else ffn_moe
+    comptime attn_peak = full_attn if full_attn > sliding_attn else sliding_attn
     return ffn_peak if ffn_peak > attn_peak else attn_peak
 
 
-def build_gemma4_load_plan[tp: Int]() -> Gemma4LoadPlan:
-    var descs = List[WeightDesc]()
-
-    # Template pass: probe strides and canonical per-layer offsets.
-    var scratch = List[WeightDesc]()
-    var sliding_offsets = sliding_layer_spec[tp]("", 0, scratch)
-    var full_offsets    = full_layer_spec[tp]("", 0, scratch)
-    var sliding_stride  = sliding_offsets.stride
-    var full_stride     = full_offsets.stride
-
-    var sliding_off       = 0
-    var full_off          = sliding_off + C.NUM_SLIDING_LAYERS * sliding_stride
-    var distributed_bytes = full_off + C.NUM_FULL_LAYERS * full_stride
-
-    # Real pass: emit entries for every layer in layer-index order.
-    var sliding_idx = 0
-    var full_idx = 0
-    for i in range(C.NUM_LAYERS):
-        var prefix = "model.language_model.layers." + String(i) + "."
-        if is_full_layer(i):
-            var base = full_off + full_idx * full_stride
-            _ = full_layer_spec[tp](prefix, base, descs)
-            full_idx += 1
-        else:
-            var base = sliding_off + sliding_idx * sliding_stride
-            _ = sliding_layer_spec[tp](prefix, base, descs)
-            sliding_idx += 1
-
-    # State block layout: [sliding KV][full KV][x_main][x_residual][scratch][rope].
-    comptime bf16 = size_of[Scalar[DType.bfloat16]]()
-    comptime f32  = size_of[Float32]()
-    comptime KV_S  = C.MAX_SEQ_LEN * C.KV_DIM_SLIDING * bf16   # k or v cache, one of
-    comptime KV_F  = C.MAX_SEQ_LEN * C.KV_DIM_FULL    * bf16
-    comptime sliding_kv_stride = 2 * KV_S                      # k + v per layer
-    comptime full_kv_stride    = 2 * KV_F
-    var sliding_kv_off = 0
-    var full_kv_off    = sliding_kv_off + C.NUM_SLIDING_LAYERS * sliding_kv_stride
-    var x_main_off     = full_kv_off + C.NUM_FULL_LAYERS * full_kv_stride
-    var x_main_bytes   = C.MAX_SEQ_LEN * C.HIDDEN * bf16
-    var x_residual_off = x_main_off + x_main_bytes
-    var scratch_off    = x_residual_off + x_main_bytes
-    var scratch_capacity = calculate_peak_scratch[tp]()
-
-    comptime sliding_rope_half = C.HEAD_DIM_SLIDING // 2
-    comptime full_rope_half = 64
-    var sliding_cos_off = scratch_off + scratch_capacity
-    var sliding_cos_bytes = C.MAX_SEQ_LEN * sliding_rope_half * f32
-    var sliding_sin_off = sliding_cos_off + sliding_cos_bytes
-    var full_cos_off    = sliding_sin_off + sliding_cos_bytes
-    var full_cos_bytes  = C.MAX_SEQ_LEN * full_rope_half * f32
-    var full_sin_off    = full_cos_off + full_cos_bytes
-    var state_bytes     = full_sin_off + full_cos_bytes
-
-    # Host-only: final_norm + tied embed table, pinned to rank 0.
-    var host_only_off = ((distributed_bytes + state_bytes + DEFAULT_ALIGNMENT - 1) // DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT
-    comptime HOST = LayerShard.HOST
-    var hb = LayerBuilder(tp, "", 0)
-    hb.cursor = host_only_off
-    var final_norm_off = hb.bf(descs, "model.language_model.norm.weight",
-                               C.HIDDEN, 1,               HOST)
-    var embed_off      = hb.bf(descs, "model.language_model.embed_tokens.weight",
-                               C.VOCAB_SIZE, C.HIDDEN,    HOST)
-
-    var layout = Gemma4ModelLayout(
-        sliding=sliding_offsets, full=full_offsets,
-        sliding_off=sliding_off, sliding_stride=sliding_stride,
-        full_off=full_off, full_stride=full_stride,
-        distributed_bytes=distributed_bytes,
-        sliding_kv_off=sliding_kv_off, sliding_kv_stride=sliding_kv_stride,
-        full_kv_off=full_kv_off, full_kv_stride=full_kv_stride,
-        x_main_off=x_main_off, x_residual_off=x_residual_off,
-        scratch_off=scratch_off, scratch_capacity=scratch_capacity,
-        sliding_cos_off=sliding_cos_off, sliding_sin_off=sliding_sin_off,
-        full_cos_off=full_cos_off, full_sin_off=full_sin_off,
-        state_bytes=state_bytes,
-        host_only_off=host_only_off,
-        final_norm_off=final_norm_off,
-        embed_off=embed_off,
-    )
-    return Gemma4LoadPlan(layout, descs^)
-
-
 # =============================================================================
-# Rank view
+# Build plan
 # =============================================================================
 
 
 @fieldwise_init
-struct RankView[tp: Int](Copyable, Movable):
-    comptime S = Gemma4Shapes[Self.tp]
+struct Gemma4LoadPlan[tp: Int](Movable):
+    var topology: Gemma4Topology[Self.tp]
+    var descs: List[WeightDesc]
 
-    # Activations / state.
-    comptime X_MAIN          = Mat[BF16, C.MAX_SEQ_LEN, C.HIDDEN]
-    comptime X_RESIDUAL      = Mat[BF16, C.MAX_SEQ_LEN, C.HIDDEN]
 
-    # RoPE tables.
-    comptime SLIDING_ROPE_HALF = C.HEAD_DIM_SLIDING // 2
-    comptime FULL_ROPE_HALF    = 64
-    comptime SLIDING_COS     = Mat[F32, C.MAX_SEQ_LEN, Self.SLIDING_ROPE_HALF]
-    comptime SLIDING_SIN     = Mat[F32, C.MAX_SEQ_LEN, Self.SLIDING_ROPE_HALF]
-    comptime FULL_COS        = Mat[F32, C.MAX_SEQ_LEN, Self.FULL_ROPE_HALF]
-    comptime FULL_SIN        = Mat[F32, C.MAX_SEQ_LEN, Self.FULL_ROPE_HALF]
+def build_gemma4_plan[tp: Int]() -> Gemma4LoadPlan[tp]:
+    debug_assert(C.NUM_HEADS % tp == 0, "NUM_HEADS % tp")
+    debug_assert(C.NUM_KV_HEADS_SLIDING % tp == 0, "NUM_KV_HEADS_SLIDING % tp")
+    debug_assert(C.NUM_KV_HEADS_FULL % tp == 0, "NUM_KV_HEADS_FULL % tp")
+    debug_assert(C.INTERMEDIATE % tp == 0, "INTERMEDIATE % tp")
+    debug_assert(C.NUM_EXPERTS % tp == 0, "NUM_EXPERTS % tp")
 
-    # KV caches.
-    comptime SLIDING_K_CACHE = Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]
-    comptime SLIDING_V_CACHE = Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]
-    comptime FULL_K_CACHE    = Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_FULL]
-    comptime FULL_V_CACHE    = Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_FULL]
-    comptime SLIDING_KV_BYTES = C.MAX_SEQ_LEN * C.KV_DIM_SLIDING * BF16.ELEMENT_BYTES
-    comptime FULL_KV_BYTES    = C.MAX_SEQ_LEN * C.KV_DIM_FULL * BF16.ELEMENT_BYTES
+    var descs = List[WeightDesc]()
 
-    # Host-only.
-    comptime EMBED           = Mat[BF16, C.VOCAB_SIZE, C.HIDDEN]
+    # Probe strides
+    var probe = List[WeightDesc]()
+    var sl_r = emit_sliding[tp]("", 0, probe)
+    var fl_r = emit_full[tp]("", 0, probe)
+    var sl_proto = sl_r[0]
+    var sl_stride = sl_r[1]
+    var fl_proto = fl_r[0]
+    var fl_stride = fl_r[1]
 
-    var base: Int
-    var layout: UnsafePointer[Gemma4ModelLayout, MutAnyOrigin]
+    # Weight sections
+    var sl_off = 0
+    var fl_off = sl_off + C.NUM_SLIDING_LAYERS * sl_stride
+    var distributed = fl_off + C.NUM_FULL_LAYERS * fl_stride
 
-    @always_inline
-    def L(self) -> ref [MutAnyOrigin] Gemma4ModelLayout:
-        return self.layout[]
+    var si = 0
+    var fi = 0
+    for i in range(C.NUM_LAYERS):
+        var prefix = "model.language_model.layers." + String(i) + "."
+        if is_full_layer(i):
+            _ = emit_full[tp](prefix, fl_off + fi * fl_stride, descs)
+            fi += 1
+        else:
+            _ = emit_sliding[tp](prefix, sl_off + si * sl_stride, descs)
+            si += 1
 
-    def weight_base(self) -> Int:
-        return self.base
-    def state_base(self) -> Int:
-        return self.base + self.L().distributed_bytes
-    def scratch_base(self) -> Int:
-        return self.state_base() + self.L().scratch_off
+    # State via SectionBuilder
+    var state = SectionBuilder()
 
-    # Activations.
-    def x_main(self, seq_len: Int) -> DynView[Self.X_MAIN]:
-        return DynView[Self.X_MAIN](self.state_base() + self.L().x_main_off, seq_len)
-    def x_residual(self, seq_len: Int) -> DynView[Self.X_RESIDUAL]:
-        return DynView[Self.X_RESIDUAL](self.state_base() + self.L().x_residual_off, seq_len)
+    var skv_sb = SectionBuilder()
+    var skv_proto = SlidingKVSlots(
+        k=skv_sb.reserve[BF16, Shape[C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]](),
+        v=skv_sb.reserve[BF16, Shape[C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]]())
+    var sliding_kv = Repeated[SlidingKVSlots](
+        skv_proto, state.cursor, skv_sb.bytes(), C.NUM_SLIDING_LAYERS)
+    _ = state.reserve_bytes(C.NUM_SLIDING_LAYERS * skv_sb.bytes())
 
-    # Scratch views.
-    def scratch_dyn[E: Encoding, cols: Int](self, read lease: ScratchLease, seq_len: Int) -> DynView[Mat[E, C.MAX_SEQ_LEN, cols]]:
-        return DynView[Mat[E, C.MAX_SEQ_LEN, cols]](self.scratch_base() + lease.offset, seq_len)
-    def scratch_ptr[T: AnyType](self, read lease: ScratchLease) -> UnsafePointer[T, MutAnyOrigin]:
-        return UnsafePointer[T, MutAnyOrigin](unsafe_from_address=self.scratch_base() + lease.offset)
+    var fkv_sb = SectionBuilder()
+    var fkv_proto = FullKVSlots(
+        k=fkv_sb.reserve[BF16, Shape[C.MAX_SEQ_LEN, C.KV_DIM_FULL]](),
+        v=fkv_sb.reserve[BF16, Shape[C.MAX_SEQ_LEN, C.KV_DIM_FULL]]())
+    var full_kv = Repeated[FullKVSlots](
+        fkv_proto, state.cursor, fkv_sb.bytes(), C.NUM_FULL_LAYERS)
+    _ = state.reserve_bytes(C.NUM_FULL_LAYERS * fkv_sb.bytes())
 
-    # KV caches.
-    def sliding_k_cache(self, sliding_idx: Int) -> CacheView[Self.SLIDING_K_CACHE]:
-        return CacheView[Self.SLIDING_K_CACHE](
-            self.state_base() + self.L().sliding_kv_off + sliding_idx * self.L().sliding_kv_stride)
-    def sliding_v_cache(self, sliding_idx: Int) -> CacheView[Self.SLIDING_V_CACHE]:
-        return CacheView[Self.SLIDING_V_CACHE](
-            self.state_base() + self.L().sliding_kv_off + sliding_idx * self.L().sliding_kv_stride
-            + Self.SLIDING_KV_BYTES)
-    def full_k_cache(self, full_idx: Int) -> CacheView[Self.FULL_K_CACHE]:
-        return CacheView[Self.FULL_K_CACHE](
-            self.state_base() + self.L().full_kv_off + full_idx * self.L().full_kv_stride)
-    def full_v_cache(self, full_idx: Int) -> CacheView[Self.FULL_V_CACHE]:
-        return CacheView[Self.FULL_V_CACHE](
-            self.state_base() + self.L().full_kv_off + full_idx * self.L().full_kv_stride
-            + Self.FULL_KV_BYTES)
+    var activations = ActivationSlots(
+        x_main=state.reserve[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](),
+        x_residual=state.reserve[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]())
 
-    # RoPE tables.
-    def sliding_cos(self) -> Bound[Self.SLIDING_COS]:
-        return Bound[Self.SLIDING_COS](self.state_base() + self.L().sliding_cos_off)
-    def sliding_sin(self) -> Bound[Self.SLIDING_SIN]:
-        return Bound[Self.SLIDING_SIN](self.state_base() + self.L().sliding_sin_off)
-    def full_cos(self) -> Bound[Self.FULL_COS]:
-        return Bound[Self.FULL_COS](self.state_base() + self.L().full_cos_off)
-    def full_sin(self) -> Bound[Self.FULL_SIN]:
-        return Bound[Self.FULL_SIN](self.state_base() + self.L().full_sin_off)
+    var scratch_cap = calculate_peak_scratch[tp]()
+    var scratch_off = state.reserve_bytes(scratch_cap)
 
-    # Per-layer weight base addresses.
-    def sliding_base(self, sliding_idx: Int) -> Int:
-        return self.weight_base() + self.L().sliding_off + sliding_idx * self.L().sliding_stride
-    def full_base(self, full_idx: Int) -> Int:
-        return self.weight_base() + self.L().full_off + full_idx * self.L().full_stride
+    var sliding_rope = RopeSlots[C.HEAD_DIM_SLIDING // 2](
+        cos=state.reserve[F32, Shape[C.MAX_SEQ_LEN, C.HEAD_DIM_SLIDING // 2]](),
+        sin=state.reserve[F32, Shape[C.MAX_SEQ_LEN, C.HEAD_DIM_SLIDING // 2]]())
+    var full_rope = RopeSlots[64](
+        cos=state.reserve[F32, Shape[C.MAX_SEQ_LEN, 64]](),
+        sin=state.reserve[F32, Shape[C.MAX_SEQ_LEN, 64]]())
 
-    # Host-only.
-    def final_norm(self) -> Bound[Mat[BF16, C.HIDDEN, 1]]:
-        return bound_vec[BF16, C.HIDDEN](self.weight_base() + self.L().final_norm_off)
-    def embed_table(self) -> Bound[Self.EMBED]:
-        return Bound[Self.EMBED](self.weight_base() + self.L().embed_off)
+    # Host section
+    var host_off = align_up(distributed + state.bytes())
+    comptime HOST = LayerShard.HOST
+    var hb = LayerBuilder(tp, "", 0)
+    hb.cursor = host_off
+    var host = HostSlots(
+        final_norm=SlotOffset[BF16, Shape[C.HIDDEN, 1]](
+            hb.bf(descs, "model.language_model.norm.weight", C.HIDDEN, 1, HOST)),
+        embed=SlotOffset[BF16, Shape[C.VOCAB_SIZE, C.HIDDEN]](
+            hb.bf(descs, "model.language_model.embed_tokens.weight", C.VOCAB_SIZE, C.HIDDEN, HOST)))
+
+    var topo = Gemma4Topology[tp](
+        arena_base=0,
+        sliding=Repeated[SlidingLayerRefs[tp]](sl_proto, sl_off, sl_stride, C.NUM_SLIDING_LAYERS),
+        full=Repeated[FullLayerRefs[tp]](fl_proto, fl_off, fl_stride, C.NUM_FULL_LAYERS),
+        distributed_bytes=distributed,
+        sliding_kv=sliding_kv, full_kv=full_kv,
+        activations=activations,
+        scratch_off=scratch_off, scratch_capacity=scratch_cap,
+        sliding_rope=sliding_rope, full_rope=full_rope,
+        state_bytes=state.bytes(),
+        host=host, host_bytes=hb.cursor)
+    return Gemma4LoadPlan[tp](topo, descs^)
 
 
 # =============================================================================
-# Loaded model
+# Model — arena, pool, scratch, topology.
 # =============================================================================
 
 
@@ -465,52 +458,49 @@ struct Gemma4[tp: Int](Movable):
     var arena: NumaArena[alignment=DEFAULT_ALIGNMENT]
     var pool: BurstPool[]
     var scratch: ScratchPool
-    var base: Int
-    var layout: Gemma4ModelLayout
+    var topology: Gemma4Topology[Self.tp]
 
     def __init__(out self,
         var arena: NumaArena[alignment=DEFAULT_ALIGNMENT],
         var pool: BurstPool[],
-        layout: Gemma4ModelLayout,
+        topology: Gemma4Topology[Self.tp],
     ):
-        self.base = Int(arena.base)
         self.arena = arena^
         self.pool = pool^
-        self.layout = layout
-        self.scratch = ScratchPool(layout.scratch_capacity)
-
-    def view(mut self) -> RankView[Self.tp]:
-        return RankView[Self.tp](self.base,
-            UnsafePointer[Gemma4ModelLayout, MutAnyOrigin](
-                unsafe_from_address=Int(UnsafePointer(to=self.layout))))
+        self.topology = topology.bind(Int(self.arena.base))
+        self.scratch = ScratchPool(topology.scratch_capacity)
 
     def init_state(mut self):
-        """Initialize RoPE tables and bake router constants."""
-        var s = self.view()
-        var L = self.layout
+        var topo = self.topology
+        var sb = topo.state_base()
 
-        # RoPE tables.
-        init_sliding_rope_tables(s.sliding_cos(), s.sliding_sin())
-        init_full_rope_tables(s.full_cos(), s.full_sin())
+        # RoPE tables
+        init_sliding_rope_tables(
+            topo.sliding_rope.cos.bound(sb),
+            topo.sliding_rope.sin.bound(sb))
+        init_full_rope_tables(
+            topo.full_rope.cos.bound(sb),
+            topo.full_rope.sin.bound(sb))
 
-        # Bake router constant: router_scale *= 1/sqrt(hidden). One-time
-        # rewrite of the bf16 gamma so the router-input rmsnorm absorbs
-        # the 1/sqrt(H) without paying for it on every forward.
+        # Router scale baking: fold 1/sqrt(hidden) into router_scale weights
         comptime inv_sqrt_hidden = 1.0 / sqrt[DType.float32, 1](C.HIDDEN)
         comptime width = simd_width_of[DType.float32]()
-        var sliding_idx = 0
-        var full_idx = 0
+        var si = 0
+        var fi = 0
         for i in range(C.NUM_LAYERS):
-            var scale_ptr: BF16Ptr
+            var scale_addr: Int
             if is_full_layer(i):
-                scale_ptr = BF16Ptr(unsafe_from_address=s.full_base(full_idx) + L.full.body.router_scale)
-                full_idx += 1
+                var lb = topo.full_base(fi)
+                scale_addr = topo.full.proto.body.router_scale.addr(lb)
+                fi += 1
             else:
-                scale_ptr = BF16Ptr(unsafe_from_address=s.sliding_base(sliding_idx) + L.sliding.body.router_scale)
-                sliding_idx += 1
+                var lb = topo.sliding_base(si)
+                scale_addr = topo.sliding.proto.body.router_scale.addr(lb)
+                si += 1
+            var p = BF16Ptr(unsafe_from_address=scale_addr)
             for j in range(0, C.HIDDEN, width):
-                var v = (scale_ptr + j).load[width=width]().cast[DType.float32]()
-                (scale_ptr + j).store((v * inv_sqrt_hidden).cast[DType.bfloat16]())
+                var v = (p + j).load[width=width]().cast[DType.float32]()
+                (p + j).store((v * inv_sqrt_hidden).cast[DType.bfloat16]())
 
         print("state initialized: rope tables + baked router constants")
 
@@ -522,19 +512,17 @@ struct Gemma4[tp: Int](Movable):
             return None
         print("found", len(shards), "shard(s)")
 
-        # Build the whole-model runtime layout and weight catalog in one
-        # pass. Single source of truth for offsets + descs — they can't
-        # drift because each sliding/full spec emit produces both.
-        var plan = build_gemma4_load_plan[Self.tp]()
+        var plan = build_gemma4_plan[Self.tp]()
+        var topo = plan.topology
 
         var numa = NumaInfo()
-        var topo = numa.plan_topology(1)
+        var nodes = numa.plan_topology(1)
 
-        var size = plan.layout.host_arena_bytes()
+        var size = topo.host_arena_bytes()
         print("allocating", size // (1024 * 1024), "MB (" +
-              String(plan.layout.distributed_bytes // (1024 * 1024)) + " MB weights + " +
-              String(plan.layout.state_bytes // (1024 * 1024)) + " MB state)")
-        var arena = NumaArena[alignment=DEFAULT_ALIGNMENT](topo[0], size)
+              String(topo.distributed_bytes // (1024 * 1024)) + " MB weights + " +
+              String(topo.state_bytes // (1024 * 1024)) + " MB state)")
+        var arena = NumaArena[alignment=DEFAULT_ALIGNMENT](nodes[0], size)
         if not arena:
             print("arena allocation failed")
             return None
@@ -542,338 +530,299 @@ struct Gemma4[tp: Int](Movable):
         var arena_bases = List[Int]()
         arena_bases.append(Int(arena.base))
 
-        var result = load_weights_from_descs(plan.descs, shards, arena_bases)
-        if not result:
+        var load_result = load_weights_from_descs(plan.descs, shards, arena_bases)
+        if not load_result:
             print("weight loading failed")
             return None
-        var loaded = result.take()
+        var loaded = load_result.take()
         print("loaded", loaded.bytes_loaded // (1024 * 1024), "MB in", loaded.num_ops, "ops")
 
-        _ = arena.prefault(plan.layout.distributed_bytes, plan.layout.state_bytes)
+        _ = arena.prefault(topo.distributed_bytes, topo.state_bytes)
 
-        var pool = BurstPool[].for_numa_node(numa, topo[0])
-        var model = Self(arena^, pool^, plan.layout)
+        var pool = BurstPool[].for_numa_node(numa, nodes[0])
+        var model = Self(arena^, pool^, topo)
         model.init_state()
         return model^
 
     def token_buffer(mut self) -> UnsafePointer[Scalar[DType.int32], MutAnyOrigin]:
         return UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
-            unsafe_from_address=self.view().scratch_base())
-
-    # =========================================================================
-    # Forward pass
-    # =========================================================================
+            unsafe_from_address=self.topology.scratch_base())
 
     def forward(mut self, tokens_ptr: Int, seq_len: Int, pos: Int) -> LogitsView[C.VOCAB_SIZE]:
         comptime S = Gemma4Shapes[Self.tp]
-        var s = self.view()
-        var L = self.layout
-        var sl = L.sliding
-        var fl = L.full
+        var topo = self.topology
+        var sb = topo.state_base()
+        var scb = topo.scratch_base()
 
         debug_assert(seq_len > 0 and pos >= 0 and pos + seq_len <= C.MAX_SEQ_LEN,
             "forward: sequence range exceeds MAX_SEQ_LEN")
 
-        # --- Embed ---
-        embed_lookup_scaled(s.embed_table(), tokens_ptr, s.x_main(seq_len),
-            EMBED_SCALE, self.pool).join()
+        var x_main = topo.x_main(seq_len)
+        var x_residual = topo.x_residual(seq_len)
+        var embed = static_tensor_view(topo.arena_base, topo.host.embed)
+        var final_norm = static_tensor_view(topo.arena_base, topo.host.final_norm)
+        var sliding_cos = static_tensor_view(sb, topo.sliding_rope.cos)
+        var sliding_sin = static_tensor_view(sb, topo.sliding_rope.sin)
+        var full_cos = static_tensor_view(sb, topo.full_rope.cos)
+        var full_sin = static_tensor_view(sb, topo.full_rope.sin)
 
-        # --- Layer loop ---
+        embed_lookup_scaled(embed, tokens_ptr, x_main, EMBED_SCALE, self.pool).join()
+
         var sliding_idx = 0
         var full_idx = 0
 
         for layer_idx in range(C.NUM_LAYERS):
             var full = is_full_layer(layer_idx)
-
-            var lb = s.full_base(full_idx) if full else s.sliding_base(sliding_idx)
-            var body = fl.body if full else sl.body
-
-            # =====================
-            # ATTENTION BLOCK
-            # =====================
+            var lb = topo.full_base(full_idx) if full else topo.sliding_base(sliding_idx)
+            var body = topo.full.proto.body if full else topo.sliding.proto.body
 
             if full:
-                self.attention_full(s, full_idx, seq_len, pos)
+                self.attention_full(
+                    topo, x_main, x_residual,
+                    full_cos, full_sin,
+                    full_idx, seq_len, pos)
             else:
-                self.attention_sliding(s, sliding_idx, seq_len, pos)
+                self.attention_sliding(
+                    topo, x_main, x_residual,
+                    sliding_cos, sliding_sin,
+                    sliding_idx, seq_len, pos)
 
-            # =====================
-            # FEEDFORWARD BLOCK
-            # =====================
+            rmsnorm(x_residual, static_tensor_view(lb, body.post_attn_norm),
+                x_residual, self.pool, Float32(C.RMS_NORM_EPS)).join()
+            elem_add(x_main, x_residual, x_main)
 
-            # --- Post-attention norm + residual add ---
-            rmsnorm(s.x_residual(seq_len), bound_vec[BF16, C.HIDDEN](lb + body.post_attn_norm),
-                s.x_residual(seq_len), self.pool, Float32(C.RMS_NORM_EPS)).join()
-            elem_add(s.x_main(seq_len), s.x_residual(seq_len), s.x_main(seq_len))
+            rmsnorm(x_main, static_tensor_view(lb, body.pre_ffn_norm),
+                x_residual, self.pool, Float32(C.RMS_NORM_EPS)).join()
 
-            # --- Dense MLP path ---
-            rmsnorm(s.x_main(seq_len), bound_vec[BF16, C.HIDDEN](lb + body.pre_ffn_norm),
-                s.x_residual(seq_len), self.pool, Float32(C.RMS_NORM_EPS)).join()
+            var gate = borrow_scratch_tensor[BF16, C.MAX_SEQ_LEN, S.GateUp.N](
+                self.scratch, scb, seq_len)
+            var up = borrow_scratch_tensor[BF16, C.MAX_SEQ_LEN, S.GateUp.N](
+                self.scratch, scb, seq_len)
 
-            var gate_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.GateUp.N]()
-            var up_lease   = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.GateUp.N]()
+            gemm(x_residual, static_tensor_view(lb, body.gate_proj),
+                gate.view(), self.pool).join()
+            gemm(x_residual, static_tensor_view(lb, body.up_proj),
+                up.view(), self.pool).join()
 
-            gemm(s.x_residual(seq_len), bound_mat[BF16, S.GateUp](lb + body.gate_proj),
-                s.scratch_dyn[BF16, S.GateUp.N](gate_lease, seq_len), self.pool).join()
-            gemm(s.x_residual(seq_len), bound_mat[BF16, S.GateUp](lb + body.up_proj),
-                s.scratch_dyn[BF16, S.GateUp.N](up_lease, seq_len), self.pool).join()
+            gelu_tanh_mul(gate.view(), up.view(), gate.view())
+            up^.release()
 
-            gelu_tanh_mul(s.scratch_dyn[BF16, S.GateUp.N](gate_lease, seq_len),
-                s.scratch_dyn[BF16, S.GateUp.N](up_lease, seq_len),
-                s.scratch_dyn[BF16, S.GateUp.N](gate_lease, seq_len))
+            gemm(gate.view(), static_tensor_view(lb, body.down_proj),
+                x_residual, self.pool).join()
+            gate^.release()
 
-            up_lease^.release()
+            var dense = borrow_scratch_tensor[BF16, C.MAX_SEQ_LEN, C.HIDDEN](
+                self.scratch, scb, seq_len)
+            rmsnorm(x_residual, static_tensor_view(lb, body.post_ffn_norm_1),
+                dense.view(), self.pool, Float32(C.RMS_NORM_EPS)).join()
 
-            gemm(s.scratch_dyn[BF16, S.GateUp.N](gate_lease, seq_len),
-                bound_mat[BF16, S.Down](lb + body.down_proj),
-                s.x_residual(seq_len), self.pool).join()
+            var router = borrow_scratch_tensor[BF16, C.MAX_SEQ_LEN, C.HIDDEN](
+                self.scratch, scb, seq_len)
+            rmsnorm(x_main, static_tensor_view(lb, body.router_scale),
+                router.view(), self.pool, Float32(C.RMS_NORM_EPS)).join()
 
-            gate_lease^.release()
-
-            var dense_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * C.HIDDEN]()
-            rmsnorm(s.x_residual(seq_len), bound_vec[BF16, C.HIDDEN](lb + body.post_ffn_norm_1),
-                s.scratch_dyn[BF16, C.HIDDEN](dense_lease, seq_len), self.pool, Float32(C.RMS_NORM_EPS)).join()
-
-            # --- MoE path ---
-            var router_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * C.HIDDEN]()
-            rmsnorm(s.x_main(seq_len), bound_vec[BF16, C.HIDDEN](lb + body.router_scale),
-                s.scratch_dyn[BF16, C.HIDDEN](router_lease, seq_len), self.pool, Float32(C.RMS_NORM_EPS)).join()
-
-            var router_logits_buf = InlineArray[Scalar[DType.bfloat16], C.NUM_EXPERTS](fill=Scalar[DType.bfloat16](0))
-            var router_logits_ptr = BF16Ptr(unsafe_from_address=Int(UnsafePointer(to=router_logits_buf[0])))
-            var router_input_ptr  = s.scratch_ptr[Scalar[DType.bfloat16]](router_lease)
+            var router_logits_buf = InlineArray[Scalar[DType.bfloat16], C.NUM_EXPERTS](
+                fill=Scalar[DType.bfloat16](0))
+            var router_logits_ptr = BF16Ptr(
+                unsafe_from_address=Int(UnsafePointer(to=router_logits_buf[0])))
+            var router_input_ptr = router.view().as_ptr[DType.bfloat16]()
 
             gemv_kernel[C.HIDDEN, C.NUM_EXPERTS](GemmArgs(
                 router_input_ptr,
-                BF16Ptr(unsafe_from_address=lb + body.router_proj),
-                router_logits_ptr, 0, C.NUM_EXPERTS, 1))
+                static_tensor_view(lb, body.router_proj).as_ptr[DType.bfloat16](),
+                router_logits_ptr,
+                0, C.NUM_EXPERTS, 1))
 
             var routing = softmax_topk_renorm[C.NUM_EXPERTS, C.TOP_K](
                 router_logits_ptr,
-                BF16Ptr(unsafe_from_address=lb + body.router_pes))
+                static_tensor_view(lb, body.router_pes).as_ptr[DType.bfloat16]())
 
-            router_lease^.release()
+            router^.release()
 
-            rmsnorm(s.x_main(seq_len), bound_vec[BF16, C.HIDDEN](lb + body.pre_ffn_norm_2),
-                s.x_residual(seq_len), self.pool, Float32(C.RMS_NORM_EPS)).join()
+            rmsnorm(x_main, static_tensor_view(lb, body.pre_ffn_norm_2),
+                x_residual, self.pool, Float32(C.RMS_NORM_EPS)).join()
 
-            var moe_lease        = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * C.HIDDEN]()
+            var moe = borrow_scratch_tensor[BF16, C.MAX_SEQ_LEN, C.HIDDEN](
+                self.scratch, scb, seq_len)
             var expert_buf_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.TOP_K * C.HIDDEN]()
 
             gemma4_moe_dispatch[C.NUM_EXPERTS, C.TOP_K, C.MOE_INTERMEDIATE, C.HIDDEN](
-                tptr[Scalar[DType.bfloat16]](s.x_residual(seq_len).ptr),
+                x_residual.as_ptr[DType.bfloat16](),
                 routing,
-                BF16Ptr(unsafe_from_address=lb + body.experts_gate_up),
-                BF16Ptr(unsafe_from_address=lb + body.experts_down),
-                s.scratch_ptr[Scalar[DType.bfloat16]](expert_buf_lease),
-                s.scratch_ptr[Scalar[DType.bfloat16]](moe_lease),
+                static_tensor_view(lb, body.experts_gate_up).as_ptr[DType.bfloat16](),
+                static_tensor_view(lb, body.experts_down).as_ptr[DType.bfloat16](),
+                scratch_ptr[Scalar[DType.bfloat16]](scb, expert_buf_lease),
+                moe.view().as_ptr[DType.bfloat16](),
                 self.pool)
 
             expert_buf_lease^.release()
 
-            rmsnorm(s.scratch_dyn[BF16, C.HIDDEN](moe_lease, seq_len),
-                bound_vec[BF16, C.HIDDEN](lb + body.post_ffn_norm_2),
-                s.x_residual(seq_len), self.pool, Float32(C.RMS_NORM_EPS)).join()
+            rmsnorm(moe.view(), static_tensor_view(lb, body.post_ffn_norm_2),
+                x_residual, self.pool, Float32(C.RMS_NORM_EPS)).join()
+            moe^.release()
 
-            moe_lease^.release()
+            elem_add(dense.view(), x_residual, x_residual)
+            dense^.release()
 
-            # --- Combine dense + MoE, final post-ffn norm, layer scalar ---
-            elem_add(s.scratch_dyn[BF16, C.HIDDEN](dense_lease, seq_len),
-                s.x_residual(seq_len), s.x_residual(seq_len))
-            dense_lease^.release()
+            rmsnorm(x_residual, static_tensor_view(lb, body.post_ffn_norm),
+                x_residual, self.pool, Float32(C.RMS_NORM_EPS)).join()
 
-            rmsnorm(s.x_residual(seq_len), bound_vec[BF16, C.HIDDEN](lb + body.post_ffn_norm),
-                s.x_residual(seq_len), self.pool, Float32(C.RMS_NORM_EPS)).join()
-
-            var layer_scalar = Float32(UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-                unsafe_from_address=lb + body.layer_scalar)[])
-            elem_add(s.x_main(seq_len), s.x_residual(seq_len), s.x_main(seq_len))
-            elem_scale(s.x_main(seq_len), layer_scalar)
+            var layer_scalar = Float32(static_tensor_view(lb, body.layer_scalar).as_ptr[DType.bfloat16]()[])
+            elem_add(x_main, x_residual, x_main)
+            elem_scale(x_main, layer_scalar)
 
             if full:
                 full_idx += 1
             else:
                 sliding_idx += 1
 
-        # --- Final norm + LM head ---
-        rmsnorm(s.x_main(seq_len), s.final_norm(),
-            s.x_main(seq_len), self.pool, Float32(C.RMS_NORM_EPS)).join()
+        rmsnorm(x_main, final_norm, x_main, self.pool, Float32(C.RMS_NORM_EPS)).join()
 
-        comptime RV = RankView[Self.tp]
-        var last_row_off = (seq_len - 1) * C.HIDDEN * RV.X_MAIN.ELEMENT_BYTES
-        var last_hidden = DynView[RV.X_MAIN](s.x_main(seq_len).ptr + last_row_off, 1)
+        var last_row_off = (seq_len - 1) * C.HIDDEN * BF16.ELEMENT_BYTES
+        var last_hidden = DynView[Mat[BF16, C.MAX_SEQ_LEN, C.HIDDEN]](x_main.ptr + last_row_off, 1)
         var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
-        var logit_view = s.scratch_dyn[BF16, C.VOCAB_SIZE](logit_lease, 1)
-        gemm(last_hidden, s.embed_table(), logit_view, self.pool).join()
-
+        var logit_view = scratch_tensor_view[BF16, 1, C.VOCAB_SIZE](scb, logit_lease, 1)
+        gemm(last_hidden, embed, logit_view, self.pool).join()
         logit_softcap(logit_view)
 
         return LogitsView[C.VOCAB_SIZE](
-            s.scratch_ptr[Scalar[DType.bfloat16]](logit_lease), logit_lease^)
+            scratch_ptr[Scalar[DType.bfloat16]](scb, logit_lease), logit_lease^)
 
-    # =========================================================================
-    # Attention helpers (separate methods to avoid massive forward body)
-    # =========================================================================
-
-    def attention_sliding(mut self, s: RankView[Self.tp], sliding_idx: Int, seq_len: Int, pos: Int):
+    def attention_sliding(mut self,
+        topo: Gemma4Topology[Self.tp],
+        x_main: DynamicTensorView[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]],
+        x_residual: DynamicTensorView[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]],
+        sliding_cos: StaticTensorView[F32, Shape[C.MAX_SEQ_LEN, C.HEAD_DIM_SLIDING // 2]],
+        sliding_sin: StaticTensorView[F32, Shape[C.MAX_SEQ_LEN, C.HEAD_DIM_SLIDING // 2]],
+        sliding_idx: Int, seq_len: Int, pos: Int,
+    ):
         comptime S = Gemma4Shapes[Self.tp]
-        var lb = s.sliding_base(sliding_idx)
-        var sl = self.layout.sliding
+        var lb = topo.sliding_base(sliding_idx)
+        var sl = topo.sliding.proto
+        var scb = topo.scratch_base()
 
-        rmsnorm(s.x_main(seq_len), bound_vec[BF16, C.HIDDEN](lb + sl.body.input_norm),
-            s.x_residual(seq_len), self.pool, Float32(C.RMS_NORM_EPS)).join()
+        rmsnorm(x_main, static_tensor_view(lb, sl.body.input_norm),
+            x_residual, self.pool, Float32(C.RMS_NORM_EPS)).join()
 
-        var q = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.SlidingQ.N]()
-        var k = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.SlidingKV.N]()
-        var v = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.SlidingKV.N]()
+        var q = borrow_scratch_tensor[BF16, C.MAX_SEQ_LEN, S.SlidingQ.N](
+            self.scratch, scb, seq_len)
+        var k = borrow_scratch_tensor[BF16, C.MAX_SEQ_LEN, S.SlidingKV.N](
+            self.scratch, scb, seq_len)
+        var v = borrow_scratch_tensor[BF16, C.MAX_SEQ_LEN, S.SlidingKV.N](
+            self.scratch, scb, seq_len)
 
-        gemm(s.x_residual(seq_len), bound_mat[BF16, S.SlidingQ](lb + sl.q_proj),
-            s.scratch_dyn[BF16, S.SlidingQ.N](q, seq_len), self.pool).join()
-        gemm(s.x_residual(seq_len), bound_mat[BF16, S.SlidingKV](lb + sl.k_proj),
-            s.scratch_dyn[BF16, S.SlidingKV.N](k, seq_len), self.pool).join()
-        gemm(s.x_residual(seq_len), bound_mat[BF16, S.SlidingKV](lb + sl.v_proj),
-            s.scratch_dyn[BF16, S.SlidingKV.N](v, seq_len), self.pool).join()
+        gemm(x_residual, static_tensor_view(lb, sl.attn.q_proj),
+            q.view(), self.pool).join()
+        gemm(x_residual, static_tensor_view(lb, sl.attn.k_proj),
+            k.view(), self.pool).join()
+        gemm(x_residual, static_tensor_view(lb, sl.attn.v_proj),
+            v.view(), self.pool).join()
 
         rmsnorm_per_head[C.HEAD_DIM_SLIDING, C.NUM_HEADS](
-            s.scratch_dyn[BF16, S.SlidingQ.N](q, seq_len),
-            bound_vec[BF16, C.HEAD_DIM_SLIDING](lb + sl.q_norm),
-            s.scratch_dyn[BF16, S.SlidingQ.N](q, seq_len),
+            q.view(),
+            static_tensor_view(lb, sl.attn.q_norm),
+            q.view(),
             self.pool, Float32(C.RMS_NORM_EPS)).join()
         rmsnorm_per_head[C.HEAD_DIM_SLIDING, C.NUM_KV_HEADS_SLIDING](
-            s.scratch_dyn[BF16, S.SlidingKV.N](k, seq_len),
-            bound_vec[BF16, C.HEAD_DIM_SLIDING](lb + sl.k_norm),
-            s.scratch_dyn[BF16, S.SlidingKV.N](k, seq_len),
+            k.view(),
+            static_tensor_view(lb, sl.attn.k_norm),
+            k.view(),
             self.pool, Float32(C.RMS_NORM_EPS)).join()
-        rmsnorm_no_scale(s.scratch_dyn[BF16, S.SlidingKV.N](v, seq_len),
-            s.scratch_dyn[BF16, S.SlidingKV.N](v, seq_len), self.pool, Float32(C.RMS_NORM_EPS)).join()
+        rmsnorm_no_scale(v.view(), v.view(), self.pool, Float32(C.RMS_NORM_EPS)).join()
 
-        rope[C.HEAD_DIM_SLIDING, C.NUM_HEADS](
-            s.scratch_dyn[BF16, S.SlidingQ.N](q, seq_len), s.sliding_cos(), s.sliding_sin(), pos)
-        rope[C.HEAD_DIM_SLIDING, C.NUM_KV_HEADS_SLIDING](
-            s.scratch_dyn[BF16, S.SlidingKV.N](k, seq_len), s.sliding_cos(), s.sliding_sin(), pos)
+        rope[C.HEAD_DIM_SLIDING, C.NUM_HEADS](q.view(), sliding_cos, sliding_sin, pos)
+        rope[C.HEAD_DIM_SLIDING, C.NUM_KV_HEADS_SLIDING](k.view(), sliding_cos, sliding_sin, pos)
 
-        kv_cache_write(s.scratch_dyn[BF16, S.SlidingKV.N](k, seq_len), s.sliding_k_cache(sliding_idx), pos)
-        kv_cache_write(s.scratch_dyn[BF16, S.SlidingKV.N](v, seq_len), s.sliding_v_cache(sliding_idx), pos)
+        kv_cache_write(k.view(), topo.sliding_k_cache(sliding_idx), pos)
+        kv_cache_write(v.view(), topo.sliding_v_cache(sliding_idx), pos)
 
         v^.release()
         k^.release()
 
-        var attn_out = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.SlidingQ.N]()
-        local_attention[C.NUM_HEADS, C.NUM_KV_HEADS_SLIDING, C.HEAD_DIM_SLIDING, C.SLIDING_WINDOW](
-            s.scratch_dyn[BF16, S.SlidingQ.N](q, seq_len),
-            s.sliding_k_cache(sliding_idx), s.sliding_v_cache(sliding_idx),
-            s.scratch_dyn[BF16, S.SlidingQ.N](attn_out, seq_len), pos, self.pool).join()
+        var attn_out = borrow_scratch_tensor[BF16, C.MAX_SEQ_LEN, S.SlidingQ.N](
+            self.scratch, scb, seq_len)
 
-        gemm(s.scratch_dyn[BF16, S.SlidingQ.N](attn_out, seq_len),
-            bound_mat[BF16, S.SlidingO](lb + sl.o_proj),
-            s.x_residual(seq_len), self.pool).join()
+        local_attention[C.NUM_HEADS, C.NUM_KV_HEADS_SLIDING, C.HEAD_DIM_SLIDING, C.SLIDING_WINDOW](
+            q.view(),
+            topo.sliding_k_cache(sliding_idx),
+            topo.sliding_v_cache(sliding_idx),
+            attn_out.view(), pos, self.pool).join()
+
+        gemm(attn_out.view(), static_tensor_view(lb, sl.attn.o_proj),
+            x_residual, self.pool).join()
 
         attn_out^.release()
         q^.release()
 
-    def attention_full(mut self, s: RankView[Self.tp], full_idx: Int, seq_len: Int, pos: Int):
+    def attention_full(mut self,
+        topo: Gemma4Topology[Self.tp],
+        x_main: DynamicTensorView[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]],
+        x_residual: DynamicTensorView[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]],
+        full_cos: StaticTensorView[F32, Shape[C.MAX_SEQ_LEN, 64]],
+        full_sin: StaticTensorView[F32, Shape[C.MAX_SEQ_LEN, 64]],
+        full_idx: Int, seq_len: Int, pos: Int,
+    ):
         comptime S = Gemma4Shapes[Self.tp]
-        var lb = s.full_base(full_idx)
-        var fl = self.layout.full
+        var lb = topo.full_base(full_idx)
+        var fl = topo.full.proto
+        var scb = topo.scratch_base()
 
-        rmsnorm(s.x_main(seq_len), bound_vec[BF16, C.HIDDEN](lb + fl.body.input_norm),
-            s.x_residual(seq_len), self.pool, Float32(C.RMS_NORM_EPS)).join()
+        rmsnorm(x_main, static_tensor_view(lb, fl.body.input_norm),
+            x_residual, self.pool, Float32(C.RMS_NORM_EPS)).join()
 
-        var q = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.FullQ.N]()
-        var k = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.FullK.N]()
-        var v = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.FullK.N]()
+        var q = borrow_scratch_tensor[BF16, C.MAX_SEQ_LEN, S.FullQ.N](
+            self.scratch, scb, seq_len)
+        var k = borrow_scratch_tensor[BF16, C.MAX_SEQ_LEN, S.FullK.N](
+            self.scratch, scb, seq_len)
+        var v = borrow_scratch_tensor[BF16, C.MAX_SEQ_LEN, S.FullK.N](
+            self.scratch, scb, seq_len)
 
-        gemm(s.x_residual(seq_len), bound_mat[BF16, S.FullQ](lb + fl.q_proj),
-            s.scratch_dyn[BF16, S.FullQ.N](q, seq_len), self.pool).join()
-        gemm(s.x_residual(seq_len), bound_mat[BF16, S.FullK](lb + fl.k_proj),
-            s.scratch_dyn[BF16, S.FullK.N](k, seq_len), self.pool).join()
+        gemm(x_residual, static_tensor_view(lb, fl.attn.q_proj),
+            q.view(), self.pool).join()
+        gemm(x_residual, static_tensor_view(lb, fl.attn.k_proj),
+            k.view(), self.pool).join()
 
-        var kp = s.scratch_ptr[Scalar[DType.bfloat16]](k)
-        var vp = s.scratch_ptr[Scalar[DType.bfloat16]](v)
+        var kp = k.view().as_ptr[DType.bfloat16]()
+        var vp = v.view().as_ptr[DType.bfloat16]()
         comptime copy_width = simd_width_of[DType.bfloat16]()
         for j in range(0, S.FullK.N * seq_len, copy_width):
             (vp + j).store((kp + j).load[width=copy_width]())
 
         rmsnorm_per_head[C.HEAD_DIM_FULL, C.NUM_HEADS](
-            s.scratch_dyn[BF16, S.FullQ.N](q, seq_len),
-            bound_vec[BF16, C.HEAD_DIM_FULL](lb + fl.q_norm),
-            s.scratch_dyn[BF16, S.FullQ.N](q, seq_len),
+            q.view(),
+            static_tensor_view(lb, fl.attn.q_norm),
+            q.view(),
             self.pool, Float32(C.RMS_NORM_EPS)).join()
         rmsnorm_per_head[C.HEAD_DIM_FULL, C.NUM_KV_HEADS_FULL](
-            s.scratch_dyn[BF16, S.FullK.N](k, seq_len),
-            bound_vec[BF16, C.HEAD_DIM_FULL](lb + fl.k_norm),
-            s.scratch_dyn[BF16, S.FullK.N](k, seq_len),
+            k.view(),
+            static_tensor_view(lb, fl.attn.k_norm),
+            k.view(),
             self.pool, Float32(C.RMS_NORM_EPS)).join()
-        rmsnorm_no_scale(s.scratch_dyn[BF16, S.FullK.N](v, seq_len),
-            s.scratch_dyn[BF16, S.FullK.N](v, seq_len), self.pool, Float32(C.RMS_NORM_EPS)).join()
+        rmsnorm_no_scale(v.view(), v.view(), self.pool, Float32(C.RMS_NORM_EPS)).join()
 
-        apply_full_rope[C.NUM_HEADS](s.scratch_dyn[BF16, S.FullQ.N](q, seq_len),
-            s.full_cos(), s.full_sin(), pos)
-        apply_full_rope[C.NUM_KV_HEADS_FULL](s.scratch_dyn[BF16, S.FullK.N](k, seq_len),
-            s.full_cos(), s.full_sin(), pos)
+        apply_full_rope[C.NUM_HEADS](q.view(), full_cos, full_sin, pos)
+        apply_full_rope[C.NUM_KV_HEADS_FULL](k.view(), full_cos, full_sin, pos)
 
-        kv_cache_write(s.scratch_dyn[BF16, S.FullK.N](k, seq_len), s.full_k_cache(full_idx), pos)
-        kv_cache_write(s.scratch_dyn[BF16, S.FullK.N](v, seq_len), s.full_v_cache(full_idx), pos)
+        kv_cache_write(k.view(), topo.full_k_cache(full_idx), pos)
+        kv_cache_write(v.view(), topo.full_v_cache(full_idx), pos)
 
         v^.release()
         k^.release()
 
-        var attn_out = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.FullQ.N]()
-        global_attention[C.NUM_HEADS, C.NUM_KV_HEADS_FULL, C.HEAD_DIM_FULL](
-            s.scratch_dyn[BF16, S.FullQ.N](q, seq_len),
-            s.full_k_cache(full_idx), s.full_v_cache(full_idx),
-            s.scratch_dyn[BF16, S.FullQ.N](attn_out, seq_len), pos, self.pool).join()
+        var attn_out = borrow_scratch_tensor[BF16, C.MAX_SEQ_LEN, S.FullQ.N](
+            self.scratch, scb, seq_len)
 
-        gemm(s.scratch_dyn[BF16, S.FullQ.N](attn_out, seq_len),
-            bound_mat[BF16, S.FullO](lb + fl.o_proj),
-            s.x_residual(seq_len), self.pool).join()
+        global_attention[C.NUM_HEADS, C.NUM_KV_HEADS_FULL, C.HEAD_DIM_FULL](
+            q.view(),
+            topo.full_k_cache(full_idx),
+            topo.full_v_cache(full_idx),
+            attn_out.view(), pos, self.pool).join()
+
+        gemm(attn_out.view(), static_tensor_view(lb, fl.attn.o_proj),
+            x_residual, self.pool).join()
 
         attn_out^.release()
         q^.release()
-
-    # =========================================================================
-    # Variance reporting (unchanged from initial bring-up)
-    # =========================================================================
-
-    @staticmethod
-    def bf16_variance(ptr: Int, n: Int) -> Float64:
-        var p = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=ptr)
-        comptime width = simd_width_of[DType.float32]()
-        var acc = SIMD[DType.float64, 1](0)
-        for i in range(0, n, width):
-            var v = p.load[width=width](offset=i).cast[DType.float64]()
-            acc += (v * v).reduce_add()
-        return acc / Float64(n)
-
-    def report_weight_variance(self):
-        var L = self.layout
-        var sl = L.sliding
-        var fl = L.full
-        var base = self.base
-
-        comptime S = Gemma4Shapes[Self.tp]
-        comptime q_sliding_n  = S.SlidingQ.ELEMS
-        comptime k_sliding_n  = S.SlidingKV.ELEMS
-        comptime q_full_n     = S.FullQ.ELEMS
-        comptime k_full_n     = S.FullK.ELEMS
-
-        var sliding_idx = 0
-        var full_idx = 0
-        for i in range(C.NUM_LAYERS):
-            if is_full_layer(i):
-                var layer_base = base + L.full_off + full_idx * L.full_stride
-                var q_ptr = layer_base + fl.q_proj
-                var k_ptr = layer_base + fl.k_proj
-                print("layer", i, "(full)   | q:", Self.bf16_variance(q_ptr, q_full_n),
-                    "| k:", Self.bf16_variance(k_ptr, k_full_n))
-                full_idx += 1
-            else:
-                var layer_base = base + L.sliding_off + sliding_idx * L.sliding_stride
-                var q_ptr = layer_base + sl.q_proj
-                var k_ptr = layer_base + sl.k_proj
-                print("layer", i, "(slide)  | q:", Self.bf16_variance(q_ptr, q_sliding_n),
-                    "| k:", Self.bf16_variance(k_ptr, k_sliding_n))
-                sliding_idx += 1
 
 
 def main():
@@ -881,5 +830,4 @@ def main():
     if not model_opt:
         print("failed to load model")
         return
-    var model = model_opt.take()
-    model.report_weight_variance()
+    print("model loaded successfully")

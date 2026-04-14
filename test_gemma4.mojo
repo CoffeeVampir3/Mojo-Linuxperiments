@@ -11,7 +11,7 @@ from std.pathlib import Path
 from std.time import perf_counter_ns
 
 from tokenizer import load_tokenizer
-from modeling.gemma_4_moe_new import Gemma4Config, Gemma4
+from modeling.gemma_4_moe import Gemma4Config, Gemma4
 from modeling.model_spec import LogitsView
 
 

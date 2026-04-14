@@ -3,6 +3,8 @@
 from std.memory import UnsafePointer
 from std.collections import InlineArray
 
+from kernels.kernel_ops import PoolFence
+from threading.threading_traits import BurstThreadPool
 from experimental.amx import VNNI_BLK
 from experimental3.kernels.int8_gemv import vpdpbusd
 from experimental3.kernels.quantize import absmax_quantize_i8
@@ -293,3 +295,44 @@ def sliding_attn_group_kernel[
             work)
 
         head_scales[qh] = absmax_quantize_i8[head_dim](work, qi_out + qh * head_dim)
+
+
+# ============================================================================
+# Dispatch wrapper
+# ============================================================================
+
+
+def sliding_attn_dispatch[
+    head_dim: Int, heads_per_group: Int, window_size: Int,
+    num_kv_heads: Int, num_q_heads: Int, P: BurstThreadPool,
+](
+    qkv_base: Int, q_dim_local: Int, kv_dim_local: Int,
+    q_norm_ptr: Int, k_norm_ptr: Int,
+    cos_ptr: Int, sin_ptr: Int,
+    cache_base: Int, cache_pos: Int, context_len: Int,
+    qi_out_ptr: Int, head_scale_ptr: Int,
+    eps: Float32, mut pool: P,
+) -> PoolFence[P]:
+    comptime NKV = num_kv_heads
+    var q_base = qkv_base
+    var k_base = qkv_base + q_dim_local * 2
+    var v_base = k_base + kv_dim_local * 2
+    var jobs = InlineArray[AttnGroupArgs, 8](fill=AttnGroupArgs())
+    for g in range(NKV):
+        jobs[g] = AttnGroupArgs(
+            q_base + g * heads_per_group * head_dim * 2,
+            k_base + g * head_dim * 2,
+            v_base + g * head_dim * 2,
+            q_norm_ptr, k_norm_ptr,
+            cos_ptr, sin_ptr,
+            cache_base, g,
+            cache_pos, context_len,
+            qi_out_ptr + g * heads_per_group * head_dim,
+            head_scale_ptr + g * heads_per_group * 4,
+            eps)
+    pool.dispatch[AttnGroupArgs,
+        sliding_attn_group_kernel[head_dim, heads_per_group,
+            window_size, num_kv_heads, num_q_heads]](
+        UnsafePointer(to=jobs[0]), NKV)
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))))

@@ -4,7 +4,6 @@ from std.memory import UnsafePointer
 from std.sys.info import simd_width_of, size_of
 from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
-from threading.threading_shared import ptr as tptr
 
 from modeling.model_spec import Encoding, Shaped, Bound, DynView
 from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY
@@ -438,8 +437,8 @@ def rmsnorm_no_scale[InT: Encoding & Shaped, OutT: Encoding & Shaped,
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
-    var ip = tptr[Scalar[DType.bfloat16]](input.ptr)
-    var op = tptr[Scalar[DType.bfloat16]](output.ptr)
+    var ip = input.as_ptr[DType.bfloat16]()
+    var op = output.as_ptr[DType.bfloat16]()
     var jobs = InlineArray[RMSNormNoScaleArgs, MAX_POOL_CAPACITY](uninitialized=True)
     for i in range(num_jobs):
         var start = i * rows_per_job
@@ -475,9 +474,9 @@ def rmsnorm_per_head[head_dim: Int, num_heads: Int,
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
-    var ip = tptr[Scalar[DType.bfloat16]](input.ptr)
-    var wp = tptr[Scalar[DType.bfloat16]](weight.ptr)
-    var op = tptr[Scalar[DType.bfloat16]](output.ptr)
+    var ip = input.as_ptr[DType.bfloat16]()
+    var wp = weight.as_ptr[DType.bfloat16]()
+    var op = output.as_ptr[DType.bfloat16]()
     var jobs = InlineArray[RMSNormPerHeadArgs, MAX_POOL_CAPACITY](uninitialized=True)
     for i in range(num_jobs):
         var start = i * rows_per_job
@@ -593,3 +592,51 @@ def post_reduce_kernel[hidden: Int](args: PostReduceArgs):
         BF16Ptr(unsafe_from_address=args.combine_norm_w_ptr),
         BF16Ptr(unsafe_from_address=args.x_main_ptr),
         args.layer_scalar, args.eps)
+
+
+# ============================================================================
+# Dispatch wrappers — single-job kernels with proper lifetime
+# ============================================================================
+
+
+def post_attn_norm_dispatch[hidden: Int, P: BurstThreadPool](
+    src_ptr: Int, norm_w_ptr: Int, x_main_ptr: Int, eps: Float32, mut pool: P,
+) -> PoolFence[P]:
+    var args = PostAttnNormArgs(src_ptr, norm_w_ptr, x_main_ptr, eps)
+    pool.dispatch[PostAttnNormArgs, post_attn_norm_kernel[hidden]](
+        UnsafePointer(to=args), 1)
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))))
+
+
+def expert_sum_dispatch[hidden: Int, P: BurstThreadPool](
+    expert_out_ptr: Int, local_count: Int, dst_ptr: Int, mut pool: P,
+) -> PoolFence[P]:
+    var args = ExpertSumArgs(expert_out_ptr, local_count, dst_ptr)
+    pool.dispatch[ExpertSumArgs, expert_sum_kernel[hidden]](
+        UnsafePointer(to=args), 1)
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))))
+
+
+def dense_norm_dispatch[hidden: Int, P: BurstThreadPool](
+    src_ptr: Int, norm_w_ptr: Int, dst_ptr: Int, eps: Float32, mut pool: P,
+) -> PoolFence[P]:
+    var args = DenseNormArgs(src_ptr, norm_w_ptr, dst_ptr, eps)
+    pool.dispatch[DenseNormArgs, dense_norm_kernel[hidden]](
+        UnsafePointer(to=args), 1)
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))))
+
+
+def post_reduce_dispatch[hidden: Int, P: BurstThreadPool](
+    moe_out_ptr: Int, moe_norm_w_ptr: Int, dense_normed_ptr: Int,
+    combine_norm_w_ptr: Int, x_main_ptr: Int,
+    layer_scalar: Float32, eps: Float32, mut pool: P,
+) -> PoolFence[P]:
+    var args = PostReduceArgs(moe_out_ptr, moe_norm_w_ptr, dense_normed_ptr,
+        combine_norm_w_ptr, x_main_ptr, layer_scalar, eps)
+    pool.dispatch[PostReduceArgs, post_reduce_kernel[hidden]](
+        UnsafePointer(to=args), 1)
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))))

@@ -10,8 +10,7 @@ from std.memory import UnsafePointer
 
 from modeling.model_spec import (
     Encoding, Shaped,
-    Shape, ShapeLike, Mat, Bound, DynView, CacheView,
-    I8, F32,
+    Shape, ShapeLike, Mat, Bound, DynView,
     DEFAULT_ALIGNMENT,
 )
 from experimental.linear_borrow_pool import ScratchLease, ScratchPool
@@ -107,36 +106,11 @@ struct TensorRef[E: Encoding, S: ShapeLike](Copyable, ImplicitlyCopyable):
         return Bound[Mat[Self.E, Self.S.N, Self.S.M]](base + self.offset)
 
     @always_inline
-    def dyn(self, base: Int, seq_len: Int) -> DynView[Mat[Self.E, Self.S.N, Self.S.M]]:
-        return DynView[Mat[Self.E, Self.S.N, Self.S.M]](base + self.offset, seq_len)
-
-    @always_inline
-    def cache(self, base: Int) -> CacheView[Mat[Self.E, Self.S.N, Self.S.M]]:
-        return CacheView[Mat[Self.E, Self.S.N, Self.S.M]](base + self.offset)
-
-    @always_inline
     def addr(self, base: Int) -> Int:
         return base + self.offset
 
 
 comptime SlotOffset[E: Encoding, S: ShapeLike] = TensorRef[E, S]
-
-
-@fieldwise_init
-struct QOffset[DS: ShapeLike, SS: ShapeLike](Copyable, ImplicitlyCopyable):
-    """Quantized weight atoms: i8 data + f32 scale."""
-    var data: SlotOffset[I8, Self.DS]
-    var scale: SlotOffset[F32, Self.SS]
-
-
-@fieldwise_init
-struct OpaqueSlot[bytes: Int](Copyable, ImplicitlyCopyable):
-    """Addressable non-matrix region with a fixed byte extent."""
-    var offset: Int
-
-    @always_inline
-    def addr(self, base: Int) -> Int:
-        return base + self.offset
 
 
 @fieldwise_init
@@ -170,13 +144,6 @@ struct SectionBuilder:
         var off = self.cursor
         self.cursor += size
         return SlotOffset[E, S](off)
-
-    @always_inline
-    def reserve_opaque[bytes: Int](mut self) -> OpaqueSlot[bytes]:
-        self.align()
-        var off = self.cursor
-        self.cursor += bytes
-        return OpaqueSlot[bytes](off)
 
     @always_inline
     def reserve_bytes(mut self, nbytes: Int, alignment: Int = DEFAULT_ALIGNMENT) -> Int:

@@ -15,21 +15,28 @@ from notstdcollections import HeapMoveArray
 comptime DEFAULT_IO_DEPTH = 2048
 
 
-def discover_shards(dir_path: Path) -> List[Path]:
-    """Enumerate safetensors files in a directory, sorted by name.
+def discover_shards(path: Path) -> List[Path]:
+    """Enumerate safetensors shard paths, sorted by name.
 
-    Matches any *.safetensors — this covers multi-shard HF checkpoints
-    (model-00001-of-000NN.safetensors), single-file HF checkpoints
-    (model.safetensors), and single-file quantizer outputs. Callers are
-    expected to point at a directory that only contains the intended
-    checkpoint's tensor files.
+    Accepts either:
+      - a directory containing one or more *.safetensors files
+      - a direct *.safetensors file path
+
+    This covers multi-shard HF checkpoints (model-00001-of-000NN.safetensors),
+    single-file HF checkpoints (model.safetensors), and single-file quantizer
+    outputs.
     """
     var shards = List[Path]()
+    var path_str = String(path)
+    if path_str.endswith(".safetensors"):
+        shards.append(path)
+        return shards^
+
     try:
-        for entry in dir_path.listdir():
+        for entry in path.listdir():
             var name = String(entry)
             if name.endswith(".safetensors"):
-                shards.append(dir_path / name)
+                shards.append(path / name)
     except:
         pass
     for i in range(len(shards)):

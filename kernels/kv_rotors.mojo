@@ -68,12 +68,8 @@ def init_rope_tables[CosT: Encoding & Shaped, SinT: Encoding & Shaped](
     comptime assert CosT.COLS == SinT.COLS, "rope init: cos/sin cols mismatch"
     comptime assert CosT.COLS % simd_width_of[DType.float64]() == 0, "rope init: cols must be f64-simd-aligned"
 
-    var cp = UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
-        unsafe_from_address=cos_buf.ptr
-    )
-    var sp = UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
-        unsafe_from_address=sin_buf.ptr
-    )
+    var cp = cos_buf.as_ptr[DType.float32]()
+    var sp = sin_buf.as_ptr[DType.float32]()
     comptime half = CosT.COLS
     comptime head_dim = half * 2
     comptime f64w = simd_width_of[DType.float64]()
@@ -161,12 +157,8 @@ def rope_apply[
     debug_assert(pos >= 0 and pos + seq_len <= CosT.ROWS,
         "rope: position range exceeds table capacity")
 
-    var cp = UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
-        unsafe_from_address=cos_table.ptr
-    )
-    var sn = UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
-        unsafe_from_address=sin_table.ptr
-    )
+    var cp = cos_table.as_ptr[DType.float32]()
+    var sn = sin_table.as_ptr[DType.float32]()
     comptime half = rope_dim // 2
     comptime width = simd_width_of[DType.float32]()
 
@@ -226,12 +218,8 @@ def rope_apply_partial[
     debug_assert(pos >= 0 and pos + seq_len <= CosT.ROWS,
         "rope partial: position range exceeds table capacity")
 
-    var cp = UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
-        unsafe_from_address=cos_table.ptr
-    )
-    var sn = UnsafePointer[Scalar[DType.float32], MutAnyOrigin](
-        unsafe_from_address=sin_table.ptr
-    )
+    var cp = cos_table.as_ptr[DType.float32]()
+    var sn = sin_table.as_ptr[DType.float32]()
     comptime full_half = head_dim // 2
     comptime rotary_half = rotary_dim // 2
     comptime width = simd_width_of[DType.float32]()
@@ -270,9 +258,7 @@ def rope[head_dim: Int, num_heads: Int,
     comptime assert XT.DTYPE == DType.bfloat16, "rope: must be bf16"
     comptime assert XT.COLS == head_dim * num_heads, "rope: cols != heads * dim"
 
-    var xp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-        unsafe_from_address=x.ptr
-    )
+    var xp = x.as_ptr[DType.bfloat16]()
     rope_apply[head_dim, num_heads, head_dim, 0](
         xp, XT.COLS, x.seq_len, cos_table, sin_table, pos,
     )
@@ -286,9 +272,7 @@ def rope_partial[head_dim: Int, rotary_dim: Int, num_heads: Int,
     comptime assert XT.DTYPE == DType.bfloat16, "rope partial: must be bf16"
     comptime assert XT.COLS == head_dim * num_heads, "rope partial: cols != heads * dim"
 
-    var xp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-        unsafe_from_address=x.ptr
-    )
+    var xp = x.as_ptr[DType.bfloat16]()
     rope_apply_partial[head_dim, rotary_dim, num_heads, head_dim, 0](
         xp, XT.COLS, x.seq_len, cos_table, sin_table, pos,
     )
@@ -305,9 +289,7 @@ def mla_rope_q[
     comptime assert XT.DTYPE == DType.bfloat16, "mla_rope_q: must be bf16"
     comptime assert XT.COLS == num_heads * head_dim, "mla_rope_q: cols mismatch"
 
-    var xp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-        unsafe_from_address=x.ptr
-    )
+    var xp = x.as_ptr[DType.bfloat16]()
     rope_apply[rope_dim, num_heads, head_dim, nope_dim](
         xp, XT.COLS, x.seq_len, cos_table, sin_table, pos,
     )
@@ -323,9 +305,7 @@ def mla_rope_kr[
     comptime kv_lora_rank = XT.COLS - rope_dim
     comptime assert XT.DTYPE == DType.bfloat16, "mla_rope_kr: must be bf16"
 
-    var xp = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-        unsafe_from_address=x.ptr
-    )
+    var xp = x.as_ptr[DType.bfloat16]()
     rope_apply[rope_dim, 1, XT.COLS, kv_lora_rank](
         xp, XT.COLS, x.seq_len, cos_table, sin_table, pos,
     )
