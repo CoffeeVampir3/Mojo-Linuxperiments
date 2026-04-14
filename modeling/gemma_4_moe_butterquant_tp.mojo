@@ -16,11 +16,14 @@ from modeling.model_spec import (
     Encoding, Shaped, Named, BF16, F32, I8,
     Replicated, HOST_RANK, DISTRIBUTED,
     Slot, Bound, DynView,
-    Shape, ShapeLike, WeightDesc,
+    Shape, WeightDesc,
     DEFAULT_ALIGNMENT,
     LogitsView,
     QuantizeTask, QuantOp,
     NoQuant, Rotated, RotatedPerBlock, Channelwise, SmoothPerBlock,
+)
+from modeling.gemma4_common import (
+    Gemma4BaseConfig, LayerShard, LayerBuilder, is_full_layer,
 )
 from kernels.kernel_ops import PoolFence
 from kernels.reductions import ring_allreduce, ring_broadcast
@@ -79,38 +82,14 @@ from simd_math import sqrt
 # =============================================================================
 
 
-struct Gemma4Config:
-    comptime HIDDEN = 2816
-    comptime NUM_LAYERS = 30
-    comptime NUM_HEADS = 16
-    comptime HEAD_DIM_SLIDING = 256
-    comptime NUM_KV_HEADS_SLIDING = 8
-    comptime Q_DIM_SLIDING = 4096
-    comptime KV_DIM_SLIDING = 2048
-    comptime HEAD_DIM_FULL = 512
-    comptime NUM_KV_HEADS_FULL = 2
-    comptime Q_DIM_FULL = 8192
-    comptime KV_DIM_FULL = 1024
-    comptime INTERMEDIATE = 2112
-    comptime MOE_GATE_UP_FUSED = 1408
-    comptime MOE_INTERMEDIATE = 704
-    comptime NUM_EXPERTS = 128
-    comptime TOP_K = 8
-    comptime FWHT_BLK = 64
-    comptime FWHT_BLK_HIDDEN = 256
-    comptime LM_HEAD_FWHT_BLK = 64
-    comptime DENSE_NUM_BLOCKS = Self.INTERMEDIATE // Self.FWHT_BLK
-    comptime MOE_NUM_BLOCKS = Self.MOE_INTERMEDIATE // Self.FWHT_BLK
-    comptime VOCAB_SIZE = 262144
-    comptime MAX_SEQ_LEN = 4096
-    comptime SLIDING_WINDOW = 1024
-    comptime NUM_SLIDING_LAYERS = 25
-    comptime NUM_FULL_LAYERS = 5
-    comptime RMS_NORM_EPS = 1e-6
-    comptime EMBED_SCALE = 53.0
-    comptime LOGIT_SOFTCAP = 30.0
-
+comptime Gemma4Config = Gemma4BaseConfig
 comptime C = Gemma4Config
+comptime FWHT_BLK = 64
+comptime FWHT_BLK_HIDDEN = 256
+comptime LM_HEAD_FWHT_BLK = 64
+comptime DENSE_NUM_BLOCKS = C.INTERMEDIATE // FWHT_BLK
+comptime MOE_NUM_BLOCKS = C.MOE_INTERMEDIATE // FWHT_BLK
+comptime EMBED_SCALE = 53.0
 comptime VNNI_ALIGN = 64
 
 
@@ -142,107 +121,6 @@ struct Gemma4Shapes[tp: Int]:
 # =============================================================================
 # Runtime layout
 # =============================================================================
-
-
-struct LayerShard:
-    comptime ROW  = 0   # split rows across ranks (local_rows = global_rows // tp)
-    comptime COL  = 1   # split cols across ranks (local_cols = global_cols // tp)
-    comptime REPL = 2   # full copy on every rank
-    comptime HOST = 3   # full copy, pinned to HOST_RANK only
-
-
-@fieldwise_init
-struct LayerBuilder(Movable):
-    """Builds weight catalog entries and byte offsets in a single pass."""
-    var tp: Int
-    var cursor: Int
-    var layer_prefix: String
-    var layer_base: Int
-
-    def __init__(out self, tp: Int, prefix: String, layer_base: Int):
-        self.tp = tp
-        self.cursor = 0
-        self.layer_prefix = prefix
-        self.layer_base = layer_base
-
-    @always_inline
-    def emit(mut self,
-            mut entries: List[WeightDesc],
-            suffix: String,
-            global_rows: Int, global_cols: Int,
-            dtype: DType, element_bytes: Int,
-            shard: Int, quantizable: Bool = False) -> Int:
-        var local_rows = global_rows // self.tp if shard == LayerShard.ROW else global_rows
-        var local_cols = global_cols // self.tp if shard == LayerShard.COL else global_cols
-        var target_rank = HOST_RANK if shard == LayerShard.HOST else DISTRIBUTED
-        var alloc = local_rows * local_cols * element_bytes
-        var off = ((self.cursor + DEFAULT_ALIGNMENT - 1) // DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT
-        self.cursor = off + alloc
-        entries.append(WeightDesc(
-            name=self.layer_prefix + suffix,
-            arena_offset=self.layer_base + off,
-            dtype=dtype, element_bytes=element_bytes,
-            global_rows=global_rows, global_cols=global_cols,
-            local_rows=local_rows, local_cols=local_cols,
-            data_rows=local_rows, data_cols=local_cols,
-            quantizable=quantizable, absorbed=False,
-            target_rank=target_rank,
-        ))
-        return off
-
-    @always_inline
-    def emit_shape[S: ShapeLike, element_bytes: Int](mut self,
-            mut entries: List[WeightDesc],
-            suffix: String,
-            dtype: DType,
-            quantizable: Bool = False) -> Int:
-        comptime alloc = S.bytes_for[element_bytes]()
-        var off = ((self.cursor + DEFAULT_ALIGNMENT - 1) // DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT
-        self.cursor = off + alloc
-        entries.append(WeightDesc(
-            name=self.layer_prefix + suffix,
-            arena_offset=self.layer_base + off,
-            dtype=dtype, element_bytes=element_bytes,
-            global_rows=S.GLOBAL_N, global_cols=S.GLOBAL_M,
-            local_rows=S.N, local_cols=S.M,
-            data_rows=S.DATA_N, data_cols=S.DATA_M,
-            quantizable=quantizable, absorbed=False,
-            target_rank=DISTRIBUTED,
-        ))
-        return off
-
-    @always_inline
-    def qs[S: ShapeLike](mut self, mut entries: List[WeightDesc], suffix: String) -> Int:
-        return self.emit_shape[S, 1](entries, suffix, DType.int8, True)
-
-    @always_inline
-    def fs[S: ShapeLike](mut self, mut entries: List[WeightDesc], suffix: String) -> Int:
-        return self.emit_shape[S, 4](entries, suffix, DType.float32, False)
-
-    @always_inline
-    def bfs[S: ShapeLike](mut self, mut entries: List[WeightDesc], suffix: String) -> Int:
-        return self.emit_shape[S, 2](entries, suffix, DType.bfloat16, False)
-
-    @always_inline
-    def colsum(mut self, nbytes: Int) -> Int:
-        var off = self.cursor
-        self.cursor += nbytes
-        return off
-
-    @always_inline
-    def q(mut self, mut entries: List[WeightDesc], suffix: String,
-          rows: Int, cols: Int, shard: Int) -> Int:
-        return self.emit(entries, suffix, rows, cols, DType.int8, 1, shard, True)
-
-    @always_inline
-    def f(mut self, mut entries: List[WeightDesc], suffix: String,
-          rows: Int, cols: Int, shard: Int) -> Int:
-        return self.emit(entries, suffix, rows, cols, DType.float32, 4, shard, False)
-
-    @always_inline
-    def bf(mut self, mut entries: List[WeightDesc], suffix: String,
-           rows: Int, cols: Int, shard: Int) -> Int:
-        return self.emit(entries, suffix, rows, cols, DType.bfloat16, 2, shard, False)
 
 
 @fieldwise_init
@@ -388,7 +266,7 @@ def emit_layer_colsums[tp: Int](mut b: LayerBuilder) -> LayerBodyColsums:
     var down_colsum         = b.colsum(H * S.DOWN_NUM_BLK * 4)
     var router_colsum       = b.colsum(NE * 4)
     var experts_gu_colsum   = b.colsum(experts_local * GU * 4)
-    var experts_down_colsum = b.colsum(experts_local * H * C.MOE_NUM_BLOCKS * 4)
+    var experts_down_colsum = b.colsum(experts_local * H * MOE_NUM_BLOCKS * 4)
     return LayerBodyColsums(
         o_colsum=o_colsum, gu_colsum=gu_colsum, down_colsum=down_colsum,
         router_colsum=router_colsum,
@@ -559,7 +437,7 @@ def calculate_peak_scratch[tp: Int]() -> Int:
         + C.NUM_EXPERTS * bf16
         + topk_bytes
         + C.TOP_K * C.MOE_INTERMEDIATE * i8
-        + C.TOP_K * C.MOE_NUM_BLOCKS * f32
+        + C.TOP_K * MOE_NUM_BLOCKS * f32
         + C.TOP_K * C.HIDDEN * bf16
         + size_of[Int32]()
         + S.GateUp.col_bytes_for[i8]()
@@ -572,7 +450,7 @@ def calculate_peak_scratch[tp: Int]() -> Int:
     )
     comptime decode_peak = ffn_peak if ffn_peak > layer_peak else layer_peak
 
-    comptime vocab_num_blocks = C.HIDDEN // C.LM_HEAD_FWHT_BLK
+    comptime vocab_num_blocks = C.HIDDEN // LM_HEAD_FWHT_BLK
     comptime lm_head_peak = (
         C.HIDDEN * i8 + vocab_num_blocks * f32
         + C.HIDDEN * f32 + C.VOCAB_SIZE * bf16
@@ -605,7 +483,7 @@ def build_gemma4_load_plan[tp: Int]() -> Gemma4LoadPlan:
     var full_idx = 0
     for i in range(C.NUM_LAYERS):
         var prefix = "model.language_model.layers." + String(i) + "."
-        if (i + 1) % 6 == 0:
+        if is_full_layer(i):
             var base = full_off + full_idx * full_stride
             _ = full_layer_spec[tp](prefix, base, descs)
             full_idx += 1
@@ -646,7 +524,7 @@ def build_gemma4_load_plan[tp: Int]() -> Gemma4LoadPlan:
 
     # Host-only section
     var host_only_off = ((distributed_bytes + state_bytes + DEFAULT_ALIGNMENT - 1) // DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT
-    comptime vocab_num_blocks = C.HIDDEN // C.LM_HEAD_FWHT_BLK
+    comptime vocab_num_blocks = C.HIDDEN // LM_HEAD_FWHT_BLK
     comptime HOST = LayerShard.HOST
     var hb = LayerBuilder(tp, "", 0)
     hb.cursor = host_only_off
@@ -708,7 +586,7 @@ struct RankView[tp: Int](Copyable, Movable):
     comptime FULL_SIN = Slot[F32, Replicated, C.MAX_SEQ_LEN, Self.FULL_ROPE_HALF, Self.tp]
     # Host-only shapes
     comptime EMBED      = Slot[I8, Replicated, C.VOCAB_SIZE, C.HIDDEN, Self.tp]
-    comptime VOCAB_NUM_BLOCKS = C.HIDDEN // C.LM_HEAD_FWHT_BLK
+    comptime VOCAB_NUM_BLOCKS = C.HIDDEN // LM_HEAD_FWHT_BLK
     comptime EMBED_SC   = Slot[F32, Replicated, C.VOCAB_SIZE, Self.VOCAB_NUM_BLOCKS, Self.tp]
     comptime FINAL_NORM = Slot[BF16, Replicated, C.HIDDEN, 1, Self.tp]
     comptime LOGITS     = Slot[BF16, Replicated, 1, C.VOCAB_SIZE, Self.tp]
@@ -847,8 +725,8 @@ def init_layer_body[tp: Int](arena_base: Int, layer_base: Int,
     for e in range(experts_local):
         block_colsum_at(arena_base,
             layer_base + body.experts_down + e * C.HIDDEN * C.MOE_INTERMEDIATE,
-            layer_base + colsums.experts_down_colsum + e * C.HIDDEN * C.MOE_NUM_BLOCKS * 4,
-            C.HIDDEN, C.MOE_INTERMEDIATE, C.FWHT_BLK)
+            layer_base + colsums.experts_down_colsum + e * C.HIDDEN * MOE_NUM_BLOCKS * 4,
+            C.HIDDEN, C.MOE_INTERMEDIATE, FWHT_BLK)
     pack_at(arena_base, layer_base + body.gate_proj,   S.DENSE_INT_LOCAL * 2, C.HIDDEN, scratch)
     pack_at(arena_base, layer_base + body.down_proj,   C.HIDDEN, S.DOWN_K,           scratch)
     pack_at(arena_base, layer_base + body.router_proj, C.NUM_EXPERTS, C.HIDDEN,      scratch)
@@ -962,7 +840,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             var sliding_idx = 0
             var full_idx = 0
             for i in range(C.NUM_LAYERS):
-                if (i + 1) % 6 == 0:
+                if is_full_layer(i):
                     init_full_layer[Self.tp](base,
                         L.full_off + full_idx * L.full_stride,
                         L.full, pack_scratch)
@@ -979,7 +857,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     base,
                     L.embed_off,
                     L.embed_colsum_off,
-                    C.VOCAB_SIZE, C.HIDDEN, C.LM_HEAD_FWHT_BLK)
+                    C.VOCAB_SIZE, C.HIDDEN, LM_HEAD_FWHT_BLK)
 
                 var fn_gamma = BF16Ptr(unsafe_from_address=base + L.final_norm_off)
                 compute_sqrt_gamma[C.HIDDEN](
@@ -995,7 +873,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             full_idx = 0
             for i in range(C.NUM_LAYERS):
                 var sc_ptr: UnsafePointer[Float32, MutAnyOrigin]
-                if (i + 1) % 6 == 0:
+                if is_full_layer(i):
                     sc_ptr = UnsafePointer[Float32, MutAnyOrigin](
                         unsafe_from_address=base + L.full_off + full_idx * L.full_stride + L.full.body.router_proj_sc)
                     full_idx += 1
@@ -1066,15 +944,15 @@ struct Gemma4ButterQuant[tp: Int](Movable):
     @staticmethod
     def build_quantizer_tasks() -> List[QuantizeTask]:
         var tasks = List[QuantizeTask]()
-        comptime HB = C.FWHT_BLK_HIDDEN
-        comptime LB = C.LM_HEAD_FWHT_BLK
+        comptime HB = FWHT_BLK_HIDDEN
+        comptime LB = LM_HEAD_FWHT_BLK
 
         var pt = NoQuant().to_op()
         var rot_hb = Rotated(HB).to_op()
 
         for i in range(C.NUM_LAYERS):
             var p = "model.language_model.layers." + String(i) + "."
-            var is_full = (i + 1) % 6 == 0
+            var is_full = is_full_layer(i)
 
             # Attention projections
             tasks.append(QuantizeTask(p + "self_attn.q_proj.weight", rot_hb))
@@ -1089,12 +967,12 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             # Dense MLP — gate/up rotate on K=HIDDEN, down is channelwise
             tasks.append(QuantizeTask(p + "mlp.gate_proj.weight", rot_hb))
             tasks.append(QuantizeTask(p + "mlp.up_proj.weight", rot_hb))
-            tasks.append(QuantizeTask(p + "mlp.down_proj.weight", Rotated(C.FWHT_BLK).to_op()))
+            tasks.append(QuantizeTask(p + "mlp.down_proj.weight", Rotated(FWHT_BLK).to_op()))
 
             # Router + experts
             tasks.append(QuantizeTask(p + "router.proj.weight", rot_hb))
             tasks.append(QuantizeTask(p + "experts.gate_up_proj", Rotated(HB).to_op()))
-            tasks.append(QuantizeTask(p + "experts.down_proj", Rotated(C.FWHT_BLK).to_op()))
+            tasks.append(QuantizeTask(p + "experts.down_proj", Rotated(FWHT_BLK).to_op()))
 
             # Norms + scalars — passthrough
             tasks.append(QuantizeTask(p + "input_layernorm.weight", pt))
@@ -1152,12 +1030,12 @@ struct Gemma4ButterQuant[tp: Int](Movable):
 
         # --- Embed ---
         var t_embed0 = Int(perf_counter_ns())
-        var embed_fence = embed_lookup_blocked[fwht_blk = C.LM_HEAD_FWHT_BLK](
+        var embed_fence = embed_lookup_blocked[fwht_blk = LM_HEAD_FWHT_BLK](
             host.embed_table(),
             host.embed_scale(),
             host.weight_base() + L.inv_sqrt_gamma_off,
             tokens_ptr,
-            host.x_main(seq_len), Float32(C.EMBED_SCALE),
+            host.x_main(seq_len), Float32(EMBED_SCALE),
             self.main_pools[0])
         var t_embed1 = Int(perf_counter_ns())
         sample.embed = finish_single_pool_fence(t_embed0, t_embed1, embed_fence^)
@@ -1177,7 +1055,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         var sliding_idx = 0
         var full_idx = 0
         for layer_idx in range(C.NUM_LAYERS):
-            var is_full = (layer_idx + 1) % 6 == 0
+            var is_full = is_full_layer(layer_idx)
 
             # =============================================================
             # ATTENTION BLOCK
@@ -1191,7 +1069,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 @parameter
                 def do_attn_quantize[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                     var slb = rv.sliding_layer_base(sliding_idx)
-                    return rmsnorm_gamma_fwht_quantize[C.HIDDEN, C.FWHT_BLK_HIDDEN](
+                    return rmsnorm_gamma_fwht_quantize[C.HIDDEN, FWHT_BLK_HIDDEN](
                         rv.x_main(seq_len).ptr, slb + sl.body.input_norm,
                         rv.scratch_addr(attn_i8_lease),
                         rv.scratch_addr(attn_work_lease), rv.scratch_addr(attn_scale_lease),
@@ -1283,7 +1161,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 @parameter
                 def do_full_attn_quantize[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                     var flb = rv.full_layer_base(full_idx)
-                    return rmsnorm_gamma_fwht_quantize[C.HIDDEN, C.FWHT_BLK_HIDDEN](
+                    return rmsnorm_gamma_fwht_quantize[C.HIDDEN, FWHT_BLK_HIDDEN](
                         rv.x_main(seq_len).ptr, flb + fl.body.input_norm,
                         rv.scratch_addr(full_attn_i8_lease),
                         rv.scratch_addr(full_attn_work_lease), rv.scratch_addr(full_attn_scale_lease),
@@ -1453,7 +1331,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             @parameter
             def do_router_quantize[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
-                return rmsnorm_gamma_fwht_quantize[C.HIDDEN, C.FWHT_BLK_HIDDEN](
+                return rmsnorm_gamma_fwht_quantize[C.HIDDEN, FWHT_BLK_HIDDEN](
                     rv.x_main(seq_len).ptr, lb + body.router_scale,
                     rv.scratch_addr(act_i8_lease),
                     rv.scratch_addr(act_work_lease), rv.scratch_addr(act_scale_lease),
@@ -1490,7 +1368,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             sample.router_topk.add(rnks.timed_parallel[do_router_topk](mp))
 
             var expert_qi_lease = self.scratch.borrow[Scalar[DType.int8], C.TOP_K * C.MOE_INTERMEDIATE]()
-            var expert_blk_scale_lease = self.scratch.borrow[Float32, C.TOP_K * C.MOE_NUM_BLOCKS]()
+            var expert_blk_scale_lease = self.scratch.borrow[Float32, C.TOP_K * MOE_NUM_BLOCKS]()
             var expert_out_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.TOP_K * C.HIDDEN]()
             var local_count_lease = self.scratch.borrow[Int32, 1]()
 
@@ -1498,7 +1376,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             @parameter
             def do_ffn_quantize[rank: Int](rv: RankView[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lb = rv.full_layer_base(full_idx) if is_full else rv.sliding_layer_base(sliding_idx)
-                return rmsnorm_dual_gamma_fwht_quantize[C.HIDDEN, C.FWHT_BLK_HIDDEN](
+                return rmsnorm_dual_gamma_fwht_quantize[C.HIDDEN, FWHT_BLK_HIDDEN](
                     rv.x_main(seq_len).ptr,
                     lb + body.pre_ffn_norm,
                     lb + body.pre_ffn_norm_2,
@@ -1531,7 +1409,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     unsafe_from_address=rv.scratch_addr(local_count_lease))[] = Int32(lc)
 
                 return gemma4_moe_phase1[
-                    C.MOE_INTERMEDIATE, C.HIDDEN, C.FWHT_BLK,
+                    C.MOE_INTERMEDIATE, C.HIDDEN, FWHT_BLK,
                     C.TOP_K, C.NUM_EXPERTS, Self.tp](
                     I8Ptr(unsafe_from_address=rv.scratch_addr(expert_act_i8_lease)),
                     F32Ptr(unsafe_from_address=rv.scratch_addr(expert_act_scale_lease)),
@@ -1570,7 +1448,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 var routing = UnsafePointer[Gemma4TopKResult[C.TOP_K], MutAnyOrigin](
                     unsafe_from_address=rv.scratch_addr(routing_lease))[]
                 return gemma4_moe_phase2[
-                    C.HIDDEN, C.MOE_INTERMEDIATE, C.FWHT_BLK,
+                    C.HIDDEN, C.MOE_INTERMEDIATE, FWHT_BLK,
                     C.TOP_K, C.NUM_EXPERTS, Self.tp](
                     I8Ptr(unsafe_from_address=rv.scratch_addr(expert_qi_lease)),
                     F32Ptr(unsafe_from_address=rv.scratch_addr(expert_blk_scale_lease)),
@@ -1580,7 +1458,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     lb + body.experts_down_sc,
                     C.HIDDEN * 4,
                     lb + cs.experts_down_colsum,
-                    C.HIDDEN * C.MOE_NUM_BLOCKS * 4,
+                    C.HIDDEN * MOE_NUM_BLOCKS * 4,
                     BF16Ptr(unsafe_from_address=rv.scratch_addr(expert_out_lease)),
                     rank, pool)
             sample.expert_phase2.add(rnks.timed_parallel[do_expert_phase2](mp))
@@ -1688,7 +1566,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         var lm_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
         var t_final0 = Int(perf_counter_ns())
         var final_fence = rmsnorm_gamma_fwht_per_block_quantize[
-            C.HIDDEN, C.LM_HEAD_FWHT_BLK](
+            C.HIDDEN, LM_HEAD_FWHT_BLK](
             last_hidden_bf16,
             host.weight_base() + L.sqrt_gamma_off,
             host.scratch_addr(lm_act_i8_lease),
@@ -1701,7 +1579,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         var logit_view = host.scratch_view[RV.LOGITS](logit_lease, 1)
         var t_lm0 = Int(perf_counter_ns())
         var lm_fence = lm_head_gemv[
-            C.VOCAB_SIZE, C.HIDDEN, C.LM_HEAD_FWHT_BLK](
+            C.VOCAB_SIZE, C.HIDDEN, LM_HEAD_FWHT_BLK](
             host.scratch_addr(lm_act_i8_lease),
             host.weight_base() + L.embed_off,
             host.scratch_addr(lm_act_blk_scale_lease),
