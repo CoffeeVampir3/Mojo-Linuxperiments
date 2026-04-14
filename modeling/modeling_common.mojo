@@ -6,12 +6,15 @@ SectionBuilder emits typed state/aux refs and derives byte counts from
 reservation side effects.
 """
 
+from std.memory import UnsafePointer
+
 from modeling.model_spec import (
     Encoding, Shaped,
-    ShapeLike, Mat, Bound, DynView, CacheView,
+    Shape, ShapeLike, Mat, Bound, DynView, CacheView,
     I8, F32,
     DEFAULT_ALIGNMENT,
 )
+from experimental.linear_borrow_pool import ScratchLease
 
 
 @always_inline
@@ -19,31 +22,44 @@ def align_up(value: Int, alignment: Int = DEFAULT_ALIGNMENT) -> Int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
+comptime StaticTensorView[E: Encoding, S: ShapeLike] = Bound[Mat[E, S.N, S.M]]
+comptime DynamicTensorView[E: Encoding, S: ShapeLike] = DynView[Mat[E, S.N, S.M]]
+
+
+@always_inline
+def static_tensor_view[E: Encoding, S: ShapeLike](
+    base: Int, slot: TensorRef[E, S],
+) -> StaticTensorView[E, S]:
+    return StaticTensorView[E, S](base + slot.offset)
+
+
+@always_inline
+def dynamic_tensor_view[E: Encoding, S: ShapeLike](
+    base: Int, slot: TensorRef[E, S], seq_len: Int,
+) -> DynamicTensorView[E, S]:
+    return DynamicTensorView[E, S](base + slot.offset, seq_len)
+
+
+@always_inline
+def scratch_tensor_view[E: Encoding, rows: Int, cols: Int](
+    scratch_base: Int, read lease: ScratchLease, seq_len: Int,
+) -> DynamicTensorView[E, Shape[rows, cols]]:
+    return DynamicTensorView[E, Shape[rows, cols]](
+        scratch_base + lease.offset, seq_len)
+
+
+@always_inline
+def scratch_ptr[T: AnyType](
+    scratch_base: Int, read lease: ScratchLease,
+) -> UnsafePointer[T, MutAnyOrigin]:
+    return UnsafePointer[T, MutAnyOrigin](
+        unsafe_from_address=scratch_base + lease.offset)
+
+
 @fieldwise_init
-struct SlotView[E: Encoding, S: ShapeLike](Encoding, Shaped, Copyable, Movable):
-    comptime DTYPE = Self.E.DTYPE
-    comptime ELEMENT_BYTES = Self.E.ELEMENT_BYTES
-    comptime ROWS = Self.S.N
-    comptime COLS = Self.S.M
-    var ptr: Int
-
-    @always_inline
-    def as_bound(self) -> Bound[Mat[Self.E, Self.S.N, Self.S.M]]:
-        return Bound[Mat[Self.E, Self.S.N, Self.S.M]](self.ptr)
-
-    @always_inline
-    def as_cache(self) -> CacheView[Mat[Self.E, Self.S.N, Self.S.M]]:
-        return CacheView[Mat[Self.E, Self.S.N, Self.S.M]](self.ptr)
-
-
-@fieldwise_init
-struct SlotOffset[E: Encoding, S: ShapeLike](Copyable, ImplicitlyCopyable):
+struct TensorRef[E: Encoding, S: ShapeLike](Copyable, ImplicitlyCopyable):
     """Typed offset for one materialized tensor family."""
     var offset: Int
-
-    @always_inline
-    def bind(self, base: Int) -> SlotView[Self.E, Self.S]:
-        return SlotView[Self.E, Self.S](base + self.offset)
 
     @always_inline
     def bound(self, base: Int) -> Bound[Mat[Self.E, Self.S.N, Self.S.M]]:
@@ -62,19 +78,14 @@ struct SlotOffset[E: Encoding, S: ShapeLike](Copyable, ImplicitlyCopyable):
         return base + self.offset
 
 
+comptime SlotOffset[E: Encoding, S: ShapeLike] = TensorRef[E, S]
+
+
 @fieldwise_init
 struct QOffset[DS: ShapeLike, SS: ShapeLike](Copyable, ImplicitlyCopyable):
     """Quantized weight atoms: i8 data + f32 scale."""
     var data: SlotOffset[I8, Self.DS]
     var scale: SlotOffset[F32, Self.SS]
-
-
-@fieldwise_init
-struct QOffset3[DS: ShapeLike, SS: ShapeLike, CS: ShapeLike](Copyable, ImplicitlyCopyable):
-    """Quantized weight atoms: i8 data + f32 scale + f32 colsum."""
-    var data: SlotOffset[I8, Self.DS]
-    var scale: SlotOffset[F32, Self.SS]
-    var colsum: SlotOffset[F32, Self.CS]
 
 
 @fieldwise_init

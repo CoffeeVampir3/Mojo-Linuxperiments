@@ -1,8 +1,8 @@
 """Gemma 4 26B-A4B — bf16 model, atomic layout primitives.
 
-Everything up to the forward boundary: architecture, storage shapes,
-family products, topology, emit, build, load, init. No forward pass,
-no RankView, no kernel-facing adapters.
+Architecture, storage shapes, family products, topology, emit, build,
+load, init, and forward — all bound directly from topology with no
+RankView or legacy layout bags.
 """
 
 from std.pathlib import Path
@@ -12,11 +12,11 @@ from simd_math import sqrt
 
 from numa import NumaArena, NumaInfo
 from threading import BurstPool
-from experimental.linear_borrow_pool import ScratchPool
+from experimental.linear_borrow_pool import ScratchPool, ScratchLease
 
 from modeling.model_spec import (
     Encoding, BF16, F32,
-    Shape, ShapeLike, WeightDesc,
+    Shape, ShapeLike, Mat, DynView, CacheView, WeightDesc,
     DEFAULT_ALIGNMENT, LogitsView,
 )
 from modeling.gemma4_common import (
@@ -24,10 +24,26 @@ from modeling.gemma4_common import (
 )
 from modeling.modeling_common import (
     SlotOffset, Repeated, SectionBuilder, align_up,
+    StaticTensorView, DynamicTensorView,
+    static_tensor_view, dynamic_tensor_view,
+    scratch_tensor_view, scratch_ptr,
 )
 from modeling.loader import discover_shards, load_weights_from_descs
-from kernels.kernel_ops import BF16Ptr
-from experimental_gemma.rope import init_sliding_rope_tables, init_full_rope_tables
+from kernels.kernel_ops import (
+    gemm, rmsnorm, elem_add, kv_cache_write,
+    gemv_kernel, GemmArgs,
+    BF16Ptr,
+)
+from kernels.kv_rotors import rope
+from threading.threading_shared import ptr as tptr
+
+from experimental_gemma.activations import gelu_tanh_mul
+from experimental_gemma.norms import rmsnorm_no_scale, rmsnorm_per_head
+from experimental_gemma.rope import init_sliding_rope_tables, init_full_rope_tables, apply_full_rope
+from experimental_gemma.router import softmax_topk_renorm
+from experimental_gemma.moe import gemma4_moe_dispatch
+from experimental_gemma.attention import local_attention, global_attention
+from experimental_gemma.ops import embed_lookup_scaled, logit_softcap, elem_scale
 
 
 comptime Gemma4Config = Gemma4BaseConfig
@@ -256,12 +272,22 @@ def calculate_peak_scratch[tp: Int]() -> Int:
     comptime seq = C.MAX_SEQ_LEN
     comptime S = Gemma4Shapes[tp]
 
+    # Match the actual live set in forward:
+    # q+k+v are live together, then k/v are released before attn_out is borrowed.
+    comptime full_q = seq * S.FullQ.N * bf16
+    comptime full_kv = seq * S.FullK.N * bf16
     comptime full_attn = (
-        seq * S.FullQ.N * bf16 + seq * S.FullK.N * bf16 +
-        seq * S.FullK.N * bf16 + seq * S.FullQ.N * bf16)
+        full_q + full_kv + full_kv
+        if full_q + full_kv + full_kv > full_q + full_q
+        else full_q + full_q
+    )
+    comptime sliding_q = seq * S.SlidingQ.N * bf16
+    comptime sliding_kv = seq * S.SlidingKV.N * bf16
     comptime sliding_attn = (
-        seq * S.SlidingQ.N * bf16 + seq * S.SlidingKV.N * bf16 +
-        seq * S.SlidingKV.N * bf16 + seq * S.SlidingQ.N * bf16)
+        sliding_q + sliding_kv + sliding_kv
+        if sliding_q + sliding_kv + sliding_kv > sliding_q + sliding_q
+        else sliding_q + sliding_q
+    )
     comptime ffn_dense = seq * S.GateUp.N * bf16 * 2
     comptime ffn_moe = seq * C.HIDDEN * bf16 * 2 + C.TOP_K * C.HIDDEN * bf16
     comptime ffn_peak = ffn_dense if ffn_dense > ffn_moe else ffn_moe
@@ -372,7 +398,48 @@ def build_gemma4_plan[tp: Int]() -> Gemma4LoadPlan[tp]:
 
 
 # =============================================================================
-# Model — arena, pool, scratch, topology. Init but no forward.
+# Forward helpers
+# =============================================================================
+
+
+@always_inline
+def sliding_k_cache[tp: Int](
+    topo: Gemma4Topology[tp], state_base: Int, sliding_idx: Int,
+) -> CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]]:
+    var kb = topo.sliding_kv.base(state_base, sliding_idx)
+    return CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]](
+        kb + topo.sliding_kv.proto.k.offset)
+
+
+@always_inline
+def sliding_v_cache[tp: Int](
+    topo: Gemma4Topology[tp], state_base: Int, sliding_idx: Int,
+) -> CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]]:
+    var kb = topo.sliding_kv.base(state_base, sliding_idx)
+    return CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]](
+        kb + topo.sliding_kv.proto.v.offset)
+
+
+@always_inline
+def full_k_cache[tp: Int](
+    topo: Gemma4Topology[tp], state_base: Int, full_idx: Int,
+) -> CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_FULL]]:
+    var kb = topo.full_kv.base(state_base, full_idx)
+    return CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_FULL]](
+        kb + topo.full_kv.proto.k.offset)
+
+
+@always_inline
+def full_v_cache[tp: Int](
+    topo: Gemma4Topology[tp], state_base: Int, full_idx: Int,
+) -> CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_FULL]]:
+    var kb = topo.full_kv.base(state_base, full_idx)
+    return CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_FULL]](
+        kb + topo.full_kv.proto.v.offset)
+
+
+# =============================================================================
+# Model — arena, pool, scratch, topology.
 # =============================================================================
 
 
@@ -471,6 +538,289 @@ struct Gemma4[tp: Int](Movable):
     def token_buffer(mut self) -> UnsafePointer[Scalar[DType.int32], MutAnyOrigin]:
         return UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
             unsafe_from_address=self.topology.scratch_base(self.base))
+
+    def forward(mut self, tokens_ptr: Int, seq_len: Int, pos: Int) -> LogitsView[C.VOCAB_SIZE]:
+        comptime S = Gemma4Shapes[Self.tp]
+        var topo = self.topology
+        var ab = self.base
+        var sb = topo.state_base(ab)
+        var scb = topo.scratch_base(ab)
+
+        debug_assert(seq_len > 0 and pos >= 0 and pos + seq_len <= C.MAX_SEQ_LEN,
+            "forward: sequence range exceeds MAX_SEQ_LEN")
+
+        var x_main = dynamic_tensor_view(sb, topo.activations.x_main, seq_len)
+        var x_residual = dynamic_tensor_view(sb, topo.activations.x_residual, seq_len)
+        var embed = static_tensor_view(ab, topo.host.embed)
+        var final_norm = static_tensor_view(ab, topo.host.final_norm)
+        var sliding_cos = static_tensor_view(sb, topo.sliding_rope.cos)
+        var sliding_sin = static_tensor_view(sb, topo.sliding_rope.sin)
+        var full_cos = static_tensor_view(sb, topo.full_rope.cos)
+        var full_sin = static_tensor_view(sb, topo.full_rope.sin)
+
+        embed_lookup_scaled(embed, tokens_ptr, x_main, EMBED_SCALE, self.pool).join()
+
+        var sliding_idx = 0
+        var full_idx = 0
+
+        for layer_idx in range(C.NUM_LAYERS):
+            var full = is_full_layer(layer_idx)
+            var lb = topo.full.base(ab, full_idx) if full else topo.sliding.base(ab, sliding_idx)
+            var body = topo.full.proto.body if full else topo.sliding.proto.body
+
+            if full:
+                self.attention_full(
+                    topo, x_main, x_residual,
+                    full_cos, full_sin,
+                    sb, scb, full_idx, seq_len, pos)
+            else:
+                self.attention_sliding(
+                    topo, x_main, x_residual,
+                    sliding_cos, sliding_sin,
+                    sb, scb, sliding_idx, seq_len, pos)
+
+            rmsnorm(x_residual, static_tensor_view(lb, body.post_attn_norm),
+                x_residual, self.pool, Float32(C.RMS_NORM_EPS)).join()
+            elem_add(x_main, x_residual, x_main)
+
+            rmsnorm(x_main, static_tensor_view(lb, body.pre_ffn_norm),
+                x_residual, self.pool, Float32(C.RMS_NORM_EPS)).join()
+
+            var gate_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.GateUp.N]()
+            var up_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.GateUp.N]()
+
+            var gate_view = scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.GateUp.N](scb, gate_lease, seq_len)
+            var up_view = scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.GateUp.N](scb, up_lease, seq_len)
+
+            gemm(x_residual, static_tensor_view(lb, body.gate_proj),
+                gate_view, self.pool).join()
+            gemm(x_residual, static_tensor_view(lb, body.up_proj),
+                up_view, self.pool).join()
+
+            gelu_tanh_mul(gate_view, up_view, gate_view)
+            up_lease^.release()
+
+            gemm(gate_view, static_tensor_view(lb, body.down_proj),
+                x_residual, self.pool).join()
+            gate_lease^.release()
+
+            var dense_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * C.HIDDEN]()
+            var dense_view = scratch_tensor_view[BF16, C.MAX_SEQ_LEN, C.HIDDEN](scb, dense_lease, seq_len)
+            rmsnorm(x_residual, static_tensor_view(lb, body.post_ffn_norm_1),
+                dense_view, self.pool, Float32(C.RMS_NORM_EPS)).join()
+
+            var router_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * C.HIDDEN]()
+            var router_view = scratch_tensor_view[BF16, C.MAX_SEQ_LEN, C.HIDDEN](scb, router_lease, seq_len)
+            rmsnorm(x_main, static_tensor_view(lb, body.router_scale),
+                router_view, self.pool, Float32(C.RMS_NORM_EPS)).join()
+
+            var router_logits_buf = InlineArray[Scalar[DType.bfloat16], C.NUM_EXPERTS](
+                fill=Scalar[DType.bfloat16](0))
+            var router_logits_ptr = BF16Ptr(
+                unsafe_from_address=Int(UnsafePointer(to=router_logits_buf[0])))
+            var router_input_ptr: BF16Ptr = scratch_ptr[Scalar[DType.bfloat16]](scb, router_lease)
+
+            gemv_kernel[C.HIDDEN, C.NUM_EXPERTS](GemmArgs(
+                router_input_ptr,
+                BF16Ptr(unsafe_from_address=static_tensor_view(lb, body.router_proj).ptr),
+                router_logits_ptr,
+                0, C.NUM_EXPERTS, 1))
+
+            var routing = softmax_topk_renorm[C.NUM_EXPERTS, C.TOP_K](
+                router_logits_ptr,
+                BF16Ptr(unsafe_from_address=static_tensor_view(lb, body.router_pes).ptr))
+
+            router_lease^.release()
+
+            rmsnorm(x_main, static_tensor_view(lb, body.pre_ffn_norm_2),
+                x_residual, self.pool, Float32(C.RMS_NORM_EPS)).join()
+
+            var moe_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * C.HIDDEN]()
+            var expert_buf_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.TOP_K * C.HIDDEN]()
+
+            gemma4_moe_dispatch[C.NUM_EXPERTS, C.TOP_K, C.MOE_INTERMEDIATE, C.HIDDEN](
+                tptr[Scalar[DType.bfloat16]](x_residual.ptr),
+                routing,
+                BF16Ptr(unsafe_from_address=static_tensor_view(lb, body.experts_gate_up).ptr),
+                BF16Ptr(unsafe_from_address=static_tensor_view(lb, body.experts_down).ptr),
+                scratch_ptr[Scalar[DType.bfloat16]](scb, expert_buf_lease),
+                scratch_ptr[Scalar[DType.bfloat16]](scb, moe_lease),
+                self.pool)
+
+            expert_buf_lease^.release()
+
+            var moe_view = scratch_tensor_view[BF16, C.MAX_SEQ_LEN, C.HIDDEN](scb, moe_lease, seq_len)
+            rmsnorm(moe_view, static_tensor_view(lb, body.post_ffn_norm_2),
+                x_residual, self.pool, Float32(C.RMS_NORM_EPS)).join()
+            moe_lease^.release()
+
+            elem_add(dense_view, x_residual, x_residual)
+            dense_lease^.release()
+
+            rmsnorm(x_residual, static_tensor_view(lb, body.post_ffn_norm),
+                x_residual, self.pool, Float32(C.RMS_NORM_EPS)).join()
+
+            var layer_scalar = Float32(UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+                unsafe_from_address=static_tensor_view(lb, body.layer_scalar).ptr)[])
+            elem_add(x_main, x_residual, x_main)
+            elem_scale(x_main, layer_scalar)
+
+            if full:
+                full_idx += 1
+            else:
+                sliding_idx += 1
+
+        rmsnorm(x_main, final_norm, x_main, self.pool, Float32(C.RMS_NORM_EPS)).join()
+
+        var last_row_off = (seq_len - 1) * C.HIDDEN * BF16.ELEMENT_BYTES
+        var last_hidden = DynView[Mat[BF16, C.MAX_SEQ_LEN, C.HIDDEN]](x_main.ptr + last_row_off, 1)
+        var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
+        var logit_view = scratch_tensor_view[BF16, 1, C.VOCAB_SIZE](scb, logit_lease, 1)
+        gemm(last_hidden, embed, logit_view, self.pool).join()
+        logit_softcap(logit_view)
+
+        return LogitsView[C.VOCAB_SIZE](
+            scratch_ptr[Scalar[DType.bfloat16]](scb, logit_lease), logit_lease^)
+
+    def attention_sliding(mut self,
+        topo: Gemma4Topology[Self.tp],
+        x_main: DynamicTensorView[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]],
+        x_residual: DynamicTensorView[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]],
+        sliding_cos: StaticTensorView[F32, Shape[C.MAX_SEQ_LEN, C.HEAD_DIM_SLIDING // 2]],
+        sliding_sin: StaticTensorView[F32, Shape[C.MAX_SEQ_LEN, C.HEAD_DIM_SLIDING // 2]],
+        state_base: Int, scratch_base: Int,
+        sliding_idx: Int, seq_len: Int, pos: Int,
+    ):
+        comptime S = Gemma4Shapes[Self.tp]
+        var lb = topo.sliding.base(self.base, sliding_idx)
+        var sl = topo.sliding.proto
+
+        rmsnorm(x_main, static_tensor_view(lb, sl.body.input_norm),
+            x_residual, self.pool, Float32(C.RMS_NORM_EPS)).join()
+
+        var q_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.SlidingQ.N]()
+        var k_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.SlidingKV.N]()
+        var v_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.SlidingKV.N]()
+
+        var q_view = scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.SlidingQ.N](scratch_base, q_lease, seq_len)
+        var k_view = scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.SlidingKV.N](scratch_base, k_lease, seq_len)
+        var v_view = scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.SlidingKV.N](scratch_base, v_lease, seq_len)
+
+        gemm(x_residual, static_tensor_view(lb, sl.attn.q_proj),
+            q_view, self.pool).join()
+        gemm(x_residual, static_tensor_view(lb, sl.attn.k_proj),
+            k_view, self.pool).join()
+        gemm(x_residual, static_tensor_view(lb, sl.attn.v_proj),
+            v_view, self.pool).join()
+
+        rmsnorm_per_head[C.HEAD_DIM_SLIDING, C.NUM_HEADS](
+            q_view,
+            static_tensor_view(lb, sl.attn.q_norm),
+            q_view,
+            self.pool, Float32(C.RMS_NORM_EPS)).join()
+        rmsnorm_per_head[C.HEAD_DIM_SLIDING, C.NUM_KV_HEADS_SLIDING](
+            k_view,
+            static_tensor_view(lb, sl.attn.k_norm),
+            k_view,
+            self.pool, Float32(C.RMS_NORM_EPS)).join()
+        rmsnorm_no_scale(v_view, v_view, self.pool, Float32(C.RMS_NORM_EPS)).join()
+
+        rope[C.HEAD_DIM_SLIDING, C.NUM_HEADS](q_view, sliding_cos, sliding_sin, pos)
+        rope[C.HEAD_DIM_SLIDING, C.NUM_KV_HEADS_SLIDING](k_view, sliding_cos, sliding_sin, pos)
+
+        kv_cache_write(k_view, sliding_k_cache[Self.tp](topo, state_base, sliding_idx), pos)
+        kv_cache_write(v_view, sliding_v_cache[Self.tp](topo, state_base, sliding_idx), pos)
+
+        v_lease^.release()
+        k_lease^.release()
+
+        var attn_out_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.SlidingQ.N]()
+        var attn_out_view = scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.SlidingQ.N](
+            scratch_base, attn_out_lease, seq_len)
+
+        local_attention[C.NUM_HEADS, C.NUM_KV_HEADS_SLIDING, C.HEAD_DIM_SLIDING, C.SLIDING_WINDOW](
+            q_view,
+            sliding_k_cache[Self.tp](topo, state_base, sliding_idx),
+            sliding_v_cache[Self.tp](topo, state_base, sliding_idx),
+            attn_out_view, pos, self.pool).join()
+
+        gemm(attn_out_view, static_tensor_view(lb, sl.attn.o_proj),
+            x_residual, self.pool).join()
+
+        attn_out_lease^.release()
+        q_lease^.release()
+
+    def attention_full(mut self,
+        topo: Gemma4Topology[Self.tp],
+        x_main: DynamicTensorView[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]],
+        x_residual: DynamicTensorView[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]],
+        full_cos: StaticTensorView[F32, Shape[C.MAX_SEQ_LEN, 64]],
+        full_sin: StaticTensorView[F32, Shape[C.MAX_SEQ_LEN, 64]],
+        state_base: Int, scratch_base: Int,
+        full_idx: Int, seq_len: Int, pos: Int,
+    ):
+        comptime S = Gemma4Shapes[Self.tp]
+        var lb = topo.full.base(self.base, full_idx)
+        var fl = topo.full.proto
+
+        rmsnorm(x_main, static_tensor_view(lb, fl.body.input_norm),
+            x_residual, self.pool, Float32(C.RMS_NORM_EPS)).join()
+
+        var q_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.FullQ.N]()
+        var k_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.FullK.N]()
+        var v_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.FullK.N]()
+
+        var q_view = scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.FullQ.N](scratch_base, q_lease, seq_len)
+        var k_view = scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.FullK.N](scratch_base, k_lease, seq_len)
+        var v_view = scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.FullK.N](scratch_base, v_lease, seq_len)
+
+        gemm(x_residual, static_tensor_view(lb, fl.attn.q_proj),
+            q_view, self.pool).join()
+        gemm(x_residual, static_tensor_view(lb, fl.attn.k_proj),
+            k_view, self.pool).join()
+
+        var kp: BF16Ptr = scratch_ptr[Scalar[DType.bfloat16]](scratch_base, k_lease)
+        var vp: BF16Ptr = scratch_ptr[Scalar[DType.bfloat16]](scratch_base, v_lease)
+        comptime copy_width = simd_width_of[DType.bfloat16]()
+        for j in range(0, S.FullK.N * seq_len, copy_width):
+            (vp + j).store((kp + j).load[width=copy_width]())
+
+        rmsnorm_per_head[C.HEAD_DIM_FULL, C.NUM_HEADS](
+            q_view,
+            static_tensor_view(lb, fl.attn.q_norm),
+            q_view,
+            self.pool, Float32(C.RMS_NORM_EPS)).join()
+        rmsnorm_per_head[C.HEAD_DIM_FULL, C.NUM_KV_HEADS_FULL](
+            k_view,
+            static_tensor_view(lb, fl.attn.k_norm),
+            k_view,
+            self.pool, Float32(C.RMS_NORM_EPS)).join()
+        rmsnorm_no_scale(v_view, v_view, self.pool, Float32(C.RMS_NORM_EPS)).join()
+
+        apply_full_rope[C.NUM_HEADS](q_view, full_cos, full_sin, pos)
+        apply_full_rope[C.NUM_KV_HEADS_FULL](k_view, full_cos, full_sin, pos)
+
+        kv_cache_write(k_view, full_k_cache[Self.tp](topo, state_base, full_idx), pos)
+        kv_cache_write(v_view, full_v_cache[Self.tp](topo, state_base, full_idx), pos)
+
+        v_lease^.release()
+        k_lease^.release()
+
+        var attn_out_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.FullQ.N]()
+        var attn_out_view = scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.FullQ.N](
+            scratch_base, attn_out_lease, seq_len)
+
+        global_attention[C.NUM_HEADS, C.NUM_KV_HEADS_FULL, C.HEAD_DIM_FULL](
+            q_view,
+            full_k_cache[Self.tp](topo, state_base, full_idx),
+            full_v_cache[Self.tp](topo, state_base, full_idx),
+            attn_out_view, pos, self.pool).join()
+
+        gemm(attn_out_view, static_tensor_view(lb, fl.attn.o_proj),
+            x_residual, self.pool).join()
+
+        attn_out_lease^.release()
+        q_lease^.release()
 
 
 def main():
