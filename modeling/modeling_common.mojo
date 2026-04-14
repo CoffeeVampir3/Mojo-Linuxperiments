@@ -13,7 +13,7 @@ from modeling.model_spec import (
     Shape, ShapeLike, Mat, Bound, DynView,
     DEFAULT_ALIGNMENT,
 )
-from experimental.linear_borrow_pool import ScratchLease, ScratchPool
+from modeling.linear_borrow_pool import ScratchLease, ScratchPool
 
 
 @always_inline

@@ -5,7 +5,7 @@ from std.collections import InlineArray
 
 from kernels.kernel_ops import PoolFence
 from threading.threading_traits import BurstThreadPool
-from experimental.amx import VNNI_BLK
+from experimental3.amx import VNNI_BLK
 from experimental3.kernels.int8_gemv import vpdpbusd
 from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH

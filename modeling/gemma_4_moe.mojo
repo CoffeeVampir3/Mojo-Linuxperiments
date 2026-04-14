@@ -12,7 +12,7 @@ from simd_math import sqrt
 
 from numa import NumaArena, NumaInfo
 from threading import BurstPool
-from experimental.linear_borrow_pool import ScratchPool, ScratchLease
+from modeling.linear_borrow_pool import ScratchPool, ScratchLease
 
 from modeling.model_spec import (
     Encoding, BF16, F32,
@@ -37,7 +37,7 @@ from kernels.kernel_ops import (
 from kernels.kv_rotors import rope
 
 from experimental_gemma.activations import gelu_tanh_mul
-from experimental_gemma.norms import rmsnorm_no_scale, rmsnorm_per_head
+from experimental3.kernels.rmsnorm import rmsnorm_no_scale, rmsnorm_per_head
 from experimental_gemma.rope import init_sliding_rope_tables, init_full_rope_tables, apply_full_rope
 from experimental_gemma.router import softmax_topk_renorm
 from experimental_gemma.moe import gemma4_moe_dispatch

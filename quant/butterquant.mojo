@@ -34,7 +34,7 @@ from numa import NumaArena, NumaInfo
 from modeling.model_spec import QuantizeTask, QuantOp
 from modeling.loader import discover_shards
 from notstdcollections import HeapMoveArray
-from experimental.hadquant_impl import fwht_row
+from experimental3.kernels.fwht import fwht_row
 from simd_math import roundeven, sqrt as simd_sqrt
 from threading import BurstPool
 
@@ -163,7 +163,7 @@ def quantize_panel_rows[block: Int, per_block: Bool, rotate: Bool](job: QuantPan
             k += 1
 
         comptime if rotate:
-            fwht_row[DType.float32, block](work_row, cols)
+            fwht_row[block](work_row, cols)
 
         # Absmax + quantize — per-row or per-block
         comptime if per_block:

@@ -20,7 +20,7 @@ from std.memory import UnsafePointer
 from std.sys.info import simd_width_of, size_of
 from std.collections import InlineArray
 
-from experimental.amx import TILE_N, TILE_BYTES, K_STEP
+from experimental3.amx import TILE_N, TILE_BYTES, K_STEP
 
 
 struct KVCache[max_seq: Int, head_dim: Int, num_kv_heads: Int, num_q_heads: Int = 0]:
@@ -106,4 +106,3 @@ struct KVCache[max_seq: Int, head_dim: Int, num_kv_heads: Int, num_q_heads: Int 
         UnsafePointer[Float32, MutAnyOrigin](
             unsafe_from_address=self.k_scale_base + head * Self.max_seq * size_of[Float32]() + pos * size_of[Float32]()
         )[] = scale
-

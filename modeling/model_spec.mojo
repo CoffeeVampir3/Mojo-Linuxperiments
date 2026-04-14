@@ -1,5 +1,5 @@
 from std.memory import UnsafePointer
-from experimental.linear_borrow_pool import ScratchLease
+from modeling.linear_borrow_pool import ScratchLease
 
 
 # =============================================================================

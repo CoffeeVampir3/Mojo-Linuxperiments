@@ -1,33 +1,36 @@
-"""SmolLM2-135M with parametric tensor parallelism.
+"""SmolLM2-135M TP rewrite using topology-bound modeling primitives.
 
-TP degree is a comptime parameter. Valid values must cleanly divide
-NUM_HEADS, NUM_KV_HEADS, and INTERMEDIATE. For SmolLM2-135M:
-  TP=1 (trivial), TP=3 (3 query heads, 1 KV head per rank).
+Target shape follows modeling/gemma_4_moe.mojo:
+  - explicit family-product refs via SlotOffset
+  - state/host layout via SectionBuilder + Repeated
+  - bound per-rank topology, no PlacedSlot / WeightIterable / RankView
 
-Each rank has its own NUMA arena, BurstPool, and activation buffers.
-Megatron-style: RowShard for output projections (no comm), ColShard
-for input projections (allreduce after). Dispatch via parallel_for.
+This file now covers topology/build-plan, desc-based loading, and the
+runtime forward path. Debug/parity helpers remain to be ported.
 """
 
 from std.pathlib import Path
-
-from std.memory import UnsafePointer, memcpy
+from std.memory import UnsafePointer
 from std.collections import InlineArray
+
 from numa import NumaArena, NumaInfo
 from notstdcollections import HeapMoveArray
 from threading import BurstPool
 
+from modeling.linear_borrow_pool import ScratchLease, ScratchPool
+
 from modeling.model_spec import (
-    Encoding, Shaped, Placed, Named, BF16, F32,
-    RowShard, ColShard, Replicated, HOST_RANK,
-    IsQuantizable, IsPassthrough,
-    Slot, PlacedSlot, Bound, DynView, CacheView, bind, byte_count,
-    WeightIterable,
-    next_offset,
-    DEFAULT_ALIGNMENT,
-    Dims, Attention, GQA, FFN, Vocab, Sequence, RoPEConfig, RMSNormConfig,
-    LogitsView,
+    BF16, F32,
+    Shape, ShapeLike, Mat, CacheView, WeightDesc,
+    DEFAULT_ALIGNMENT, HOST_RANK, LogitsView,
 )
+from modeling.gemma4_common import LayerShard, LayerBuilder
+from modeling.modeling_common import (
+    SlotOffset, Repeated, SectionBuilder, align_up,
+    DynamicTensorView, dynamic_tensor_view,
+    static_tensor_view, scratch_tensor_view, scratch_ptr,
+)
+from modeling.loader import discover_shards, load_weights_from_descs
 from kernels.kernel_ops import (
     gemm, rmsnorm, embed_lookup, silu_mul, elem_add, kv_cache_write,
     attention,
@@ -35,18 +38,15 @@ from kernels.kernel_ops import (
 )
 from kernels.kv_rotors import init_rope_tables, rope
 from kernels.reductions import ring_allreduce, ring_broadcast
-from modeling.loader import load_safetensors
 from kernels.profiler import Profiler
-from experimental.linear_borrow_pool import ScratchPool, ScratchLease
 
 
 # =============================================================================
-# Shared types: model config, logit access
+# Model config
 # =============================================================================
 
 
-
-struct SmolLM2Config(Dims, Attention, GQA, FFN, Vocab, Sequence, RoPEConfig, RMSNormConfig):
+struct SmolLM2Config:
     comptime HIDDEN = 576
     comptime NUM_LAYERS = 30
     comptime NUM_HEADS = 9
@@ -63,321 +63,395 @@ struct SmolLM2Config(Dims, Attention, GQA, FFN, Vocab, Sequence, RoPEConfig, RMS
     comptime GQA_FACTOR = Self.NUM_HEADS // Self.NUM_KV_HEADS
 
 
-# =============================================================================
-# Parametric model spec
-# =============================================================================
-
 comptime C = SmolLM2Config
 
 
-struct TPLayer[E: Encoding, tp: Int]:
-    comptime Q_PROJ      = PlacedSlot[Self.E, RowShard, C.HIDDEN, C.HIDDEN, Self.tp, 0, "self_attn.q_proj.weight", IsQuantizable]
-    comptime K_PROJ      = PlacedSlot[Self.E, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.Q_PROJ](), "self_attn.k_proj.weight", IsQuantizable]
-    comptime V_PROJ      = PlacedSlot[Self.E, RowShard, C.KV_HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.K_PROJ](), "self_attn.v_proj.weight", IsQuantizable]
-    comptime O_PROJ      = PlacedSlot[Self.E, ColShard, C.HIDDEN, C.HIDDEN, Self.tp, next_offset[Self.V_PROJ](), "self_attn.o_proj.weight", IsQuantizable]
-    comptime GATE_PROJ   = PlacedSlot[Self.E, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.O_PROJ](), "mlp.gate_proj.weight", IsQuantizable]
-    comptime UP_PROJ     = PlacedSlot[Self.E, RowShard, C.INTERMEDIATE, C.HIDDEN, Self.tp, next_offset[Self.GATE_PROJ](), "mlp.up_proj.weight", IsQuantizable]
-    comptime DOWN_PROJ   = PlacedSlot[Self.E, ColShard, C.HIDDEN, C.INTERMEDIATE, Self.tp, next_offset[Self.UP_PROJ](), "mlp.down_proj.weight", IsQuantizable]
-    comptime INPUT_NORM  = PlacedSlot[BF16, Replicated, C.HIDDEN, 1, Self.tp, next_offset[Self.DOWN_PROJ](), "input_layernorm.weight"]
-    comptime POST_ATTN_NORM = PlacedSlot[BF16, Replicated, C.HIDDEN, 1, Self.tp, next_offset[Self.INPUT_NORM](), "post_attention_layernorm.weight"]
-    comptime STRIDE      = next_offset[Self.POST_ATTN_NORM]()
-
-    comptime K_CACHE = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.KV_HIDDEN, Self.tp]
-    comptime V_CACHE = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.KV_HIDDEN, Self.tp]
-
-    @staticmethod
-    def for_each_weight[
-        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
-    ](prefix: String, base: Int):
-        func[Self.Q_PROJ](prefix, base)
-        func[Self.K_PROJ](prefix, base)
-        func[Self.V_PROJ](prefix, base)
-        func[Self.O_PROJ](prefix, base)
-        func[Self.GATE_PROJ](prefix, base)
-        func[Self.UP_PROJ](prefix, base)
-        func[Self.DOWN_PROJ](prefix, base)
-        func[Self.INPUT_NORM](prefix, base)
-        func[Self.POST_ATTN_NORM](prefix, base)
-
-    @staticmethod
-    def cache_bytes() -> Int:
-        return byte_count[Self.K_CACHE]() + byte_count[Self.V_CACHE]()
-
-
-struct TPModel[E: Encoding, tp: Int](WeightIterable):
-    comptime LAYER = TPLayer[Self.E, Self.tp]
-
-    comptime LAYERS_OFF = 0
-    comptime LAYER_STRIDE = Self.LAYER.STRIDE
-    comptime DISTRIBUTED_BYTES = C.NUM_LAYERS * Self.LAYER.STRIDE
-
-    # Per-rank head counts.
-    comptime LOCAL_HEADS = C.NUM_HEADS // Self.tp
-    comptime LOCAL_KV_HEADS = C.NUM_KV_HEADS // Self.tp
-
-    # Per-rank activation slots.
-    comptime ROPE_HALF = C.HEAD_DIM // 2
-    comptime ROPE_COS = Slot[F32, Replicated, C.MAX_SEQ_LEN, Self.ROPE_HALF, Self.tp]
-    comptime ROPE_SIN = Slot[F32, Replicated, C.MAX_SEQ_LEN, Self.ROPE_HALF, Self.tp]
-    comptime X_MAIN = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.HIDDEN, Self.tp]
-    comptime X_RESIDUAL = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.HIDDEN, Self.tp]
-    comptime LOGITS = Slot[BF16, Replicated, C.MAX_SEQ_LEN, C.VOCAB_SIZE, Self.tp]
-
-    # Typed DynView slots — used to construct views over borrowed scratch.
-    comptime Q_VIEW = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.HIDDEN, Self.tp]
-    comptime KV_VIEW = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.KV_HIDDEN, Self.tp]
-    comptime MLP_VIEW = Slot[BF16, ColShard, C.MAX_SEQ_LEN, C.INTERMEDIATE, Self.tp]
-
-    # Scratch capacity: derived from the peak phase.
-    comptime SCRATCH_CAPACITY = Self.calculate_peak_scratch()
-
-    @staticmethod
-    def calculate_peak_scratch() -> Int:
-        """Peak scratch bytes across both phases of one layer.
-
-        Each phase creates a fresh ScratchPool. The pool is a bump
-        allocator (no reclaim), so the peak is the cumulative sum of
-        all borrows within the largest phase.
-
-        Attention phase borrows (in order, all bf16):
-            q:        MAX_SEQ_LEN * HIDDEN/tp * 2
-            k:        MAX_SEQ_LEN * KV_HIDDEN/tp * 2
-            v:        MAX_SEQ_LEN * KV_HIDDEN/tp * 2
-            attn_out: MAX_SEQ_LEN * HIDDEN/tp * 2
-
-        MLP phase borrows (in order, all bf16):
-            gate:     MAX_SEQ_LEN * INTERMEDIATE/tp * 2
-            up:       MAX_SEQ_LEN * INTERMEDIATE/tp * 2
-
-        Post-loop: logits reuse scratch from offset 0 (fresh pool).
-        An assert verifies they fit within the layer-phase capacity.
-        """
-        comptime S = C.MAX_SEQ_LEN
-        comptime H = C.HIDDEN
-        comptime KV = C.KV_HIDDEN
-        comptime I = C.INTERMEDIATE
-        comptime TP = Self.tp
-
-        comptime attn_peak = (
-            S * (H // TP) * 2      # q
-            + S * (KV // TP) * 2   # k
-            + S * (KV // TP) * 2   # v
-            + S * (H // TP) * 2    # attn_out
-        )
-
-        comptime mlp_peak = (
-            S * (I // TP) * 2      # gate
-            + S * (I // TP) * 2    # up
-        )
-
-        comptime if attn_peak > mlp_peak:
-            return attn_peak
-        else:
-            return mlp_peak
-
-    # Per-rank state layout.
-    comptime KV_STRIDE = Self.LAYER.cache_bytes()
-    comptime KV_OFF = 0
-    comptime X_MAIN_OFF = Self.KV_OFF + C.NUM_LAYERS * Self.KV_STRIDE
-    comptime X_RESIDUAL_OFF = Self.X_MAIN_OFF + byte_count[Self.X_MAIN]()
-    comptime SCRATCH_OFF = Self.X_RESIDUAL_OFF + byte_count[Self.X_RESIDUAL]()
-    comptime ROPE_COS_OFF = Self.SCRATCH_OFF + Self.SCRATCH_CAPACITY
-    comptime ROPE_SIN_OFF = Self.ROPE_COS_OFF + byte_count[Self.ROPE_COS]()
-    comptime STATE_BYTES = Self.ROPE_SIN_OFF + byte_count[Self.ROPE_SIN]()
-
-    # Host-only weights (host arena only).
-    comptime HOST_ONLY_OFF = ((Self.DISTRIBUTED_BYTES + Self.STATE_BYTES + DEFAULT_ALIGNMENT - 1) // DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT
-    comptime FINAL_NORM = PlacedSlot[BF16, Replicated, C.HIDDEN, 1, Self.tp, Self.HOST_ONLY_OFF, "model.norm.weight", target_rank=HOST_RANK]
-    comptime EMBED = PlacedSlot[Self.E, Replicated, C.VOCAB_SIZE, C.HIDDEN, Self.tp, next_offset[Self.FINAL_NORM](), "model.embed_tokens.weight", target_rank=HOST_RANK]
-
-    @staticmethod
-    def for_each_weight[
-        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
-    ]():
-        comptime for i in range(C.NUM_LAYERS):
-            var prefix = "model.layers." + String(i) + "."
-            var base = Self.LAYERS_OFF + i * Self.LAYER_STRIDE
-            Self.LAYER.for_each_weight[func](prefix, base)
-        func[Self.FINAL_NORM]("", 0)
-        func[Self.EMBED]("", 0)
-
-    @staticmethod
-    def arena_bytes() -> Int:
-        return Self.DISTRIBUTED_BYTES + Self.STATE_BYTES
-
-    @staticmethod
-    def host_arena_bytes() -> Int:
-        return next_offset[Self.EMBED]()
-
-
 # =============================================================================
-# Per-rank state accessor
+# Storage shapes
 # =============================================================================
 
 
-struct RankView[E: Encoding, tp: Int]:
-    comptime M = TPModel[Self.E, Self.tp]
-    comptime L = Self.M.LAYER
-    var base: Int
+struct SmolLM2Shapes[tp: Int]:
+    comptime QProj = Shape[C.HIDDEN, C.HIDDEN, shard_n=True, tp=Self.tp]
+    comptime KVProj = Shape[C.KV_HIDDEN, C.HIDDEN, shard_n=True, tp=Self.tp]
+    comptime OProj = Shape[C.HIDDEN, C.HIDDEN, shard_m=True, tp=Self.tp]
+    comptime GateUp = Shape[C.INTERMEDIATE, C.HIDDEN, shard_n=True, tp=Self.tp]
+    comptime Down = Shape[C.HIDDEN, C.INTERMEDIATE, shard_m=True, tp=Self.tp]
 
-    def __init__(out self, arena_base: Int):
-        self.base = arena_base
+    comptime QAct = Shape[C.MAX_SEQ_LEN, C.HIDDEN, shard_m=True, tp=Self.tp]
+    comptime KVAct = Shape[C.MAX_SEQ_LEN, C.KV_HIDDEN, shard_m=True, tp=Self.tp]
+    comptime MLPAct = Shape[C.MAX_SEQ_LEN, C.INTERMEDIATE, shard_m=True, tp=Self.tp]
 
-    def weight_base(self) -> Int:
-        return self.base
-
-    def state_base(self) -> Int:
-        return self.base + Self.M.DISTRIBUTED_BYTES
-
-    def layer_weight[T: Encoding & Shaped & Placed & Named](self, layer: Int) -> Bound[T]:
-        return bind[T](self.weight_base() + Self.M.LAYERS_OFF + layer * Self.M.LAYER_STRIDE)
-
-    def weight[T: Encoding & Shaped & Placed & Named](self) -> Bound[T]:
-        return bind[T](self.weight_base())
-
-    def k_cache(self, layer: Int) -> CacheView[Self.L.K_CACHE]:
-        return CacheView[Self.L.K_CACHE](self.state_base() + Self.M.KV_OFF + layer * Self.M.KV_STRIDE)
-
-    def v_cache(self, layer: Int) -> CacheView[Self.L.V_CACHE]:
-        return CacheView[Self.L.V_CACHE](
-            self.state_base() + Self.M.KV_OFF + layer * Self.M.KV_STRIDE + byte_count[Self.L.K_CACHE]()
-        )
-
-    def x_main(self, seq_len: Int) -> DynView[Self.M.X_MAIN]:
-        return DynView[Self.M.X_MAIN](self.state_base() + Self.M.X_MAIN_OFF, seq_len)
-
-    def x_residual(self, seq_len: Int) -> DynView[Self.M.X_RESIDUAL]:
-        return DynView[Self.M.X_RESIDUAL](self.state_base() + Self.M.X_RESIDUAL_OFF, seq_len)
-
-    def scratch_base(self) -> Int:
-        return self.state_base() + Self.M.SCRATCH_OFF
-
-    def scratch_view[V: Encoding & Shaped](self, read lease: ScratchLease, seq_len: Int) -> DynView[V]:
-        """Materialize a DynView from a scratch lease offset."""
-        return DynView[V](self.scratch_base() + lease.offset, seq_len)
-
-    def scratch_ptr[T: AnyType](self, read lease: ScratchLease) -> UnsafePointer[T, MutAnyOrigin]:
-        """Materialize a typed pointer from a scratch lease offset."""
-        return UnsafePointer[T, MutAnyOrigin](unsafe_from_address=self.scratch_base() + lease.offset)
-
-    def rope_cos(self) -> Bound[Self.M.ROPE_COS]:
-        return Bound[Self.M.ROPE_COS](self.state_base() + Self.M.ROPE_COS_OFF)
-
-    def rope_sin(self) -> Bound[Self.M.ROPE_SIN]:
-        return Bound[Self.M.ROPE_SIN](self.state_base() + Self.M.ROPE_SIN_OFF)
+    comptime LocalHeads = C.NUM_HEADS // Self.tp
+    comptime LocalKVHeads = C.NUM_KV_HEADS // Self.tp
+    comptime RopeHalf = C.HEAD_DIM // 2
 
 
 # =============================================================================
-# Ranks — dispatch helper
+# Family products — typed refs, no RankView / PlacedSlot chain
 # =============================================================================
 
 
 @fieldwise_init
-struct Ranks[E: Encoding, tp: Int]:
-    """Rank-indexed dispatch helper."""
-    var bases: InlineArray[Int, Self.tp]
-    var pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]
+struct AttentionRefs[tp: Int](Copyable, ImplicitlyCopyable):
+    comptime S = SmolLM2Shapes[Self.tp]
+    var q_proj: SlotOffset[BF16, Self.S.QProj]
+    var k_proj: SlotOffset[BF16, Self.S.KVProj]
+    var v_proj: SlotOffset[BF16, Self.S.KVProj]
+    var o_proj: SlotOffset[BF16, Self.S.OProj]
 
-    def view(self, r: Int) -> RankView[Self.E, Self.tp]:
-        return RankView[Self.E, Self.tp](self.bases[r])
 
-    def parallel[body: def[rank: Int] (RankView[Self.E, Self.tp], mut BurstPool[]) capturing -> PoolFence[BurstPool[]]](self):
-        @parameter
-        def dispatch[rank: Int]() -> PoolFence[BurstPool[]]:
-            var rv = RankView[Self.E, Self.tp](self.bases[rank])
-            return body[rank](rv, self.pool_ptrs[rank][])
-        parallel_for[BurstPool[], Self.tp, dispatch]()
+@fieldwise_init
+struct BodyRefs[tp: Int](Copyable, ImplicitlyCopyable):
+    comptime S = SmolLM2Shapes[Self.tp]
+    var input_norm: SlotOffset[BF16, Shape[C.HIDDEN, 1]]
+    var post_attn_norm: SlotOffset[BF16, Shape[C.HIDDEN, 1]]
+    var gate_proj: SlotOffset[BF16, Self.S.GateUp]
+    var up_proj: SlotOffset[BF16, Self.S.GateUp]
+    var down_proj: SlotOffset[BF16, Self.S.Down]
 
-    def each[body: def (RankView[Self.E, Self.tp]) capturing -> None](self):
-        for r in range(Self.tp):
-            body(self.view(r))
 
-    def x_main_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
-        var ptrs = InlineArray[Int, Self.tp](fill=0)
-        for r in range(Self.tp):
-            ptrs[r] = self.view(r).x_main(seq_len).ptr
-        return ptrs^
-
-    def x_residual_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
-        var ptrs = InlineArray[Int, Self.tp](fill=0)
-        for r in range(Self.tp):
-            ptrs[r] = self.view(r).x_residual(seq_len).ptr
-        return ptrs^
+@fieldwise_init
+struct LayerRefs[tp: Int](Copyable, ImplicitlyCopyable):
+    var attn: AttentionRefs[Self.tp]
+    var body: BodyRefs[Self.tp]
 
 
 # =============================================================================
-# Loaded model
+# State + host families
 # =============================================================================
 
 
-struct SmolLM2TP[E: Encoding, tp: Int](Movable):
-    comptime M = TPModel[Self.E, Self.tp]
+@fieldwise_init
+struct KVSlots[tp: Int](Copyable, ImplicitlyCopyable):
+    comptime S = SmolLM2Shapes[Self.tp]
+    var k: SlotOffset[BF16, Self.S.KVAct]
+    var v: SlotOffset[BF16, Self.S.KVAct]
 
+
+@fieldwise_init
+struct RopeSlots[half: Int](Copyable, ImplicitlyCopyable):
+    var cos: SlotOffset[F32, Shape[C.MAX_SEQ_LEN, Self.half]]
+    var sin: SlotOffset[F32, Shape[C.MAX_SEQ_LEN, Self.half]]
+
+
+@fieldwise_init
+struct ActivationSlots(Copyable, ImplicitlyCopyable):
+    var x_main: SlotOffset[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]
+    var x_residual: SlotOffset[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]
+
+
+@fieldwise_init
+struct HostSlots(Copyable, ImplicitlyCopyable):
+    var final_norm: SlotOffset[BF16, Shape[C.HIDDEN, 1]]
+    var embed: SlotOffset[BF16, Shape[C.VOCAB_SIZE, C.HIDDEN]]
+
+
+# =============================================================================
+# Topology
+# =============================================================================
+
+
+@fieldwise_init
+struct SmolLM2Topology[tp: Int](Copyable, ImplicitlyCopyable):
+    var arena_base: Int
+    var layers: Repeated[LayerRefs[Self.tp]]
+    var distributed_bytes: Int
+
+    var kv: Repeated[KVSlots[Self.tp]]
+    var activations: ActivationSlots
+    var scratch_off: Int
+    var scratch_capacity: Int
+    var rope: RopeSlots[C.HEAD_DIM // 2]
+    var state_bytes: Int
+
+    var host: HostSlots
+    var host_bytes: Int
+
+    def bind(self, base: Int) -> Self:
+        var t = self
+        t.arena_base = base
+        return t
+
+    def arena_bytes(self) -> Int:
+        return self.distributed_bytes + self.state_bytes
+
+    def host_arena_bytes(self) -> Int:
+        return self.host_bytes
+
+    @always_inline
+    def layer_base(self, idx: Int) -> Int:
+        return self.arena_base + self.layers.off + idx * self.layers.stride
+
+    @always_inline
+    def state_base(self) -> Int:
+        return self.arena_base + self.distributed_bytes
+
+    @always_inline
+    def scratch_base(self) -> Int:
+        return self.state_base() + self.scratch_off
+
+    @always_inline
+    def scratch_addr(self, read lease: ScratchLease) -> Int:
+        return self.scratch_base() + lease.offset
+
+    @always_inline
+    def x_main(self, seq_len: Int) -> DynamicTensorView[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]:
+        return dynamic_tensor_view(self.state_base(), self.activations.x_main, seq_len)
+
+    @always_inline
+    def x_residual(self, seq_len: Int) -> DynamicTensorView[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]:
+        return dynamic_tensor_view(self.state_base(), self.activations.x_residual, seq_len)
+
+    @always_inline
+    def k_cache(self, layer_idx: Int) -> CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_HIDDEN // Self.tp]]:
+        var kb = self.kv.base(self.state_base(), layer_idx)
+        return CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_HIDDEN // Self.tp]](
+            kb + self.kv.proto.k.offset)
+
+    @always_inline
+    def v_cache(self, layer_idx: Int) -> CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_HIDDEN // Self.tp]]:
+        var kb = self.kv.base(self.state_base(), layer_idx)
+        return CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_HIDDEN // Self.tp]](
+            kb + self.kv.proto.v.offset)
+
+
+# =============================================================================
+# Emit
+# =============================================================================
+
+
+def emit_body[tp: Int](mut b: LayerBuilder, mut e: List[WeightDesc]) -> BodyRefs[tp]:
+    comptime S = SmolLM2Shapes[tp]
+    comptime REPL = LayerShard.REPL
+    comptime H = C.HIDDEN
+    return BodyRefs[tp](
+        input_norm=SlotOffset[BF16, Shape[H, 1]](
+            b.bf(e, "input_layernorm.weight", H, 1, REPL)),
+        post_attn_norm=SlotOffset[BF16, Shape[H, 1]](
+            b.bf(e, "post_attention_layernorm.weight", H, 1, REPL)),
+        gate_proj=SlotOffset[BF16, S.GateUp](
+            b.bfs[S.GateUp](e, "mlp.gate_proj.weight")),
+        up_proj=SlotOffset[BF16, S.GateUp](
+            b.bfs[S.GateUp](e, "mlp.up_proj.weight")),
+        down_proj=SlotOffset[BF16, S.Down](
+            b.bfs[S.Down](e, "mlp.down_proj.weight")),
+    )
+
+
+def emit_layer[tp: Int](
+    prefix: String, layer_base: Int, mut e: List[WeightDesc],
+) -> Tuple[LayerRefs[tp], Int]:
+    var b = LayerBuilder(tp, prefix, layer_base)
+    comptime S = SmolLM2Shapes[tp]
+    var attn = AttentionRefs[tp](
+        q_proj=SlotOffset[BF16, S.QProj](b.bfs[S.QProj](e, "self_attn.q_proj.weight")),
+        k_proj=SlotOffset[BF16, S.KVProj](b.bfs[S.KVProj](e, "self_attn.k_proj.weight")),
+        v_proj=SlotOffset[BF16, S.KVProj](b.bfs[S.KVProj](e, "self_attn.v_proj.weight")),
+        o_proj=SlotOffset[BF16, S.OProj](b.bfs[S.OProj](e, "self_attn.o_proj.weight")),
+    )
+    return (LayerRefs[tp](attn=attn, body=emit_body[tp](b, e)), b.cursor)
+
+
+# =============================================================================
+# Scratch budget
+# =============================================================================
+
+
+def calculate_peak_scratch[tp: Int]() -> Int:
+    comptime S = SmolLM2Shapes[tp]
+    comptime bf16 = BF16.ELEMENT_BYTES
+
+    comptime q_bytes = S.QAct.bytes_for[bf16]()
+    comptime kv_bytes = S.KVAct.bytes_for[bf16]()
+    comptime mlp_bytes = S.MLPAct.bytes_for[bf16]()
+
+    comptime attn_qkv = q_bytes + kv_bytes + kv_bytes
+    comptime attn_out = q_bytes + q_bytes
+    comptime attn_peak = attn_qkv if attn_qkv > attn_out else attn_out
+    comptime mlp_peak = mlp_bytes + mlp_bytes
+    return attn_peak if attn_peak > mlp_peak else mlp_peak
+
+
+# =============================================================================
+# Build plan
+# =============================================================================
+
+
+@fieldwise_init
+struct SmolLM2LoadPlan[tp: Int](Movable):
+    var topology: SmolLM2Topology[Self.tp]
+    var descs: List[WeightDesc]
+
+
+def build_smollm2_plan[tp: Int]() -> SmolLM2LoadPlan[tp]:
+    debug_assert(C.NUM_HEADS % tp == 0, "NUM_HEADS % tp")
+    debug_assert(C.NUM_KV_HEADS % tp == 0, "NUM_KV_HEADS % tp")
+    debug_assert(C.INTERMEDIATE % tp == 0, "INTERMEDIATE % tp")
+
+    var descs = List[WeightDesc]()
+
+    var probe = List[WeightDesc]()
+    var layer_r = emit_layer[tp]("", 0, probe)
+    var layer_proto = layer_r[0]
+    var layer_stride = layer_r[1]
+    var distributed = C.NUM_LAYERS * layer_stride
+
+    for i in range(C.NUM_LAYERS):
+        var prefix = "model.layers." + String(i) + "."
+        _ = emit_layer[tp](prefix, i * layer_stride, descs)
+
+    var state = SectionBuilder()
+
+    var kv_sb = SectionBuilder()
+    var kv_proto = KVSlots[tp](
+        k=kv_sb.reserve[BF16, SmolLM2Shapes[tp].KVAct](),
+        v=kv_sb.reserve[BF16, SmolLM2Shapes[tp].KVAct]())
+    var kv = Repeated[KVSlots[tp]](
+        kv_proto, state.cursor, kv_sb.bytes(), C.NUM_LAYERS)
+    _ = state.reserve_bytes(C.NUM_LAYERS * kv_sb.bytes())
+
+    var activations = ActivationSlots(
+        x_main=state.reserve[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](),
+        x_residual=state.reserve[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]())
+
+    var scratch_cap = calculate_peak_scratch[tp]()
+    var scratch_off = state.reserve_bytes(scratch_cap)
+
+    var rope = RopeSlots[C.HEAD_DIM // 2](
+        cos=state.reserve[F32, Shape[C.MAX_SEQ_LEN, C.HEAD_DIM // 2]](),
+        sin=state.reserve[F32, Shape[C.MAX_SEQ_LEN, C.HEAD_DIM // 2]]())
+
+    var host_off = align_up(distributed + state.bytes())
+    comptime HOST = LayerShard.HOST
+    var hb = LayerBuilder(tp, "", 0)
+    hb.cursor = host_off
+    var host = HostSlots(
+        final_norm=SlotOffset[BF16, Shape[C.HIDDEN, 1]](
+            hb.bf(descs, "model.norm.weight", C.HIDDEN, 1, HOST)),
+        embed=SlotOffset[BF16, Shape[C.VOCAB_SIZE, C.HIDDEN]](
+            hb.bf(descs, "model.embed_tokens.weight", C.VOCAB_SIZE, C.HIDDEN, HOST)))
+
+    var topo = SmolLM2Topology[tp](
+        arena_base=0,
+        layers=Repeated[LayerRefs[tp]](layer_proto, 0, layer_stride, C.NUM_LAYERS),
+        distributed_bytes=distributed,
+        kv=kv,
+        activations=activations,
+        scratch_off=scratch_off,
+        scratch_capacity=scratch_cap,
+        rope=rope,
+        state_bytes=state.bytes(),
+        host=host,
+        host_bytes=hb.cursor,
+    )
+    return SmolLM2LoadPlan[tp](topo, descs^)
+
+
+# =============================================================================
+# TP model shell
+# =============================================================================
+
+
+def tp_parallel[tp: Int,
+    body: def[rank: Int](SmolLM2Topology[tp], mut BurstPool[]) capturing -> PoolFence[BurstPool[]],
+](
+    topos: InlineArray[SmolLM2Topology[tp], tp],
+    pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp],
+):
+    @parameter
+    def dispatch[rank: Int]() -> PoolFence[BurstPool[]]:
+        return body[rank](topos[rank], pool_ptrs[rank][])
+    parallel_for[BurstPool[], tp, dispatch]()
+
+
+struct SmolLM2TP[tp: Int](Movable):
     var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]]
     var pools: HeapMoveArray[BurstPool[]]
     var scratch: ScratchPool
-    var bases: InlineArray[Int, Self.tp]
-    var pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]
+    var topos: InlineArray[SmolLM2Topology[Self.tp], Self.tp]
 
-    def __init__(out self, var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]],
-                var pools: HeapMoveArray[BurstPool[]]):
-        self.bases = InlineArray[Int, Self.tp](fill=0)
-        self.pool_ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp](
-            fill=UnsafePointer[BurstPool[], MutAnyOrigin]()
-        )
-        self.scratch = ScratchPool(Self.M.SCRATCH_CAPACITY)
+    def __init__(
+        out self,
+        var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]],
+        var pools: HeapMoveArray[BurstPool[]],
+        var scratch: ScratchPool,
+        topos: InlineArray[SmolLM2Topology[Self.tp], Self.tp],
+    ):
         self.arenas = arenas^
         self.pools = pools^
-        for rank in range(Self.tp):
-            self.bases[rank] = Int(self.arenas[rank].base)
-            self.pool_ptrs[rank] = UnsafePointer[BurstPool[], MutAnyOrigin](
-                unsafe_from_address=Int(UnsafePointer(to=self.pools[rank]))
-            )
-
-    def rank(self, r: Int) -> RankView[Self.E, Self.tp]:
-        return RankView[Self.E, Self.tp](self.bases[r])
+        self.scratch = scratch^
+        self.topos = topos
 
     @staticmethod
     def print_memory():
-        """Print total memory required to run this model."""
-        comptime arena_per_rank = Self.M.arena_bytes()
-        comptime host_arena = Self.M.host_arena_bytes()
+        comptime arena_per_rank = build_smollm2_plan[Self.tp]().topology.arena_bytes()
+        comptime host_arena = build_smollm2_plan[Self.tp]().topology.host_arena_bytes()
         comptime total = host_arena + (Self.tp - 1) * arena_per_rank
 
-        print("SmolLM2 TP=" + String(Self.tp) + ": " + String(total // (1024 * 1024)) + " MB total")
-        comptime if Self.tp == 1:
+        print("SmolLM2 TP=" + String(Self.tp) + ": "
+            + String(total // (1024 * 1024)) + " MB total")
+        if Self.tp == 1:
             print("  rank 0 (host): " + String(host_arena // (1024 * 1024)) + " MB")
         else:
             print("  rank 0 (host): " + String(host_arena // (1024 * 1024)) + " MB")
             comptime for r in range(1, Self.tp):
-                print("  rank " + String(r) + ":        " + String(arena_per_rank // (1024 * 1024)) + " MB")
+                print("  rank " + String(r) + ":        "
+                    + String(arena_per_rank // (1024 * 1024)) + " MB")
 
-    def token_buffer(self) -> UnsafePointer[Scalar[DType.int32], MutAnyOrigin]:
-        """Pointer for writing input token IDs. Points to rank 0's scratch region.
-        Valid until the next forward() call (which borrows scratch for computation).
-        """
+    def init_state(mut self):
+        for rank in range(Self.tp):
+            var topo = self.topos[rank]
+            var sb = topo.state_base()
+            init_rope_tables(
+                topo.rope.cos.bound(sb),
+                topo.rope.sin.bound(sb),
+                Float64(C.ROPE_THETA))
+
+    def token_buffer(mut self) -> UnsafePointer[Scalar[DType.int32], MutAnyOrigin]:
         return UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
-            unsafe_from_address=self.rank(0).state_base() + Self.M.SCRATCH_OFF
-        )
+            unsafe_from_address=self.topos[0].scratch_base())
+
+    def pool_ptrs(self) -> InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]:
+        var ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp](
+            fill=UnsafePointer[BurstPool[], MutAnyOrigin]())
+        for rank in range(Self.tp):
+            ptrs[rank] = UnsafePointer[BurstPool[], MutAnyOrigin](
+                unsafe_from_address=Int(UnsafePointer(to=self.pools[rank])))
+        return ptrs^
+
+    def x_main_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
+        var ptrs = InlineArray[Int, Self.tp](fill=0)
+        for rank in range(Self.tp):
+            ptrs[rank] = self.topos[rank].x_main(seq_len).ptr
+        return ptrs^
+
+    def x_residual_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
+        var ptrs = InlineArray[Int, Self.tp](fill=0)
+        for rank in range(Self.tp):
+            ptrs[rank] = self.topos[rank].x_residual(seq_len).ptr
+        return ptrs^
 
     @staticmethod
-    def load(path: Path) -> Optional[Self]:
-        """Load SmolLM2 with automatic NUMA-aware rank placement.
-        Discovers topology, selects the tightest node cluster,
-        and orders ranks for optimal ring allreduce adjacency."""
-        comptime assert C.NUM_HEADS % Self.tp == 0, "TP must evenly divide NUM_HEADS"
-        comptime assert C.NUM_KV_HEADS % Self.tp == 0, "TP must evenly divide NUM_KV_HEADS"
-        comptime assert C.INTERMEDIATE % Self.tp == 0, "TP must evenly divide INTERMEDIATE"
+    def load(dir_path: Path) -> Optional[Self]:
+        var shards = discover_shards(dir_path)
+        if len(shards) == 0:
+            print("no safetensors shards found in", String(dir_path))
+            return None
+        print("found", len(shards), "shard(s)")
+
+        var plan = build_smollm2_plan[Self.tp]()
+        var topo = plan.topology
 
         var numa = NumaInfo()
-        var topo = numa.plan_topology(Self.tp)
+        var numa_topo = numa.plan_topology(Self.tp)
 
         var arenas = HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]](Self.tp)
         for rank in range(Self.tp):
-            var size = Self.M.host_arena_bytes() if rank == HOST_RANK else Self.M.arena_bytes()
-            var arena = NumaArena[alignment=DEFAULT_ALIGNMENT](topo[rank], size)
+            var size = topo.host_arena_bytes() if rank == HOST_RANK else topo.arena_bytes()
+            var arena = NumaArena[alignment=DEFAULT_ALIGNMENT](numa_topo[rank], size)
             if not arena:
-                print("TP: arena allocation failed for rank", rank, "on node", topo[rank])
+                print("arena allocation failed for rank", rank)
                 return None
             arenas.push(arena^)
 
@@ -385,317 +459,280 @@ struct SmolLM2TP[E: Encoding, tp: Int](Movable):
         for rank in range(Self.tp):
             arena_bases.append(Int(arenas[rank].base))
 
-        var result = load_safetensors[Self.M](path, arena_bases)
-        if not result:
-            print("TP: weight loading failed")
+        var load_result = load_weights_from_descs(plan.descs, shards, arena_bases)
+        if not load_result:
+            print("weight loading failed")
             return None
+        var loaded = load_result.take()
+        print("loaded", loaded.bytes_loaded // (1024 * 1024), "MB in", loaded.num_ops, "ops")
 
         for rank in range(Self.tp):
-            _ = arenas[rank].prefault(Self.M.DISTRIBUTED_BYTES, Self.M.STATE_BYTES)
+            _ = arenas[rank].prefault(topo.distributed_bytes, topo.state_bytes)
 
         var pools = HeapMoveArray[BurstPool[]](Self.tp)
         for rank in range(Self.tp):
-            pools.push(BurstPool[].for_numa_node(numa, topo[rank]))
+            pools.push(BurstPool[].for_numa_node(numa, numa_topo[rank]))
 
-        var model = Self(arenas^, pools^)
-
+        var topos = InlineArray[SmolLM2Topology[Self.tp], Self.tp](fill=topo)
         for rank in range(Self.tp):
-            var rv = model.rank(rank)
-            init_rope_tables(rv.rope_cos(), rv.rope_sin(), Float64(C.ROPE_THETA))
+            topos[rank] = topo.bind(Int(arenas[rank].base))
 
+        var scratch = ScratchPool(topo.scratch_capacity)
+        var model = Self(arenas^, pools^, scratch^, topos)
+        model.init_state()
         return model^
 
     def forward(
         mut self, tokens_ptr: Int, seq_len: Int, pos: Int,
         profile: Bool = False,
-    ) -> LogitsView[C.VOCAB_SIZE]
-        where Self.E.DTYPE == DType.bfloat16:
-        comptime M = Self.M
-        comptime L = M.LAYER
+    ) -> LogitsView[C.VOCAB_SIZE]:
+        comptime S = SmolLM2Shapes[Self.tp]
+        comptime XSlot = Mat[BF16, C.MAX_SEQ_LEN, C.HIDDEN]
+
         var prof = Profiler(profile)
         debug_assert(seq_len > 0 and pos >= 0 and pos + seq_len <= C.MAX_SEQ_LEN,
             "forward: sequence range exceeds MAX_SEQ_LEN")
 
-        var ranks = Ranks[Self.E, Self.tp](self.bases, self.pool_ptrs)
-        var host = ranks.view(0)
+        var topos = self.topos
+        var host = topos[0]
+        var mp = self.pool_ptrs()
+        var x_main = host.x_main(seq_len)
+        var embed = static_tensor_view(host.arena_base, host.host.embed)
+        var final_norm = static_tensor_view(host.arena_base, host.host.final_norm)
 
-        # --- Embed (host rank, then broadcast) ---
-        embed_lookup(host.weight[M.EMBED](), tokens_ptr, host.x_main(seq_len), ranks.pool_ptrs[0][]).join()
-        ring_broadcast[M.X_MAIN, Self.tp](host.x_main(seq_len).ptr, ranks.x_main_ptrs(seq_len), seq_len, ranks.pool_ptrs)
+        embed_lookup(embed, tokens_ptr, x_main, self.pools[0]).join()
+        ring_broadcast[XSlot, Self.tp](
+            x_main.ptr, self.x_main_ptrs(seq_len), seq_len, mp)
 
         for layer_idx in range(C.NUM_LAYERS):
+            var layer = host.layers.proto
 
-            # === Attention block ===
-
-            # Borrow scratch for Q, K, V (offsets, same for every rank)
-            var q = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.Q_VIEW.COLS]()
-            var k = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.KV_VIEW.COLS]()
-            var v = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.KV_VIEW.COLS]()
-
-            # This serves as a way to get the right pointers in parallel easily.
-            @parameter
-            def do_input_norm[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                return rmsnorm(rv.x_main(seq_len), rv.layer_weight[L.INPUT_NORM](layer_idx), rv.x_residual(seq_len), pool)
-            ranks.parallel[do_input_norm]()
+            var q_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.QAct.M]()
+            var k_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.KVAct.M]()
+            var v_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.KVAct.M]()
 
             @parameter
-            def do_q[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.Q_PROJ](layer_idx), rv.scratch_view[M.Q_VIEW](q, seq_len), pool)
-            ranks.parallel[do_q]()
+            def do_input_norm[rank: Int](
+                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
+            ) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                return rmsnorm(
+                    topo.x_main(seq_len),
+                    static_tensor_view(lb, layer.body.input_norm),
+                    topo.x_residual(seq_len),
+                    pool,
+                    Float32(C.RMS_NORM_EPS))
+            tp_parallel[Self.tp, do_input_norm](topos, mp)
 
             @parameter
-            def do_k[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.K_PROJ](layer_idx), rv.scratch_view[M.KV_VIEW](k, seq_len), pool)
-            ranks.parallel[do_k]()
+            def do_q[rank: Int](
+                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
+            ) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                return gemm(
+                    topo.x_residual(seq_len),
+                    static_tensor_view(lb, layer.attn.q_proj),
+                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.QAct.M](
+                        topo.scratch_base(), q_lease, seq_len),
+                    pool)
+            tp_parallel[Self.tp, do_q](topos, mp)
 
             @parameter
-            def do_v[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.V_PROJ](layer_idx), rv.scratch_view[M.KV_VIEW](v, seq_len), pool)
-            ranks.parallel[do_v]()
+            def do_k[rank: Int](
+                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
+            ) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                return gemm(
+                    topo.x_residual(seq_len),
+                    static_tensor_view(lb, layer.attn.k_proj),
+                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.KVAct.M](
+                        topo.scratch_base(), k_lease, seq_len),
+                    pool)
+            tp_parallel[Self.tp, do_k](topos, mp)
 
             @parameter
-            def do_rope(rv: RankView[Self.E, Self.tp]):
-                rope[C.HEAD_DIM, M.LOCAL_HEADS](rv.scratch_view[M.Q_VIEW](q, seq_len), rv.rope_cos(), rv.rope_sin(), pos)
-                rope[C.HEAD_DIM, M.LOCAL_KV_HEADS](rv.scratch_view[M.KV_VIEW](k, seq_len), rv.rope_cos(), rv.rope_sin(), pos)
-            ranks.each[do_rope]()
+            def do_v[rank: Int](
+                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
+            ) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                return gemm(
+                    topo.x_residual(seq_len),
+                    static_tensor_view(lb, layer.attn.v_proj),
+                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.KVAct.M](
+                        topo.scratch_base(), v_lease, seq_len),
+                    pool)
+            tp_parallel[Self.tp, do_v](topos, mp)
+
+            for rank in range(Self.tp):
+                var topo = topos[rank]
+                var sb = topo.state_base()
+                rope[C.HEAD_DIM, S.LocalHeads](
+                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.QAct.M](
+                        topo.scratch_base(), q_lease, seq_len),
+                    static_tensor_view(sb, topo.rope.cos),
+                    static_tensor_view(sb, topo.rope.sin),
+                    pos)
+                rope[C.HEAD_DIM, S.LocalKVHeads](
+                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.KVAct.M](
+                        topo.scratch_base(), k_lease, seq_len),
+                    static_tensor_view(sb, topo.rope.cos),
+                    static_tensor_view(sb, topo.rope.sin),
+                    pos)
+                kv_cache_write(
+                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.KVAct.M](
+                        topo.scratch_base(), k_lease, seq_len),
+                    topo.k_cache(layer_idx),
+                    pos)
+                kv_cache_write(
+                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.KVAct.M](
+                        topo.scratch_base(), v_lease, seq_len),
+                    topo.v_cache(layer_idx),
+                    pos)
+
+            v_lease^.release()
+            k_lease^.release()
+
+            var attn_out_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.QAct.M]()
 
             @parameter
-            def do_kv_write(rv: RankView[Self.E, Self.tp]):
-                kv_cache_write(rv.scratch_view[M.KV_VIEW](k, seq_len), rv.k_cache(layer_idx), pos)
-                kv_cache_write(rv.scratch_view[M.KV_VIEW](v, seq_len), rv.v_cache(layer_idx), pos)
-            ranks.each[do_kv_write]()
-
-            # K, V written to cache — release and borrow attn_out in their place
-            v^.release()
-            k^.release()
-
-            var attn_out = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.Q_VIEW.COLS]()
-
-            @parameter
-            def do_attn[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                return attention[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM](
-                    rv.scratch_view[M.Q_VIEW](q, seq_len), rv.k_cache(layer_idx), rv.v_cache(layer_idx),
-                    rv.scratch_view[M.Q_VIEW](attn_out, seq_len), pos, pool)
-            ranks.parallel[do_attn]()
+            def do_attn[rank: Int](
+                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
+            ) -> PoolFence[BurstPool[]]:
+                return attention[S.LocalHeads, S.LocalKVHeads, C.HEAD_DIM](
+                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.QAct.M](
+                        topo.scratch_base(), q_lease, seq_len),
+                    topo.k_cache(layer_idx),
+                    topo.v_cache(layer_idx),
+                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.QAct.M](
+                        topo.scratch_base(), attn_out_lease, seq_len),
+                    pos,
+                    pool)
+            tp_parallel[Self.tp, do_attn](topos, mp)
 
             @parameter
-            def do_o[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                return gemm(rv.scratch_view[M.Q_VIEW](attn_out, seq_len), rv.layer_weight[L.O_PROJ](layer_idx), rv.x_residual(seq_len), pool)
-            ranks.parallel[do_o]()
+            def do_o[rank: Int](
+                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
+            ) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                return gemm(
+                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.QAct.M](
+                        topo.scratch_base(), attn_out_lease, seq_len),
+                    static_tensor_view(lb, layer.attn.o_proj),
+                    topo.x_residual(seq_len),
+                    pool)
+            tp_parallel[Self.tp, do_o](topos, mp)
 
-            attn_out^.release()
-            q^.release()
+            attn_out_lease^.release()
+            q_lease^.release()
 
-            ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
+            ring_allreduce[XSlot, Self.tp](
+                self.x_residual_ptrs(seq_len), seq_len, mp)
 
-            @parameter
-            def do_res_add(rv: RankView[Self.E, Self.tp]):
-                elem_add(rv.x_main(seq_len), rv.x_residual(seq_len), rv.x_main(seq_len))
-            ranks.each[do_res_add]()
-
-            # === MLP block ===
-
-            @parameter
-            def do_post_norm[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                return rmsnorm(rv.x_main(seq_len), rv.layer_weight[L.POST_ATTN_NORM](layer_idx), rv.x_residual(seq_len), pool)
-            ranks.parallel[do_post_norm]()
-
-            var gate = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.MLP_VIEW.COLS]()
-            var up = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.MLP_VIEW.COLS]()
-
-            @parameter
-            def do_gate[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.GATE_PROJ](layer_idx), rv.scratch_view[M.MLP_VIEW](gate, seq_len), pool)
-            ranks.parallel[do_gate]()
+            for rank in range(Self.tp):
+                var topo = topos[rank]
+                elem_add(
+                    topo.x_main(seq_len),
+                    topo.x_residual(seq_len),
+                    topo.x_main(seq_len))
 
             @parameter
-            def do_up[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                return gemm(rv.x_residual(seq_len), rv.layer_weight[L.UP_PROJ](layer_idx), rv.scratch_view[M.MLP_VIEW](up, seq_len), pool)
-            ranks.parallel[do_up]()
+            def do_post_norm[rank: Int](
+                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
+            ) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                return rmsnorm(
+                    topo.x_main(seq_len),
+                    static_tensor_view(lb, layer.body.post_attn_norm),
+                    topo.x_residual(seq_len),
+                    pool,
+                    Float32(C.RMS_NORM_EPS))
+            tp_parallel[Self.tp, do_post_norm](topos, mp)
+
+            var gate_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.MLPAct.M]()
+            var up_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.MAX_SEQ_LEN * S.MLPAct.M]()
 
             @parameter
-            def do_silu(rv: RankView[Self.E, Self.tp]):
-                silu_mul(rv.scratch_view[M.MLP_VIEW](gate, seq_len), rv.scratch_view[M.MLP_VIEW](up, seq_len), rv.scratch_view[M.MLP_VIEW](gate, seq_len))
-            ranks.each[do_silu]()
-
-            up^.release()
+            def do_gate[rank: Int](
+                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
+            ) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                return gemm(
+                    topo.x_residual(seq_len),
+                    static_tensor_view(lb, layer.body.gate_proj),
+                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](
+                        topo.scratch_base(), gate_lease, seq_len),
+                    pool)
+            tp_parallel[Self.tp, do_gate](topos, mp)
 
             @parameter
-            def do_down[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                return gemm(rv.scratch_view[M.MLP_VIEW](gate, seq_len), rv.layer_weight[L.DOWN_PROJ](layer_idx), rv.x_residual(seq_len), pool)
-            ranks.parallel[do_down]()
+            def do_up[rank: Int](
+                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
+            ) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                return gemm(
+                    topo.x_residual(seq_len),
+                    static_tensor_view(lb, layer.body.up_proj),
+                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](
+                        topo.scratch_base(), up_lease, seq_len),
+                    pool)
+            tp_parallel[Self.tp, do_up](topos, mp)
 
-            gate^.release()
+            for rank in range(Self.tp):
+                var topo = topos[rank]
+                silu_mul(
+                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](
+                        topo.scratch_base(), gate_lease, seq_len),
+                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](
+                        topo.scratch_base(), up_lease, seq_len),
+                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](
+                        topo.scratch_base(), gate_lease, seq_len))
 
-            ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
-            ranks.each[do_res_add]()
+            up_lease^.release()
 
-            _ = layer_idx
+            @parameter
+            def do_down[rank: Int](
+                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
+            ) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                return gemm(
+                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](
+                        topo.scratch_base(), gate_lease, seq_len),
+                    static_tensor_view(lb, layer.body.down_proj),
+                    topo.x_residual(seq_len),
+                    pool)
+            tp_parallel[Self.tp, do_down](topos, mp)
 
-        # --- Final norm + LM head (host rank only) ---
-        rmsnorm(host.x_main(seq_len), host.weight[M.FINAL_NORM](), host.x_main(seq_len), ranks.pool_ptrs[0][]).join()
+            gate_lease^.release()
 
-        var last_row_off = (seq_len - 1) * C.HIDDEN * M.X_MAIN.ELEMENT_BYTES
-        var last_hidden = DynView[M.X_MAIN](host.x_main(seq_len).ptr + last_row_off, 1)
+            ring_allreduce[XSlot, Self.tp](
+                self.x_residual_ptrs(seq_len), seq_len, mp)
+
+            for rank in range(Self.tp):
+                var topo = topos[rank]
+                elem_add(
+                    topo.x_main(seq_len),
+                    topo.x_residual(seq_len),
+                    topo.x_main(seq_len))
+
+        rmsnorm(
+            x_main,
+            final_norm,
+            x_main,
+            self.pools[0],
+            Float32(C.RMS_NORM_EPS)).join()
+
+        var last_row_off = (seq_len - 1) * C.HIDDEN * BF16.ELEMENT_BYTES
+        var last_hidden = DynamicTensorView[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](
+            x_main.ptr + last_row_off, 1)
         var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
-        var logit_view = host.scratch_view[M.LOGITS](logit_lease, 1)
-        gemm(last_hidden, host.weight[M.EMBED](), logit_view, ranks.pool_ptrs[0][]).join()
+        var logit_view = scratch_tensor_view[BF16, 1, C.VOCAB_SIZE](
+            host.scratch_base(), logit_lease, 1)
+        gemm(last_hidden, embed, logit_view, self.pools[0]).join()
         prof.finish()
         prof.report()
 
         return LogitsView[C.VOCAB_SIZE](
-            host.scratch_ptr[Scalar[DType.bfloat16]](logit_lease), logit_lease^,
-        )
+            scratch_ptr[Scalar[DType.bfloat16]](host.scratch_base(), logit_lease),
+            logit_lease^)
 
-    # =========================================================================
-    # === DEBUG === Stepped forward pass for layer-by-layer comparison
-    # =========================================================================
-
-    def debug_embed(mut self, tokens_ptr: Int, seq_len: Int)
-        where Self.E.DTYPE == DType.bfloat16:
-        debug_assert(seq_len >= 0 and seq_len <= C.MAX_SEQ_LEN,
-            "debug_embed: seq_len exceeds MAX_SEQ_LEN")
-        comptime M = Self.M
-        var ranks = Ranks[Self.E, Self.tp](self.bases, self.pool_ptrs)
-        var host = ranks.view(0)
-        embed_lookup(host.weight[M.EMBED](), tokens_ptr, host.x_main(seq_len), ranks.pool_ptrs[0][]).join()
-        ring_broadcast[M.X_MAIN, Self.tp](host.x_main(seq_len).ptr, ranks.x_main_ptrs(seq_len), seq_len, ranks.pool_ptrs)
-
-    def debug_layer_attn(mut self, layer_idx: Int, seq_len: Int, pos: Int)
-        where Self.E.DTYPE == DType.bfloat16:
-        debug_assert(seq_len >= 0 and pos >= 0 and pos + seq_len <= C.MAX_SEQ_LEN,
-            "debug_layer_attn: sequence range exceeds MAX_SEQ_LEN")
-        comptime M = Self.M
-        comptime L = M.LAYER
-        var ranks = Ranks[Self.E, Self.tp](self.bases, self.pool_ptrs)
-
-        var q = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.Q_VIEW.COLS]()
-        var k = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.KV_VIEW.COLS]()
-        var v = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.KV_VIEW.COLS]()
-
-        @parameter
-        def do_input_norm[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-            return rmsnorm(rv.x_main(seq_len), rv.layer_weight[L.INPUT_NORM](layer_idx), rv.x_residual(seq_len), pool)
-        ranks.parallel[do_input_norm]()
-
-        @parameter
-        def do_q[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-            return gemm(rv.x_residual(seq_len), rv.layer_weight[L.Q_PROJ](layer_idx), rv.scratch_view[M.Q_VIEW](q, seq_len), pool)
-        ranks.parallel[do_q]()
-        @parameter
-        def do_k[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-            return gemm(rv.x_residual(seq_len), rv.layer_weight[L.K_PROJ](layer_idx), rv.scratch_view[M.KV_VIEW](k, seq_len), pool)
-        ranks.parallel[do_k]()
-        @parameter
-        def do_v[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-            return gemm(rv.x_residual(seq_len), rv.layer_weight[L.V_PROJ](layer_idx), rv.scratch_view[M.KV_VIEW](v, seq_len), pool)
-        ranks.parallel[do_v]()
-
-        @parameter
-        def do_rope(rv: RankView[Self.E, Self.tp]):
-            rope[C.HEAD_DIM, M.LOCAL_HEADS](rv.scratch_view[M.Q_VIEW](q, seq_len), rv.rope_cos(), rv.rope_sin(), pos)
-            rope[C.HEAD_DIM, M.LOCAL_KV_HEADS](rv.scratch_view[M.KV_VIEW](k, seq_len), rv.rope_cos(), rv.rope_sin(), pos)
-        ranks.each[do_rope]()
-        @parameter
-        def do_kv_write(rv: RankView[Self.E, Self.tp]):
-            kv_cache_write(rv.scratch_view[M.KV_VIEW](k, seq_len), rv.k_cache(layer_idx), pos)
-            kv_cache_write(rv.scratch_view[M.KV_VIEW](v, seq_len), rv.v_cache(layer_idx), pos)
-        ranks.each[do_kv_write]()
-
-        v^.release(); k^.release()
-        var attn_out = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.Q_VIEW.COLS]()
-        @parameter
-        def do_attn[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-            return attention[M.LOCAL_HEADS, M.LOCAL_KV_HEADS, C.HEAD_DIM](
-                rv.scratch_view[M.Q_VIEW](q, seq_len), rv.k_cache(layer_idx), rv.v_cache(layer_idx),
-                rv.scratch_view[M.Q_VIEW](attn_out, seq_len), pos, pool)
-        ranks.parallel[do_attn]()
-        @parameter
-        def do_o[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-            return gemm(rv.scratch_view[M.Q_VIEW](attn_out, seq_len), rv.layer_weight[L.O_PROJ](layer_idx), rv.x_residual(seq_len), pool)
-        ranks.parallel[do_o]()
-        attn_out^.release()
-        q^.release()
-
-        ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
-        @parameter
-        def do_res_add(rv: RankView[Self.E, Self.tp]):
-            elem_add(rv.x_main(seq_len), rv.x_residual(seq_len), rv.x_main(seq_len))
-        ranks.each[do_res_add]()
-
-    def debug_layer_mlp(mut self, layer_idx: Int, seq_len: Int, pos: Int)
-        where Self.E.DTYPE == DType.bfloat16:
-        debug_assert(seq_len >= 0 and pos >= 0 and pos + seq_len <= C.MAX_SEQ_LEN,
-            "debug_layer_mlp: sequence range exceeds MAX_SEQ_LEN")
-        comptime M = Self.M
-        comptime L = M.LAYER
-        var ranks = Ranks[Self.E, Self.tp](self.bases, self.pool_ptrs)
-
-        @parameter
-        def do_post_norm[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-            return rmsnorm(rv.x_main(seq_len), rv.layer_weight[L.POST_ATTN_NORM](layer_idx), rv.x_residual(seq_len), pool)
-        ranks.parallel[do_post_norm]()
-
-        var gate = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.MLP_VIEW.COLS]()
-        var up = self.scratch.borrow[Scalar[Self.E.DTYPE], C.MAX_SEQ_LEN * M.MLP_VIEW.COLS]()
-        @parameter
-        def do_gate[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-            return gemm(rv.x_residual(seq_len), rv.layer_weight[L.GATE_PROJ](layer_idx), rv.scratch_view[M.MLP_VIEW](gate, seq_len), pool)
-        ranks.parallel[do_gate]()
-        @parameter
-        def do_up[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-            return gemm(rv.x_residual(seq_len), rv.layer_weight[L.UP_PROJ](layer_idx), rv.scratch_view[M.MLP_VIEW](up, seq_len), pool)
-        ranks.parallel[do_up]()
-        @parameter
-        def do_silu(rv: RankView[Self.E, Self.tp]):
-            silu_mul(rv.scratch_view[M.MLP_VIEW](gate, seq_len), rv.scratch_view[M.MLP_VIEW](up, seq_len), rv.scratch_view[M.MLP_VIEW](gate, seq_len))
-        ranks.each[do_silu]()
-        up^.release()
-        @parameter
-        def do_down[rank: Int](rv: RankView[Self.E, Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-            return gemm(rv.scratch_view[M.MLP_VIEW](gate, seq_len), rv.layer_weight[L.DOWN_PROJ](layer_idx), rv.x_residual(seq_len), pool)
-        ranks.parallel[do_down]()
-        gate^.release()
-
-        ring_allreduce[M.X_RESIDUAL, Self.tp](ranks.x_residual_ptrs(seq_len), seq_len, ranks.pool_ptrs)
-        @parameter
-        def do_res_add(rv: RankView[Self.E, Self.tp]):
-            elem_add(rv.x_main(seq_len), rv.x_residual(seq_len), rv.x_main(seq_len))
-        ranks.each[do_res_add]()
-
-    def debug_x_main_ptr(self, seq_len: Int) -> Int:
-        return RankView[Self.E, Self.tp](self.bases[0]).x_main(seq_len).ptr
-
-    def debug_set_x_main(mut self, src_ptr: Int, seq_len: Int)
-        where Self.E.DTYPE == DType.bfloat16:
-        debug_assert(seq_len >= 0 and seq_len <= C.MAX_SEQ_LEN,
-            "debug_set_x_main: seq_len exceeds MAX_SEQ_LEN")
-        comptime M = Self.M
-        var ranks = Ranks[Self.E, Self.tp](self.bases, self.pool_ptrs)
-        var host = ranks.view(0)
-        memcpy(
-            dest=UnsafePointer[Byte, MutAnyOrigin](
-                unsafe_from_address=host.x_main(seq_len).ptr),
-            src=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=src_ptr),
-            count=seq_len * C.HIDDEN * 2)
-        ring_broadcast[M.X_MAIN, Self.tp](
-            host.x_main(seq_len).ptr, ranks.x_main_ptrs(seq_len), seq_len, ranks.pool_ptrs)
-
-
-# =============================================================================
-# Entry point — TP=3
-# =============================================================================
-
-comptime MODEL_PATH = "checkpoints/SmolLM2/model.safetensors"
-
-
-def main():
-    var model_opt = SmolLM2TP[BF16, 3].load(Path(MODEL_PATH))
-    if not model_opt:
-        return
-    var model = model_opt.take()
-
-    var tp = model.token_buffer()
-    tp[0] = Scalar[DType.int32](42)
-    var logits = model.forward(Int(tp), 1, 0, profile=True)
-    logits^.release()
+    # TODO: debug/parity helpers copied over only after forward lands.

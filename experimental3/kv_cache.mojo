@@ -18,7 +18,7 @@ hardware VNNI instruction reads contiguous data with no transposition.
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of, size_of
 
-from experimental.amx import VNNI_BLK
+from experimental3.amx import VNNI_BLK
 
 
 comptime CACHE_WIDTH = simd_width_of[DType.int32]()

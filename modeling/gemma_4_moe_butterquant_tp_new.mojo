@@ -33,7 +33,7 @@ from modeling.modeling_common import (
 )
 from kernels.kernel_ops import PoolFence, BF16Ptr
 from kernels.reductions import ring_allreduce, ring_broadcast
-from experimental.linear_borrow_pool import ScratchPool, ScratchLease
+from modeling.linear_borrow_pool import ScratchPool, ScratchLease
 
 from experimental3.kernels.rmsnorm import (
     rmsnorm_gamma_fwht_quantize,

@@ -24,7 +24,7 @@ from simd_math import exp_f32_fast
 from experimental2.kv_cache import KVCache
 from experimental2.helpers import AttnCtx, pack_v_tile_vnni, amx_gemm_1x3, prep_q_row, softmax_row
 from experimental2.kernel_profile import KernelProfile, tap, ProfileAggregator
-from experimental.amx import (
+from experimental3.amx import (
     TILE_M, TILE_K, TILE_N, VNNI_BLK, M_STEP, N_STEP, K_STEP, TILE_BYTES,
     TileConfig, make_133_i8_config,
     ldtilecfg, tilezero, tileload, tilestore, tile_dp,

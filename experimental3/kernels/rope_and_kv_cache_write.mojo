@@ -3,7 +3,7 @@
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 
-from experimental.amx import VNNI_BLK
+from experimental3.amx import VNNI_BLK
 from experimental3.kv_cache import Gemma4KVCache
 from experimental3.kernels.fwht import fwht_block
 from experimental3.common_math import rms_normalize_inplace

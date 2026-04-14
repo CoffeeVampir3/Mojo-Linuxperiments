@@ -1,6 +1,5 @@
 """Gemma4 elementwise operations.
 
-scaled_add: dst += src * scalar (pool-dispatched, for layer_scalar)
 embed_lookup_scaled: table[token] * scale (pool-dispatched, for embed_scale)
 embed_lookup_blocked: per-block-quantized table gather + dequant + iFWHT + scale
 logit_softcap: tanh(x/30) * 30 (inline, final output transform)
@@ -21,15 +20,6 @@ from experimental3.kernels.fwht import fwht_block
 # =============================================================================
 # Dispatch arg structs
 # =============================================================================
-
-
-@fieldwise_init
-struct ScaledAddArgs(Copyable, ImplicitlyCopyable):
-    var src: BF16Ptr
-    var dst: BF16Ptr
-    var scale: Float32
-    var start_row: Int
-    var end_row: Int
 
 
 @fieldwise_init
@@ -57,22 +47,6 @@ struct BlockedEmbedArgs(Copyable, ImplicitlyCopyable):
 # =============================================================================
 # Kernel functions
 # =============================================================================
-
-
-def scaled_add_kernel[cols: Int](args: ScaledAddArgs):
-    """dst[row, j] += src[row, j] * scale. F32 compute, bf16 I/O."""
-    comptime width = simd_width_of[DType.float32]()
-    var sp = args.src
-    var dp = args.dst
-    var sv = SIMD[DType.float32, width](args.scale)
-
-    for row in range(args.start_row, args.end_row):
-        var src_row = sp + row * cols
-        var dst_row = dp + row * cols
-        for j in range(0, cols, width):
-            var s = (src_row + j).load[width=width]().cast[DType.float32]()
-            var d = (dst_row + j).load[width=width]().cast[DType.float32]()
-            (dst_row + j).store((d + s * sv).cast[DType.bfloat16]())
 
 
 def embed_lookup_scaled_kernel[cols: Int](args: ScaledEmbedArgs):
@@ -144,40 +118,6 @@ def embed_lookup_blocked_kernel[cols: Int, fwht_blk: Int](args: BlockedEmbedArgs
 # =============================================================================
 # High-level operations
 # =============================================================================
-
-
-def scaled_add[SrcT: Encoding & Shaped, DstT: Encoding & Shaped,
-    P: BurstThreadPool](
-    src: DynView[SrcT], dst: DynView[DstT],
-    scale: Float32,
-    mut pool: P,
-) -> PoolFence[P]:
-    """dst += src * scale. F32 compute, bf16 I/O. Partitioned by rows."""
-    comptime assert SrcT.DTYPE == DType.bfloat16, "scaled_add: src must be bf16"
-    comptime assert DstT.DTYPE == DType.bfloat16, "scaled_add: dst must be bf16"
-    comptime assert SrcT.COLS == DstT.COLS, "scaled_add: src/dst cols mismatch"
-    comptime assert SrcT.COLS % simd_width_of[DType.float32]() == 0, "scaled_add: cols must be f32-simd-aligned"
-
-    var seq_len = src.seq_len
-    if seq_len == 0:
-        return PoolFence[P].completed()
-
-    var num_jobs = min(seq_len, pool.get_capacity())
-    var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
-
-    var sp = src.as_ptr[DType.bfloat16]()
-    var dp = dst.as_ptr[DType.bfloat16]()
-    var jobs = InlineArray[ScaledAddArgs, MAX_POOL_CAPACITY](uninitialized=True)
-    for i in range(num_jobs):
-        var start = i * rows_per_job
-        var end = min(start + rows_per_job, seq_len)
-        jobs[i] = ScaledAddArgs(sp, dp, scale, start, end)
-
-    pool.dispatch[ScaledAddArgs, scaled_add_kernel[SrcT.COLS]](
-        UnsafePointer(to=jobs[0]), num_jobs)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
 
 
 def embed_lookup_scaled[W: Encoding & Shaped, OutT: Encoding & Shaped,

@@ -78,3 +78,12 @@ def fwht_block[block: Int](buf: UnsafePointer[Float32, MutAnyOrigin]):
     fwht_apply[DType.float32, block](r)
     comptime for i in range(regs):
         (buf + i * width).store(r[i])
+
+
+@always_inline
+def fwht_row[block: Int](
+    buf: UnsafePointer[Float32, MutAnyOrigin], cols: Int,
+):
+    """Apply the block-diagonal FWHT to one f32 row."""
+    for b in range(cols // block):
+        fwht_block[block](buf + b * block)
