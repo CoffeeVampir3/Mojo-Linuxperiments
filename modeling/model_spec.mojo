@@ -191,6 +191,22 @@ struct Shape[
 
 
 # =============================================================================
+# Mat — lightweight Encoding & Shaped for Bound / DynView / CacheView
+#
+# Carries only the local dimensions the kernel needs (ROWS, COLS) plus the
+# dtype.  No sharding, no tp, no placement — those live in LayerBuilder /
+# Shape / WeightDesc where the layout is computed.  Mat is what you hand to
+# a kernel via Bound[Mat[...]] or DynView[Mat[...]].
+# =============================================================================
+
+struct Mat[E: Encoding, rows: Int, cols: Int](Encoding, Shaped):
+    comptime DTYPE = Self.E.DTYPE
+    comptime ELEMENT_BYTES = Self.E.ELEMENT_BYTES
+    comptime ROWS = Self.rows
+    comptime COLS = Self.cols
+
+
+# =============================================================================
 # Legacy DimStrategy / ShardStrategy — used by SmolLM2 PlacedSlot chain
 # =============================================================================
 
