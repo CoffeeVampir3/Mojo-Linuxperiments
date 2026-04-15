@@ -347,7 +347,7 @@ ptr.scatter[width=8](vals, offsets)
 - Freeing same memory twice = UB
 - Double-check: who allocates, who frees
 
-**Explicitly-destroyed types (linear types)**: `UnsafePointer`, `Pointer`, `OwnedPointer`, `Span`, `List`, `InlineArray`, `Optional`, `Variant`, `VariadicListMem`, and `VariadicPack` can contain explicitly-destroyed types. `Iterator.Element` does not require `ImplicitlyDestructible`.
+**Explicitly-destroyed types (linear types)**: `UnsafePointer`, `Pointer`, `OwnedPointer`, `Span`, `List`, `InlineArray`, `Optional`, `Variant`, and variadic packs/lists can contain explicitly-destroyed types. `Iterator.Element` does not require `ImplicitlyDestructible`.
 
 ```mojo
 def __init__(out self, args)
@@ -428,11 +428,10 @@ struct MyTensor[*dimensions: Int]:
     pass
 
 def sum_params[*values: Int]() -> Int:
-    comptime list = VariadicList(values)
-    var sum = 0
-    for v in list:
-        sum += v
-    return sum
+    var total = 0
+    for value in values:
+        total += value
+    return total
 
 # Optional and keyword parameters
 def speak[a: Int = 3, msg: String = "woof"]():
@@ -498,7 +497,7 @@ comptime if conforms_to(Slot[SomeStrategy, "w"], NodeLocal):
     ...  # taken only when SomeStrategy is NodeLocal
 ```
 
-**comptime Declarations** (use `comptime`, not `alias`):
+**comptime Declarations**:
 ```mojo
 # Named compile-time constants
 comptime rows = 512
@@ -508,7 +507,7 @@ comptime block_size = _calculate_block_size()
 def takes_layout[a: Layout]():
     print(comptime(a.size()))
 
-# Type aliases
+# Type shorthands
 comptime Float16 = SIMD[DType.float16, 1]
 comptime UInt8 = SIMD[DType.uint8, 1]
 
@@ -830,7 +829,7 @@ Int8, UInt8, Int16, UInt16, Int32, UInt32, Int64, UInt64, Int, UInt
 Float16, Float32, Float64
 DType.float4_e2m1fn
 
-# UInt is a type alias for Scalar[DType.uint] (machine word size unsigned SIMD)
+# UInt names Scalar[DType.uint] (machine word size unsigned SIMD)
 vec = SIMD[DType.f32, 4](1.0, 2.0, 3.0, 4.0)
 result = vec1 + vec2 | vec * scalar
 result = Float32(int_value) | simd1.cast[DType.i32]()
@@ -919,8 +918,9 @@ slice[0:5]                                 # StringSlice[byte=] returns StringSl
 slice.byte_length() | count_codepoints() | is_codepoint_boundary(index)
 slice.split(sep) | strip() | codepoints() | as_bytes()
 
-# CStringSlice - nul-terminated C-style strings
+# CStringSlice - nul-terminated C-style strings (non-null)
 cslice = CStringSlice(ptr)
+var maybe_cslice: Optional[CStringSlice] = None
 cslice.byte_length() | as_string_slice()
 
 # Codepoint
@@ -1131,7 +1131,13 @@ from ffi import external_call
 # Python (ConvertibleFromPython requires keyword: Int(py=pyObj))
 ptr = arr.ctypes.data.unsafe_get_as_pointer[DType.int64]()
 
-# C/C++ FFI
+# C-ABI functions and function pointer types
+def add(a: Int32, b: Int32) abi("C") -> Int32:
+    return a + b
+
+comptime CUnaryF64 = def(Float64) abi("C") -> Float64
+
+# Raw symbol / function calls
 ptr = external_call["c_func", UnsafePointer[Int, MutOrigin.external]]()
 
 # Opaque pointer (void* equivalent)
@@ -1391,6 +1397,7 @@ from gpu.sync.semaphore import Semaphore
 
 ### Thread Hierarchy
 ```mojo
+# GPU primitive ids are Int
 thread_idx.x|y|z, block_idx.x|y|z, block_dim.x|y|z, grid_dim.x|y|z
 global_idx.x|y|z, cluster_idx.x|y|z, cluster_dim.x|y|z
 block_id_in_cluster.x|y|z, block_rank_in_cluster()
@@ -2075,18 +2082,22 @@ b16encode(str), b16decode(str)
 ## 20. Variadics
 
 ```mojo
-def sum(*args: Int) -> Int:
-    for i in range(len(args)):
-        total += args[i]
+def sum_params[*values: Int]() -> Int:
+    var total = 0
+    for i in range(len(values)):
+        total += values[i]
+    for value in values:
+        total += value
+    return total
 
-def sum[*T: Intable](*args: *T) -> Int:
-    comptime
-    for i in range(args.__len__()):
-        total += Int(args[i])
+def print_all[*Ts: Writable](*args: *Ts):
+    for arg in args:
+        print(arg)
 
-# Variadic utilities
-# zip_types(), zip_values(), slice_types() available on Variadic
-# *args syntax supports explicitly-destroyed types
+def forward[*Ts: Writable](*args: *Ts):
+    print_all(*args)
+
+comptime assert TypeList[Trait=AnyType, Int, String]().contains[Int]
 ```
 
 ## 21. Compilation
@@ -2158,7 +2169,8 @@ is_struct_type[Int]()                      # True for Mojo struct types
 get_base_type_name[List[Int]]()            # Returns "List"
 
 # Source location
-var loc = source_location()                # Returns SourceLocation(filename, line, col)
+var loc = source_location()
+print(loc.file_name(), loc.line(), loc.column())
 print(loc)                                 # main.mojo:5:15
 
 @always_inline
@@ -2229,9 +2241,9 @@ def main():
 
 ```mojo
 import module
-from module import Item
+from module import Item                    # Imports Item only; does not bind `module`
 from package.module import Item
-import module as alias
+import module as local_name
 ```
 ## 24. Pixi Package Manager
 

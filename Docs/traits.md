@@ -66,14 +66,14 @@ A comptime value is always evaluated at compile time, so you can use comptime to
 
 comptime block_size = _calculate_block_size()
 
-Types are another common use for comptime values. Because types are compile-time expressions, you can use a comptime value as a shorthand (a type alias or "typedef") for a parameterized type:
+Types are another common use for comptime values. Because types are compile-time expressions, you can use a comptime value as a shorthand name for a parameterized type:
 
 comptime Float16 = SIMD[DType.float16, 1]
 comptime UInt8 = SIMD[DType.uint8, 1]
 
-var x: Float16 = 0  # Float16 works like a "typedef"
+var x: Float16 = 0  # Float16 works like a named shorthand
 
-(These aliases and others are actually defined in the simd module.)
+(These shorthands and others are actually defined in the simd module.)
 
 You can also parameterize a comptime value to express more complicated relationships. For details, see Parameterized comptime values.
 Compile-time scope
@@ -632,25 +632,27 @@ def use_kw_params():
 Mojo supports positional-only and keyword-only parameters, following the same rules as positional-only and keyword-only arguments.
 Variadic parameters
 
-Mojo also supports variadic parameters, similar to Variadic arguments:
+Mojo also supports variadic parameters and runtime variadic packs:
 
 struct MyTensor[*dimensions: Int]:
     pass
 
-Variadic parameters currently have some limitations that variadic arguments don't have:
+def sum_params[*values: Int]() -> Int:
+    var sum = 0
+    for value in values:
+        sum += value
+    return sum
 
-    Variadic parameters must be homogeneous—that is, all the values must be the same type.
+def dump[*Ts: Writable](*args: *Ts):
+    for arg in args:
+        print(arg)
 
-    The parameter type must be register-passable.
+def forward[*Ts: Writable](*args: *Ts):
+    dump(*args)
 
-    The parameter values aren't automatically projected into a list, so you need to construct the list (in this case, a VariadicParamList) explicitly:
+comptime assert TypeList[Trait=AnyType, Int, String]().contains[Int]
 
-    def sum_params[*values: Int]() -> Int:
-        comptime list = VariadicParamList[*values]()
-        var sum = 0
-        for v in list:
-            sum += v
-        return sum
+Variadic parameter lists can be indexed, iterated, and forwarded directly. Type variadics are exposed through `TypeList`.
 
 Variadic keyword parameters (for example, **kwparams) are not supported yet.
 Infer-only parameters
@@ -843,15 +845,15 @@ Fully-bound, partially-bound, and unbound types
 
 A parameterized type with its parameters specified is said to be fully-bound. That is, all of its parameters are bound to values. As mentioned before, you can only instantiate a fully-bound type (sometimes called a concrete type).
 
-However, parameterized types can be unbound or partially bound in some contexts. For example, you can use comptime to create a type alias to a partially-bound type to create a new type that requires fewer parameters:
+However, parameterized types can be unbound or partially bound in some contexts. For example, you can use comptime to create a shorthand for a partially-bound type to create a new type that requires fewer parameters:
 
 comptime StringKeyDict = Dict[String, _]
 var b: StringKeyDict[UInt8] = {"answer": 42}
 
-Here, StringKeyDict is a type alias for a Dict that takes String keys. The underscore _ in the parameter list indicates that the second parameter, V (the value type), is unbound. You specify the V parameter later, when you use StringKeyDict.
+Here, StringKeyDict is a shorthand for a Dict that takes String keys. The underscore _ in the parameter list indicates that the second parameter, V (the value type), is unbound. You specify the V parameter later, when you use StringKeyDict.
 Partially-bound types versus parameterized comptime values
 
-You may notice that this example is very similar to an example in the section on parameterized comptime values. For simple type aliases like this, you can use either a partially-bound type or a parameterized comptime value. Parameterized comptime values provide a more flexible way to define type aliases, since you can define the order of the parameters, add default values, and so on.
+You may notice that this example is very similar to an example in the section on parameterized comptime values. For simple type shorthands like this, you can use either a partially-bound type or a parameterized comptime value. Parameterized comptime values provide a more flexible way to define named type shorthands, since you can define the order of the parameters, add default values, and so on.
 
 Partially-bound and unbound types can provide a handy shortcut when defining parameterized functions and comptime values, called automatic parameterization.
 
@@ -1232,7 +1234,7 @@ def __ne__(self, other: Self) -> Bool:
 
 Trait compositions
 
-Mojo uses `def` for all function declarations, function type positions, and comptime aliases. There is no separate `fn` keyword — `def` is used everywhere.
+Mojo uses `def` for all function declarations and function type positions. Named compile-time type shorthands are written with `comptime`.
 
 You can compose traits using the & sigil. This lets you define new traits that are simple combinations of other traits. You can use a trait composition anywhere that you'd use a single trait:
 
@@ -1781,9 +1783,6 @@ Think comparisons, predicates, and pure operations.
 
 As a working rule of thumb, if your generic code needs to own, copy, or decide when a value dies, avoid explicitly destroyed types. Add ImplicitlyDestructible bounds to bypass any issues.
 Conditional trait conformance
-Caution
-
-Conditional trait conformance is new and evolving. Certain capabilities may be unstable or unusable during roll-out. Use caution with Copyable, Movable, RegisterPassable, TrivialRegisterPassable, and ImplicitlyDestructible.
 
 Conditional trait conformance uses checks before allowing a type to adopt a trait. If the condition is satisfied, the type conforms. It must fulfill the trait's requirements by providing required methods and associated types, and it gains any default implementation provided by the trait. The type can then be used anywhere the trait is required, such as when passing it to a function that expects a conforming type.
 
