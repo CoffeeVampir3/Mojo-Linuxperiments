@@ -1,12 +1,13 @@
 """Forward-pass profiling — per-phase timing capture and reporting."""
 
 from std.time import perf_counter_ns
+from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
 
 from kernels.kernel_ops import PoolFence
 
 
-comptime NUM_FORWARD_PHASES = 27
+comptime MAX_PHASES = 64
 
 
 struct PhaseTiming(Copyable, ImplicitlyCopyable):
@@ -90,185 +91,21 @@ def finish_single_pool_fence[P: BurstThreadPool](
 struct ForwardSample(Copyable, ImplicitlyCopyable):
     var pos: Int
     var wall_ns: Int
-    var embed: PhaseTiming
-    var broadcast: PhaseTiming
-    var local_attn_quantize: PhaseTiming
-    var local_attn_proj: PhaseTiming
-    var local_attention: PhaseTiming
-    var local_o_proj: PhaseTiming
-    var local_attn_reduce: PhaseTiming
-    var global_attn_quantize: PhaseTiming
-    var global_attn_proj: PhaseTiming
-    var global_attention: PhaseTiming
-    var global_o_proj: PhaseTiming
-    var global_attn_reduce: PhaseTiming
-    var post_attn_norm: PhaseTiming
-    var router_quantize: PhaseTiming
-    var router_proj: PhaseTiming
-    var router_topk: PhaseTiming
-    var ffn_quantize: PhaseTiming
-    var expert_phase1: PhaseTiming
-    var dense_phase1: PhaseTiming
-    var expert_phase2: PhaseTiming
-    var dense_phase2: PhaseTiming
-    var pre_reduce: PhaseTiming
-    var mlp_reduce: PhaseTiming
-    var post_reduce: PhaseTiming
-    var final_norm: PhaseTiming
-    var lm_head: PhaseTiming
-    var softcap: PhaseTiming
+    var phases: InlineArray[PhaseTiming, MAX_PHASES]
 
     def __init__(out self, pos: Int):
         self.pos = pos
         self.wall_ns = 0
-        self.embed = PhaseTiming()
-        self.broadcast = PhaseTiming()
-        self.local_attn_quantize = PhaseTiming()
-        self.local_attn_proj = PhaseTiming()
-        self.local_attention = PhaseTiming()
-        self.local_o_proj = PhaseTiming()
-        self.local_attn_reduce = PhaseTiming()
-        self.global_attn_quantize = PhaseTiming()
-        self.global_attn_proj = PhaseTiming()
-        self.global_attention = PhaseTiming()
-        self.global_o_proj = PhaseTiming()
-        self.global_attn_reduce = PhaseTiming()
-        self.post_attn_norm = PhaseTiming()
-        self.router_quantize = PhaseTiming()
-        self.router_proj = PhaseTiming()
-        self.router_topk = PhaseTiming()
-        self.ffn_quantize = PhaseTiming()
-        self.expert_phase1 = PhaseTiming()
-        self.dense_phase1 = PhaseTiming()
-        self.expert_phase2 = PhaseTiming()
-        self.dense_phase2 = PhaseTiming()
-        self.pre_reduce = PhaseTiming()
-        self.mlp_reduce = PhaseTiming()
-        self.post_reduce = PhaseTiming()
-        self.final_norm = PhaseTiming()
-        self.lm_head = PhaseTiming()
-        self.softcap = PhaseTiming()
+        self.phases = InlineArray[PhaseTiming, MAX_PHASES](fill=PhaseTiming())
 
-    def phase(self, idx: Int) -> PhaseTiming:
-        if idx == 0:
-            return self.embed
-        if idx == 1:
-            return self.broadcast
-        if idx == 2:
-            return self.local_attn_quantize
-        if idx == 3:
-            return self.local_attn_proj
-        if idx == 4:
-            return self.local_attention
-        if idx == 5:
-            return self.local_o_proj
-        if idx == 6:
-            return self.local_attn_reduce
-        if idx == 7:
-            return self.global_attn_quantize
-        if idx == 8:
-            return self.global_attn_proj
-        if idx == 9:
-            return self.global_attention
-        if idx == 10:
-            return self.global_o_proj
-        if idx == 11:
-            return self.global_attn_reduce
-        if idx == 12:
-            return self.post_attn_norm
-        if idx == 13:
-            return self.router_quantize
-        if idx == 14:
-            return self.router_proj
-        if idx == 15:
-            return self.router_topk
-        if idx == 16:
-            return self.ffn_quantize
-        if idx == 17:
-            return self.expert_phase1
-        if idx == 18:
-            return self.dense_phase1
-        if idx == 19:
-            return self.expert_phase2
-        if idx == 20:
-            return self.dense_phase2
-        if idx == 21:
-            return self.pre_reduce
-        if idx == 22:
-            return self.mlp_reduce
-        if idx == 23:
-            return self.post_reduce
-        if idx == 24:
-            return self.final_norm
-        if idx == 25:
-            return self.lm_head
-        if idx == 26:
-            return self.softcap
-        return PhaseTiming()
+    def add(mut self, phase: Int, timing: PhaseTiming):
+        self.phases[phase].add(timing)
 
-    def phase_sum_ns(self) -> Int:
+    def phase_sum_ns(self, count: Int) -> Int:
         var total = 0
-        for idx in range(NUM_FORWARD_PHASES):
-            total += self.phase(idx).total()
+        for i in range(count):
+            total += self.phases[i].total()
         return total
-
-    @staticmethod
-    def phase_name(idx: Int) -> String:
-        if idx == 0:
-            return "embed"
-        if idx == 1:
-            return "broadcast"
-        if idx == 2:
-            return "local_attn_quant"
-        if idx == 3:
-            return "local_attn_proj"
-        if idx == 4:
-            return "local_attention"
-        if idx == 5:
-            return "local_o_proj"
-        if idx == 6:
-            return "local_attn_reduce"
-        if idx == 7:
-            return "global_attn_quant"
-        if idx == 8:
-            return "global_attn_proj"
-        if idx == 9:
-            return "global_attention"
-        if idx == 10:
-            return "global_o_proj"
-        if idx == 11:
-            return "global_attn_reduce"
-        if idx == 12:
-            return "post_attn_norm"
-        if idx == 13:
-            return "router_quantize"
-        if idx == 14:
-            return "router_proj"
-        if idx == 15:
-            return "router_topk"
-        if idx == 16:
-            return "ffn_quantize"
-        if idx == 17:
-            return "expert_phase1"
-        if idx == 18:
-            return "dense_phase1"
-        if idx == 19:
-            return "expert_phase2"
-        if idx == 20:
-            return "dense_phase2"
-        if idx == 21:
-            return "pre_reduce"
-        if idx == 22:
-            return "mlp_reduce"
-        if idx == 23:
-            return "post_reduce"
-        if idx == 24:
-            return "final_norm"
-        if idx == 25:
-            return "lm_head"
-        if idx == 26:
-            return "softcap"
-        return "unknown"
 
 
 struct NsStats(Copyable, ImplicitlyCopyable):
@@ -439,18 +276,29 @@ def sort_phase_rows(mut rows: List[PhaseReportRow]):
 
 struct ForwardLogger(Movable):
     var samples: List[ForwardSample]
+    var names: List[String]
 
     def __init__(out self):
         self.samples = List[ForwardSample]()
+        self.names = List[String]()
 
     def clear(mut self):
         self.samples = List[ForwardSample]()
+
+    def phase(mut self, name: String) -> Int:
+        for i in range(len(self.names)):
+            if self.names[i] == name:
+                return i
+        var idx = len(self.names)
+        self.names.append(name)
+        return idx
 
     def record(mut self, sample: ForwardSample):
         self.samples.append(sample)
 
     def report(self, label: String):
         var n = len(self.samples)
+        var np = len(self.names)
         if n == 0:
             print(label + ": no profiled forwards")
             return
@@ -462,7 +310,7 @@ struct ForwardLogger(Movable):
         for i in range(n):
             var s = self.samples[i]
             wall_vals.append(s.wall_ns)
-            phase_sum_vals.append(s.phase_sum_ns())
+            phase_sum_vals.append(s.phase_sum_ns(np))
             if s.pos < min_pos:
                 min_pos = s.pos
             if s.pos > max_pos:
@@ -483,13 +331,13 @@ struct ForwardLogger(Movable):
         print("  phase-sum / token")
         print("    avg    " + pad_left(format_ms3(phase_sum.mean_ns), 9)
             + " ms    overlap-counted " + pad_left(format_pct1(phase_sum.mean_ns, wall.mean_ns), 8) + " of wall")
-        var rows = List[PhaseReportRow](capacity=NUM_FORWARD_PHASES)
-        for phase_idx in range(NUM_FORWARD_PHASES):
+        var rows = List[PhaseReportRow](capacity=np)
+        for phase_idx in range(np):
             var dispatch_vals = List[Int](capacity=n)
             var kernel_vals = List[Int](capacity=n)
             var join_vals = List[Int](capacity=n)
             for i in range(n):
-                var t = self.samples[i].phase(phase_idx)
+                var t = self.samples[i].phases[phase_idx]
                 dispatch_vals.append(t.dispatch_ns)
                 kernel_vals.append(t.kernel_ns)
                 join_vals.append(t.join_ns)
@@ -505,12 +353,12 @@ struct ForwardLogger(Movable):
             if ps.total.max_ns < 50_000 and ps.dispatch.p99_ns < 50_000 and ps.join.p99_ns < 50_000:
                 if omitted.byte_length() > 0:
                     omitted += ", "
-                omitted += ForwardSample.phase_name(row.phase_idx)
+                omitted += self.names[row.phase_idx]
                 continue
             if shown < 5:
                 if top_summary.byte_length() > 0:
                     top_summary += "  "
-                top_summary += ForwardSample.phase_name(row.phase_idx) + " "
+                top_summary += self.names[row.phase_idx] + " "
                 top_summary += format_pct1(ps.total.mean_ns, wall.mean_ns)
                 shown += 1
 
@@ -520,13 +368,13 @@ struct ForwardLogger(Movable):
 
         print("  phases")
         print("    "
-            + pad_right("phase", 18)
+            + pad_right("phase", 20)
             + pad_left("vs wall", 8) + "  "
             + pad_left("avg", 9) + "  "
             + pad_left("p99", 9) + "  "
             + pad_left("max", 9)
             + " | dispatch avg/p99 | kernel avg/p99 | join avg/p99  [ms]")
-        print("    " + repeat_spaces(18) + "--------  ---------  ---------  --------- | ---------------- | -------------- | ------------")
+        print("    " + repeat_spaces(20) + "--------  ---------  ---------  --------- | ---------------- | -------------- | ------------")
 
         for i in range(len(rows)):
             var row = rows[i]
@@ -534,7 +382,7 @@ struct ForwardLogger(Movable):
             if ps.total.max_ns < 50_000 and ps.dispatch.p99_ns < 50_000 and ps.join.p99_ns < 50_000:
                 continue
             print("    "
-                + pad_right(ForwardSample.phase_name(row.phase_idx), 18)
+                + pad_right(self.names[row.phase_idx], 20)
                 + pad_left(format_pct1(ps.total.mean_ns, wall.mean_ns), 8) + "  "
                 + pad_left(format_ms3(ps.total.mean_ns), 9) + "  "
                 + pad_left(format_ms3(ps.total.p99_ns), 9) + "  "
