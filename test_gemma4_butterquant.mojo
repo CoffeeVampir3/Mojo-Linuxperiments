@@ -13,7 +13,7 @@ from std.pathlib import Path
 from std.time import perf_counter_ns
 
 from tokenizer import load_tokenizer
-from modeling.gemma_4_moe_butterquant_tp_new import (
+from modeling.gemma_4_moe_butterquant_tp import (
     Gemma4Config, Gemma4ButterQuant,
 )
 from modeling.model_spec import LogitsView
@@ -22,9 +22,8 @@ from modeling.model_spec import LogitsView
 comptime TOKENIZER_PATH = "checkpoints/gemma-4-26B-A4B/tokenizer.json"
 comptime MODEL_DIR = "quantized_models"
 comptime VOCAB = Gemma4Config.VOCAB_SIZE
-comptime MAX_NEW_TOKENS = 128
-comptime TP = 1
-
+comptime MAX_NEW_TOKENS = 15
+comptime TP = 4
 
 def greedy_argmax(read view: LogitsView[VOCAB]) -> Tuple[Int, Float32]:
     comptime width = simd_width_of[DType.float32]()

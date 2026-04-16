@@ -100,17 +100,18 @@ def emit_reads(
     mut ops: List[ReadFragment],
 ):
     var dest = arena_base + desc.arena_offset
-    var local_bytes = desc.local_rows * desc.local_cols * desc.element_bytes
 
-    if desc.local_rows == desc.global_rows and desc.local_cols == desc.global_cols:
+    if desc.data_rows == desc.global_rows and desc.data_cols == desc.global_cols:
+        var data_bytes = desc.data_rows * desc.data_cols * desc.element_bytes
         ops.append(ReadFragment(
-            file_idx=file_idx, file_offset=file_data_start, dest=dest, length=local_bytes,
+            file_idx=file_idx, file_offset=file_data_start, dest=dest, length=data_bytes,
         ))
-    elif desc.local_rows != desc.global_rows:
-        var row_start = rank * desc.local_rows
+    elif desc.data_rows != desc.global_rows:
+        var row_start = rank * desc.data_rows
+        var data_bytes = desc.data_rows * desc.global_cols * desc.element_bytes
         var file_off = file_data_start + row_start * desc.global_cols * desc.element_bytes
         ops.append(ReadFragment(
-            file_idx=file_idx, file_offset=file_off, dest=dest, length=local_bytes,
+            file_idx=file_idx, file_offset=file_off, dest=dest, length=data_bytes,
         ))
     else:
         var file_cols = desc.data_cols
@@ -118,7 +119,7 @@ def emit_reads(
         var col_start = rank * file_cols
         var file_row_bytes = file_cols * desc.element_bytes
         var stride_bytes = stride_cols * desc.element_bytes
-        for r in range(desc.local_rows):
+        for r in range(desc.data_rows):
             var src = file_data_start + (r * desc.global_cols + col_start) * desc.element_bytes
             var dst = dest + r * stride_bytes
             ops.append(ReadFragment(

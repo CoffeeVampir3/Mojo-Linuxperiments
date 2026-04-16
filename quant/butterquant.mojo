@@ -22,6 +22,7 @@ from std.pathlib import Path
 from std.sys.info import simd_width_of
 from std.time import perf_counter_ns
 from std.math import max, align_up
+from std.os import abort
 
 from safetensors.parser import (
     parse_safetensors_header, SafetensorsHeader, TensorMeta,
@@ -295,7 +296,10 @@ def run_panel[mask_size: Int](
     elif op.block == 256: go[256]()
     elif op.block == 128: go[128]()
     elif op.block == 64: go[64]()
-    else: go[32]()
+    elif op.block == 32: go[32]()
+    elif op.block == 16: go[16]()
+    else:
+        abort("run_panel: unsupported block size")
 
 
 def bf16_to_f32(src: PtrU8, dst: PtrF32, count: Int):

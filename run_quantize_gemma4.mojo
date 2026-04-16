@@ -1,7 +1,7 @@
 """Run ButterQuant quantization on Gemma4 26B-A4B."""
 
 from std.pathlib import Path
-from modeling.gemma_4_moe_butterquant_tp_new import Gemma4ButterQuant
+from modeling.gemma_4_moe_butterquant_tp import Gemma4ButterQuant
 from quant.butterquant import run_quantizer
 
 

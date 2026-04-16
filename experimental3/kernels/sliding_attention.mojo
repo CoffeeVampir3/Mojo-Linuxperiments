@@ -306,7 +306,7 @@ def sliding_attn_dispatch[
     head_dim: Int, heads_per_group: Int, window_size: Int,
     num_kv_heads: Int, num_q_heads: Int, P: BurstThreadPool,
 ](
-    qkv_base: Int, q_dim_local: Int, kv_dim_local: Int,
+    q_base: Int, k_base: Int, v_base: Int,
     q_norm_ptr: Int, k_norm_ptr: Int,
     cos_ptr: Int, sin_ptr: Int,
     cache_base: Int, cache_pos: Int, context_len: Int,
@@ -314,9 +314,6 @@ def sliding_attn_dispatch[
     eps: Float32, mut pool: P,
 ) -> PoolFence[P]:
     comptime NKV = num_kv_heads
-    var q_base = qkv_base
-    var k_base = qkv_base + q_dim_local * 2
-    var v_base = k_base + kv_dim_local * 2
     var jobs = InlineArray[AttnGroupArgs, 8](fill=AttnGroupArgs())
     for g in range(NKV):
         jobs[g] = AttnGroupArgs(
