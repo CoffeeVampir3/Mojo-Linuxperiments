@@ -46,6 +46,93 @@ def done_ptr(state_base: Int, rank: Int) -> UnsafePointer[Int32, MutAnyOrigin]:
 
 
 # =============================================================================
+# Small-tensor replicated reduce
+# =============================================================================
+#
+# For small tensors the multi-worker allreduce is dispatch-dominated.
+# Each rank dispatches a single worker that reduces the full tensor from
+# all sources. Every rank gets the complete result with no gather phase,
+# no atomics, and no cross-rank synchronization.
+
+
+struct SmallReduceConfig:
+    var ptrs_addr: Int
+    var total_elements: Int
+    var tp: Int
+
+    def __init__(out self):
+        self.ptrs_addr = 0
+        self.total_elements = 0
+        self.tp = 0
+
+
+@fieldwise_init
+struct SmallReduceArgs(Copyable, ImplicitlyCopyable):
+    var config_addr: Int
+    var my_rank: Int
+
+
+def small_reduce_kernel(args: SmallReduceArgs):
+    """Replicated reduce: single worker reduces the full tensor from all ranks."""
+    var cfg = tptr[SmallReduceConfig](args.config_addr)
+    var ptrs = tptr[Int](cfg[].ptrs_addr)
+    var total_elements = cfg[].total_elements
+    var tp = cfg[].tp
+    var dst = tptr[Scalar[DType.bfloat16]](ptrs[args.my_rank])
+    comptime width = simd_width_of[DType.float32]()
+
+    var src0 = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+        unsafe_from_address=ptrs[0])
+    var i = 0
+    while i + width <= total_elements:
+        var acc = (src0 + i).load[width=width]().cast[DType.float32]()
+        for r in range(1, tp):
+            var src_r = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+                unsafe_from_address=ptrs[r])
+            acc += (src_r + i).load[width=width]().cast[DType.float32]()
+        (dst + i).store(acc.cast[DType.bfloat16]())
+        i += width
+    while i < total_elements:
+        var acc = Float32(src0[i])
+        for r in range(1, tp):
+            acc += Float32(UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+                unsafe_from_address=ptrs[r])[i])
+        dst[i] = Scalar[DType.bfloat16](acc)
+        i += 1
+
+
+def small_allreduce[T: Encoding & Shaped, tp: Int](
+    ptrs: InlineArray[Int, tp],
+    seq_len: Int,
+    pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp],
+):
+    """Replicated allreduce for small tensors. Each rank's single worker
+    reduces the full tensor from all sources — no chunking, no atomics,
+    no gather phase. All writes NUMA-local.
+
+    Same signature as ring_allreduce for easy substitution at call sites.
+    """
+    comptime cols = T.COLS
+    var total_elements = seq_len * cols
+    if total_elements <= 0 or tp <= 1:
+        return
+
+    var sr_cfg = SmallReduceConfig()
+    sr_cfg.ptrs_addr = Int(UnsafePointer(to=ptrs))
+    sr_cfg.total_elements = total_elements
+    sr_cfg.tp = tp
+    var sr_config_addr = Int(UnsafePointer(to=sr_cfg))
+
+    var sr_args = SmallReduceArgs(0, 0)
+    for r in range(tp):
+        sr_args = SmallReduceArgs(sr_config_addr, r)
+        pool_ptrs[r][].dispatch[SmallReduceArgs, small_reduce_kernel](
+            UnsafePointer(to=sr_args), 1)
+    for r in range(tp):
+        pool_ptrs[r][].join()
+
+
+# =============================================================================
 # Dispatch args structs
 # =============================================================================
 
@@ -246,10 +333,6 @@ def ring_allreduce[T: Encoding & Shaped, tp: Int](
         return
 
     var total_bytes = total_elements * T.ELEMENT_BYTES
-
-    # TODO: small-tensor fast path disabled — it runs on the main thread with
-    # remote NUMA reads/writes for tp>1. Need a NUMA-aware small-tensor path
-    # that dispatches to per-rank pools.
 
     var chunk = total_elements // tp
     var rem = total_elements - chunk * tp

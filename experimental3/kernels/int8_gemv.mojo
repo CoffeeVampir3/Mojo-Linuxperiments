@@ -6,9 +6,6 @@ from threading.threading_traits import BurstThreadPool
 
 from kernels.kernel_ops import PoolFence
 from kernels.vnni import VNNI_N_STEP, VNNI_K_STEP, VNNI_TILE_N, VNNI_BLK, compute_n_block
-from simd_math import exp_f32
-from experimental3.kernels.fwht import fwht_block
-from experimental3.kernels.quantize import absmax_quantize_i8
 
 
 # ============================================================================
@@ -22,7 +19,7 @@ def vpdpbusd[width: Int](
     a: SIMD[DType.uint8, width * 4],
     b: SIMD[DType.int8, width * 4],
 ) -> SIMD[DType.int32, width]:
-    """AVX-512 VNNI: u8 x i8 -> i32 dot product accumulate.
+    """x86 VNNI: u8 x i8 -> i32 dot product accumulate.
     Per dword lane i: acc[i] += sum_{j=0..3} u8(a[i].byte[j]) * i8(b[i].byte[j])
     """
     return llvm_intrinsic[
@@ -32,20 +29,41 @@ def vpdpbusd[width: Int](
 
 
 @always_inline
+def act_broadcast_vnni[width: Int](
+    act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    k_pos: Int,
+) -> SIMD[DType.uint8, width * 4]:
+    var b4 = (act_row + k_pos).bitcast[UInt8]().load[width=4]() ^ SIMD[DType.uint8, 4](0x80)
+    var b8 = b4.join(b4)
+    var b16 = b8.join(b8)
+    var b32 = b16.join(b16)
+    comptime if width <= 8:
+        return b32.slice[width * 4]()
+    else:
+        var b64 = b32.join(b32)
+        return b64.slice[width * 4]()
+
+
+@always_inline
+def dot_vnni_broadcasted[width: Int](
+    acc: SIMD[DType.int32, width],
+    act_bytes: SIMD[DType.uint8, width * 4],
+    wpacked: UnsafePointer[UInt8, MutAnyOrigin],
+) -> SIMD[DType.int32, width]:
+    var w = wpacked.bitcast[Scalar[DType.int8]]().load[width = width * 4]()
+    return vpdpbusd[width](acc, act_bytes, w)
+
+
+@always_inline
 def dot_vnni[width: Int](
     acc: SIMD[DType.int32, width],
     act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     wpacked: UnsafePointer[UInt8, MutAnyOrigin],
     k_pos: Int,
 ) -> SIMD[DType.int32, width]:
-    """VNNI dot: width channels x 4 K values via vpdpbusd."""
-    var w = wpacked.bitcast[Scalar[DType.int8]]().load[width = width * 4]()
-    var b4 = (act_row + k_pos).bitcast[UInt8]().load[width=4]() ^ SIMD[DType.uint8, 4](0x80)
-    var b8 = b4.join(b4)
-    var b16 = b8.join(b8)
-    var b32 = b16.join(b16)
-    var b64 = b32.join(b32)
-    return vpdpbusd[width](acc, b64.slice[width * 4](), w)
+    return dot_vnni_broadcasted[width](
+        acc, act_broadcast_vnni[width](act_row, k_pos), wpacked,
+    )
 
 
 @always_inline
@@ -217,114 +235,6 @@ def int8_gemv[N: Int, K: Int, P: BurstThreadPool](
             act_scale_ptr, start, end - start)
 
     pool.dispatch[WorkerConfig, int8_gemv_worker[N, K]](
-        UnsafePointer(to=jobs[0]), num_jobs)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
-
-
-# ============================================================================
-# Fused gate+up GEMV → SiLU → FWHT → i8 quantize
-# ============================================================================
-
-
-@fieldwise_init
-struct FusedGUSiluConfig(Copyable, ImplicitlyCopyable):
-    var act_ptr: Int
-    var gate_wpacked_ptr: Int
-    var up_wpacked_ptr: Int
-    var qi_ptr: Int
-    var scale_ptr: Int
-    var act_scale_ptr: Int
-    var start_row: Int
-    var row_count: Int
-    var gate_colsum_ptr: Int
-    var up_colsum_ptr: Int
-    var gate_wscale_ptr: Int
-    var up_wscale_ptr: Int
-
-
-def fused_gu_silu_worker[GATE_ROWS: Int, K: Int, FWHT_BLK: Int](cfg: FusedGUSiluConfig):
-    """Fused gate+up GEMV -> SiLU(gate)*up -> FWHT -> per-row i8 quantize."""
-    var act = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=cfg.act_ptr)
-    var gate_wp = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=cfg.gate_wpacked_ptr)
-    var up_wp = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=cfg.up_wpacked_ptr)
-    var qi_out = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=cfg.qi_ptr)
-    var scales = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cfg.scale_ptr)
-    var act_scales = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cfg.act_scale_ptr)
-    var gate_cs = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cfg.gate_colsum_ptr)
-    var up_cs = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cfg.up_colsum_ptr)
-    var gate_ws = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cfg.gate_wscale_ptr)
-    var up_ws = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cfg.up_wscale_ptr)
-    var start = cfg.start_row
-
-    # Stack buffers for one row of gate and up (f32)
-    var gate_buf = InlineArray[Float32, GATE_ROWS](fill=Float32(0))
-    var up_buf = InlineArray[Float32, GATE_ROWS](fill=Float32(0))
-    var gate_f32 = UnsafePointer(to=gate_buf).bitcast[Scalar[DType.float32]]()
-    var up_f32 = UnsafePointer(to=up_buf).bitcast[Scalar[DType.float32]]()
-
-    # Work buffer for FWHT (reuse gate_buf after silu consumes it)
-    var work = UnsafePointer(to=gate_buf).bitcast[Float32]()
-
-    comptime width = simd_width_of[DType.float32]()
-
-    for m in range(cfg.row_count):
-        var act_dequant = act_scales[start + m] / Float32(127)
-
-        # Gate GEMV → f32 stack buffer
-        gemv_row[GATE_ROWS, K, DType.float32](
-            act + m * K, gate_wp, act_dequant, gate_ws, gate_cs, gate_f32)
-
-        # Up GEMV → f32 stack buffer
-        gemv_row[GATE_ROWS, K, DType.float32](
-            act + m * K, up_wp, act_dequant, up_ws, up_cs, up_f32)
-
-        # SiLU(gate) * up → work buffer (reuses gate_buf)
-        var k = 0
-        while k + width <= GATE_ROWS:
-            var g = (gate_f32 + k).load[width=width]()
-            var u = (up_f32 + k).load[width=width]()
-            var sig = SIMD[DType.float32, width](1.0) / (SIMD[DType.float32, width](1.0) + exp_f32[width](-g))
-            (work + k).store(g * sig * u)
-            k += width
-
-        # Block-diagonal FWHT
-        for b in range(GATE_ROWS // FWHT_BLK):
-            fwht_block[FWHT_BLK](work + b * FWHT_BLK)
-
-        # Dynamic absmax + quantize → i8 output
-        scales[start + m] = absmax_quantize_i8[GATE_ROWS](work, qi_out + (start + m) * GATE_ROWS)
-
-
-def fused_gu_silu[GATE_ROWS: Int, K: Int, FWHT_BLK: Int, P: BurstThreadPool](
-    act_ptr: Int,
-    gate_wpacked_ptr: Int, gate_colsum_ptr: Int, gate_wscale_ptr: Int,
-    up_wpacked_ptr: Int, up_colsum_ptr: Int, up_wscale_ptr: Int,
-    qi_ptr: Int, scale_ptr: Int,
-    seq_len: Int, act_scale_ptr: Int,
-    mut pool: P,
-) -> PoolFence[P]:
-    """Fused gate+up GEMV -> SiLU(gate)*up -> FWHT -> per-row i8 quantize."""
-    if seq_len == 0:
-        return PoolFence[P].completed()
-
-    comptime MAX_POOL_CAPACITY = 128
-    var num_jobs = min(seq_len, pool.get_capacity())
-    var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
-
-    var jobs = InlineArray[FusedGUSiluConfig, MAX_POOL_CAPACITY](
-        fill=FusedGUSiluConfig(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0))
-    for i in range(num_jobs):
-        var start = i * rows_per_job
-        var end = min(start + rows_per_job, seq_len)
-        jobs[i] = FusedGUSiluConfig(
-            act_ptr + start * K, gate_wpacked_ptr, up_wpacked_ptr,
-            qi_ptr, scale_ptr, act_scale_ptr, start, end - start,
-            gate_colsum_ptr, up_colsum_ptr,
-            gate_wscale_ptr, up_wscale_ptr)
-
-    pool.dispatch[FusedGUSiluConfig, fused_gu_silu_worker[GATE_ROWS, K, FWHT_BLK]](
         UnsafePointer(to=jobs[0]), num_jobs)
     return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
         unsafe_from_address=Int(UnsafePointer(to=pool))

@@ -27,10 +27,6 @@ from kernels.kernel_ops import PoolFence
 from threading.threading_traits import BurstThreadPool
 
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
-from experimental3.kernels.full_chunked_attention import (
-    partial_head_stride, partial_chunk_stride,
-    ChunkedAttnArgs,
-)
 from experimental3.kernels.sliding_attention import score_group, v_agg_group
 from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.kernels.rope_and_kv_cache_write import (
@@ -43,6 +39,57 @@ from simd_math import exp_f32
 # ============================================================================
 # Position routing
 # ============================================================================
+
+
+# ============================================================================
+# Partial state layout
+# ============================================================================
+#
+# Per Q head per chunk: [max: f32, sum: f32, v_acc: f32 × head_dim]
+# Stride per head   = (2 + head_dim) f32s
+# Stride per chunk  = heads_per_group × stride_per_head
+
+
+@always_inline
+def partial_head_stride[head_dim: Int]() -> Int:
+    """F32 element stride between consecutive Q heads in a partial buffer."""
+    return 2 + head_dim
+
+
+@always_inline
+def partial_chunk_stride[head_dim: Int, heads_per_group: Int]() -> Int:
+    """F32 element stride between consecutive chunks in a partial buffer."""
+    return heads_per_group * partial_head_stride[head_dim]()
+
+
+# ============================================================================
+# Worker args
+# ============================================================================
+
+
+@fieldwise_init
+struct ChunkedAttnArgs(Copyable, ImplicitlyCopyable):
+    """Per-worker arguments for chunked attention scoring."""
+    var q_i8_base: Int
+    var qi_biases_base: Int
+    var q_scales_base: Int
+    var cache_base: Int
+    var kv_head: Int
+    var start_pg: Int
+    var end_pg: Int
+    var partial_out: Int
+    var context_len: Int
+
+    def __init__(out self):
+        self.q_i8_base = 0
+        self.qi_biases_base = 0
+        self.q_scales_base = 0
+        self.cache_base = 0
+        self.kv_head = 0
+        self.start_pg = 0
+        self.end_pg = 0
+        self.partial_out = 0
+        self.context_len = 0
 
 
 @always_inline
@@ -64,6 +111,16 @@ def cp_local_context_len(global_context_len: Int, rank: Int, tp: Int) -> Int:
 @always_inline
 def cp_local_max_seq[max_seq: Int, tp: Int]() -> Int:
     return (max_seq + tp - 1) // tp
+
+
+@always_inline
+def cp_group_valid_mask[width: Int](
+    group_start: Int, context_len: Int,
+) -> SIMD[DType.bool, width]:
+    var lanes = SIMD[DType.int32, width]()
+    comptime for lane in range(width):
+        lanes[lane] = Int32(group_start + lane)
+    return lanes.lt(SIMD[DType.int32, width](context_len))
 
 
 # ============================================================================
@@ -195,9 +252,6 @@ def cp_attn_prep_dispatch[
 # ============================================================================
 # CP chunked attention dispatch
 # ============================================================================
-#
-# Re-uses the existing chunked_attn_kernel from full_chunked_attention.mojo
-# but with CP cache parameters (local_max_seq, all KV heads).
 
 
 comptime MAX_CHUNKS = 32
@@ -230,8 +284,8 @@ def cp_chunked_attn_kernel[
     var v_acc_storage = InlineArray[Float32, V_ACC_TOTAL](fill=Float32(0))
     var v_acc_base = UnsafePointer(to=v_acc_storage).bitcast[Float32]()
 
-    var scores_arr = InlineArray[Float32, WIDTH](uninitialized=True)
-    var scores = UnsafePointer(to=scores_arr).bitcast[Float32]()
+    var neg_inf = SIMD[DType.float32, WIDTH](Float32(-1e30))
+    var zero = SIMD[DType.float32, WIDTH](0)
 
     comptime Q_DENOM = Float32(127) * Float32(127)
     var q_factors = InlineArray[Float32, heads_per_group](uninitialized=True)
@@ -244,19 +298,17 @@ def cp_chunked_attn_kernel[
         var k_sc_pg = k_scales + pg * WIDTH
         var v_sc_pg = v_scales + pg * WIDTH
         var group_start = pg * WIDTH
+        var valid = cp_group_valid_mask[WIDTH](group_start, args.context_len)
 
         for qh in range(heads_per_group):
             var q_i8 = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](
                 unsafe_from_address=args.q_i8_base + qh * head_dim)
 
-            score_group[head_dim](
-                q_i8, k_pg, qi_biases[qh], q_factors[qh], k_sc_pg, scores)
-
-            for lane in range(WIDTH):
-                if group_start + lane >= args.context_len:
-                    scores[lane] = Float32(-1e30)
-
-            var scores_vec = scores.load[width=WIDTH]()
+            var scores_vec = valid.select(
+                score_group[head_dim](
+                    q_i8, k_pg, qi_biases[qh], q_factors[qh], k_sc_pg),
+                neg_inf,
+            )
             var group_max = scores_vec.reduce_max()
             var new_max = max(running_max[qh], group_max)
             var v_acc = v_acc_base + qh * head_dim
@@ -270,11 +322,8 @@ def cp_chunked_attn_kernel[
                 running_sum[qh] *= rescale
 
             running_max[qh] = new_max
-            var exp_scores = exp_f32[WIDTH](scores_vec - new_max)
-
-            for lane in range(WIDTH):
-                if group_start + lane >= args.context_len:
-                    exp_scores[lane] = Float32(0)
+            var exp_scores = valid.select(
+                exp_f32[WIDTH](scores_vec - new_max), zero)
 
             running_sum[qh] += exp_scores.reduce_add()
             v_agg_group[head_dim](exp_scores, v_sc_pg, v_pg, v_acc)

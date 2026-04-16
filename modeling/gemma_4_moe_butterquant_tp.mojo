@@ -32,7 +32,7 @@ from modeling.modeling_common import (
     scratch_tensor_view, scratch_ptr,
 )
 from kernels.kernel_ops import PoolFence, BF16Ptr
-from kernels.reductions import ring_allreduce, ring_broadcast, ring_allgather
+from kernels.reductions import ring_allreduce, small_allreduce, ring_broadcast, ring_allgather
 from modeling.linear_borrow_pool import ScratchPool, ScratchLease
 
 from experimental3.kernels.rmsnorm import (
@@ -66,10 +66,6 @@ from experimental3.kernels.dense_ffn_workaround import (
 )
 from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr
 from experimental3.kernels.sliding_attention import sliding_attn_dispatch
-from experimental3.kernels.full_chunked_attention import (
-    merge_and_quantize, full_attn_prep_dispatch, chunked_attn_dispatch,
-    CACHE_WIDTH as ATTN_CACHE_WIDTH,
-)
 from experimental3.kernels.full_chunked_attention_fused import (
     cp_attn_prep_dispatch, cp_chunked_attn_dispatch,
     merge_local_chunks_dispatch, cp_gather_dispatch, MAX_CP_RANKS,
@@ -1324,7 +1320,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
 
             # Allreduce + post-attn norm
             var t_attn_reduce0 = Int(perf_counter_ns())
-            ring_allreduce[X_SLOT, Self.tp](
+            small_allreduce[X_SLOT, Self.tp](
                 self.x_residual_ptrs(seq_len), seq_len, mp)
             sample.attn_reduce.add(PhaseTiming.opaque(Int(perf_counter_ns()) - t_attn_reduce0))
 
@@ -1509,7 +1505,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             var dense_out_ptrs = InlineArray[Int, Self.tp](fill=0)
             for r in range(Self.tp):
                 dense_out_ptrs[r] = topos[r].scratch_addr(dense_out_lease)
-            ring_allreduce[X_SLOT, Self.tp](dense_out_ptrs, 1, mp)
+            small_allreduce[X_SLOT, Self.tp](dense_out_ptrs, 1, mp)
             sample.mlp_reduce.add(PhaseTiming.opaque(Int(perf_counter_ns()) - t_dense_reduce0))
 
             @parameter
@@ -1523,7 +1519,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             sample.pre_reduce.add(tp_parallel[Self.tp, do_dense_norm](topos, mp))
 
             var t_mlp_reduce0 = Int(perf_counter_ns())
-            ring_allreduce[X_SLOT, Self.tp](
+            small_allreduce[X_SLOT, Self.tp](
                 self.x_residual_ptrs(seq_len), seq_len, mp)
             sample.mlp_reduce.add(PhaseTiming.opaque(Int(perf_counter_ns()) - t_mlp_reduce0))
 

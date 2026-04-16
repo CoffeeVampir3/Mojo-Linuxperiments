@@ -13,8 +13,8 @@ Changes from the standard kernels:
     the FWHT + quantize at the smaller fwht_blk. Decouples GEMV tile from
     rotation block.
   - int8_gemv_blocked: accumulates across multiple small K-blocks within each
-    VNNI_K_STEP, dequantizing per sub-block. Processes one VNNI_TILE_N (16)
-    at a time to support N=fwht_blk < VNNI_N_STEP.
+    VNNI_K_STEP, dequantizing per sub-block while keeping each logical VNNI
+    tile as a full SIMD value instead of width-sized storage slices.
 """
 
 from std.memory import UnsafePointer
@@ -167,6 +167,29 @@ def gemv_tile_width[T: DType, tile: Int]() -> Int:
         return hw
 
 
+@always_inline
+def dot_tile_chunked[width: Int](
+    acc: SIMD[DType.int32, VNNI_TILE_N],
+    act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    wpacked: UnsafePointer[UInt8, MutAnyOrigin],
+    k_pos: Int,
+) -> SIMD[DType.int32, VNNI_TILE_N]:
+    comptime assert VNNI_TILE_N % width == 0,
+        "tile rewrite requires width to divide VNNI_TILE_N"
+    comptime regs = VNNI_TILE_N // width
+    var result = acc
+    comptime for r in range(regs):
+        comptime lane_off = r * width
+        result = result.insert[offset=lane_off](
+            dot[width](
+                result.slice[width, offset=lane_off](),
+                act_row,
+                wpacked + lane_off * VNNI_BLK,
+                k_pos,
+            ))
+    return result
+
+
 def gemv_row_blocked_wa[N: Int, K: Int, fwht_blk: Int](
     act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     wpacked: UnsafePointer[UInt8, MutAnyOrigin],
@@ -178,18 +201,20 @@ def gemv_row_blocked_wa[N: Int, K: Int, fwht_blk: Int](
     """Blocked GEMV supporting fwht_blk <= VNNI_K_STEP.
 
     Traverses packed data at VNNI_K_STEP granularity (tile0 all dc's, then
-    tile1 all dc's) matching the 6D VNNI layout. Dequantizes at fwht_blk
-    boundaries within each K_STEP."""
+    tile1 all dc's) matching the 6D VNNI layout. Each logical VNNI tile is
+    tracked as a full SIMD value and only sliced at the dot-product boundary
+    to match the native hardware width. Dequantizes at fwht_blk boundaries
+    within each K_STEP."""
     debug_assert(K % VNNI_K_STEP == 0, "K must be a multiple of VNNI_K_STEP")
     debug_assert(K % fwht_blk == 0, "K must be a multiple of fwht_blk")
     debug_assert(N % VNNI_N_STEP == 0, "N must be a multiple of VNNI_N_STEP")
     debug_assert(VNNI_K_STEP % fwht_blk == 0, "VNNI_K_STEP must be a multiple of fwht_blk")
 
     comptime width = gemv_tile_width[DType.int32, VNNI_TILE_N]()
-    comptime regs = VNNI_TILE_N // width
     comptime dc_per_kstep = VNNI_K_STEP // VNNI_BLK
     comptime dc_per_fwht_blk = fwht_blk // VNNI_BLK
     comptime sub_blks_per_kstep = VNNI_K_STEP // fwht_blk
+    comptime tiles_per_nstep = VNNI_N_STEP // VNNI_TILE_N
 
     var n_block = compute_n_block(N, K)
     var packed_off = 0
@@ -197,49 +222,41 @@ def gemv_row_blocked_wa[N: Int, K: Int, fwht_blk: Int](
     for nb in range(0, N, n_block):
         var nb_size = min(n_block, N - nb)
         for ns in range(0, nb_size, VNNI_N_STEP):
-            var f32_t0 = SIMD[DType.float32, VNNI_TILE_N](0)
-            var f32_t1 = SIMD[DType.float32, VNNI_TILE_N](0)
+            var f32_tiles = InlineArray[SIMD[DType.float32, VNNI_TILE_N], tiles_per_nstep](
+                fill=SIMD[DType.float32, VNNI_TILE_N](0))
 
             for ks in range(0, K, VNNI_K_STEP):
-                var t0 = InlineArray[SIMD[DType.int32, VNNI_TILE_N], sub_blks_per_kstep](
-                    fill=SIMD[DType.int32, VNNI_TILE_N](0))
-                var t1 = InlineArray[SIMD[DType.int32, VNNI_TILE_N], sub_blks_per_kstep](
-                    fill=SIMD[DType.int32, VNNI_TILE_N](0))
+                var block_tiles = InlineArray[
+                    SIMD[DType.int32, VNNI_TILE_N],
+                    sub_blks_per_kstep * tiles_per_nstep
+                ](fill=SIMD[DType.int32, VNNI_TILE_N](0))
 
-                for dc in range(dc_per_kstep):
-                    var sb = dc // dc_per_fwht_blk
-                    var k_pos = ks + dc * VNNI_BLK
-                    var acc = t0[sb]
-                    comptime for r in range(regs):
-                        acc = acc.insert[offset=r * width](
-                            dot[width](acc.slice[width, offset=r * width](),
-                                act_row, wpacked + packed_off + r * width * VNNI_BLK, k_pos))
-                    t0[sb] = acc
-                    packed_off += VNNI_TILE_N * VNNI_BLK
+                comptime for tile in range(tiles_per_nstep):
+                    for dc in range(dc_per_kstep):
+                        var sb = dc // dc_per_fwht_blk
+                        var idx = sb * tiles_per_nstep + tile
+                        var k_pos = ks + dc * VNNI_BLK
+                        block_tiles[idx] = dot_tile_chunked[width](
+                            block_tiles[idx], act_row, wpacked + packed_off, k_pos)
+                        packed_off += VNNI_TILE_N * VNNI_BLK
 
-                for dc in range(dc_per_kstep):
-                    var sb = dc // dc_per_fwht_blk
-                    var k_pos = ks + dc * VNNI_BLK
-                    var acc = t1[sb]
-                    comptime for r in range(regs):
-                        acc = acc.insert[offset=r * width](
-                            dot[width](acc.slice[width, offset=r * width](),
-                                act_row, wpacked + packed_off + r * width * VNNI_BLK, k_pos))
-                    t1[sb] = acc
-                    packed_off += VNNI_TILE_N * VNNI_BLK
-
+                var n0 = nb + ns
                 for sb in range(sub_blks_per_kstep):
                     var blk_idx = ks // fwht_blk + sb
                     var dq = block_scales[blk_idx] / 127.0
-                    var n0 = nb + ns
-                    var cs0 = (block_colsums + blk_idx * N + n0).load[width=VNNI_TILE_N]()
-                    var cs1 = (block_colsums + blk_idx * N + n0 + VNNI_TILE_N).load[width=VNNI_TILE_N]()
-                    f32_t0 += (t0[sb].cast[DType.float32]() - 128.0 * cs0) * dq
-                    f32_t1 += (t1[sb].cast[DType.float32]() - 128.0 * cs1) * dq
+                    comptime for tile in range(tiles_per_nstep):
+                        var idx = sb * tiles_per_nstep + tile
+                        comptime tile_off = tile * VNNI_TILE_N
+                        var cs = (block_colsums + blk_idx * N + n0 + tile_off).load[width=VNNI_TILE_N]()
+                        f32_tiles[tile] += (
+                            block_tiles[idx].cast[DType.float32]() - 128.0 * cs
+                        ) * dq
 
             var n0 = nb + ns
-            (dst + n0).store(f32_t0 * (wsc + n0).load[width=VNNI_TILE_N]())
-            (dst + n0 + VNNI_TILE_N).store(f32_t1 * (wsc + n0 + VNNI_TILE_N).load[width=VNNI_TILE_N]())
+            comptime for tile in range(tiles_per_nstep):
+                comptime tile_off = tile * VNNI_TILE_N
+                (dst + n0 + tile_off).store(
+                    f32_tiles[tile] * (wsc + n0 + tile_off).load[width=VNNI_TILE_N]())
 
 
 def int8_gemv_blocked_wa_worker[N: Int, K: Int, fwht_blk: Int](

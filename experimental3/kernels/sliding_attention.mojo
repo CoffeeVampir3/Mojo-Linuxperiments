@@ -53,9 +53,8 @@ def score_group[head_dim: Int](
     qi_bias: Float32,
     q_factor: Float32,
     k_scales: UnsafePointer[Float32, MutAnyOrigin],
-    scores_out: UnsafePointer[Float32, MutAnyOrigin],
-):
-    """Score WIDTH positions, dequant to f32, write to scores_out."""
+) -> SIMD[DType.float32, WIDTH]:
+    """Score WIDTH positions, dequant to f32, and return them as SIMD."""
     comptime K_DIM_GROUPS = head_dim // VNNI_BLK
 
     var acc = SIMD[DType.int32, WIDTH](0)
@@ -66,7 +65,17 @@ def score_group[head_dim: Int](
             kdg * VNNI_BLK)
     var corrected = acc.cast[DType.float32]() - qi_bias
     var k_sc = k_scales.load[width=WIDTH]()
-    scores_out.store(corrected * q_factor * k_sc)
+    return corrected * q_factor * k_sc
+
+
+@always_inline
+def group_valid_mask[width: Int](
+    group_start: Int, context_len: Int,
+) -> SIMD[DType.bool, width]:
+    var lanes = SIMD[DType.int32, width]()
+    comptime for lane in range(width):
+        lanes[lane] = Int32(group_start + lane)
+    return lanes.lt(SIMD[DType.int32, width](context_len))
 
 
 # ============================================================================
@@ -155,23 +164,22 @@ def single_pass_attention[head_dim: Int, max_seq: Int, num_kv_heads: Int, num_q_
     var v_acc_arr = InlineArray[Float32, head_dim](fill=Float32(0))
     var v_acc = UnsafePointer(to=v_acc_arr).bitcast[Float32]()
 
-    var scores_arr = InlineArray[Float32, WIDTH](fill=Float32(0))
-    var scores = UnsafePointer(to=scores_arr).bitcast[Float32]()
+    var neg_inf = SIMD[DType.float32, WIDTH](Float32(-1e30))
+    var zero = SIMD[DType.float32, WIDTH](0)
 
     for pg in range(num_pos_groups):
         var k_pg = cache.k_pg_ptr(kv_head, pg)
         var v_pg = cache.v_pg_ptr(kv_head, pg)
-
-        score_group[head_dim](
-            q_i8, k_pg, qi_bias, q_factor,
-            k_scales + pg * WIDTH, scores)
-
         var group_start = pg * WIDTH
-        for p in range(WIDTH):
-            if group_start + p >= context_len:
-                scores[p] = Float32(-1e30)
+        var valid = group_valid_mask[WIDTH](group_start, context_len)
+        var scores_vec = valid.select(
+            score_group[head_dim](
+                q_i8, k_pg, qi_bias, q_factor,
+                k_scales + pg * WIDTH),
+            neg_inf,
+        )
 
-        var group_max = scores.load[width=WIDTH]().reduce_max()
+        var group_max = scores_vec.reduce_max()
         var new_max = max(running_max, group_max)
 
         if running_sum > 0:
@@ -181,11 +189,8 @@ def single_pass_attention[head_dim: Int, max_seq: Int, num_kv_heads: Int, num_q_
             running_sum *= rescale
 
         running_max = new_max
-        var exp_scores = exp_f32[WIDTH](scores.load[width=WIDTH]() - new_max)
-
-        for p in range(WIDTH):
-            if group_start + p >= context_len:
-                exp_scores[p] = Float32(0)
+        var exp_scores = valid.select(
+            exp_f32[WIDTH](scores_vec - new_max), zero)
 
         running_sum += exp_scores.reduce_add()
         v_agg_group[head_dim](exp_scores, v_scales + pg * WIDTH, v_pg, v_acc)

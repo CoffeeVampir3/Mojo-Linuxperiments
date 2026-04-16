@@ -24,23 +24,34 @@ def lm_head_row_dot[K: Int, fwht_blk: Int](
     w_blk_colsums_row: F32Ptr,
 ) -> Float32:
     """Fully-dequant'd dot product for one output row."""
+    comptime dp_width = simd_width_of[DType.int32]()
+    comptime vnni_k_step = dp_width * 4
+    debug_assert(K % fwht_blk == 0, "K must be a multiple of fwht_blk")
+    debug_assert(
+        fwht_blk % vnni_k_step == 0,
+        "fwht_blk must be a multiple of the VNNI dot-product step",
+    )
     comptime num_blocks = K // fwht_blk
-    comptime width = simd_width_of[DType.int32]()
-    comptime k_per_step = width * 4
-    comptime steps_per_block = fwht_blk // k_per_step
+    comptime steps_per_block = fwht_blk // vnni_k_step
 
+    var act_u8 = act.bitcast[UInt8]()
+    var u8_bias = SIMD[DType.uint8, vnni_k_step](0x80)
+    var inv_i8_max = Float32(1.0) / Float32(127.0)
+    var colsum_bias = Float32(128.0)
     var total = Float32(0)
     for b in range(num_blocks):
-        var i32_acc = SIMD[DType.int32, width](0)
+        var i32_acc = SIMD[DType.int32, dp_width](0)
         var k_base = b * fwht_blk
-        for s in range(steps_per_block):
-            var k_off = k_base + s * k_per_step
-            var act_u8 = (act + k_off).bitcast[UInt8]().load[width=k_per_step]() ^ SIMD[DType.uint8, k_per_step](0x80)
-            var w_i8 = (weight_row + k_off).load[width=k_per_step]()
-            i32_acc = vpdpbusd[width](i32_acc, act_u8, w_i8)
+        comptime for s in range(steps_per_block):
+            comptime step_k_off = s * vnni_k_step
+            var k_off = k_base + step_k_off
+            var act_step = (act_u8 + k_off).load[width=vnni_k_step]() ^ u8_bias
+            var w_i8 = (weight_row + k_off).load[width=vnni_k_step]()
+            i32_acc = vpdpbusd[dp_width](i32_acc, act_step, w_i8)
         var block_dot = i32_acc.reduce_add().cast[DType.float32]()
-        var corrected = block_dot - Float32(128.0) * w_blk_colsums_row[b]
-        total += corrected * (act_blk_scales[b] / Float32(127.0)) * w_blk_scales_row[b]
+        var corrected = block_dot - colsum_bias * w_blk_colsums_row[b]
+        var act_dequant = act_blk_scales[b] * inv_i8_max
+        total += corrected * act_dequant * w_blk_scales_row[b]
     return total
 
 

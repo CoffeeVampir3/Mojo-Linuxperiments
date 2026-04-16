@@ -1,0 +1,25 @@
+The purpose of inspectables is to provide easy to inspect assembly-reproductions of a concept. Avoid using prints or anything that adds extra noise. Ensure the file is compilable and keeps the output alive so it's not optimized out. The file should be fully self-contained, and require no external imports used in this codebase. If there's strong dependencies, copy them into the inspectable.
+
+Use asserts off to disable bounds checking:
+
+pixi run mojo build -D ASSERT=none main.mojo
+
+Benchmark keep will keep a value alive without needing to do anything fancy:
+
+Mojo function
+keep
+
+keep[T: AnyType, origin: Origin[mut=origin.mut], //](ref[origin] value: T)
+
+Provides a hint to the compiler to not optimize the variable use away.
+
+This is useful in benchmarking to avoid the compiler not deleting the code to be benchmarked because the variable is not used in a side-effecting manner.
+
+Parameters:
+
+    ​T (AnyType): The type of the input.
+    ​origin (Origin): The origin of the input.
+
+Args:
+
+    ​value (T): The value to not optimize away.

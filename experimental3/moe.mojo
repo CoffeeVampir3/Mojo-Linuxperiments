@@ -81,15 +81,18 @@ def gemv_row_blocked[N: Int, K: Int, fwht_block_size: Int](
                     for dc in range(VNNI_K_STEP // VNNI_BLK):
                         var k_pos = blk * fwht_block_size + ks + dc * VNNI_BLK
                         for p in range(passes_per_subtile):
-                            i32_acc[p] = dot[width](i32_acc[p], act_row,
-                                wpacked + packed_off + p * bytes_per_pass, k_pos)
+                            i32_acc[p] = dot[width](
+                                i32_acc[p], act_row,
+                                wpacked + packed_off + p * bytes_per_pass, k_pos,
+                            )
                         packed_off += VNNI_TILE_N * VNNI_BLK
                     for dc in range(VNNI_K_STEP // VNNI_BLK):
                         var k_pos = blk * fwht_block_size + ks + dc * VNNI_BLK
                         for p in range(passes_per_subtile):
                             i32_acc[passes_per_subtile + p] = dot[width](
                                 i32_acc[passes_per_subtile + p], act_row,
-                                wpacked + packed_off + p * bytes_per_pass, k_pos)
+                                wpacked + packed_off + p * bytes_per_pass, k_pos,
+                            )
                         packed_off += VNNI_TILE_N * VNNI_BLK
                 var blk_dequant = block_scales[blk] / 127.0
                 for a in range(acc_count):

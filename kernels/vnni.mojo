@@ -1,7 +1,8 @@
 """VNNI int8 weight packing — 6D blocked layout for vpdpbusd.
 
-The vpdpbusd instruction consumes weights as 16 dwords per register,
-each dword holding 4 consecutive K values for one output channel.
+The kernels in this repo operate on logical 16-channel VNNI subtiles, with
+each dword holding 4 consecutive K values for one output channel. Native VNNI
+instructions may process that subtile as one or more hardware-width vectors.
 The 6D layout is:
 
     [N/N_BLOCK, K/K_BLOCK, N_BLOCK/N_STEP, K_BLOCK/K_STEP,
