@@ -1,14 +1,11 @@
 """Autoregressive generation test for Gemma4 26B-A4B ButterQuant (int8).
 
-Same structure as test_gemma4.mojo: loads model + tokenizer, processes prompt
-one token at a time, decodes greedily, reports timing and generated text.
-
-Uses the int8 ButterQuant forward path with VNNI attention, per-block
-quantized MLP, and NUMA-aware expert dispatch.
+Loads model + tokenizer, processes prompt one token at a time, samples tokens
+via the fused FlashSampling LM head (Gumbel-Max argmax in the matmul epilogue),
+reports timing and generated text.
 """
 
 from std.memory import UnsafePointer
-from std.sys.info import simd_width_of
 from std.pathlib import Path
 from std.time import perf_counter_ns
 
@@ -16,28 +13,14 @@ from tokenizer import load_tokenizer
 from modeling.gemma_4_moe_butterquant_tp import (
     Gemma4Config, Gemma4ButterQuant,
 )
-from modeling.model_spec import LogitsView
 
 
 comptime TOKENIZER_PATH = "checkpoints/gemma-4-26B-A4B/tokenizer.json"
 comptime MODEL_DIR = "quantized_models"
 comptime VOCAB = Gemma4Config.VOCAB_SIZE
 comptime MAX_NEW_TOKENS = 15
-comptime TP = 4
-
-def greedy_argmax(read view: LogitsView[VOCAB]) -> Tuple[Int, Float32]:
-    comptime width = simd_width_of[DType.float32]()
-    var best_val = Float32(-1e30)
-    var best_idx = 0
-
-    for j in range(0, VOCAB, width):
-        var v = view.load_f32[width](j)
-        for k in range(width):
-            if v[k] > best_val:
-                best_val = v[k]
-                best_idx = j + k
-
-    return (best_idx, best_val)
+comptime TP = 1
+comptime RNG_SEED_BASE = UInt64(0xD1CEFA57D1CEFA57)
 
 
 def main():
@@ -79,35 +62,13 @@ def main():
     var t1 = perf_counter_ns()
     for i in range(prompt_len - 1):
         tp[0] = Scalar[DType.int32](token_ids[i])
-        var logits = model.forward_decode(Int(tp), i)
-        logits^.release()
+        _ = model.forward_decode(Int(tp), i, RNG_SEED_BASE ^ UInt64(i))
 
-    # Last prompt token — get logits for first generated token
+    # Last prompt token: sample first generated token from the fused LM head.
     tp[0] = Scalar[DType.int32](token_ids[prompt_len - 1])
-    var logits = model.forward_decode(Int(tp), prompt_len - 1)
+    var next_id = Int(model.forward_decode(
+        Int(tp), prompt_len - 1, RNG_SEED_BASE ^ UInt64(prompt_len - 1)))
     var prefill_ms = (perf_counter_ns() - t1) / 1_000_000
-
-    # Top-5 logits diagnostic
-    var top_vals = InlineArray[Float32, 5](fill=Float32(-1e30))
-    var top_ids = InlineArray[Int, 5](fill=0)
-    for j in range(VOCAB):
-        var v = logits.load_f32[1](j)
-        if v[0] > top_vals[4]:
-            top_vals[4] = v[0]
-            top_ids[4] = j
-            for k in range(3, -1, -1):
-                if top_vals[k + 1] > top_vals[k]:
-                    var tv = top_vals[k]; top_vals[k] = top_vals[k + 1]; top_vals[k + 1] = tv
-                    var ti = top_ids[k]; top_ids[k] = top_ids[k + 1]; top_ids[k + 1] = ti
-    print("top-5 logits after prompt:")
-    for i in range(5):
-        var id_list = List[Int]()
-        id_list.append(top_ids[i])
-        print(" ", i, "id=", top_ids[i], "val=", top_vals[i], "tok=", repr(tok.decode(id_list)))
-
-    var result = greedy_argmax(logits)
-    var next_id = result[0]
-    logits^.release()
 
     var generated = List[Int]()
     generated.append(next_id)
@@ -126,12 +87,8 @@ def main():
 
     for step in range(1, MAX_NEW_TOKENS):
         tp[0] = Scalar[DType.int32](next_id)
-
-        logits = model.forward_decode(Int(tp), pos)
-
-        result = greedy_argmax(logits)
-        next_id = result[0]
-        logits^.release()
+        next_id = Int(model.forward_decode(
+            Int(tp), pos, RNG_SEED_BASE ^ UInt64(pos)))
         generated.append(next_id)
         pos += 1
 

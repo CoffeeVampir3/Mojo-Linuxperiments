@@ -23,9 +23,6 @@ from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 from std.collections import InlineArray
 
-from kernels.kernel_ops import PoolFence
-from threading.threading_traits import BurstThreadPool
-
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
 from experimental3.kernels.sliding_attention import score_group, v_agg_group
 from experimental3.kernels.quantize import absmax_quantize_i8
@@ -220,37 +217,8 @@ def cp_attn_prep_kernel[
         q_scales[qh] = result[1]
 
 
-def cp_attn_prep_dispatch[
-    head_dim: Int, rope_dims: Int, heads_per_group: Int,
-    local_max_seq: Int, num_kv_heads: Int, num_q_heads: Int,
-    P: BurstThreadPool,
-](
-    q_bf16_base: Int, k_bf16_ptr: Int,
-    q_norm_ptr: Int, k_norm_ptr: Int,
-    cos_ptr: Int, sin_ptr: Int,
-    cache_base: Int, local_pos: Int, kv_head: Int,
-    eps: Float32, write_kv: Bool,
-    q_i8_out: Int, qi_biases_out: Int, q_scales_out: Int,
-    mut pool: P,
-) -> PoolFence[P]:
-    var args = CpAttnPrepArgs(
-        q_bf16_base=q_bf16_base, k_bf16_ptr=k_bf16_ptr,
-        q_norm_ptr=q_norm_ptr, k_norm_ptr=k_norm_ptr,
-        cos_ptr=cos_ptr, sin_ptr=sin_ptr,
-        cache_base=cache_base, cache_pos=local_pos, kv_head=kv_head,
-        eps=eps,
-        q_i8_out=q_i8_out, qi_biases_out=qi_biases_out, q_scales_out=q_scales_out,
-        write_kv=Int32(1) if write_kv else Int32(0))
-    pool.dispatch[CpAttnPrepArgs,
-        cp_attn_prep_kernel[head_dim, rope_dims, heads_per_group,
-            local_max_seq, num_kv_heads, num_q_heads]](
-        UnsafePointer(to=args), 1)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))))
-
-
 # ============================================================================
-# CP chunked attention dispatch
+# CP chunked attention worker
 # ============================================================================
 
 
@@ -341,47 +309,6 @@ def cp_chunked_attn_kernel[
         while d + WIDTH <= head_dim:
             (dst + 2 + d).store((src + d).load[width=WIDTH]())
             d += WIDTH
-
-
-def cp_chunked_attn_dispatch[
-    head_dim: Int, local_max_seq: Int,
-    num_kv_heads: Int, num_q_heads: Int, heads_per_group: Int,
-    P: BurstThreadPool,
-](
-    q_i8_base: Int, qi_biases_base: Int, q_scales_base: Int,
-    cache_base: Int, kv_head: Int,
-    local_context_len: Int, pool_capacity: Int,
-    partial_out_base: Int,
-    mut pool: P,
-) -> PoolFence[P]:
-    """Dispatch chunked attention with CP cache parameters."""
-    var num_pg = (local_context_len + CACHE_WIDTH - 1) // CACHE_WIDTH
-    var num_chunks = min(pool_capacity, MAX_CHUNKS)
-    if num_chunks > num_pg:
-        num_chunks = num_pg
-    if num_chunks <= 0:
-        return PoolFence[P].completed()
-    var pgs_per_chunk = (num_pg + num_chunks - 1) // num_chunks
-    comptime CHUNK_F32_STRIDE = heads_per_group * (2 + head_dim)
-    var chunk_args = InlineArray[ChunkedAttnArgs, MAX_CHUNKS](fill=ChunkedAttnArgs())
-    for c in range(num_chunks):
-        var start = c * pgs_per_chunk
-        var end = min((c + 1) * pgs_per_chunk, num_pg)
-        chunk_args[c] = ChunkedAttnArgs(
-            q_i8_base=q_i8_base,
-            qi_biases_base=qi_biases_base,
-            q_scales_base=q_scales_base,
-            cache_base=cache_base,
-            kv_head=kv_head,
-            start_pg=start,
-            end_pg=end,
-            partial_out=partial_out_base + c * CHUNK_F32_STRIDE * 4,
-            context_len=local_context_len)
-    pool.dispatch[ChunkedAttnArgs,
-        cp_chunked_attn_kernel[head_dim, local_max_seq, num_kv_heads, num_q_heads, heads_per_group]](
-        UnsafePointer(to=chunk_args[0]), num_chunks)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))))
 
 
 # ============================================================================
@@ -537,17 +464,14 @@ def cp_merge_and_quantize[
 
 
 # ============================================================================
-# NUMA-safe dispatch wrappers
+# NUMA-safe worker wrappers
 # ============================================================================
 #
 # The merge and gather kernels above are called directly by the benchmark.
-# For the model's forward path, these dispatch wrappers run the same work
-# on NUMA-local pool workers so all writes target local memory.
+# For the model's forward path, dispatchers in dispatch_kernels.mojo run the
+# same work on NUMA-local pool workers so all writes target local memory.
 
 comptime MAX_CP_RANKS = 8
-
-
-# --- merge_local_chunks dispatch: runs chunk merge on rank-local pool ---
 
 
 @fieldwise_init
@@ -575,28 +499,6 @@ def merge_local_chunks_kernel[head_dim: Int, heads_per_group: Int](
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.out_m),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.out_l),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.out_v))
-
-
-def merge_local_chunks_dispatch[
-    head_dim: Int, heads_per_group: Int, P: BurstThreadPool,
-](
-    partial_base: Int, num_chunks: Int,
-    out_m: Int, out_l: Int, out_v: Int,
-    mut pool: P,
-) -> PoolFence[P]:
-    if num_chunks <= 0:
-        return PoolFence[P].completed()
-    var args = MergeChunksArgs(
-        partial_base=partial_base, num_chunks=num_chunks,
-        out_m=out_m, out_l=out_l, out_v=out_v)
-    pool.dispatch[MergeChunksArgs,
-        merge_local_chunks_kernel[head_dim, heads_per_group]](
-        UnsafePointer(to=args), 1)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))))
-
-
-# --- cp_gather_and_quantize dispatch: cross-rank V merge on rank-local pool ---
 
 
 @fieldwise_init
@@ -645,25 +547,3 @@ def cp_gather_kernel[head_dim: Int, num_heads: Int, tp: Int](
         UnsafePointer[Float32, MutAnyOrigin](
             unsafe_from_address=args.head_scales),
         args.head_start, args.head_count)
-
-
-def cp_gather_dispatch[
-    head_dim: Int, num_heads: Int, tp: Int, P: BurstThreadPool,
-](
-    rank: Int,
-    all_m: InlineArray[Int, MAX_CP_RANKS],
-    all_l: InlineArray[Int, MAX_CP_RANKS],
-    all_v: InlineArray[Int, MAX_CP_RANKS],
-    qi_out: Int, head_scales: Int,
-    head_start: Int, head_count: Int,
-    mut pool: P,
-) -> PoolFence[P]:
-    var args = CpGatherArgs(
-        rank=rank, head_start=head_start, head_count=head_count,
-        qi_out=qi_out, head_scales=head_scales,
-        all_m=all_m, all_l=all_l, all_v=all_v)
-    pool.dispatch[CpGatherArgs,
-        cp_gather_kernel[head_dim, num_heads, tp]](
-        UnsafePointer(to=args), 1)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))))

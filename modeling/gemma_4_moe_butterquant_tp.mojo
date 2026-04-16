@@ -35,7 +35,7 @@ from kernels.kernel_ops import PoolFence, BF16Ptr
 from kernels.reductions import ring_allreduce, small_allreduce, ring_broadcast, ring_allgather
 from modeling.linear_borrow_pool import ScratchPool, ScratchLease
 
-from experimental3.kernels.rmsnorm import (
+from experimental3.kernels.dispatch_kernels import (
     rmsnorm_gamma_fwht_quantize,
     rmsnorm_dual_gamma_fwht_quantize,
     rmsnorm_gamma_fwht_per_block_quantize,
@@ -43,6 +43,14 @@ from experimental3.kernels.rmsnorm import (
     expert_sum_dispatch,
     dense_norm_dispatch,
     post_reduce_dispatch,
+    int8_gemv,
+    fused_gu_gelu_tanh, fused_gu_gelu_tanh_wa,
+    int8_gemv_blocked, int8_gemv_blocked_wa,
+    lm_head_flash,
+    gemma4_moe_phase1, gemma4_moe_phase2, router_topk_dispatch,
+    sliding_attn_dispatch,
+    cp_attn_prep_dispatch, cp_chunked_attn_dispatch,
+    merge_local_chunks_dispatch, cp_gather_dispatch,
 )
 from experimental3.profiler import (
     PhaseTiming, phase_timing_from_points, finish_single_pool_fence,
@@ -52,29 +60,18 @@ from experimental3.init_weights import (
     colsum_at, block_colsum_at, block_colsum_row_major_at, pack_at,
 )
 from experimental3.gamma import compute_sqrt_gamma, compute_inv_sqrt_gamma
-from experimental3.kernels.int8_gemv import int8_gemv
-from experimental3.moe import gemma4_moe_phase1, gemma4_moe_phase2
+from experimental3.kernels.gemm import (
+    lm_head_flash_reduce, LmHeadCands,
+)
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
-from experimental3.kernels.dense_ffn import (
-    fused_gu_gelu_tanh,
-    int8_gemv_blocked,
-    router_topk_dispatch,
-)
-from experimental3.kernels.dense_ffn_workaround import (
-    fused_gu_gelu_tanh_wa,
-    int8_gemv_blocked_wa,
-)
 from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr
-from experimental3.kernels.sliding_attention import sliding_attn_dispatch
 from experimental3.kernels.full_chunked_attention_fused import (
-    cp_attn_prep_dispatch, cp_chunked_attn_dispatch,
-    merge_local_chunks_dispatch, cp_gather_dispatch, MAX_CP_RANKS,
+    MAX_CP_RANKS,
     cp_local_pos, cp_owning_rank, cp_local_context_len,
 )
-from experimental3.kernels.lm_head import lm_head_gemv
 from experimental_gemma.router import Gemma4TopKResult
 from experimental_gemma.rope import init_sliding_rope_tables, init_full_rope_tables
-from experimental_gemma.ops import embed_lookup_blocked, logit_softcap
+from experimental_gemma.ops import embed_lookup_blocked
 from modeling.loader import discover_shards, load_weights_from_descs
 from modeling.model_spec import HOST_RANK
 from simd_math import sqrt
@@ -529,7 +526,7 @@ def calculate_peak_scratch[tp: Int]() -> Int:
     comptime vocab_num_blocks = C.HIDDEN // LM_HEAD_FWHT_BLK
     comptime lm_head_peak = (
         C.HIDDEN * i8 + vocab_num_blocks * f32
-        + C.HIDDEN * f32 + C.VOCAB_SIZE * bf16
+        + C.HIDDEN * f32 + size_of[LmHeadCands]()
     )
     return lm_head_peak if lm_head_peak > decode_peak else decode_peak
 
@@ -1006,7 +1003,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
     # Forward — decode (seq_len=1)
     # =========================================================================
 
-    def forward_decode(mut self, tokens_ptr: Int, pos: Int) -> LogitsView[C.VOCAB_SIZE]:
+    def forward_decode(mut self, tokens_ptr: Int, pos: Int, rng_key: UInt64) -> Int32:
         comptime S = Gemma4Shapes[Self.tp]
         comptime Q_DIM_LOCAL_SLIDING = C.Q_DIM_SLIDING // Self.tp
         comptime KV_DIM_LOCAL_SLIDING = C.KV_DIM_SLIDING // Self.tp
@@ -1577,30 +1574,31 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             EPS, 1, self.main_pools[0])
         var t_final1 = Int(perf_counter_ns())
         sample.add(self.profile.phase("final_norm"), finish_single_pool_fence(t_final0, t_final1, final_fence^))
-        var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
-        var logit_view = scratch_tensor_view[BF16, 1, C.VOCAB_SIZE](host.scratch_base(), logit_lease, 1)
+        var candidates_lease = self.scratch.borrow[LmHeadCands, 1]()
+        var candidates_ptr = UnsafePointer[LmHeadCands, MutAnyOrigin](
+            unsafe_from_address=host.scratch_addr(candidates_lease))
         var t_lm0 = Int(perf_counter_ns())
-        var lm_fence = lm_head_gemv[
+        var lm_fence = lm_head_flash[
             C.VOCAB_SIZE, C.HIDDEN, LM_HEAD_FWHT_BLK](
-            host.scratch_addr(lm_act_i8_lease),
-            host.host.embed.addr(host.arena_base),
-            host.scratch_addr(lm_act_blk_scale_lease),
-            host.host.embed_sc.addr(host.arena_base),
-            host.arena_base + host.host.embed_colsum_off,
-            logit_view.ptr,
+            I8Ptr(unsafe_from_address=host.scratch_addr(lm_act_i8_lease)),
+            I8Ptr(unsafe_from_address=host.host.embed.addr(host.arena_base)),
+            F32Ptr(unsafe_from_address=host.scratch_addr(lm_act_blk_scale_lease)),
+            F32Ptr(unsafe_from_address=host.host.embed_sc.addr(host.arena_base)),
+            F32Ptr(unsafe_from_address=host.arena_base + host.host.embed_colsum_off),
+            candidates_ptr,
+            rng_key,
+            Float32(C.LOGIT_SOFTCAP),
             self.main_pools[0])
         var t_lm1 = Int(perf_counter_ns())
         sample.add(self.profile.phase("lm_head"), finish_single_pool_fence(t_lm0, t_lm1, lm_fence^))
         lm_work_lease^.release()
         lm_act_blk_scale_lease^.release()
         lm_act_i8_lease^.release()
-        var t_softcap0 = Int(perf_counter_ns())
-        logit_softcap(logit_view)
-        sample.add(self.profile.phase("softcap"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_softcap0))
+        var sampled = lm_head_flash_reduce(candidates_ptr)
+        candidates_lease^.release()
         sample.wall_ns = Int(perf_counter_ns()) - t_forward0
         self.profile.record(sample)
-        return LogitsView[C.VOCAB_SIZE](
-            scratch_ptr[Scalar[DType.bfloat16]](host.scratch_base(), logit_lease), logit_lease^)
+        return sampled
 
 
 def main():

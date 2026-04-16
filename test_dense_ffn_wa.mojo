@@ -14,12 +14,12 @@ from std.collections import InlineArray
 
 from threading import BurstPool
 from kernels.vnni import pack_vnni, VNNI_N_STEP, VNNI_K_STEP, VNNI_TILE_N, VNNI_BLK, compute_n_block
-from experimental3.kernels.int8_gemv import dot
+from experimental3.kernels.dot_prod import dot
 from experimental3.kernels.fwht import fwht_block
 from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.kernels.gelu_tanh_fwht_quantize import gelu_tanh_f32
-from experimental3.moe import gemv_row_blocked
-from experimental3.kernels.dense_ffn_workaround import gemv_row_blocked_wa, fused_gu_gelu_tanh_wa
+from experimental3.kernels.gemv import gemv_row_blocked, gemv_row_blocked_wa
+from experimental3.kernels.dispatch_kernels import fused_gu_gelu_tanh_wa
 
 
 # --- test data ---

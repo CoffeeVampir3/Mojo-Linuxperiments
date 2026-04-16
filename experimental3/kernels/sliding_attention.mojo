@@ -1,12 +1,13 @@
-"""Sliding window decode attention — single-pass online softmax with VNNI."""
+"""Sliding window decode attention — single-pass online softmax with VNNI.
+
+Pool dispatcher (sliding_attn_dispatch) lives in dispatch_kernels.mojo.
+"""
 
 from std.memory import UnsafePointer
 from std.collections import InlineArray
 
-from kernels.kernel_ops import PoolFence
-from threading.threading_traits import BurstThreadPool
 from experimental3.amx import VNNI_BLK
-from experimental3.kernels.int8_gemv import vpdpbusd
+from experimental3.kernels.dot_prod import vpdpbusd
 from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
 from experimental3.kernels.rope_and_kv_cache_write import (
@@ -302,39 +303,3 @@ def sliding_attn_group_kernel[
         head_scales[qh] = absmax_quantize_i8[head_dim](work, qi_out + qh * head_dim)
 
 
-# ============================================================================
-# Dispatch wrapper
-# ============================================================================
-
-
-def sliding_attn_dispatch[
-    head_dim: Int, heads_per_group: Int, window_size: Int,
-    num_kv_heads: Int, num_q_heads: Int, P: BurstThreadPool,
-](
-    q_base: Int, k_base: Int, v_base: Int,
-    q_norm_ptr: Int, k_norm_ptr: Int,
-    cos_ptr: Int, sin_ptr: Int,
-    cache_base: Int, cache_pos: Int, context_len: Int,
-    qi_out_ptr: Int, head_scale_ptr: Int,
-    eps: Float32, mut pool: P,
-) -> PoolFence[P]:
-    comptime NKV = num_kv_heads
-    var jobs = InlineArray[AttnGroupArgs, 8](fill=AttnGroupArgs())
-    for g in range(NKV):
-        jobs[g] = AttnGroupArgs(
-            q_base + g * heads_per_group * head_dim * 2,
-            k_base + g * head_dim * 2,
-            v_base + g * head_dim * 2,
-            q_norm_ptr, k_norm_ptr,
-            cos_ptr, sin_ptr,
-            cache_base, g,
-            cache_pos, context_len,
-            qi_out_ptr + g * heads_per_group * head_dim,
-            head_scale_ptr + g * heads_per_group * 4,
-            eps)
-    pool.dispatch[AttnGroupArgs,
-        sliding_attn_group_kernel[head_dim, heads_per_group,
-            window_size, num_kv_heads, num_q_heads]](
-        UnsafePointer(to=jobs[0]), NKV)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))))

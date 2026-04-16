@@ -19,7 +19,7 @@ from modeling.gemma4_common import is_full_layer
 from experimental3.kernels.full_chunked_attention import (
     merge_and_quantize, partial_head_stride, partial_chunk_stride,
 )
-from experimental3.kernels.dense_ffn import (
+from experimental3.kernels.gemm import (
     int8_gemv_blocked_worker, Int8GemvBlockedArgs,
 )
 from experimental3.kernels.quantize import absmax_quantize_i8

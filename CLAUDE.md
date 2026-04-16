@@ -6,4 +6,6 @@ Avoid comments that add no value. Avoid commenting on unfinished code or prototy
 
 This is a mojo project, mojo is very good at simd. Where possible prefer simd over scalar code.
 
+Avoid using reserved keywords life "ref". Try to name things with names that are helpful to the reader.
+
 NumaArena is designed to regionalize local memory to a numa domain. BurstPools are designed to run numa-local workers at HFT frequency dispatch/join cycles. The project has a high focus on these concepts and they should be respected.

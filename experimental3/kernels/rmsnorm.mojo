@@ -1,12 +1,7 @@
-"""RMSNorm kernels — composed from atomic stages in common_math."""
+"""RMSNorm kernels — row-level math + workers. Dispatchers in dispatch_kernels.mojo."""
 
-from std.memory import UnsafePointer
-from std.sys.info import simd_width_of, size_of
-from std.collections import InlineArray
-from threading.threading_traits import BurstThreadPool
+from std.sys.info import simd_width_of
 
-from modeling.model_spec import Encoding, Shaped, Bound, DynView
-from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY
 from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.kernels.fwht import fwht_block
 from experimental3.moe import moe_combine
@@ -21,13 +16,6 @@ from experimental3.common_math import (
 # ============================================================================
 # Shared helpers
 # ============================================================================
-
-
-@always_inline
-def rmsnorm_pool_fence[P: BurstThreadPool](mut pool: P) -> PoolFence[P]:
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
 
 
 @always_inline
@@ -220,7 +208,7 @@ def rmsnorm_bf16_row[cols: Int, has_gamma: Bool, has_residual: Bool](
 
 
 # ============================================================================
-# FWHT + quantize: unified args, worker, dispatcher
+# FWHT + quantize: unified args, worker
 # ============================================================================
 
 
@@ -268,66 +256,8 @@ def rmsnorm_fwht_quant_worker[cols: Int, block: Int,
             work, scales + m * scale_stride, args.eps)
 
 
-def rmsnorm_fwht_quant[cols: Int, block: Int,
-    has_gamma: Bool, per_block: Bool, P: BurstThreadPool](
-    in_ptr: Int, gamma_ptr: Int, qi_ptr: Int, work_ptr: Int,
-    scale_ptr: Int, eps: Float32, seq_len: Int, mut pool: P,
-) -> PoolFence[P]:
-    """Unified FWHT+quantize dispatcher. Use convenience wrappers below."""
-    if seq_len == 0:
-        return PoolFence[P].completed()
-
-    var num_jobs = min(seq_len, pool.get_capacity())
-    var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
-
-    var jobs = InlineArray[RmsNormFwhtQuantArgs, MAX_POOL_CAPACITY](
-        fill=RmsNormFwhtQuantArgs())
-    for i in range(num_jobs):
-        var start = i * rows_per_job
-        var end = min(start + rows_per_job, seq_len)
-        jobs[i] = RmsNormFwhtQuantArgs(
-            in_ptr, gamma_ptr, qi_ptr,
-            work_ptr + i * cols * size_of[Float32](),
-            scale_ptr, eps, start, end)
-
-    pool.dispatch[RmsNormFwhtQuantArgs,
-        rmsnorm_fwht_quant_worker[cols, block, has_gamma, per_block]](
-        UnsafePointer(to=jobs[0]), num_jobs)
-    return rmsnorm_pool_fence(pool)
-
-
-# ---- Convenience wrappers (preserve existing call-site names) ----
-
-
-def rmsnorm_gamma_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
-    in_ptr: Int, gamma_ptr: Int, qi_ptr: Int, work_ptr: Int,
-    scale_ptr: Int, eps: Float32, seq_len: Int, mut pool: P,
-) -> PoolFence[P]:
-    """RMSNorm * gamma + FWHT + per-row i8."""
-    return rmsnorm_fwht_quant[cols, block, True, False, P](
-        in_ptr, gamma_ptr, qi_ptr, work_ptr, scale_ptr, eps, seq_len, pool)
-
-
-def rmsnorm_gamma_fwht_per_block_quantize[cols: Int, block: Int, P: BurstThreadPool](
-    in_ptr: Int, gamma_ptr: Int, qi_ptr: Int, work_ptr: Int,
-    blk_scale_ptr: Int, eps: Float32, seq_len: Int, mut pool: P,
-) -> PoolFence[P]:
-    """RMSNorm * gamma + FWHT + per-block i8."""
-    return rmsnorm_fwht_quant[cols, block, True, True, P](
-        in_ptr, gamma_ptr, qi_ptr, work_ptr, blk_scale_ptr, eps, seq_len, pool)
-
-
-def rmsnorm_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
-    in_ptr: Int, qi_ptr: Int, work_ptr: Int,
-    scale_ptr: Int, eps: Float32, seq_len: Int, mut pool: P,
-) -> PoolFence[P]:
-    """RMSNorm + FWHT + per-row i8. No gamma."""
-    return rmsnorm_fwht_quant[cols, block, False, False, P](
-        in_ptr, 0, qi_ptr, work_ptr, scale_ptr, eps, seq_len, pool)
-
-
 # ============================================================================
-# Dual-lane FWHT + quantize: args, worker, dispatcher
+# Dual-lane FWHT + quantize: args, worker
 # ============================================================================
 
 
@@ -384,40 +314,6 @@ def rmsnorm_dual_gamma_fwht_quant_worker[cols: Int, block: Int](
         )
 
 
-def rmsnorm_dual_gamma_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
-    in_ptr: Int,
-    gamma_a_ptr: Int, gamma_b_ptr: Int,
-    qi_a_ptr: Int, qi_b_ptr: Int,
-    work_a_ptr: Int, work_b_ptr: Int,
-    scale_a_ptr: Int, scale_b_ptr: Int,
-    eps: Float32, seq_len: Int, mut pool: P,
-) -> PoolFence[P]:
-    """Dual-gamma RMSNorm + FWHT + per-row i8. One pass, two outputs."""
-    if seq_len == 0:
-        return PoolFence[P].completed()
-
-    var num_jobs = min(seq_len, pool.get_capacity())
-    var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
-
-    var jobs = InlineArray[RmsNormDualGammaFwhtArgs, MAX_POOL_CAPACITY](
-        fill=RmsNormDualGammaFwhtArgs())
-    for i in range(num_jobs):
-        var start = i * rows_per_job
-        var end = min(start + rows_per_job, seq_len)
-        jobs[i] = RmsNormDualGammaFwhtArgs(
-            in_ptr, gamma_a_ptr, gamma_b_ptr,
-            qi_a_ptr, qi_b_ptr,
-            work_a_ptr + i * cols * size_of[Float32](),
-            work_b_ptr + i * cols * size_of[Float32](),
-            scale_a_ptr, scale_b_ptr,
-            eps, start, end)
-
-    pool.dispatch[RmsNormDualGammaFwhtArgs,
-        rmsnorm_dual_gamma_fwht_quant_worker[cols, block]](
-        UnsafePointer(to=jobs[0]), num_jobs)
-    return rmsnorm_pool_fence(pool)
-
-
 # ============================================================================
 # bf16 norms: no FWHT, no quantize
 #
@@ -470,76 +366,8 @@ def rmsnorm_per_head_kernel[head_dim: Int, num_heads: Int](args: RMSNormPerHeadA
                 args.eps)
 
 
-def rmsnorm_no_scale[InT: Encoding & Shaped, OutT: Encoding & Shaped,
-    P: BurstThreadPool](
-    input: DynView[InT], output: DynView[OutT],
-    mut pool: P,
-    eps: Float32 = 1e-6,
-) -> PoolFence[P]:
-    """RMSNorm without learnable scale via BurstPool."""
-    comptime assert InT.DTYPE == DType.bfloat16, "rmsnorm_no_scale: input must be bf16"
-    comptime assert OutT.DTYPE == DType.bfloat16, "rmsnorm_no_scale: output must be bf16"
-    comptime assert InT.COLS == OutT.COLS, "rmsnorm_no_scale: input/output cols mismatch"
-    comptime assert InT.COLS % simd_width_of[DType.float32]() == 0, "rmsnorm_no_scale: cols must be f32-simd-aligned"
-
-    var seq_len = input.seq_len
-    if seq_len == 0:
-        return PoolFence[P].completed()
-
-    var num_jobs = min(seq_len, pool.get_capacity())
-    var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
-
-    var ip = input.as_ptr[DType.bfloat16]()
-    var op = output.as_ptr[DType.bfloat16]()
-    var jobs = InlineArray[RMSNormNoScaleArgs, MAX_POOL_CAPACITY](uninitialized=True)
-    for i in range(num_jobs):
-        var start = i * rows_per_job
-        var end = min(start + rows_per_job, seq_len)
-        jobs[i] = RMSNormNoScaleArgs(ip, op, start, end, eps)
-
-    pool.dispatch[RMSNormNoScaleArgs, rmsnorm_no_scale_kernel[InT.COLS]](
-        UnsafePointer(to=jobs[0]), num_jobs)
-    return rmsnorm_pool_fence(pool)
-
-
-def rmsnorm_per_head[head_dim: Int, num_heads: Int,
-    W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped,
-    P: BurstThreadPool](
-    input: DynView[InT], weight: Bound[W], output: DynView[OutT],
-    mut pool: P,
-    eps: Float32 = 1e-6,
-) -> PoolFence[P] where W.DTYPE == DType.bfloat16:
-    """Per-head RMSNorm with learnable scale via BurstPool."""
-    comptime assert InT.DTYPE == DType.bfloat16, "rmsnorm_per_head: input must be bf16"
-    comptime assert OutT.DTYPE == DType.bfloat16, "rmsnorm_per_head: output must be bf16"
-    comptime assert InT.COLS == OutT.COLS, "rmsnorm_per_head: input/output cols mismatch"
-    comptime assert InT.COLS == head_dim * num_heads, "rmsnorm_per_head: cols != heads * dim"
-    comptime assert W.ROWS * W.COLS == head_dim, "rmsnorm_per_head: weight size != head_dim"
-    comptime assert head_dim % simd_width_of[DType.float32]() == 0, "rmsnorm_per_head: head_dim must be f32-simd-aligned"
-
-    var seq_len = input.seq_len
-    if seq_len == 0:
-        return PoolFence[P].completed()
-
-    var num_jobs = min(seq_len, pool.get_capacity())
-    var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
-
-    var ip = input.as_ptr[DType.bfloat16]()
-    var wp = weight.as_ptr[DType.bfloat16]()
-    var op = output.as_ptr[DType.bfloat16]()
-    var jobs = InlineArray[RMSNormPerHeadArgs, MAX_POOL_CAPACITY](uninitialized=True)
-    for i in range(num_jobs):
-        var start = i * rows_per_job
-        var end = min(start + rows_per_job, seq_len)
-        jobs[i] = RMSNormPerHeadArgs(ip, wp, op, start, end, eps)
-
-    pool.dispatch[RMSNormPerHeadArgs, rmsnorm_per_head_kernel[head_dim, num_heads]](
-        UnsafePointer(to=jobs[0]), num_jobs)
-    return rmsnorm_pool_fence(pool)
-
-
 # ============================================================================
-# Fused norm + residual kernels (single-row, dispatched for decode forward)
+# Fused norm + residual kernels (single-row)
 # ============================================================================
 
 
@@ -630,47 +458,3 @@ def post_reduce_kernel[hidden: Int](args: PostReduceArgs):
         BF16Ptr(unsafe_from_address=args.combine_norm_w_ptr),
         BF16Ptr(unsafe_from_address=args.x_main_ptr),
         args.layer_scalar, args.eps)
-
-
-# ============================================================================
-# Dispatch wrappers — single-job kernels with proper lifetime
-# ============================================================================
-
-
-def post_attn_norm_dispatch[hidden: Int, P: BurstThreadPool](
-    src_ptr: Int, norm_w_ptr: Int, x_main_ptr: Int, eps: Float32, mut pool: P,
-) -> PoolFence[P]:
-    var args = PostAttnNormArgs(src_ptr, norm_w_ptr, x_main_ptr, eps)
-    pool.dispatch[PostAttnNormArgs, post_attn_norm_kernel[hidden]](
-        UnsafePointer(to=args), 1)
-    return rmsnorm_pool_fence(pool)
-
-
-def expert_sum_dispatch[hidden: Int, P: BurstThreadPool](
-    expert_out_ptr: Int, local_count: Int, dst_ptr: Int, mut pool: P,
-) -> PoolFence[P]:
-    var args = ExpertSumArgs(expert_out_ptr, local_count, dst_ptr)
-    pool.dispatch[ExpertSumArgs, expert_sum_kernel[hidden]](
-        UnsafePointer(to=args), 1)
-    return rmsnorm_pool_fence(pool)
-
-
-def dense_norm_dispatch[hidden: Int, P: BurstThreadPool](
-    src_ptr: Int, norm_w_ptr: Int, dst_ptr: Int, eps: Float32, mut pool: P,
-) -> PoolFence[P]:
-    var args = DenseNormArgs(src_ptr, norm_w_ptr, dst_ptr, eps)
-    pool.dispatch[DenseNormArgs, dense_norm_kernel[hidden]](
-        UnsafePointer(to=args), 1)
-    return rmsnorm_pool_fence(pool)
-
-
-def post_reduce_dispatch[hidden: Int, P: BurstThreadPool](
-    moe_out_ptr: Int, moe_norm_w_ptr: Int, dense_normed_ptr: Int,
-    combine_norm_w_ptr: Int, x_main_ptr: Int,
-    layer_scalar: Float32, eps: Float32, mut pool: P,
-) -> PoolFence[P]:
-    var args = PostReduceArgs(moe_out_ptr, moe_norm_w_ptr, dense_normed_ptr,
-        combine_norm_w_ptr, x_main_ptr, layer_scalar, eps)
-    pool.dispatch[PostReduceArgs, post_reduce_kernel[hidden]](
-        UnsafePointer(to=args), 1)
-    return rmsnorm_pool_fence(pool)

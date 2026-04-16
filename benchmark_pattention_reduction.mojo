@@ -33,7 +33,7 @@ from experimental3.kernels.full_chunked_attention import (
     partial_head_stride, partial_chunk_stride,
 )
 from experimental3.kernels.full_chunked_attention_fused import cp_merge_and_quantize
-from experimental3.kernels.dense_ffn import int8_gemv_blocked
+from experimental3.kernels.dispatch_kernels import int8_gemv_blocked
 from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr, BF16Ptr
 from modeling.model_spec import Mat, BF16
 

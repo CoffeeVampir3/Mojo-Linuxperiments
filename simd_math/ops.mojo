@@ -185,3 +185,42 @@ def exp_f32_fast[width: Int](x: SIMD[DType.float32, width]) -> SIMD[DType.float3
     )
 
     return p * pow2n
+
+
+# =============================================================================
+# Logarithm
+# =============================================================================
+
+
+def log_f32[width: Int](x: SIMD[DType.float32, width]) -> SIMD[DType.float32, width]:
+    """ln(x) for f32, x > 0. Bit-split + atanh series, branchless.
+
+    Splits x = m * 2^e with m ∈ [1, 2), centers m to [sqrt(2)/2, sqrt(2)) by
+    halving when m > sqrt(2), then uses log(m) = 2·atanh((m-1)/(m+1)) as a
+    degree-11 odd polynomial in z = (m-1)/(m+1). See validate_log_f32.mojo.
+    """
+    comptime LN2 = Float32(0.6931471805599453)
+    comptime SQRT2 = Float32(1.4142135623730951)
+
+    var bits = x.to_bits()
+    var e = (bits >> 23).cast[DType.int32]() - 127
+    var m_bits = (bits & 0x007FFFFF) | 0x3F800000
+    var m = SIMD[DType.float32, width](from_bits=m_bits)
+
+    # Center: if m > sqrt(2), m *= 0.5 and e += 1. Sign-bit of (SQRT2 - m)
+    # is 1 iff m > SQRT2.
+    var big = (SIMD[DType.float32, width](SQRT2) - m).to_bits() >> 31
+    var big_f = big.cast[DType.float32]()
+    m = m * (1.0 - 0.5 * big_f)
+    e = e + big.cast[DType.int32]()
+
+    var z = (m - 1.0) / (m + 1.0)
+    var z2 = z * z
+    var t = SIMD[DType.float32, width](Float32(1.0 / 11.0))
+    t = Float32(1.0 / 9.0) + z2 * t
+    t = Float32(1.0 / 7.0) + z2 * t
+    t = Float32(1.0 / 5.0) + z2 * t
+    t = Float32(1.0 / 3.0) + z2 * t
+    t = Float32(1.0) + z2 * t
+
+    return 2.0 * z * t + e.cast[DType.float32]() * LN2
