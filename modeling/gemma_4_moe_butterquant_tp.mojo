@@ -991,7 +991,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
 
         var main_pools = HeapMoveArray[BurstPool[]](Self.tp)
         for rank in range(Self.tp):
-            main_pools.push(BurstPool[].for_numa_node(numa, numa_topo[rank]))
+            main_pools.push(BurstPool[].for_numa_node(numa, numa_topo[rank], headroom=2))
 
         var topos = InlineArray[Gemma4Topology[Self.tp], Self.tp](fill=plan.topology)
         for rank in range(Self.tp):
