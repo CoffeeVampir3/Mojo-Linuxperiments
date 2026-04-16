@@ -301,3 +301,96 @@ def ring_allreduce[T: Encoding & Shaped, tp: Int](
 
     for r in range(tp):
         pool_ptrs[r][].join()
+
+
+# =============================================================================
+# Allgather: parallel pull — each rank assembles all shards locally
+# =============================================================================
+
+
+struct AllGatherConfig:
+    var src_ptrs_addr: Int
+    var dst_ptrs_addr: Int
+    var shard_bytes: Int
+    var tp: Int
+
+    def __init__(out self):
+        self.src_ptrs_addr = 0
+        self.dst_ptrs_addr = 0
+        self.shard_bytes = 0
+        self.tp = 0
+
+
+@fieldwise_init
+struct AllGatherArgs(Copyable, ImplicitlyCopyable):
+    var config_addr: Int
+    var my_rank: Int
+    var worker_idx: Int
+    var num_workers: Int
+
+
+def allgather_kernel(args: AllGatherArgs):
+    """Each worker copies its slice of every shard into the local dst buffer."""
+    var cfg = tptr[AllGatherConfig](args.config_addr)
+    var src_ptrs = tptr[Int](cfg[].src_ptrs_addr)
+    var dst_ptrs = tptr[Int](cfg[].dst_ptrs_addr)
+    var shard_bytes = cfg[].shard_bytes
+    var tp = cfg[].tp
+    var my_dst = dst_ptrs[args.my_rank]
+    var workers = args.num_workers if args.num_workers > 0 else 1
+
+    var bytes_per_worker = (shard_bytes + workers - 1) // workers
+    var start = args.worker_idx * bytes_per_worker
+    var end = min(start + bytes_per_worker, shard_bytes)
+    if start >= end:
+        return
+
+    var count = end - start
+    for src in range(tp):
+        memcpy(
+            dest=tptr[Byte](my_dst + src * shard_bytes + start),
+            src=tptr[Byte](src_ptrs[src] + start),
+            count=count)
+
+
+def ring_allgather[tp: Int](
+    src_ptrs: InlineArray[Int, tp],
+    dst_ptrs: InlineArray[Int, tp],
+    shard_bytes: Int,
+    pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp],
+):
+    """Parallel pull allgather. Each rank's pool workers copy all shards
+    into the local concatenated buffer. Shard s is placed at
+    dst[rank] + s * shard_bytes. All writes are NUMA-local.
+
+    Caller must ensure source data is ready (e.g. via tp_parallel join)
+    before calling — no cross-rank synchronization is performed.
+    """
+    if shard_bytes <= 0:
+        return
+    if tp <= 1:
+        if src_ptrs[0] != dst_ptrs[0]:
+            memcpy(
+                dest=tptr[Byte](dst_ptrs[0]),
+                src=tptr[Byte](src_ptrs[0]),
+                count=shard_bytes)
+        return
+
+    var cfg = AllGatherConfig()
+    cfg.src_ptrs_addr = Int(UnsafePointer(to=src_ptrs))
+    cfg.dst_ptrs_addr = Int(UnsafePointer(to=dst_ptrs))
+    cfg.shard_bytes = shard_bytes
+    cfg.tp = tp
+    var config_addr = Int(UnsafePointer(to=cfg))
+
+    var jobs = InlineArray[AllGatherArgs, 128](
+        fill=AllGatherArgs(0, 0, 0, 0))
+    for r in range(tp):
+        var num_workers = pool_ptrs[r][].capacity
+        for w in range(num_workers):
+            jobs[w] = AllGatherArgs(config_addr, r, w, num_workers)
+        pool_ptrs[r][].dispatch[AllGatherArgs, allgather_kernel](
+            UnsafePointer(to=jobs[0]), num_workers)
+
+    for r in range(tp):
+        pool_ptrs[r][].join()

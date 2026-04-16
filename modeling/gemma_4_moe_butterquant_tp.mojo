@@ -32,7 +32,7 @@ from modeling.modeling_common import (
     scratch_tensor_view, scratch_ptr,
 )
 from kernels.kernel_ops import PoolFence, BF16Ptr
-from kernels.reductions import ring_allreduce, ring_broadcast
+from kernels.reductions import ring_allreduce, ring_broadcast, ring_allgather
 from modeling.linear_borrow_pool import ScratchPool, ScratchLease
 
 from experimental3.kernels.rmsnorm import (
@@ -70,6 +70,11 @@ from experimental3.kernels.full_chunked_attention import (
     merge_and_quantize, full_attn_prep_dispatch, chunked_attn_dispatch,
     CACHE_WIDTH as ATTN_CACHE_WIDTH,
 )
+from experimental3.kernels.full_chunked_attention_fused import (
+    cp_attn_prep_dispatch, cp_chunked_attn_dispatch,
+    merge_local_chunks_dispatch, cp_gather_dispatch, MAX_CP_RANKS,
+    cp_local_pos, cp_owning_rank, cp_local_context_len,
+)
 from experimental3.kernels.lm_head import lm_head_gemv
 from experimental_gemma.router import Gemma4TopKResult
 from experimental_gemma.rope import init_sliding_rope_tables, init_full_rope_tables
@@ -77,6 +82,7 @@ from experimental_gemma.ops import embed_lookup_blocked, logit_softcap
 from modeling.loader import discover_shards, load_weights_from_descs
 from modeling.model_spec import HOST_RANK
 from simd_math import sqrt
+from experimental3.tensor_dump import Dumper
 
 
 
@@ -94,6 +100,7 @@ comptime LM_HEAD_FWHT_BLK = 64
 comptime MOE_NUM_BLOCKS = C.MOE_INTERMEDIATE // FWHT_BLK
 comptime EMBED_SCALE = 53.0
 comptime VNNI_ALIGN = 64
+comptime DUMP_ATTENTION = False
 
 
 # =============================================================================
@@ -486,6 +493,11 @@ def calculate_peak_scratch[tp: Int]() -> Int:
         full_q_bf16 + full_k_bf16
         + C.HIDDEN * i8 + C.HIDDEN * f32 + f32
     )
+    comptime full_attn_cp_extra = (
+        C.Q_DIM_FULL * bf16
+        + C.NUM_HEADS * f32 * 2
+        + C.NUM_HEADS * C.HEAD_DIM_FULL * f32
+    )
     comptime full_attn_phase2 = persistent + (
         full_q_bf16 + full_k_bf16
         + S.FullQ.N * i8
@@ -493,6 +505,7 @@ def calculate_peak_scratch[tp: Int]() -> Int:
         + S.FULL_HPG * C.HEAD_DIM_FULL * i8
         + S.FULL_HPG * f32 * 2
         + FULL_ATTN_MAX_CHUNKS * S.FULL_HPG * (2 + C.HEAD_DIM_FULL) * f32
+        + full_attn_cp_extra
     )
     comptime full_attn_peak = (
         full_attn_phase1 if full_attn_phase1 > full_attn_phase2 else full_attn_phase2
@@ -582,9 +595,10 @@ def build_gemma4_plan[tp: Int]() -> Gemma4LoadPlan[tp]:
     comptime sliding_cache_stride = Gemma4KVCache[
         C.SLIDING_WINDOW, C.HEAD_DIM_SLIDING,
         C.NUM_KV_HEADS_SLIDING // tp, C.NUM_HEADS // tp].TOTAL_BYTES
+    comptime LOCAL_MAX_SEQ_FULL = (C.MAX_SEQ_LEN + tp - 1) // tp
     comptime full_cache_stride = Gemma4KVCache[
-        C.MAX_SEQ_LEN, C.HEAD_DIM_FULL,
-        C.NUM_KV_HEADS_FULL // tp, C.NUM_HEADS // tp].TOTAL_BYTES
+        LOCAL_MAX_SEQ_FULL, C.HEAD_DIM_FULL,
+        C.NUM_KV_HEADS_FULL, C.NUM_HEADS].TOTAL_BYTES
     var sliding_cache_off = state.reserve_bytes(C.NUM_SLIDING_LAYERS * sliding_cache_stride)
     var full_cache_off = state.reserve_bytes(C.NUM_FULL_LAYERS * full_cache_stride)
 
@@ -936,14 +950,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             )
             return None
 
-        if C.NUM_KV_HEADS_FULL % Self.tp != 0:
-            print(
-                "unsupported TP=", Self.tp,
-                ": full attention requires NUM_KV_HEADS_FULL divisible by tp;",
-                " got NUM_KV_HEADS_FULL=", C.NUM_KV_HEADS_FULL,
-            )
-            return None
-
         if C.NUM_KV_HEADS_SLIDING % Self.tp != 0:
             print(
                 "unsupported TP=", Self.tp,
@@ -1142,8 +1148,12 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 attn_work_lease^.release()
                 attn_i8_lease^.release()
             else:
-                # Full attention
-                comptime FULL_NKV_LOCAL = C.NUM_KV_HEADS_FULL // Self.tp
+                # Full attention — context parallel
+                comptime LOCAL_MAX_SEQ_FULL = (C.MAX_SEQ_LEN + Self.tp - 1) // Self.tp
+                comptime HEADS_PER_RANK = C.NUM_HEADS // Self.tp
+                comptime Q_GROUP_BF16 = FULL_HPG * C.HEAD_DIM_FULL * 2
+                comptime K_HEAD_BF16 = C.HEAD_DIM_FULL * 2
+
                 var full_q_lease = self.scratch.borrow[Scalar[DType.bfloat16], Q_DIM_LOCAL_FULL]()
                 var full_k_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.KV_DIM_FULL]()
 
@@ -1191,61 +1201,102 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 full_attn_work_lease^.release()
                 full_attn_i8_lease^.release()
 
+                # Q all-gather: each rank pulls all Q shards locally
+                var full_q_all_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.Q_DIM_FULL]()
+                var q_shard_ptrs = InlineArray[Int, Self.tp](fill=0)
+                var q_dst_ptrs = InlineArray[Int, Self.tp](fill=0)
+                for r in range(Self.tp):
+                    q_shard_ptrs[r] = topos[r].scratch_addr(full_q_lease)
+                    q_dst_ptrs[r] = topos[r].scratch_addr(full_q_all_lease)
+                ring_allgather[Self.tp](
+                    q_shard_ptrs, q_dst_ptrs, Q_DIM_LOCAL_FULL * 2, mp)
+
                 var attn_qi_lease = self.scratch.borrow[Scalar[DType.int8], Q_DIM_LOCAL_FULL]()
-                var attn_head_sc_lease = self.scratch.borrow[Float32, Q_DIM_LOCAL_FULL // C.HEAD_DIM_FULL]()
+                var attn_head_sc_lease = self.scratch.borrow[Float32, HEADS_PER_RANK]()
                 var q_i8_prep_lease = self.scratch.borrow[Scalar[DType.int8], FULL_HPG * C.HEAD_DIM_FULL]()
                 var qi_biases_lease = self.scratch.borrow[Float32, FULL_HPG]()
                 var q_scales_lease = self.scratch.borrow[Float32, FULL_HPG]()
                 comptime PARTIAL_F32S = FULL_ATTN_MAX_CHUNKS * FULL_HPG * (2 + C.HEAD_DIM_FULL)
                 var partial_lease = self.scratch.borrow[Float32, PARTIAL_F32S]()
+                var cp_m_lease = self.scratch.borrow[Float32, C.NUM_HEADS]()
+                var cp_l_lease = self.scratch.borrow[Float32, C.NUM_HEADS]()
+                var cp_v_lease = self.scratch.borrow[Float32, C.NUM_HEADS * C.HEAD_DIM_FULL]()
+
+                for kv in range(C.NUM_KV_HEADS_FULL):
+                    @parameter
+                    def do_cp_attn_prep[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                        var lb = topo.full_base(full_idx)
+                        var fl = topo.full.proto
+                        var lp = cp_local_pos(pos, Self.tp)
+                        var is_owner = cp_owning_rank(pos, Self.tp) == rank
+                        return cp_attn_prep_dispatch[
+                            C.HEAD_DIM_FULL, ROPE_DIMS_FULL, FULL_HPG,
+                            LOCAL_MAX_SEQ_FULL, C.NUM_KV_HEADS_FULL, C.NUM_HEADS](
+                            topo.scratch_addr(full_q_all_lease) + kv * Q_GROUP_BF16,
+                            topo.scratch_addr(full_k_lease) + kv * K_HEAD_BF16,
+                            fl.attn.q_norm.addr(lb), fl.attn.k_norm.addr(lb),
+                            topo.state_base() + topo.full_rope.cos.offset + pos * 64 * size_of[Float32](),
+                            topo.state_base() + topo.full_rope.sin.offset + pos * 64 * size_of[Float32](),
+                            topo.full_cache_base(full_idx), lp, kv,
+                            EPS, is_owner,
+                            topo.scratch_addr(q_i8_prep_lease),
+                            topo.scratch_addr(qi_biases_lease),
+                            topo.scratch_addr(q_scales_lease),
+                            pool)
+                    sample.attention.add(tp_parallel[Self.tp, do_cp_attn_prep](topos, mp))
+
+                    @parameter
+                    def do_cp_chunk_attn[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                        var local_ctx = cp_local_context_len(pos + 1, rank, Self.tp)
+                        return cp_chunked_attn_dispatch[
+                            C.HEAD_DIM_FULL, LOCAL_MAX_SEQ_FULL,
+                            C.NUM_KV_HEADS_FULL, C.NUM_HEADS, FULL_HPG](
+                            topo.scratch_addr(q_i8_prep_lease),
+                            topo.scratch_addr(qi_biases_lease),
+                            topo.scratch_addr(q_scales_lease),
+                            topo.full_cache_base(full_idx), kv,
+                            local_ctx, Int(pool.capacity),
+                            topo.scratch_addr(partial_lease),
+                            pool)
+                    sample.attention.add(tp_parallel[Self.tp, do_cp_chunk_attn](topos, mp))
+
+                    @parameter
+                    def do_merge_chunks[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                        var local_ctx = cp_local_context_len(pos + 1, rank, Self.tp)
+                        var num_pg = (local_ctx + CACHE_WIDTH - 1) // CACHE_WIDTH
+                        var nc = min(Int(pool.capacity), FULL_ATTN_MAX_CHUNKS)
+                        if nc > num_pg:
+                            nc = num_pg
+                        return merge_local_chunks_dispatch[C.HEAD_DIM_FULL, FULL_HPG](
+                            topo.scratch_addr(partial_lease), nc,
+                            topo.scratch_addr(cp_m_lease) + kv * FULL_HPG * 4,
+                            topo.scratch_addr(cp_l_lease) + kv * FULL_HPG * 4,
+                            topo.scratch_addr(cp_v_lease) + kv * FULL_HPG * C.HEAD_DIM_FULL * 4,
+                            pool)
+                    sample.attention.add(tp_parallel[Self.tp, do_merge_chunks](topos, mp))
+
+                # Cross-rank gather + quantize: each rank's pool merges V
+                # from all ranks (remote reads) and writes qi/scales locally
+                var all_m_addrs = InlineArray[Int, MAX_CP_RANKS](fill=0)
+                var all_l_addrs = InlineArray[Int, MAX_CP_RANKS](fill=0)
+                var all_v_addrs = InlineArray[Int, MAX_CP_RANKS](fill=0)
+                for r in range(Self.tp):
+                    all_m_addrs[r] = topos[r].scratch_addr(cp_m_lease)
+                    all_l_addrs[r] = topos[r].scratch_addr(cp_l_lease)
+                    all_v_addrs[r] = topos[r].scratch_addr(cp_v_lease)
 
                 @parameter
-                def do_full_attn_prep[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                    var lb = topo.full_base(full_idx)
-                    var fl = topo.full.proto
-                    var k_off = rank * FULL_NKV_LOCAL * C.HEAD_DIM_FULL * 2
-                    return full_attn_prep_dispatch[
-                        C.HEAD_DIM_FULL, ROPE_DIMS_FULL, FULL_HPG,
-                        C.MAX_SEQ_LEN, FULL_NKV_LOCAL, C.NUM_HEADS // Self.tp](
-                        topo.scratch_addr(full_q_lease),
-                        topo.scratch_addr(full_k_lease) + k_off,
-                        fl.attn.q_norm.addr(lb), fl.attn.k_norm.addr(lb),
-                        topo.state_base() + topo.full_rope.cos.offset + pos * 64 * size_of[Float32](),
-                        topo.state_base() + topo.full_rope.sin.offset + pos * 64 * size_of[Float32](),
-                        topo.full_cache_base(full_idx), pos, 0, EPS,
-                        topo.scratch_addr(q_i8_prep_lease),
-                        topo.scratch_addr(qi_biases_lease),
-                        topo.scratch_addr(q_scales_lease),
-                        pool)
-                sample.attention.add(tp_parallel[Self.tp, do_full_attn_prep](topos, mp))
+                def do_cp_gather[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                    return cp_gather_dispatch[C.HEAD_DIM_FULL, C.NUM_HEADS, Self.tp](
+                        rank, all_m_addrs, all_l_addrs, all_v_addrs,
+                        topo.scratch_addr(attn_qi_lease),
+                        topo.scratch_addr(attn_head_sc_lease),
+                        rank * HEADS_PER_RANK, HEADS_PER_RANK, pool)
+                sample.attention.add(tp_parallel[Self.tp, do_cp_gather](topos, mp))
 
-                @parameter
-                def do_full_chunk_attn[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                    return chunked_attn_dispatch[
-                        C.HEAD_DIM_FULL, C.MAX_SEQ_LEN,
-                        FULL_NKV_LOCAL, C.NUM_HEADS // Self.tp, FULL_HPG](
-                        topo.scratch_addr(q_i8_prep_lease),
-                        topo.scratch_addr(qi_biases_lease),
-                        topo.scratch_addr(q_scales_lease),
-                        topo.full_cache_base(full_idx), 0,
-                        pos + 1, Int(pool.capacity),
-                        topo.scratch_addr(partial_lease),
-                        pool)
-                sample.attention.add(tp_parallel[Self.tp, do_full_chunk_attn](topos, mp))
-
-                for rank in range(Self.tp):
-                    var topo = topos[rank]
-                    var context_len = pos + 1
-                    var num_pg = (context_len + CACHE_WIDTH - 1) // CACHE_WIDTH
-                    var num_chunks = min(Int(self.main_pools[rank].capacity), FULL_ATTN_MAX_CHUNKS)
-                    if num_chunks > num_pg:
-                        num_chunks = num_pg
-                    merge_and_quantize[C.HEAD_DIM_FULL, FULL_HPG](
-                        F32Ptr(unsafe_from_address=topo.scratch_addr(partial_lease)),
-                        num_chunks,
-                        I8Ptr(unsafe_from_address=topo.scratch_addr(attn_qi_lease)),
-                        F32Ptr(unsafe_from_address=topo.scratch_addr(attn_head_sc_lease)))
-
+                cp_v_lease^.release()
+                cp_l_lease^.release()
+                cp_m_lease^.release()
                 partial_lease^.release()
                 q_scales_lease^.release()
                 qi_biases_lease^.release()
@@ -1264,8 +1315,10 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                         topo.x_residual(seq_len).as_ptr(),
                         seq_len, pool)
                 sample.o_proj.add(tp_parallel[Self.tp, do_full_o_proj](topos, mp))
+
                 attn_head_sc_lease^.release()
                 attn_qi_lease^.release()
+                full_q_all_lease^.release()
                 full_k_lease^.release()
                 full_q_lease^.release()
 
