@@ -6,7 +6,7 @@ from threading.threading_traits import BurstThreadPool
 from kernels.kernel_ops import PoolFence
 
 
-comptime NUM_FORWARD_PHASES = 22
+comptime NUM_FORWARD_PHASES = 27
 
 
 struct PhaseTiming(Copyable, ImplicitlyCopyable):
@@ -92,11 +92,16 @@ struct ForwardSample(Copyable, ImplicitlyCopyable):
     var wall_ns: Int
     var embed: PhaseTiming
     var broadcast: PhaseTiming
-    var attn_quantize: PhaseTiming
-    var attn_proj: PhaseTiming
-    var attention: PhaseTiming
-    var o_proj: PhaseTiming
-    var attn_reduce: PhaseTiming
+    var local_attn_quantize: PhaseTiming
+    var local_attn_proj: PhaseTiming
+    var local_attention: PhaseTiming
+    var local_o_proj: PhaseTiming
+    var local_attn_reduce: PhaseTiming
+    var global_attn_quantize: PhaseTiming
+    var global_attn_proj: PhaseTiming
+    var global_attention: PhaseTiming
+    var global_o_proj: PhaseTiming
+    var global_attn_reduce: PhaseTiming
     var post_attn_norm: PhaseTiming
     var router_quantize: PhaseTiming
     var router_proj: PhaseTiming
@@ -118,11 +123,16 @@ struct ForwardSample(Copyable, ImplicitlyCopyable):
         self.wall_ns = 0
         self.embed = PhaseTiming()
         self.broadcast = PhaseTiming()
-        self.attn_quantize = PhaseTiming()
-        self.attn_proj = PhaseTiming()
-        self.attention = PhaseTiming()
-        self.o_proj = PhaseTiming()
-        self.attn_reduce = PhaseTiming()
+        self.local_attn_quantize = PhaseTiming()
+        self.local_attn_proj = PhaseTiming()
+        self.local_attention = PhaseTiming()
+        self.local_o_proj = PhaseTiming()
+        self.local_attn_reduce = PhaseTiming()
+        self.global_attn_quantize = PhaseTiming()
+        self.global_attn_proj = PhaseTiming()
+        self.global_attention = PhaseTiming()
+        self.global_o_proj = PhaseTiming()
+        self.global_attn_reduce = PhaseTiming()
         self.post_attn_norm = PhaseTiming()
         self.router_quantize = PhaseTiming()
         self.router_proj = PhaseTiming()
@@ -145,44 +155,54 @@ struct ForwardSample(Copyable, ImplicitlyCopyable):
         if idx == 1:
             return self.broadcast
         if idx == 2:
-            return self.attn_quantize
+            return self.local_attn_quantize
         if idx == 3:
-            return self.attn_proj
+            return self.local_attn_proj
         if idx == 4:
-            return self.attention
+            return self.local_attention
         if idx == 5:
-            return self.o_proj
+            return self.local_o_proj
         if idx == 6:
-            return self.attn_reduce
+            return self.local_attn_reduce
         if idx == 7:
-            return self.post_attn_norm
+            return self.global_attn_quantize
         if idx == 8:
-            return self.router_quantize
+            return self.global_attn_proj
         if idx == 9:
-            return self.router_proj
+            return self.global_attention
         if idx == 10:
-            return self.router_topk
+            return self.global_o_proj
         if idx == 11:
-            return self.ffn_quantize
+            return self.global_attn_reduce
         if idx == 12:
-            return self.expert_phase1
+            return self.post_attn_norm
         if idx == 13:
-            return self.dense_phase1
+            return self.router_quantize
         if idx == 14:
-            return self.expert_phase2
+            return self.router_proj
         if idx == 15:
-            return self.dense_phase2
+            return self.router_topk
         if idx == 16:
-            return self.pre_reduce
+            return self.ffn_quantize
         if idx == 17:
-            return self.mlp_reduce
+            return self.expert_phase1
         if idx == 18:
-            return self.post_reduce
+            return self.dense_phase1
         if idx == 19:
-            return self.final_norm
+            return self.expert_phase2
         if idx == 20:
-            return self.lm_head
+            return self.dense_phase2
         if idx == 21:
+            return self.pre_reduce
+        if idx == 22:
+            return self.mlp_reduce
+        if idx == 23:
+            return self.post_reduce
+        if idx == 24:
+            return self.final_norm
+        if idx == 25:
+            return self.lm_head
+        if idx == 26:
             return self.softcap
         return PhaseTiming()
 
@@ -199,44 +219,54 @@ struct ForwardSample(Copyable, ImplicitlyCopyable):
         if idx == 1:
             return "broadcast"
         if idx == 2:
-            return "attn_quantize"
+            return "local_attn_quant"
         if idx == 3:
-            return "attn_proj"
+            return "local_attn_proj"
         if idx == 4:
-            return "attention"
+            return "local_attention"
         if idx == 5:
-            return "o_proj"
+            return "local_o_proj"
         if idx == 6:
-            return "attn_reduce"
+            return "local_attn_reduce"
         if idx == 7:
-            return "post_attn_norm"
+            return "global_attn_quant"
         if idx == 8:
-            return "router_quantize"
+            return "global_attn_proj"
         if idx == 9:
-            return "router_proj"
+            return "global_attention"
         if idx == 10:
-            return "router_topk"
+            return "global_o_proj"
         if idx == 11:
-            return "ffn_quantize"
+            return "global_attn_reduce"
         if idx == 12:
-            return "expert_phase1"
+            return "post_attn_norm"
         if idx == 13:
-            return "dense_phase1"
+            return "router_quantize"
         if idx == 14:
-            return "expert_phase2"
+            return "router_proj"
         if idx == 15:
-            return "dense_phase2"
+            return "router_topk"
         if idx == 16:
-            return "pre_reduce"
+            return "ffn_quantize"
         if idx == 17:
-            return "mlp_reduce"
+            return "expert_phase1"
         if idx == 18:
-            return "post_reduce"
+            return "dense_phase1"
         if idx == 19:
-            return "final_norm"
+            return "expert_phase2"
         if idx == 20:
-            return "lm_head"
+            return "dense_phase2"
         if idx == 21:
+            return "pre_reduce"
+        if idx == 22:
+            return "mlp_reduce"
+        if idx == 23:
+            return "post_reduce"
+        if idx == 24:
+            return "final_norm"
+        if idx == 25:
+            return "lm_head"
+        if idx == 26:
             return "softcap"
         return "unknown"
 
