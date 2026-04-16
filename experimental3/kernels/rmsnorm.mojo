@@ -7,7 +7,6 @@ from threading.threading_traits import BurstThreadPool
 
 from modeling.model_spec import Encoding, Shaped, Bound, DynView
 from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY
-from simd_math import sqrt
 from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.kernels.fwht import fwht_block
 from experimental3.moe import moe_combine
@@ -17,6 +16,33 @@ from experimental3.common_math import (
     inv_rms_from_sum_sq,
     normalize_inplace,
 )
+
+
+# ============================================================================
+# Shared helpers
+# ============================================================================
+
+
+@always_inline
+def rmsnorm_pool_fence[P: BurstThreadPool](mut pool: P) -> PoolFence[P]:
+    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
+        unsafe_from_address=Int(UnsafePointer(to=pool))
+    ))
+
+
+@always_inline
+def accumulate_expert_outputs[hidden: Int](
+    expert_buf: BF16Ptr,
+    local_count: Int,
+    dst: BF16Ptr,
+):
+    comptime width = simd_width_of[DType.float32]()
+    debug_assert(hidden % width == 0, "hidden must be f32-simd-aligned")
+    for i in range(0, hidden, width):
+        var acc = SIMD[DType.float32, width](0)
+        for e in range(local_count):
+            acc += (expert_buf + e * hidden + i).load[width=width]().cast[DType.float32]()
+        (dst + i).store(acc.cast[DType.bfloat16]())
 
 
 # ============================================================================
@@ -35,9 +61,10 @@ def load_and_reduce[cols: Int, has_gamma: Bool](
     has_gamma=False: work[k] = x[k]. gamma ptr ignored.
     """
     comptime width = simd_width_of[DType.float32]()
+    debug_assert(cols % width == 0, "cols must be a multiple of f32 SIMD width")
     var vsum = SIMD[DType.float32, width](0)
     var k = 0
-    while k + width <= cols:
+    while k < cols:
         var x = (src + k).load[width=width]().cast[DType.float32]()
         vsum = x.fma(x, vsum)
         comptime if has_gamma:
@@ -57,9 +84,10 @@ def load_and_reduce_dual[cols: Int](
 ) -> Float32:
     """Load bf16 to two f32 work buffers with two gammas, shared sum(x^2)."""
     comptime width = simd_width_of[DType.float32]()
+    debug_assert(cols % width == 0, "cols must be a multiple of f32 SIMD width")
     var vsum = SIMD[DType.float32, width](0)
     var k = 0
-    while k + width <= cols:
+    while k < cols:
         var x = (src + k).load[width=width]().cast[DType.float32]()
         var ga = (gamma_a + k).load[width=width]().cast[DType.float32]()
         var gb = (gamma_b + k).load[width=width]().cast[DType.float32]()
@@ -73,6 +101,7 @@ def load_and_reduce_dual[cols: Int](
 @always_inline
 def fwht_rotate[cols: Int, block: Int](work: F32Ptr):
     """Block-diagonal FWHT on f32 work buffer."""
+    debug_assert(cols % block == 0, "cols must be a multiple of block")
     for b in range(cols // block):
         fwht_block[block](work + b * block)
 
@@ -86,7 +115,11 @@ def emit_quant[cols: Int, block: Int, per_block: Bool](
     per_block=True: one absmax per FWHT block (cols/block scales).
     per_block=False: one absmax for the whole row (1 scale).
     """
+    comptime width = simd_width_of[DType.float32]()
+    debug_assert(cols % width == 0, "cols must be a multiple of f32 SIMD width")
     comptime if per_block:
+        debug_assert(block % width == 0, "block must be a multiple of f32 SIMD width")
+        debug_assert(cols % block == 0, "cols must be a multiple of block")
         comptime num_blocks = cols // block
         for b in range(num_blocks):
             scales[b] = absmax_quantize_i8[block](
@@ -166,11 +199,12 @@ def rmsnorm_bf16_row[cols: Int, has_gamma: Bool, has_residual: Bool](
     has_gamma=True, has_residual=True: dst += (src / rms(src)) * gamma.
     """
     comptime width = simd_width_of[DType.float32]()
+    debug_assert(cols % width == 0, "cols must be a multiple of f32 SIMD width")
     var sum_sq = rms_reduce[cols](src)
     var inv = inv_rms_from_sum_sq(sum_sq, cols, eps)
     var vinv = SIMD[DType.float32, width](inv)
     var k = 0
-    while k + width <= cols:
+    while k < cols:
         var v = (src + k).load[width=width]().cast[DType.float32]()
         comptime if has_gamma:
             var g = (gamma + k).load[width=width]().cast[DType.float32]()
@@ -206,6 +240,16 @@ struct RmsNormFwhtQuantArgs(Copyable, ImplicitlyCopyable):
     var start_row: Int
     var end_row: Int
 
+    def __init__(out self):
+        self.in_ptr = 0
+        self.gamma_ptr = 0
+        self.qi_ptr = 0
+        self.work_ptr = 0
+        self.scale_ptr = 0
+        self.eps = 0.0
+        self.start_row = 0
+        self.end_row = 0
+
 
 def rmsnorm_fwht_quant_worker[cols: Int, block: Int,
     has_gamma: Bool, per_block: Bool](
@@ -233,12 +277,11 @@ def rmsnorm_fwht_quant[cols: Int, block: Int,
     if seq_len == 0:
         return PoolFence[P].completed()
 
-    comptime MAX = 128
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
-    var jobs = InlineArray[RmsNormFwhtQuantArgs, MAX](
-        fill=RmsNormFwhtQuantArgs(0, 0, 0, 0, 0, 0.0, 0, 0))
+    var jobs = InlineArray[RmsNormFwhtQuantArgs, MAX_POOL_CAPACITY](
+        fill=RmsNormFwhtQuantArgs())
     for i in range(num_jobs):
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
@@ -250,9 +293,7 @@ def rmsnorm_fwht_quant[cols: Int, block: Int,
     pool.dispatch[RmsNormFwhtQuantArgs,
         rmsnorm_fwht_quant_worker[cols, block, has_gamma, per_block]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
+    return rmsnorm_pool_fence(pool)
 
 
 # ---- Convenience wrappers (preserve existing call-site names) ----
@@ -305,6 +346,20 @@ struct RmsNormDualGammaFwhtArgs(Copyable, ImplicitlyCopyable):
     var start_row: Int
     var end_row: Int
 
+    def __init__(out self):
+        self.in_ptr = 0
+        self.gamma_a_ptr = 0
+        self.gamma_b_ptr = 0
+        self.qi_a_ptr = 0
+        self.qi_b_ptr = 0
+        self.work_a_ptr = 0
+        self.work_b_ptr = 0
+        self.scale_a_ptr = 0
+        self.scale_b_ptr = 0
+        self.eps = 0.0
+        self.start_row = 0
+        self.end_row = 0
+
 
 def rmsnorm_dual_gamma_fwht_quant_worker[cols: Int, block: Int](
     args: RmsNormDualGammaFwhtArgs,
@@ -341,12 +396,11 @@ def rmsnorm_dual_gamma_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
     if seq_len == 0:
         return PoolFence[P].completed()
 
-    comptime MAX = 128
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
-    var jobs = InlineArray[RmsNormDualGammaFwhtArgs, MAX](
-        fill=RmsNormDualGammaFwhtArgs(0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0, 0))
+    var jobs = InlineArray[RmsNormDualGammaFwhtArgs, MAX_POOL_CAPACITY](
+        fill=RmsNormDualGammaFwhtArgs())
     for i in range(num_jobs):
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
@@ -361,9 +415,7 @@ def rmsnorm_dual_gamma_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
     pool.dispatch[RmsNormDualGammaFwhtArgs,
         rmsnorm_dual_gamma_fwht_quant_worker[cols, block]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
+    return rmsnorm_pool_fence(pool)
 
 
 # ============================================================================
@@ -447,9 +499,7 @@ def rmsnorm_no_scale[InT: Encoding & Shaped, OutT: Encoding & Shaped,
 
     pool.dispatch[RMSNormNoScaleArgs, rmsnorm_no_scale_kernel[InT.COLS]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
+    return rmsnorm_pool_fence(pool)
 
 
 def rmsnorm_per_head[head_dim: Int, num_heads: Int,
@@ -485,9 +535,7 @@ def rmsnorm_per_head[head_dim: Int, num_heads: Int,
 
     pool.dispatch[RMSNormPerHeadArgs, rmsnorm_per_head_kernel[head_dim, num_heads]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
+    return rmsnorm_pool_fence(pool)
 
 
 # ============================================================================
@@ -523,14 +571,9 @@ struct PreReduceArgs(Copyable, ImplicitlyCopyable):
 
 def pre_reduce_kernel[hidden: Int](args: PreReduceArgs):
     """Accumulate local experts into dst + rmsnorm(dense, norm_w) into normed."""
-    comptime width = simd_width_of[DType.float32]()
     var expert_buf = BF16Ptr(unsafe_from_address=args.expert_out_ptr)
     var dst = BF16Ptr(unsafe_from_address=args.dst_ptr)
-    for i in range(0, hidden, width):
-        var acc = SIMD[DType.float32, width](0)
-        for e in range(args.local_count):
-            acc += (expert_buf + e * hidden + i).load[width=width]().cast[DType.float32]()
-        (dst + i).store(acc.cast[DType.bfloat16]())
+    accumulate_expert_outputs[hidden](expert_buf, args.local_count, dst)
     var dense = BF16Ptr(unsafe_from_address=args.dense_ptr)
     rmsnorm_bf16_row[hidden, True, False](
         dense,
@@ -547,14 +590,9 @@ struct ExpertSumArgs(Copyable, ImplicitlyCopyable):
 
 def expert_sum_kernel[hidden: Int](args: ExpertSumArgs):
     """Accumulate local expert outputs into dst."""
-    comptime width = simd_width_of[DType.float32]()
     var expert_buf = BF16Ptr(unsafe_from_address=args.expert_out_ptr)
     var dst = BF16Ptr(unsafe_from_address=args.dst_ptr)
-    for i in range(0, hidden, width):
-        var acc = SIMD[DType.float32, width](0)
-        for e in range(args.local_count):
-            acc += (expert_buf + e * hidden + i).load[width=width]().cast[DType.float32]()
-        (dst + i).store(acc.cast[DType.bfloat16]())
+    accumulate_expert_outputs[hidden](expert_buf, args.local_count, dst)
 
 
 @fieldwise_init
@@ -605,8 +643,7 @@ def post_attn_norm_dispatch[hidden: Int, P: BurstThreadPool](
     var args = PostAttnNormArgs(src_ptr, norm_w_ptr, x_main_ptr, eps)
     pool.dispatch[PostAttnNormArgs, post_attn_norm_kernel[hidden]](
         UnsafePointer(to=args), 1)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))))
+    return rmsnorm_pool_fence(pool)
 
 
 def expert_sum_dispatch[hidden: Int, P: BurstThreadPool](
@@ -615,8 +652,7 @@ def expert_sum_dispatch[hidden: Int, P: BurstThreadPool](
     var args = ExpertSumArgs(expert_out_ptr, local_count, dst_ptr)
     pool.dispatch[ExpertSumArgs, expert_sum_kernel[hidden]](
         UnsafePointer(to=args), 1)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))))
+    return rmsnorm_pool_fence(pool)
 
 
 def dense_norm_dispatch[hidden: Int, P: BurstThreadPool](
@@ -625,8 +661,7 @@ def dense_norm_dispatch[hidden: Int, P: BurstThreadPool](
     var args = DenseNormArgs(src_ptr, norm_w_ptr, dst_ptr, eps)
     pool.dispatch[DenseNormArgs, dense_norm_kernel[hidden]](
         UnsafePointer(to=args), 1)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))))
+    return rmsnorm_pool_fence(pool)
 
 
 def post_reduce_dispatch[hidden: Int, P: BurstThreadPool](
@@ -638,5 +673,4 @@ def post_reduce_dispatch[hidden: Int, P: BurstThreadPool](
         combine_norm_w_ptr, x_main_ptr, layer_scalar, eps)
     pool.dispatch[PostReduceArgs, post_reduce_kernel[hidden]](
         UnsafePointer(to=args), 1)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))))
+    return rmsnorm_pool_fence(pool)

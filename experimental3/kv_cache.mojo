@@ -61,6 +61,24 @@ struct Gemma4KVCache[max_seq: Int, head_dim: Int, num_kv_heads: Int, num_q_heads
         self.k_scale_base = self.v_base + Self.V_TOTAL
         self.v_scale_base = self.k_scale_base + Self.K_SCALE_BYTES
 
+    @always_inline
+    def assert_layout(self):
+        debug_assert(Self.head_dim % VNNI_BLK == 0, "head_dim must be a multiple of VNNI_BLK")
+        debug_assert(Self.head_dim % Self.WIDTH == 0, "head_dim must be a multiple of cache WIDTH")
+        debug_assert(Self.WIDTH % VNNI_BLK == 0, "cache WIDTH must be a multiple of VNNI_BLK")
+
+    @always_inline
+    def assert_head(self, head: Int):
+        debug_assert(head >= 0 and head < Self.num_kv_heads, "head out of range")
+
+    @always_inline
+    def assert_pos(self, pos: Int):
+        debug_assert(pos >= 0 and pos < Self.max_seq, "position out of range")
+
+    @always_inline
+    def assert_pos_group(self, pos_group: Int):
+        debug_assert(pos_group >= 0 and pos_group < Self.K_POS_GROUPS, "position group out of range")
+
     # ================================================================
     # K write — scatter into width-packed VNNI layout
     # ================================================================
@@ -73,15 +91,18 @@ struct Gemma4KVCache[max_seq: Int, head_dim: Int, num_kv_heads: Int, num_q_heads
         Each K dim group holds WIDTH positions × VNNI_BLK K values.
         This write places one position's data at its slot within each group.
         """
+        self.assert_layout()
+        self.assert_head(head)
+        self.assert_pos(pos)
         var pos_group = pos // Self.WIDTH
         var slot = pos % Self.WIDTH
-        var k_pg = UnsafePointer[UInt8, MutAnyOrigin](
-            unsafe_from_address=self.k_base + head * Self.K_HEAD_BYTES + pos_group * Self.K_PG_BYTES)
+        var k_pg = self.k_pg_ptr(head, pos_group)
+        var u8_bias = SIMD[DType.uint8, VNNI_BLK](0x80)
 
         for kdg in range(Self.K_DIM_GROUPS):
             var src = data_i8 + kdg * VNNI_BLK
             var dst = k_pg + kdg * Self.WIDTH * VNNI_BLK + slot * VNNI_BLK
-            var v = src.load[width=VNNI_BLK]().cast[DType.uint8]() ^ SIMD[DType.uint8, VNNI_BLK](0x80)
+            var v = src.load[width=VNNI_BLK]().cast[DType.uint8]() ^ u8_bias
             dst.store(v)
 
     # ================================================================
@@ -96,30 +117,32 @@ struct Gemma4KVCache[max_seq: Int, head_dim: Int, num_kv_heads: Int, num_q_heads
         V lanes are channels (WIDTH), VNNI_BLK inner axis is positions.
         Each write scatters head_dim values across channel_groups.
         """
+        self.assert_layout()
+        self.assert_head(head)
+        self.assert_pos(pos)
         var pos_group = pos // Self.WIDTH
         var sub_quad = (pos % Self.WIDTH) // VNNI_BLK
         var vnni_slot = pos % VNNI_BLK
-        var v_pg = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](
-            unsafe_from_address=self.v_base + head * Self.V_HEAD_BYTES + pos_group * Self.V_PG_BYTES)
+        var v_pg = self.v_pg_ptr(head, pos_group)
 
         for cg in range(Self.V_CHANNEL_GROUPS):
             var cg_base = v_pg + cg * Self.V_CG_BYTES + sub_quad * Self.WIDTH * VNNI_BLK
-            for ci in range(Self.WIDTH):
-                cg_base[ci * VNNI_BLK + vnni_slot] = data_i8[cg * Self.WIDTH + ci]
+            var channels = (data_i8 + cg * Self.WIDTH).load[width=Self.WIDTH]()
+            (cg_base + vnni_slot).strided_store[width=Self.WIDTH](channels, VNNI_BLK)
 
     # ================================================================
     # Scale write
     # ================================================================
 
     def write_k_scale(self, pos: Int, head: Int, scale: Float32):
-        UnsafePointer[Float32, MutAnyOrigin](
-            unsafe_from_address=self.k_scale_base + head * Self.max_seq * size_of[Float32]() + pos * size_of[Float32]()
-        )[] = scale
+        self.assert_head(head)
+        self.assert_pos(pos)
+        self.k_scale_ptr(head)[pos] = scale
 
     def write_v_scale(self, pos: Int, head: Int, scale: Float32):
-        UnsafePointer[Float32, MutAnyOrigin](
-            unsafe_from_address=self.v_scale_base + head * Self.max_seq * size_of[Float32]() + pos * size_of[Float32]()
-        )[] = scale
+        self.assert_head(head)
+        self.assert_pos(pos)
+        self.v_scale_ptr(head)[pos] = scale
 
     # ================================================================
     # Scoring/V-agg access helpers
@@ -127,18 +150,24 @@ struct Gemma4KVCache[max_seq: Int, head_dim: Int, num_kv_heads: Int, num_q_heads
 
     def k_pg_ptr(self, head: Int, pos_group: Int) -> UnsafePointer[UInt8, MutAnyOrigin]:
         """K data pointer for one position group (all K dim groups)."""
+        self.assert_head(head)
+        self.assert_pos_group(pos_group)
         return UnsafePointer[UInt8, MutAnyOrigin](
             unsafe_from_address=self.k_base + head * Self.K_HEAD_BYTES + pos_group * Self.K_PG_BYTES)
 
     def v_pg_ptr(self, head: Int, pos_group: Int) -> UnsafePointer[Scalar[DType.int8], MutAnyOrigin]:
         """V data pointer for one position group (all channel groups)."""
+        self.assert_head(head)
+        self.assert_pos_group(pos_group)
         return UnsafePointer[Scalar[DType.int8], MutAnyOrigin](
             unsafe_from_address=self.v_base + head * Self.V_HEAD_BYTES + pos_group * Self.V_PG_BYTES)
 
     def k_scale_ptr(self, head: Int) -> UnsafePointer[Float32, MutAnyOrigin]:
+        self.assert_head(head)
         return UnsafePointer[Float32, MutAnyOrigin](
             unsafe_from_address=self.k_scale_base + head * Self.max_seq * size_of[Float32]())
 
     def v_scale_ptr(self, head: Int) -> UnsafePointer[Float32, MutAnyOrigin]:
+        self.assert_head(head)
         return UnsafePointer[Float32, MutAnyOrigin](
             unsafe_from_address=self.v_scale_base + head * Self.max_seq * size_of[Float32]())
