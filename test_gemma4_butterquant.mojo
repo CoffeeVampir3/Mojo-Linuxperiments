@@ -1,8 +1,8 @@
 """Autoregressive generation test for Gemma4 26B-A4B ButterQuant (int8).
 
-Loads model + tokenizer, processes prompt one token at a time, samples tokens
-via the fused FlashSampling LM head (Gumbel-Max argmax in the matmul epilogue),
-reports timing and generated text.
+Loads model + tokenizer, processes prompt one token at a time, picks the next
+token by greedy argmax on the softcapped LM-head logits, reports timing and
+generated text.
 """
 
 from std.memory import UnsafePointer
@@ -20,7 +20,6 @@ comptime MODEL_DIR = "quantized_models"
 comptime VOCAB = Gemma4Config.VOCAB_SIZE
 comptime MAX_NEW_TOKENS = 15
 comptime TP = 1
-comptime RNG_SEED_BASE = UInt64(0xD1CEFA57D1CEFA57)
 
 
 def main():
@@ -62,12 +61,11 @@ def main():
     var t1 = perf_counter_ns()
     for i in range(prompt_len - 1):
         tp[0] = Scalar[DType.int32](token_ids[i])
-        _ = model.forward_decode(Int(tp), i, RNG_SEED_BASE ^ UInt64(i))
+        _ = model.forward_decode(Int(tp), i)
 
-    # Last prompt token: sample first generated token from the fused LM head.
+    # Last prompt token: greedy argmax picks the first generated token.
     tp[0] = Scalar[DType.int32](token_ids[prompt_len - 1])
-    var next_id = Int(model.forward_decode(
-        Int(tp), prompt_len - 1, RNG_SEED_BASE ^ UInt64(prompt_len - 1)))
+    var next_id = Int(model.forward_decode(Int(tp), prompt_len - 1))
     var prefill_ms = (perf_counter_ns() - t1) / 1_000_000
 
     var generated = List[Int]()
@@ -87,8 +85,7 @@ def main():
 
     for step in range(1, MAX_NEW_TOKENS):
         tp[0] = Scalar[DType.int32](next_id)
-        next_id = Int(model.forward_decode(
-            Int(tp), pos, RNG_SEED_BASE ^ UInt64(pos)))
+        next_id = Int(model.forward_decode(Int(tp), pos))
         generated.append(next_id)
         pos += 1
 

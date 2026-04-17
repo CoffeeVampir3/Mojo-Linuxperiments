@@ -30,7 +30,6 @@ from experimental3.kernels.gemm import (
     FusedGuGeluTanhArgs, fused_gu_gelu_tanh_worker, fused_gu_gelu_tanh_worker_wa,
     GEMV_TILE,
     LmHeadArgs, lm_head_worker,
-    LmHeadFlashArgs, lm_head_flash_worker, LmHeadCands, LmHeadCandPtr,
 )
 from experimental3.moe import (
     RouterTopkArgs, router_topk_kernel,
@@ -334,50 +333,6 @@ def lm_head_gemv[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
         actual_jobs += 1
 
     pool.dispatch[LmHeadArgs, lm_head_worker[K, fwht_blk]](
-        UnsafePointer(to=jobs[0]), actual_jobs)
-    return pool_fence(pool)
-
-
-def lm_head_flash[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
-    act: I8Ptr,
-    weight: I8Ptr,
-    act_blk_scales: F32Ptr,
-    w_blk_scales: F32Ptr,
-    w_blk_colsums: F32Ptr,
-    candidates: LmHeadCandPtr,
-    rng_key: UInt64,
-    softcap_val: Float32,
-    mut pool: P,
-) -> PoolFence[P]:
-    """Fused LM-head GEMV + Gumbel-Max sample.
-
-    `candidates` is a single LmHeadCandidates[MAX_POOL_CAPACITY] struct; each
-    worker writes its result into scores[worker_idx] and indices[worker_idx].
-    After the returned fence joins, call lm_head_flash_reduce(candidates) for
-    the winner.
-    """
-    var num_workers = min(N, pool.get_capacity())
-    var rows_per_worker = (N + num_workers - 1) // num_workers
-
-    var jobs = InlineArray[LmHeadFlashArgs, MAX_POOL_CAPACITY](uninitialized=True)
-    var actual_jobs = 0
-    for i in range(num_workers):
-        var n_start = i * rows_per_worker
-        if n_start >= N:
-            break
-        var n_count = min(rows_per_worker, N - n_start)
-        jobs[i] = LmHeadFlashArgs(
-            act, weight, act_blk_scales, w_blk_scales, w_blk_colsums,
-            candidates, n_start, n_count, rng_key, UInt64(i), softcap_val)
-        actual_jobs += 1
-
-    # Sentinel only the tail that no worker will write, so the reducer's SIMD
-    # sweep of the full buffer still sees valid -inf / -1 in unused lanes.
-    for i in range(actual_jobs, MAX_POOL_CAPACITY):
-        candidates[].scores[i] = Float32(-1.0e30)
-        candidates[].indices[i] = Int32(-1)
-
-    pool.dispatch[LmHeadFlashArgs, lm_head_flash_worker[K, fwht_blk]](
         UnsafePointer(to=jobs[0]), actual_jobs)
     return pool_fence(pool)
 
