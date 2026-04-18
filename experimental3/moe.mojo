@@ -19,18 +19,12 @@ from std.sys.info import simd_width_of
 from simd_math import sqrt
 from experimental_gemma.router import softmax_topk_renorm, Gemma4TopKResult
 from experimental3.common_math import BF16Ptr
+from experimental3.kernels.dispatch_args import RouterTopkArgs
 
 
 # ============================================================================
 # Router: softmax + top-k kernel
 # ============================================================================
-
-
-@fieldwise_init
-struct RouterTopkArgs(Copyable, ImplicitlyCopyable):
-    var logits: BF16Ptr
-    var per_expert_scale: BF16Ptr
-    var result_ptr: Int
 
 
 def router_topk_kernel[num_experts: Int, k: Int](args: RouterTopkArgs):

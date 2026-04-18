@@ -19,9 +19,8 @@ from modeling.gemma4_common import is_full_layer
 from experimental3.kernels.full_chunked_attention import (
     merge_and_quantize, partial_head_stride, partial_chunk_stride,
 )
-from experimental3.kernels.gemm import (
-    int8_gemv_blocked_worker, Int8GemvBlockedArgs,
-)
+from experimental3.kernels.gemm import int8_gemv_blocked_worker
+from experimental3.kernels.dispatch_args import Int8GemvBlockedArgs
 from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr, BF16Ptr
 from simd_math import exp_f32, sqrt

@@ -4,6 +4,7 @@ test_models/
 validation/
 checkpoints/
 quantized_models/
+Minimax-M2.7/
 
 # Compiled executables
 test_linux_threading

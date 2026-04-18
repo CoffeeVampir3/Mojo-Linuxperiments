@@ -28,23 +28,14 @@ from experimental3.kernels.fwht import fwht_block
 from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.kernels.gelu_tanh_fwht_quantize import gelu_tanh_f32
 from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr, BF16Ptr
+from experimental3.kernels.dispatch_args import (
+    WorkerConfig, Int8GemvBlockedArgs, FusedGuGeluTanhArgs, LmHeadArgs,
+)
 
 
 # ============================================================================
 # int8_gemv worker
 # ============================================================================
-
-
-@fieldwise_init
-struct WorkerConfig(Copyable, ImplicitlyCopyable):
-    var act_ptr: Int
-    var wpacked_ptr: Int
-    var colsum_ptr: Int
-    var weight_scale_ptr: Int
-    var dst_ptr: Int
-    var act_scale_ptr: Int
-    var start_row: Int
-    var row_count: Int
 
 
 def int8_gemv_worker[N: Int, K: Int](cfg: WorkerConfig):
@@ -66,17 +57,6 @@ def int8_gemv_worker[N: Int, K: Int](cfg: WorkerConfig):
 # ============================================================================
 # int8_gemv_blocked workers (standard + _wa variant)
 # ============================================================================
-
-
-@fieldwise_init
-struct Int8GemvBlockedArgs(Copyable, ImplicitlyCopyable):
-    var act: I8Ptr
-    var wpacked: U8Ptr
-    var blk_scale: F32Ptr
-    var wscale: F32Ptr
-    var blk_colsum: F32Ptr
-    var dst: BF16Ptr
-    var output_scale: Float32
 
 
 def int8_gemv_blocked_worker[N: Int, K: Int, fwht_blk: Int](
@@ -116,20 +96,6 @@ def int8_gemv_blocked_wa_worker[N: Int, K: Int, fwht_blk: Int](
 # ============================================================================
 # fused_gu_gelu_tanh workers (standard + _wa variant)
 # ============================================================================
-
-
-@fieldwise_init
-struct FusedGuGeluTanhArgs(Copyable, ImplicitlyCopyable):
-    var act_i8: I8Ptr
-    var act_scale: F32Ptr
-    var wpacked: U8Ptr
-    var wscale: F32Ptr
-    var wcolsum: F32Ptr
-    var qi_out: I8Ptr
-    var blk_scale: F32Ptr
-    var n_start: Int
-    var n_count: Int
-    var row_count: Int
 
 
 def fused_gu_gelu_tanh_worker[intermediate: Int, K: Int, fwht_blk: Int,
@@ -263,18 +229,6 @@ def fused_gu_gelu_tanh_worker_wa[intermediate: Int, K: Int, fwht_blk: Int](
 # ============================================================================
 # lm_head worker — decode-only N-parallel scan
 # ============================================================================
-
-
-@fieldwise_init
-struct LmHeadArgs(Copyable, ImplicitlyCopyable):
-    var act: Int
-    var weight: Int
-    var act_blk_scales: Int
-    var w_blk_scales: Int
-    var w_blk_colsums: Int
-    var dst: Int
-    var n_start: Int
-    var n_count: Int
 
 
 def lm_head_worker[K: Int, fwht_blk: Int](args: LmHeadArgs):

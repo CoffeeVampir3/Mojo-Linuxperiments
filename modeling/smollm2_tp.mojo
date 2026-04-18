@@ -24,11 +24,11 @@ from modeling.model_spec import (
     Shape, ShapeLike, Mat, CacheView, WeightDesc,
     DEFAULT_ALIGNMENT, HOST_RANK, LogitsView,
 )
-from modeling.gemma4_common import LayerShard, LayerBuilder
 from modeling.modeling_common import (
     SlotOffset, Repeated, SectionBuilder, align_up,
     DynamicTensorView, dynamic_tensor_view,
     static_tensor_view, scratch_tensor_view, scratch_ptr,
+    LayerShard, LayerBuilder,
 )
 from modeling.loader import discover_shards, load_weights_from_descs
 from kernels.kernel_ops import (

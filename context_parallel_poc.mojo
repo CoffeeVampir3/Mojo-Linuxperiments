@@ -23,9 +23,10 @@ from notstdcollections import HeapMoveArray
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
 from experimental3.kernels.sliding_attention import single_pass_attention
 from experimental3.kernels.full_chunked_attention import (
-    ChunkedAttnArgs, chunked_attn_kernel,
+    chunked_attn_kernel,
     partial_head_stride, partial_chunk_stride,
 )
+from experimental3.kernels.dispatch_args import ChunkedAttnArgs
 from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.kernels.fwht import fwht_block
 from experimental3.common_math import F32Ptr, I8Ptr

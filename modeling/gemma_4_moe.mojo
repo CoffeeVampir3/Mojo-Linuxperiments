@@ -20,13 +20,14 @@ from modeling.model_spec import (
     DEFAULT_ALIGNMENT, LogitsView,
 )
 from modeling.gemma4_common import (
-    Gemma4BaseConfig, LayerShard, LayerBuilder, is_full_layer,
+    Gemma4BaseConfig, is_full_layer,
 )
 from modeling.modeling_common import (
     SlotOffset, Repeated, SectionBuilder, align_up,
     StaticTensorView, DynamicTensorView,
     static_tensor_view, dynamic_tensor_view,
     borrow_scratch_tensor, scratch_tensor_view, scratch_ptr,
+    LayerShard, LayerBuilder,
 )
 from modeling.loader import discover_shards, load_weights_from_descs
 from kernels.kernel_ops import (

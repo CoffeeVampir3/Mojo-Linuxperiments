@@ -23,6 +23,10 @@ from .gemma4 import (
     Gemma4ByteTransform, Gemma4PreTokenizer,
     pre_tokenize_gemma4, gemma4_encode_bytes, gemma4_decode_bytes,
 )
+from .minimax_m27 import (
+    MinimaxM27ByteTransform, MinimaxM27PreTokenizer,
+    pre_tokenize_minimax_m27,
+)
 
 
 comptime TOKENIZER_FLAVOR_UNSUPPORTED = 0
@@ -30,6 +34,7 @@ comptime TOKENIZER_FLAVOR_GPT2 = 1
 comptime TOKENIZER_FLAVOR_DEEPSEEK_V3 = 2
 comptime TOKENIZER_FLAVOR_GPT_OSS = 3
 comptime TOKENIZER_FLAVOR_GEMMA4 = 4
+comptime TOKENIZER_FLAVOR_MINIMAX_M27 = 5
 
 
 struct AutoPreTokenizer(PreTokenizerCapability):
@@ -49,6 +54,8 @@ struct AutoPreTokenizer(PreTokenizerCapability):
             return pre_tokenize_gpt_oss(text)
         if self.flavor == TOKENIZER_FLAVOR_GEMMA4:
             return pre_tokenize_gemma4(text)
+        if self.flavor == TOKENIZER_FLAVOR_MINIMAX_M27:
+            return pre_tokenize_minimax_m27(text)
 
         var out = List[String]()
         out.append(text.copy())
@@ -99,6 +106,7 @@ struct PreTokenizerStageSignature(Copyable, ImplicitlyCopyable):
     var use_regex: Bool
     var add_prefix_space: Bool
     var individual_digits: Bool
+    var invert: Bool
 
     def __init__(out self):
         self.stage_type = String("")
@@ -107,6 +115,7 @@ struct PreTokenizerStageSignature(Copyable, ImplicitlyCopyable):
         self.use_regex = False
         self.add_prefix_space = False
         self.individual_digits = False
+        self.invert = False
 
 
 def parse_optional_bool(mut parser: Parser, default_value: Bool) raises ParseError -> Bool:
@@ -163,6 +172,8 @@ def parse_pretokenizer_stage_signature(
             stage.add_prefix_space = parse_optional_bool(parser, stage.add_prefix_space)
         elif key == "individual_digits":
             stage.individual_digits = parse_optional_bool(parser, stage.individual_digits)
+        elif key == "invert":
+            stage.invert = parse_optional_bool(parser, stage.invert)
         elif key == "pattern":
             stage.regex_pattern = parse_regex_pattern(parser)
         else:
@@ -321,6 +332,32 @@ def is_gpt_oss_pretokenizer_signature(stages: List[PreTokenizerStageSignature]) 
     return True
 
 
+def is_minimax_m27_pretokenizer_signature(stages: List[PreTokenizerStageSignature]) -> Bool:
+    if len(stages) != 2:
+        return False
+
+    var s0 = stages[0]
+    var s1 = stages[1]
+
+    if s0.stage_type != "Split" or s0.behavior != "Removed" or not s0.invert:
+        return False
+    if not ("\\p{Lu}\\p{Lt}\\p{Lm}\\p{Lo}\\p{M}" in s0.regex_pattern):
+        return False
+    if not ("\\p{Ll}\\p{Lm}\\p{Lo}\\p{M}" in s0.regex_pattern):
+        return False
+    if not ("\\p{N}{1,3}" in s0.regex_pattern):
+        return False
+
+    if s1.stage_type != "ByteLevel":
+        return False
+    if s1.use_regex:
+        return False
+    if s1.add_prefix_space:
+        return False
+
+    return True
+
+
 def is_gemma4_pretokenizer_signature(stages: List[PreTokenizerStageSignature]) -> Bool:
     if len(stages) != 1:
         return False
@@ -367,6 +404,8 @@ def detect_tokenizer_flavor(path: Path) -> Int:
         return TOKENIZER_FLAVOR_DEEPSEEK_V3
     if is_gpt_oss_pretokenizer_signature(stages):
         return TOKENIZER_FLAVOR_GPT_OSS
+    if is_minimax_m27_pretokenizer_signature(stages):
+        return TOKENIZER_FLAVOR_MINIMAX_M27
     if is_gemma4_pretokenizer_signature(stages):
         return TOKENIZER_FLAVOR_GEMMA4
     return TOKENIZER_FLAVOR_UNSUPPORTED
@@ -752,4 +791,14 @@ def load_gemma4_tokenizer(path: Path) -> Optional[
         Gemma4PreTokenizer(),
         Gemma4ByteTransform(),
         use_piece_cache=False,
+    )
+
+
+def load_minimax_m27_tokenizer(path: Path) -> Optional[
+    BPETokenizer[MinimaxM27PreTokenizer, MinimaxM27ByteTransform]
+]:
+    return load_tokenizer_with_capabilities(
+        path,
+        MinimaxM27PreTokenizer(),
+        MinimaxM27ByteTransform(),
     )

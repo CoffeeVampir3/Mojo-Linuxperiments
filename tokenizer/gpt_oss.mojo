@@ -275,20 +275,15 @@ def try_match_symbols(
 def try_match_newlines(
     data: Span[Byte, _], pos: Int, end: Int, ctx: UnicodeContext,
 ) -> Int:
-    """Alt 5: \\s*[\\r\\n]+"""
     var i = pos
-    var found_newline = False
+    var last_newline_end = -1
 
-    # \s* then \r\n+
     while i < end:
         var b = data[i]
         if is_newline_byte(b):
-            found_newline = True
             i += 1
+            last_newline_end = i
             continue
-        if found_newline:
-            break
-        # Before first newline, consume whitespace
         if b < Byte(0x80):
             if is_ascii_regex_space(b):
                 i += 1
@@ -300,9 +295,7 @@ def try_match_newlines(
             continue
         break
 
-    if found_newline:
-        return i
-    return -1
+    return last_newline_end
 
 
 def try_match_whitespace(

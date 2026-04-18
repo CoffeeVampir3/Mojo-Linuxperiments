@@ -41,6 +41,27 @@ def check(
     return False
 
 
+def check_encode_only(
+    mut tok: BPETokenizer[...],
+    text: String,
+    expected: List[Int],
+    expected_decoded: String,
+) -> Bool:
+    var got = tok.encode(text)
+    var decoded = tok.decode(got)
+    if ids_equal(got, expected) and decoded == expected_decoded:
+        return True
+    print("  FAIL:", repr(text))
+    if not ids_equal(got, expected):
+        print("    expected:", end=" ")
+        print_ids(expected)
+        print("    got:     ", end=" ")
+        print_ids(got)
+    if decoded != expected_decoded:
+        print("    DECODE:", repr(decoded), "WANT:", repr(expected_decoded))
+    return False
+
+
 def test_smollm2(mut tok: BPETokenizer[...]) -> Tuple[Int, Int]:
     var p = 0
     var f = 0
@@ -459,6 +480,194 @@ def test_gemma4(mut tok: BPETokenizer[...]) -> Tuple[Int, Int]:
     return (p, f)
 
 
+def test_minimax_m27(mut tok: BPETokenizer[...]) -> Tuple[Int, Int]:
+    var p = 0
+    var f = 0
+
+    # Basic English
+    if check(tok, "Hello, world!", [19739, 44, 2035, 33]): p += 1
+    else: f += 1
+    if check(tok, "The quick brown fox jumps over the lazy dog.",
+        [758, 4729, 15801, 62222, 58841, 1049, 275, 34810, 6787, 46]): p += 1
+    else: f += 1
+
+    # CamelCase
+    if check(tok, "camelCase httpClient parseHTTPResponse",
+        [99, 27096, 11766, 8432, 7477, 16407, 36484, 5933]): p += 1
+    else: f += 1
+    if check(tok, "DON'T don't Can't can't",
+        [111083, 59982, 3110, 67879, 6965]): p += 1
+    else: f += 1
+    if check(tok, "CamelCase XMLParser HTMLElement",
+        [67, 27096, 11766, 27190, 17980, 16176, 172017]): p += 1
+    else: f += 1
+    if check(tok, "ALLCAPS lowercase MiXeD",
+        [2131, 10896, 66177, 97737, 21879, 166122, 68]): p += 1
+    else: f += 1
+
+    # Numbers
+    if check(tok, "12345 123 1 42 999",
+        [10010, 2879, 32, 10010, 32, 49, 32, 5130, 32, 13408]): p += 1
+    else: f += 1
+
+    # Whitespace
+    if check(tok, " leading space", [7440, 3992]): p += 1
+    else: f += 1
+    if check(tok, "multiple   spaces   here",
+        [79401, 256, 14525, 256, 2003]): p += 1
+    else: f += 1
+    if check(tok, "line1\nline2\nline3",
+        [1182, 49, 10, 1182, 50, 10, 1182, 51]): p += 1
+    else: f += 1
+    if check(tok, "tabs\there\ttoo",
+        [81787, 9, 11475, 9, 59470]): p += 1
+    else: f += 1
+
+    # Symbols / code
+    if check(tok, "symbols: @#$%^&*()",
+        [193506, 58, 1399, 129880, 37, 94, 38, 42, 911]): p += 1
+    else: f += 1
+    if check(tok, "mixed: Hello123 world! 42test",
+        [129034, 58, 53398, 10010, 2035, 33, 32, 5130, 4500]): p += 1
+    else: f += 1
+    if check(tok, "code: def foo(x): return x + 1",
+        [3689, 58, 1112, 40589, 4704, 3342, 1126, 1905, 1349, 32, 49]): p += 1
+    else: f += 1
+
+    # Chinese
+    if check(tok, "你好世界", [56658, 4083]): p += 1
+    else: f += 1
+    if check(tok, "今天天气很好，我想出去走走。",
+        [8922, 30219, 19300, 37692, 15916, 135034, 350]): p += 1
+    else: f += 1
+    if check(tok, "深度学习是人工智能的一个分支。",
+        [35833, 5504, 485, 74565, 17714, 63359, 350]): p += 1
+    else: f += 1
+    if check(tok, "中英混合test测试123",
+        [700, 4232, 29925, 4500, 15329, 10010]): p += 1
+    else: f += 1
+
+    # Japanese
+    if check(tok, "こんにちは世界", [36334, 4083]): p += 1
+    else: f += 1
+    if check(tok, "東京は日本の首都です。",
+        [11186, 601, 27918, 44190, 1256, 350]): p += 1
+    else: f += 1
+    if check(tok, "カタカナとひらがなの混合テスト",
+        [63217, 70890, 545, 8081, 57905, 57980, 29925, 32826]): p += 1
+    else: f += 1
+    if check(tok, "日本語English混在テキスト",
+        [38196, 27116, 9131, 594, 54271]): p += 1
+    else: f += 1
+
+    # Korean
+    if check(tok, "안녕하세요 세계", [11878, 175354, 36372]): p += 1
+    else: f += 1
+    if check(tok, "한국어 테스트입니다", [47543, 4750, 115649, 18339]): p += 1
+    else: f += 1
+
+    # Arabic
+    if check(tok, "مرحبا بالعالم",
+        [9390, 55141, 349, 96013, 11946]): p += 1
+    else: f += 1
+    if check(tok, "هذا اختبار للغة العربية",
+        [55993, 146087, 4002, 39503, 34728]): p += 1
+    else: f += 1
+
+    # Russian
+    if check(tok, "Привет мир", [45775, 31016, 158440]): p += 1
+    else: f += 1
+    if check(tok, "Тестирование токенизатора",
+        [113136, 8313, 107627, 7110, 6881, 4777, 10107, 40774]): p += 1
+    else: f += 1
+
+    # Thai
+    if check(tok, "สวัสดีชาวโลก",
+        [115548, 94807, 75993, 115548, 114477, 92574, 7491, 138, 56654, 167, 178765, 102085, 74406]): p += 1
+    else: f += 1
+
+    # Emoji
+    if check(tok, "emoji: 👩‍💻 🚀 ❤️",
+        [155923, 58, 57528, 169, 61587, 42431, 187, 190740, 128, 119917]): p += 1
+    else: f += 1
+
+    # Edge cases / probes
+    if check(tok, "hello", [37964]): p += 1
+    else: f += 1
+    if check(tok, " hello", [53343]): p += 1
+    else: f += 1
+    if check(tok, "  hello", [32, 53343]): p += 1
+    else: f += 1
+    if check(tok, "foo\r\nbar", [17658, 2535, 3991]): p += 1
+    else: f += 1
+    if check(tok, "foo\rbar", [17658, 13, 3991]): p += 1
+    else: f += 1
+    if check(tok, "\x00\x01\x02", [0, 1, 2]): p += 1
+    else: f += 1
+    if check(tok, "", List[Int]()): p += 1
+    else: f += 1
+    if check(tok, "\u200B", [16348]): p += 1
+    else: f += 1
+    if check(tok, "\u3000", [3466]): p += 1
+    else: f += 1
+    if check(tok, "\uFEFF", [136868]): p += 1
+    else: f += 1
+    if check(tok, "\n", [10]): p += 1
+    else: f += 1
+    if check(tok, "\n\n\n", [4368]): p += 1
+    else: f += 1
+    if check(tok, " \n", [1056]): p += 1
+    else: f += 1
+    if check(tok, "\t\n", [10380]): p += 1
+    else: f += 1
+    if check(tok, "   ", [326]): p += 1
+    else: f += 1
+    if check(tok, "a ", [97, 32]): p += 1
+    else: f += 1
+    # NFKC-only compat chars (NFC leaves them alone, so these SHOULD pass).
+    if check(tok, "Ⅻ", [29437, 171]): p += 1
+    else: f += 1
+    if check(tok, "ﬁ", [33112]): p += 1
+    else: f += 1
+    if check(tok, "Ａ", [24630]): p += 1
+    else: f += 1
+    if check(tok, "①", [18433]): p += 1
+    else: f += 1
+    if check(tok, "😀", [21557, 128]): p += 1
+    else: f += 1
+    if check(tok, "👨\u200d👩\u200d👧",
+        [44026, 168, 61587, 44026, 169, 61587, 44026, 167]): p += 1
+    else: f += 1
+
+    if check(tok, "café", [103082, 337]): p += 1
+    else: f += 1
+    if check_encode_only(tok, "cafe\u0301", [103082, 337], "café"): p += 1
+    else: f += 1
+    if check_encode_only(tok, "\u212B", [105352], "\u00C5"): p += 1
+    else: f += 1
+
+    # Special tokens
+    if check(tok, "]~!b[", [200034]): p += 1
+    else: f += 1
+    if check(tok, "[e~[", [200020]): p += 1
+    else: f += 1
+    if check(tok, "]!d~[", [200021]): p += 1
+    else: f += 1
+    if check(tok, "]~!b[Hello[e~[", [200034, 19739, 200020]): p += 1
+    else: f += 1
+    if check(tok, "<fim_prefix>code<fim_suffix>tail<fim_middle>",
+        [200001, 3689, 200003, 29904, 200002]): p += 1
+    else: f += 1
+    if check(tok, "<think>reasoning</think>",
+        [200050, 64639, 289, 200051]): p += 1
+    else: f += 1
+    if check(tok, "<minimax:tool_call>x</minimax:tool_call>",
+        [200052, 120, 200053]): p += 1
+    else: f += 1
+
+    return (p, f)
+
+
 def main():
     var total_pass = 0
     var total_fail = 0
@@ -518,6 +727,20 @@ def main():
         print("Vocab:", g4.vocab_size(), "Merges:", g4.num_merges())
         var result = test_gemma4(g4)
         print("Gemma 4:", result[0], "passed,", result[1], "failed")
+        total_pass += result[0]
+        total_fail += result[1]
+
+    print()
+
+    print("=== MiniMax-M2.7 ===")
+    var mm_opt = load_tokenizer(Path("checkpoints/Minimax-M2.7/tokenizer.json"))
+    if not mm_opt:
+        print("FAILED to load MiniMax-M2.7 tokenizer")
+    else:
+        var mm = mm_opt.take()
+        print("Vocab:", mm.vocab_size(), "Merges:", mm.num_merges())
+        var result = test_minimax_m27(mm)
+        print("MiniMax-M2.7:", result[0], "passed,", result[1], "failed")
         total_pass += result[0]
         total_fail += result[1]
 

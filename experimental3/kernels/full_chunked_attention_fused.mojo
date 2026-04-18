@@ -30,6 +30,10 @@ from experimental3.kernels.rope_and_kv_cache_write import (
     write_k_head_normed, write_v_head_normed,
 )
 from experimental3.helpers import prep_q_row_normed_partial
+from experimental3.kernels.dispatch_args import (
+    ChunkedAttnArgs, CpAttnPrepArgs, MergeChunksArgs, CpGatherArgs,
+    MAX_CP_RANKS,
+)
 from simd_math import exp_f32
 
 
@@ -57,36 +61,6 @@ def partial_head_stride[head_dim: Int]() -> Int:
 def partial_chunk_stride[head_dim: Int, heads_per_group: Int]() -> Int:
     """F32 element stride between consecutive chunks in a partial buffer."""
     return heads_per_group * partial_head_stride[head_dim]()
-
-
-# ============================================================================
-# Worker args
-# ============================================================================
-
-
-@fieldwise_init
-struct ChunkedAttnArgs(Copyable, ImplicitlyCopyable):
-    """Per-worker arguments for chunked attention scoring."""
-    var q_i8_base: Int
-    var qi_biases_base: Int
-    var q_scales_base: Int
-    var cache_base: Int
-    var kv_head: Int
-    var start_pg: Int
-    var end_pg: Int
-    var partial_out: Int
-    var context_len: Int
-
-    def __init__(out self):
-        self.q_i8_base = 0
-        self.qi_biases_base = 0
-        self.q_scales_base = 0
-        self.cache_base = 0
-        self.kv_head = 0
-        self.start_pg = 0
-        self.end_pg = 0
-        self.partial_out = 0
-        self.context_len = 0
 
 
 @always_inline
@@ -123,40 +97,6 @@ def cp_group_valid_mask[width: Int](
 # ============================================================================
 # CP prep kernel — Q prep (all ranks) + conditional KV cache write
 # ============================================================================
-
-
-@fieldwise_init
-struct CpAttnPrepArgs(Copyable, ImplicitlyCopyable):
-    var q_bf16_base: Int
-    var k_bf16_ptr: Int
-    var q_norm_ptr: Int
-    var k_norm_ptr: Int
-    var cos_ptr: Int
-    var sin_ptr: Int
-    var cache_base: Int
-    var cache_pos: Int
-    var kv_head: Int
-    var eps: Float32
-    var q_i8_out: Int
-    var qi_biases_out: Int
-    var q_scales_out: Int
-    var write_kv: Int32
-
-    def __init__(out self):
-        self.q_bf16_base = 0
-        self.k_bf16_ptr = 0
-        self.q_norm_ptr = 0
-        self.k_norm_ptr = 0
-        self.cos_ptr = 0
-        self.sin_ptr = 0
-        self.cache_base = 0
-        self.cache_pos = 0
-        self.kv_head = 0
-        self.eps = Float32(0)
-        self.q_i8_out = 0
-        self.qi_biases_out = 0
-        self.q_scales_out = 0
-        self.write_kv = Int32(0)
 
 
 def cp_attn_prep_kernel[
@@ -471,25 +411,6 @@ def cp_merge_and_quantize[
 # For the model's forward path, dispatchers in dispatch_kernels.mojo run the
 # same work on NUMA-local pool workers so all writes target local memory.
 
-comptime MAX_CP_RANKS = 8
-
-
-@fieldwise_init
-struct MergeChunksArgs(Copyable, ImplicitlyCopyable):
-    var partial_base: Int
-    var num_chunks: Int
-    var out_m: Int
-    var out_l: Int
-    var out_v: Int
-
-    def __init__(out self):
-        self.partial_base = 0
-        self.num_chunks = 0
-        self.out_m = 0
-        self.out_l = 0
-        self.out_v = 0
-
-
 def merge_local_chunks_kernel[head_dim: Int, heads_per_group: Int](
     args: MergeChunksArgs,
 ):
@@ -499,28 +420,6 @@ def merge_local_chunks_kernel[head_dim: Int, heads_per_group: Int](
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.out_m),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.out_l),
         UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.out_v))
-
-
-@fieldwise_init
-struct CpGatherArgs(Copyable, ImplicitlyCopyable):
-    var rank: Int
-    var head_start: Int
-    var head_count: Int
-    var qi_out: Int
-    var head_scales: Int
-    var all_m: InlineArray[Int, MAX_CP_RANKS]
-    var all_l: InlineArray[Int, MAX_CP_RANKS]
-    var all_v: InlineArray[Int, MAX_CP_RANKS]
-
-    def __init__(out self):
-        self.rank = 0
-        self.head_start = 0
-        self.head_count = 0
-        self.qi_out = 0
-        self.head_scales = 0
-        self.all_m = InlineArray[Int, MAX_CP_RANKS](fill=0)
-        self.all_l = InlineArray[Int, MAX_CP_RANKS](fill=0)
-        self.all_v = InlineArray[Int, MAX_CP_RANKS](fill=0)
 
 
 def cp_gather_kernel[head_dim: Int, num_heads: Int, tp: Int](

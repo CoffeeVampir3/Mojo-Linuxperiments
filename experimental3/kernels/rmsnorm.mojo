@@ -11,6 +11,11 @@ from experimental3.common_math import (
     inv_rms_from_sum_sq,
     normalize_inplace,
 )
+from experimental3.kernels.dispatch_args import (
+    RmsNormFwhtQuantArgs, RmsNormDualGammaFwhtArgs,
+    RMSNormNoScaleArgs, RMSNormPerHeadArgs,
+    PostAttnNormArgs, ExpertSumArgs, DenseNormArgs, PostReduceArgs,
+)
 
 
 # ============================================================================
@@ -212,33 +217,6 @@ def rmsnorm_bf16_row[cols: Int, has_gamma: Bool, has_residual: Bool](
 # ============================================================================
 
 
-@fieldwise_init
-struct RmsNormFwhtQuantArgs(Copyable, ImplicitlyCopyable):
-    """Unified args for all single-lane FWHT+quantize variants.
-
-    gamma_ptr is 0 when has_gamma=False (never dereferenced).
-    scale_ptr points to 1 scale per row (per-row) or cols/block per row (per-block).
-    """
-    var in_ptr: Int
-    var gamma_ptr: Int
-    var qi_ptr: Int
-    var work_ptr: Int
-    var scale_ptr: Int
-    var eps: Float32
-    var start_row: Int
-    var end_row: Int
-
-    def __init__(out self):
-        self.in_ptr = 0
-        self.gamma_ptr = 0
-        self.qi_ptr = 0
-        self.work_ptr = 0
-        self.scale_ptr = 0
-        self.eps = 0.0
-        self.start_row = 0
-        self.end_row = 0
-
-
 def rmsnorm_fwht_quant_worker[cols: Int, block: Int,
     has_gamma: Bool, per_block: Bool](
     args: RmsNormFwhtQuantArgs,
@@ -257,38 +235,8 @@ def rmsnorm_fwht_quant_worker[cols: Int, block: Int,
 
 
 # ============================================================================
-# Dual-lane FWHT + quantize: args, worker
+# Dual-lane FWHT + quantize: worker
 # ============================================================================
-
-
-@fieldwise_init
-struct RmsNormDualGammaFwhtArgs(Copyable, ImplicitlyCopyable):
-    var in_ptr: Int
-    var gamma_a_ptr: Int
-    var gamma_b_ptr: Int
-    var qi_a_ptr: Int
-    var qi_b_ptr: Int
-    var work_a_ptr: Int
-    var work_b_ptr: Int
-    var scale_a_ptr: Int
-    var scale_b_ptr: Int
-    var eps: Float32
-    var start_row: Int
-    var end_row: Int
-
-    def __init__(out self):
-        self.in_ptr = 0
-        self.gamma_a_ptr = 0
-        self.gamma_b_ptr = 0
-        self.qi_a_ptr = 0
-        self.qi_b_ptr = 0
-        self.work_a_ptr = 0
-        self.work_b_ptr = 0
-        self.scale_a_ptr = 0
-        self.scale_b_ptr = 0
-        self.eps = 0.0
-        self.start_row = 0
-        self.end_row = 0
 
 
 def rmsnorm_dual_gamma_fwht_quant_worker[cols: Int, block: Int](
@@ -322,15 +270,6 @@ def rmsnorm_dual_gamma_fwht_quant_worker[cols: Int, block: Int](
 # ============================================================================
 
 
-@fieldwise_init
-struct RMSNormNoScaleArgs(Copyable, ImplicitlyCopyable):
-    var input: BF16Ptr
-    var output: BF16Ptr
-    var start_row: Int
-    var end_row: Int
-    var eps: Float32
-
-
 def rmsnorm_no_scale_kernel[cols: Int](args: RMSNormNoScaleArgs):
     """RMSNorm without learnable scale, multi-row."""
     for row in range(args.start_row, args.end_row):
@@ -339,16 +278,6 @@ def rmsnorm_no_scale_kernel[cols: Int](args: RMSNormNoScaleArgs):
             BF16Ptr(),
             args.output + row * cols,
             args.eps)
-
-
-@fieldwise_init
-struct RMSNormPerHeadArgs(Copyable, ImplicitlyCopyable):
-    var input: BF16Ptr
-    var weight: BF16Ptr
-    var output: BF16Ptr
-    var start_row: Int
-    var end_row: Int
-    var eps: Float32
 
 
 def rmsnorm_per_head_kernel[head_dim: Int, num_heads: Int](args: RMSNormPerHeadArgs):
@@ -370,13 +299,6 @@ def rmsnorm_per_head_kernel[head_dim: Int, num_heads: Int](args: RMSNormPerHeadA
 # Fused norm + residual kernels (single-row)
 # ============================================================================
 
-
-@fieldwise_init
-struct PostAttnNormArgs(Copyable, ImplicitlyCopyable):
-    var src_ptr: Int
-    var norm_w_ptr: Int
-    var x_main_ptr: Int
-    var eps: Float32
 
 def post_attn_norm_kernel[hidden: Int](args: PostAttnNormArgs):
     """RMSNorm + residual add: x_main += rmsnorm(src, norm_w)."""
@@ -410,25 +332,12 @@ def pre_reduce_kernel[hidden: Int](args: PreReduceArgs):
         args.eps)
 
 
-@fieldwise_init
-struct ExpertSumArgs(Copyable, ImplicitlyCopyable):
-    var expert_out_ptr: Int
-    var local_count: Int
-    var dst_ptr: Int
-
 def expert_sum_kernel[hidden: Int](args: ExpertSumArgs):
     """Accumulate local expert outputs into dst."""
     var expert_buf = BF16Ptr(unsafe_from_address=args.expert_out_ptr)
     var dst = BF16Ptr(unsafe_from_address=args.dst_ptr)
     accumulate_expert_outputs[hidden](expert_buf, args.local_count, dst)
 
-
-@fieldwise_init
-struct DenseNormArgs(Copyable, ImplicitlyCopyable):
-    var src_ptr: Int
-    var norm_w_ptr: Int
-    var dst_ptr: Int
-    var eps: Float32
 
 def dense_norm_kernel[hidden: Int](args: DenseNormArgs):
     """RMSNorm dense output (no residual add)."""
@@ -438,16 +347,6 @@ def dense_norm_kernel[hidden: Int](args: DenseNormArgs):
         BF16Ptr(unsafe_from_address=args.dst_ptr),
         args.eps)
 
-
-@fieldwise_init
-struct PostReduceArgs(Copyable, ImplicitlyCopyable):
-    var moe_out_ptr: Int
-    var moe_norm_w_ptr: Int
-    var dense_normed_ptr: Int
-    var combine_norm_w_ptr: Int
-    var x_main_ptr: Int
-    var layer_scalar: Float32
-    var eps: Float32
 
 def post_reduce_kernel[hidden: Int](args: PostReduceArgs):
     """Post-allreduce: norms + combine + residual + scalar."""

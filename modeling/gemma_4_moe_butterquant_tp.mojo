@@ -23,13 +23,14 @@ from modeling.model_spec import (
     QuantizeTask, NoQuant, Rotated, SmoothPerBlock,
 )
 from modeling.gemma4_common import (
-    Gemma4BaseConfig, LayerShard, LayerBuilder, is_full_layer,
+    Gemma4BaseConfig, is_full_layer,
 )
 from modeling.modeling_common import (
     SlotOffset, Repeated, SectionBuilder, align_up,
     StaticTensorView, DynamicTensorView,
     static_tensor_view, dynamic_tensor_view,
     scratch_tensor_view, scratch_ptr,
+    LayerShard, LayerBuilder,
 )
 from kernels.kernel_ops import PoolFence, BF16Ptr
 from kernels.reductions import ring_allreduce, small_allreduce, ring_broadcast, ring_allgather

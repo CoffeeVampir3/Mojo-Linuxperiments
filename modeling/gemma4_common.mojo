@@ -1,10 +1,8 @@
-"""Gemma 4 shared infrastructure — config, layout builder, typed view helpers."""
+"""Gemma 4 shared infrastructure — config + layer-type routing.
 
-from modeling.model_spec import (
-    HOST_RANK, DISTRIBUTED,
-    ShapeLike, WeightDesc,
-    DEFAULT_ALIGNMENT,
-)
+LayerShard / LayerBuilder used to live here; they are now in modeling_common
+since every architecture uses them.
+"""
 
 
 # =============================================================================
@@ -50,113 +48,3 @@ struct Gemma4BaseConfig:
 @always_inline
 def is_full_layer(layer_idx: Int) -> Bool:
     return (layer_idx + 1) % 6 == 0
-
-
-# =============================================================================
-# Layer sharding modes
-# =============================================================================
-
-
-struct LayerShard:
-    comptime ROW  = 0
-    comptime COL  = 1
-    comptime REPL = 2
-    comptime HOST = 3
-
-
-# =============================================================================
-# Layer builder — cursor-based weight catalog emitter
-# =============================================================================
-
-
-@fieldwise_init
-struct LayerBuilder(Movable):
-    var tp: Int
-    var cursor: Int
-    var layer_prefix: String
-    var layer_base: Int
-
-    def __init__(out self, tp: Int, prefix: String, layer_base: Int):
-        self.tp = tp
-        self.cursor = 0
-        self.layer_prefix = prefix
-        self.layer_base = layer_base
-
-    @always_inline
-    def emit(mut self,
-            mut entries: List[WeightDesc],
-            suffix: String,
-            global_rows: Int, global_cols: Int,
-            dtype: DType, element_bytes: Int,
-            shard: Int, quantizable: Bool = False) -> Int:
-        var local_rows = global_rows // self.tp if shard == LayerShard.ROW else global_rows
-        var local_cols = global_cols // self.tp if shard == LayerShard.COL else global_cols
-        var target_rank = HOST_RANK if shard == LayerShard.HOST else DISTRIBUTED
-        var alloc = local_rows * local_cols * element_bytes
-        var off = ((self.cursor + DEFAULT_ALIGNMENT - 1) // DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT
-        self.cursor = off + alloc
-        entries.append(WeightDesc(
-            name=self.layer_prefix + suffix,
-            arena_offset=self.layer_base + off,
-            dtype=dtype, element_bytes=element_bytes,
-            global_rows=global_rows, global_cols=global_cols,
-            local_rows=local_rows, local_cols=local_cols,
-            data_rows=local_rows, data_cols=local_cols,
-            quantizable=quantizable, absorbed=False,
-            target_rank=target_rank,
-        ))
-        return off
-
-    @always_inline
-    def emit_shape[S: ShapeLike, element_bytes: Int](mut self,
-            mut entries: List[WeightDesc],
-            suffix: String,
-            dtype: DType,
-            quantizable: Bool = False) -> Int:
-        comptime alloc = S.bytes_for[element_bytes]()
-        var off = ((self.cursor + DEFAULT_ALIGNMENT - 1) // DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT
-        self.cursor = off + alloc
-        entries.append(WeightDesc(
-            name=self.layer_prefix + suffix,
-            arena_offset=self.layer_base + off,
-            dtype=dtype, element_bytes=element_bytes,
-            global_rows=S.GLOBAL_N, global_cols=S.GLOBAL_M,
-            local_rows=S.N, local_cols=S.M,
-            data_rows=S.DATA_N, data_cols=S.DATA_M,
-            quantizable=quantizable, absorbed=False,
-            target_rank=DISTRIBUTED,
-        ))
-        return off
-
-    @always_inline
-    def qs[S: ShapeLike](mut self, mut entries: List[WeightDesc], suffix: String) -> Int:
-        return self.emit_shape[S, 1](entries, suffix, DType.int8, True)
-
-    @always_inline
-    def fs[S: ShapeLike](mut self, mut entries: List[WeightDesc], suffix: String) -> Int:
-        return self.emit_shape[S, 4](entries, suffix, DType.float32, False)
-
-    @always_inline
-    def bfs[S: ShapeLike](mut self, mut entries: List[WeightDesc], suffix: String) -> Int:
-        return self.emit_shape[S, 2](entries, suffix, DType.bfloat16, False)
-
-    @always_inline
-    def colsum(mut self, nbytes: Int) -> Int:
-        var off = self.cursor
-        self.cursor += nbytes
-        return off
-
-    @always_inline
-    def q(mut self, mut entries: List[WeightDesc], suffix: String,
-          rows: Int, cols: Int, shard: Int) -> Int:
-        return self.emit(entries, suffix, rows, cols, DType.int8, 1, shard, True)
-
-    @always_inline
-    def f(mut self, mut entries: List[WeightDesc], suffix: String,
-          rows: Int, cols: Int, shard: Int) -> Int:
-        return self.emit(entries, suffix, rows, cols, DType.float32, 4, shard, False)
-
-    @always_inline
-    def bf(mut self, mut entries: List[WeightDesc], suffix: String,
-           rows: Int, cols: Int, shard: Int) -> Int:
-        return self.emit(entries, suffix, rows, cols, DType.bfloat16, 2, shard, False)

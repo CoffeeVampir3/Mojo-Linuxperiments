@@ -14,6 +14,7 @@ from experimental3.kernels.rope_and_kv_cache_write import (
     write_k_head_normed, write_v_head_normed,
 )
 from experimental3.helpers import prep_q_row_normed
+from experimental3.kernels.dispatch_args import AttnGroupArgs
 from simd_math import exp_f32, roundeven
 
 
@@ -204,44 +205,6 @@ def single_pass_attention[head_dim: Int, max_seq: Int, num_kv_heads: Int, num_q_
 # ============================================================================
 # Per-KV-group worker
 # ============================================================================
-
-
-@fieldwise_init
-struct AttnGroupArgs(Copyable, ImplicitlyCopyable):
-    """Shared args for both sliding and full attention group kernels.
-
-    For full attention (K=V shared), set v_bf16_ptr = k_bf16_ptr.
-    """
-    var q_bf16_ptr: Int
-    var k_bf16_ptr: Int
-    var v_bf16_ptr: Int
-    var q_norm_ptr: Int
-    var k_norm_ptr: Int
-    var cos_ptr: Int
-    var sin_ptr: Int
-    var cache_base: Int
-    var kv_head: Int
-    var cache_pos: Int
-    var context_len: Int
-    var qi_out_ptr: Int
-    var head_scale_ptr: Int
-    var eps: Float32
-
-    def __init__(out self):
-        self.q_bf16_ptr = 0
-        self.k_bf16_ptr = 0
-        self.v_bf16_ptr = 0
-        self.q_norm_ptr = 0
-        self.k_norm_ptr = 0
-        self.cos_ptr = 0
-        self.sin_ptr = 0
-        self.cache_base = 0
-        self.kv_head = 0
-        self.cache_pos = 0
-        self.context_len = 0
-        self.qi_out_ptr = 0
-        self.head_scale_ptr = 0
-        self.eps = Float32(0)
 
 
 def sliding_attn_group_kernel[
