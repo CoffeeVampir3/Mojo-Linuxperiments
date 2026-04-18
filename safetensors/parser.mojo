@@ -37,6 +37,8 @@ def parse_dtype(s: String) -> DType:
         return DType.float32
     if s == "F64":
         return DType.float64
+    if s == "F8_E4M3" or s == "F8_E4M3FN":
+        return DType.float8_e4m3fn
     if s == "I64":
         return DType.int64
     if s == "U64":
@@ -65,7 +67,7 @@ struct TensorMeta(Copyable, Writable):
         return n
 
 @fieldwise_init
-struct SafetensorsHeader(Movable):
+struct SafetensorsHeader(Copyable, Movable):
     var path: Path
     var tensors: Dict[String, TensorMeta]
     var data_offset: Int

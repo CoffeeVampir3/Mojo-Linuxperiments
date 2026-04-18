@@ -20,7 +20,9 @@ from modeling.model_spec import (
     Encoding, Shaped, BF16, F32, I8,
     Shape, ShapeLike, Mat, DynView, Bound,
     WeightDesc, DEFAULT_ALIGNMENT, LogitsView,
-    QuantizeTask, NoQuant, Rotated, SmoothPerBlock,
+    Task, SourceFormat,
+    Passthrough, ButterquantI8PerRow, ButterquantI8PerRowAbsorbed,
+    ButterquantI8PerBlock, ButterquantI8PerBlockAbsorbed,
 )
 from modeling.gemma4_common import (
     Gemma4BaseConfig, is_full_layer,
@@ -779,53 +781,61 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             unsafe_from_address=self.topos[0].scratch_base())
 
     @staticmethod
-    def build_quantizer_tasks() -> List[QuantizeTask]:
-        var tasks = List[QuantizeTask]()
+    def build_quantizer_tasks() -> List[Task]:
+        var tasks = List[Task]()
         comptime HB = FWHT_BLK_HIDDEN
         comptime LB = LM_HEAD_FWHT_BLK
-
-        var pt = NoQuant().to_op()
-        var rot_hb = Rotated(HB).to_op()
 
         for i in range(C.NUM_LAYERS):
             var p = "model.language_model.layers." + String(i) + "."
             var is_full = is_full_layer(i)
 
-            tasks.append(QuantizeTask(p + "self_attn.q_proj.weight", rot_hb))
-            tasks.append(QuantizeTask(p + "self_attn.k_proj.weight", rot_hb))
+            tasks.append(ButterquantI8PerRow(p + "self_attn.q_proj.weight",
+                SourceFormat.BF16, HB))
+            tasks.append(ButterquantI8PerRow(p + "self_attn.k_proj.weight",
+                SourceFormat.BF16, HB))
             if not is_full:
-                tasks.append(QuantizeTask(p + "self_attn.v_proj.weight", rot_hb))
+                tasks.append(ButterquantI8PerRow(p + "self_attn.v_proj.weight",
+                    SourceFormat.BF16, HB))
             if is_full:
-                tasks.append(QuantizeTask(p + "self_attn.o_proj.weight", Rotated(512).to_op()))
+                tasks.append(ButterquantI8PerRow(p + "self_attn.o_proj.weight",
+                    SourceFormat.BF16, 512))
             else:
-                tasks.append(QuantizeTask(p + "self_attn.o_proj.weight", rot_hb))
+                tasks.append(ButterquantI8PerRow(p + "self_attn.o_proj.weight",
+                    SourceFormat.BF16, HB))
 
-            tasks.append(QuantizeTask(p + "mlp.gate_proj.weight", rot_hb))
-            tasks.append(QuantizeTask(p + "mlp.up_proj.weight", rot_hb))
-            tasks.append(QuantizeTask(p + "mlp.down_proj.weight", Rotated(FWHT_BLK_DENSE_DOWN).to_op()))
+            tasks.append(ButterquantI8PerRow(p + "mlp.gate_proj.weight",
+                SourceFormat.BF16, HB))
+            tasks.append(ButterquantI8PerRow(p + "mlp.up_proj.weight",
+                SourceFormat.BF16, HB))
+            tasks.append(ButterquantI8PerRow(p + "mlp.down_proj.weight",
+                SourceFormat.BF16, FWHT_BLK_DENSE_DOWN))
 
-            tasks.append(QuantizeTask(p + "router.proj.weight", rot_hb))
-            tasks.append(QuantizeTask(p + "experts.gate_up_proj", Rotated(HB).to_op()))
-            tasks.append(QuantizeTask(p + "experts.down_proj", Rotated(FWHT_BLK).to_op()))
+            tasks.append(ButterquantI8PerRow(p + "router.proj.weight",
+                SourceFormat.BF16, HB))
+            tasks.append(ButterquantI8PerRow(p + "experts.gate_up_proj",
+                SourceFormat.BF16, HB))
+            tasks.append(ButterquantI8PerRow(p + "experts.down_proj",
+                SourceFormat.BF16, FWHT_BLK))
 
-            tasks.append(QuantizeTask(p + "input_layernorm.weight", pt))
-            tasks.append(QuantizeTask(p + "post_attention_layernorm.weight", pt))
-            tasks.append(QuantizeTask(p + "pre_feedforward_layernorm.weight", pt))
-            tasks.append(QuantizeTask(p + "pre_feedforward_layernorm_2.weight", pt))
-            tasks.append(QuantizeTask(p + "post_feedforward_layernorm.weight", pt))
-            tasks.append(QuantizeTask(p + "post_feedforward_layernorm_1.weight", pt))
-            tasks.append(QuantizeTask(p + "post_feedforward_layernorm_2.weight", pt))
-            tasks.append(QuantizeTask(p + "self_attn.q_norm.weight", pt))
-            tasks.append(QuantizeTask(p + "self_attn.k_norm.weight", pt))
-            tasks.append(QuantizeTask(p + "router.scale", pt))
-            tasks.append(QuantizeTask(p + "router.per_expert_scale", pt))
-            tasks.append(QuantizeTask(p + "layer_scalar", pt))
+            tasks.append(Passthrough(p + "input_layernorm.weight", DType.bfloat16))
+            tasks.append(Passthrough(p + "post_attention_layernorm.weight", DType.bfloat16))
+            tasks.append(Passthrough(p + "pre_feedforward_layernorm.weight", DType.bfloat16))
+            tasks.append(Passthrough(p + "pre_feedforward_layernorm_2.weight", DType.bfloat16))
+            tasks.append(Passthrough(p + "post_feedforward_layernorm.weight", DType.bfloat16))
+            tasks.append(Passthrough(p + "post_feedforward_layernorm_1.weight", DType.bfloat16))
+            tasks.append(Passthrough(p + "post_feedforward_layernorm_2.weight", DType.bfloat16))
+            tasks.append(Passthrough(p + "self_attn.q_norm.weight", DType.bfloat16))
+            tasks.append(Passthrough(p + "self_attn.k_norm.weight", DType.bfloat16))
+            tasks.append(Passthrough(p + "router.scale", DType.bfloat16))
+            tasks.append(Passthrough(p + "router.per_expert_scale", DType.bfloat16))
+            tasks.append(Passthrough(p + "layer_scalar", DType.bfloat16))
 
-        tasks.append(QuantizeTask("model.language_model.norm.weight", pt))
-        tasks.append(QuantizeTask(
+        tasks.append(Passthrough("model.language_model.norm.weight", DType.bfloat16))
+        tasks.append(ButterquantI8PerBlockAbsorbed(
             "model.language_model.embed_tokens.weight",
-            SmoothPerBlock(LB, "model.language_model.norm.weight").to_op(),
-        ))
+            SourceFormat.BF16, LB,
+            "model.language_model.norm.weight"))
         return tasks^
 
     def report_profile(self, label: String):

@@ -73,12 +73,12 @@ comptime Untiled = Kernel2DTiling[1, 1]
 trait WeightTag: ...
 trait Quantizable: ...
 trait Gamma: ...
-trait Passthrough: ...
+trait PassthroughTag: ...
 trait Absorbed: ...
 
 struct IsQuantizable(WeightTag, Quantizable): ...
 struct IsGammaQuantizable(WeightTag, Quantizable, Gamma): ...
-struct IsPassthrough(WeightTag, Passthrough): ...
+struct IsPassthrough(WeightTag, PassthroughTag): ...
 struct IsAbsorbed(WeightTag, Absorbed): ...
 
 
@@ -269,7 +269,7 @@ struct PlacedSlot[
     Encoding, Shaped, Placed, Named, ShardStrategy,
     Quantizable where conforms_to(Tag, Quantizable),
     Gamma where conforms_to(Tag, Gamma),
-    Passthrough where conforms_to(Tag, Passthrough),
+    PassthroughTag where conforms_to(Tag, PassthroughTag),
     Absorbed where conforms_to(Tag, Absorbed),
 ):
     comptime DTYPE = Self.E.DTYPE
@@ -389,89 +389,107 @@ trait WeightIterable:
 
 
 # =============================================================================
-# Runtime quantizer task — one work unit per source weight.
+# Quantizer tasks — one concrete variant per real operation.
 #
-# Replaces the WeightIterable-driven template dispatch in the quantizer.
-# Each task is self-contained: the kind tells the driver which processing
-# path to take, and gamma_src names the norm tensor to absorb into this
-# weight (empty string for no absorption). The old ABSORBED / GAMMA_QUANTIZE
-# two-task handshake is gone — gamma is an explicit edge from consumer to
-# source, loaded lazily by the driver's one-slot cache.
+# The quantizer's task list is a heterogeneous `List[Task]` where `Task`
+# is the `Variant` over the five structs below. Each variant is
+# self-describing: read the fields at the call site, you know the full
+# scope of what hits disk for that weight. No `to_op()` indirection, no
+# flag-bag struct, no "is this combination legitimate" check at runtime.
+#
+# Adding a variant is one new struct here + one arm in the dispatch
+# match in quant/butterquant.mojo. Nothing else moves.
 # =============================================================================
 
 
-# --- QuantOp: flat operational struct consumed by the quantizer core ---
+struct SourceFormat:
+    """Vendor-side disk encoding for a quantizable tensor.
 
-
-@fieldwise_init
-struct QuantOp(Copyable, Movable, ImplicitlyCopyable):
-    """Fully-resolved quantization operation.
-
-    Flat, no variant dispatch. The quantizer core works exclusively
-    with this. num_blocks is derived at plan time from block and cols.
+    A runtime tag that picks the `Converter` used to dequant source bytes
+    into f32. The converter traits live in `quant/source_format.mojo`;
+    this module only exposes the tag so modeling files can declare
+    source formats without depending on the quantizer pipeline.
     """
-    var quantize: Bool     # False = passthrough (copy raw bytes)
-    var rotate: Bool       # apply FWHT?
-    var block: Int         # FWHT block size (0 when not rotating)
-    var per_block: Bool    # per-block scales vs per-row
-    var smooth_src: String # "" = no smooth absorption
+    comptime BF16 = 0
+    comptime F32 = 1
+    comptime FP8_E4M3_BLOCK128 = 2
 
 
-# --- Quantization trait: the extensibility contract ---
-
-
-trait Quantization:
-    def to_op(self) -> QuantOp: ...
-
-
-struct NoQuant(Quantization, Copyable, ImplicitlyCopyable):
-    """Weight copied unchanged at source dtype."""
-
-    def __init__(out self):
-        pass
-
-    def to_op(self) -> QuantOp:
-        return QuantOp(quantize=False, rotate=False, block=0,
-                       per_block=False, smooth_src="")
-
-
-struct Rotated(Quantization, Copyable, ImplicitlyCopyable):
-    """FWHT rotation + per-row absmax i8."""
-    var block: Int
-
-    def __init__(out self, block: Int):
-        debug_assert(block > 0 and (block & (block - 1)) == 0,
-            "Rotated: block must be a positive power of 2")
-        self.block = block
-
-    def to_op(self) -> QuantOp:
-        return QuantOp(quantize=True, rotate=True, block=self.block,
-                       per_block=False, smooth_src="")
-
-
-struct SmoothPerBlock(Quantization, Copyable, Movable):
-    """Gamma absorption + FWHT rotation + per-block absmax i8."""
-    var block: Int
-    var src: String
-
-    def __init__(out self, block: Int, src: String):
-        debug_assert(block > 0 and (block & (block - 1)) == 0,
-            "SmoothPerBlock: block must be a positive power of 2")
-        self.block = block
-        self.src = src
-
-    def to_op(self) -> QuantOp:
-        return QuantOp(quantize=True, rotate=True, block=self.block,
-                       per_block=True, smooth_src=self.src)
-
-
-# --- QuantizeTask: pairs a weight name with its resolved operation ---
+# --- Concrete task variants -------------------------------------------------
 
 
 @fieldwise_init
-struct QuantizeTask(Copyable, Movable):
+struct Passthrough(Copyable, Movable, ImplicitlyCopyable):
+    """Copy bytes from source to output unchanged.
+
+    `expected_dtype` is a plan-time sanity gate: the planner fails hard
+    if the on-disk tensor's dtype doesn't match. Catches the "thought
+    this was bf16 but it's f32" class of mistake without coupling the
+    passthrough path to any decode logic.
+    """
     var name: String
-    var op: QuantOp
+    var expected_dtype: DType
+
+
+@fieldwise_init
+struct ButterquantI8PerRow(Copyable, Movable, ImplicitlyCopyable):
+    """FWHT rotate at `block`, emit int8 weight + f32 per-row scale.
+
+    Output entries: `<name>` int8, `<name>_scale` f32 shape (rows,).
+    """
+    var name: String
+    var source: Int   # SourceFormat tag
+    var block: Int    # FWHT rotation block (power of 2)
+
+
+@fieldwise_init
+struct ButterquantI8PerRowAbsorbed(Copyable, Movable, ImplicitlyCopyable):
+    """Same as PerRow but first multiplies the weight row-wise by
+    sqrt(|gamma|) where gamma is loaded from the tensor named by
+    `gamma_src`. The runtime RMSNorm consuming this weight can then
+    skip the gamma multiply.
+    """
+    var name: String
+    var source: Int
+    var block: Int
+    var gamma_src: String
+
+
+@fieldwise_init
+struct ButterquantI8PerBlock(Copyable, Movable, ImplicitlyCopyable):
+    """FWHT rotate at `block`, emit int8 weight + f32 per-block scale
+    grid. One scale per (row, col_block) pair.
+
+    Output entries: `<name>` int8, `<name>_scale` f32 shape (rows, cols/block).
+    """
+    var name: String
+    var source: Int
+    var block: Int
+
+
+@fieldwise_init
+struct ButterquantI8PerBlockAbsorbed(Copyable, Movable, ImplicitlyCopyable):
+    """Gamma-absorbed PerBlock — absorbs sqrt(|gamma|) from `gamma_src`
+    before FWHT + per-block absmax i8.
+    """
+    var name: String
+    var source: Int
+    var block: Int
+    var gamma_src: String
+
+
+# --- Task variant umbrella --------------------------------------------------
+
+
+from std.utils.variant import Variant
+
+comptime Task = Variant[
+    Passthrough,
+    ButterquantI8PerRow,
+    ButterquantI8PerRowAbsorbed,
+    ButterquantI8PerBlock,
+    ButterquantI8PerBlockAbsorbed,
+]
 
 
 trait Dims:

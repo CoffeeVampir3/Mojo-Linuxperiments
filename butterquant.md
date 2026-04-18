@@ -10,9 +10,9 @@ The quantization scheme follows the same principle as TurboQuant (Zandieh et al.
 
 - **Hadamard rotation** rather than random orthogonal: O(n log n) structured transform, self-inverse, implemented as in-register SIMD butterfly stages. Required for GEMM algebra (single-sided weight rotation cancels with activation rotation on the contraction dimension) and attention domain consistency (Parseval preserves dot products). Does not eliminate per-head magnitude variance — dynamic scales handle that.
 
-- **Dynamic per-row absmax scales** at all activation quantization points (S_act, S_Q, S_K, S_post): empirically measured cos=0.879 with fixed analytical scales vs cos=0.9999 with dynamic absmax. The analytical scale derivation (from weight Frobenius norms) underestimates actual magnitudes by 1.4–3.3× because it assumes isotropic inputs, which real activations are not. Dynamic absmax eliminates this gap at negligible cost (one SIMD reduction per row, fused into the quantize loop).
+- **Dynamic per-row absmax scales** at all activation quantization points (S_act, S_Q, S_K, S_V, S_post): empirically measured cos=0.879 with fixed analytical scales vs cos=0.9999 with dynamic absmax. The analytical scale derivation (from weight Frobenius norms) underestimates actual magnitudes by 1.4–3.3× because it assumes isotropic inputs, which real activations are not. Dynamic absmax eliminates this gap at negligible cost (one SIMD reduction per row, fused into the quantize loop).
 
-- **Fixed scale for V only**: V projection outputs have small, uniform per-head norms (max/min ratio ~1.5×) because V magnitude doesn't affect attention distribution — only Q/K do. Per-position V scales would require dequantization inside the AMX tile accumulation, breaking the hardware pipeline. Measured round-trip cos=0.993 with fixed V scale, adequate for the convex-combination output.
+- **V scales folded into attention weights**: per-position V scales are absorbed into the softmax-derived attention weights before u8 quantization for the V-aggregation VNNI pass. This preserves the AMX tile accumulation pattern — the V-agg kernel sees a single u8×i8 VNNI multiply-accumulate with no per-position dequant inside the sum. The V scale is read alongside the K scale (both L1-resident) during the softmax→u8 pass, adding one multiply per position.
 
 - **Layer-by-layer accuracy**: measured cos>0.999 between bf16 reference and ButterQuant hidden states through all 30 layers of SmolLM2-135M, with no degradation trend. Output quality is indistinguishable from the bf16 model.
 
@@ -62,7 +62,7 @@ The FWHT serves two distinct roles in ButterQuant:
 
 $$C(n) = \mathbb{E}_{x \sim \text{Uniform}(S^{n-1})} \left[\sqrt{n} \cdot \max_{i=1}^{n} |[H_n x]_i|\right]$$
 
-$C(n)$ is a deterministic function of $n$ alone, computed via Monte Carlo at compile time. It is used in the derivation of the V projection scale (the only remaining fixed scale — see §3.2).
+$C(n)$ is a deterministic function of $n$ alone, computed via Monte Carlo at compile time.
 
 ---
 
@@ -140,34 +140,20 @@ $$\hat{x} = Q_S(x) \cdot \frac{S}{127}$$
 
 ## 3.2 Scale Strategy
 
-ButterQuant uses **dynamic per-row absmax scales** at all activation quantization points, with one exception: V projection uses a fixed scale derived from weight norms.
-
-### Dynamic scales (runtime)
+ButterQuant uses **dynamic per-row absmax scales** at all activation quantization points.
 
 At each quantization boundary, after FWHT, compute the absmax of the transformed values and use it as the scale:
 
 $$S[m] = \max_k |\tilde{x}[m, k]|$$
 
-This is one SIMD reduction per row, fused into the quantize loop. The scale is written to an output array and passed to the downstream GEMV for dequantization.
+This is one SIMD reduction per row, fused into the quantize loop. The scale is written to an output array and passed to the downstream operation for dequantization.
 
 **Where used:**
 - $S_{\text{act}}[m]$: RMSNorm + FWHT output, per sequence position. Used by QKV and gate+up GEMVs.
 - $S_Q[h, m]$: Q head after RoPE + FWHT, per head per position. Stored in cache, used for score dequant.
 - $S_K[h, m]$: K head after RoPE + FWHT, per head per position. Stored in cache, used for score dequant.
+- $S_V[g, m]$: V head after FWHT, per KV head per position. Stored in cache, folded into attention weights during V-agg (see §6.5).
 - $S_{\text{post}}[m]$: silu(gate)×up after FWHT, per sequence position. Used by down GEMV.
-
-### Fixed scale (V projection only)
-
-$$\boxed{S_V = \frac{\|W'_V\|_F}{\sqrt{M_V}} \cdot C(d_k)}$$
-
-where $M_V$ is the output dimension of the V projection (= KV\_HIDDEN) and $C(d_k)$ is the concentration constant for the FWHT block size.
-
-V uses a fixed scale because:
-1. V projection outputs have small, uniform per-head norms (measured max/min ratio ~1.5× vs Q's ~2.1×)
-2. Per-position V scales would require dequantization inside the V-aggregation GEMM summation, breaking the AMX accumulation pattern
-3. Measured round-trip quality with fixed V scale: cos ≈ 0.993, adequate for the convex-combination output
-
-The attention output is also quantized with $S_V$ for the O projection (Category D: $S_{\text{attn\_out}} = S_V$, bounded by convexity of softmax-weighted sum).
 
 ### Scale summary
 
@@ -176,9 +162,8 @@ The attention output is also quantized with $S_V$ for the O projection (Category
 | $S_{\text{act}}$ | Dynamic absmax | Per row | Runtime (fused with FWHT+quantize) |
 | $S_Q$ | Dynamic absmax | Per head, per position | Runtime (in Q prep) |
 | $S_K$ | Dynamic absmax | Per head, per position | Runtime (in K cache write) |
-| $S_V$ | Fixed | Per layer | Load time (from weight Frobenius norm) |
+| $S_V$ | Dynamic absmax | Per KV head, per position | Runtime (in V cache write) |
 | $S_{\text{post}}$ | Dynamic absmax | Per row | Runtime (fused with SiLU+FWHT+quantize) |
-| $S_{\text{attn\_out}}$ | Fixed ($= S_V$) | Per layer | Load time |
 
 ## 3.3 Storage Convention
 
@@ -224,7 +209,7 @@ where $x_{\text{u8}} = x_{\text{i8}} \oplus \texttt{0x80}$. The dequantized outp
 
 $$\boxed{y[m, n] = \left(\text{raw}[m, n] - 128 \cdot \text{colsum}[n]\right) \cdot \frac{S_{\text{act}}[m]}{127} \cdot s_w[n]}$$
 
-Note: $S_{\text{act}}[m]$ is per-row (dynamic), not per-model. For the O projection, $S_{\text{act}}[m] = S_V$ (fixed). For the down projection, $S_{\text{act}}[m] = S_{\text{post}}[m]$ (dynamic).
+Note: $S_{\text{act}}[m]$ is per-row (dynamic), not per-model. For the O projection, $S_{\text{act}}[m]$ is the dynamic absmax of the attention output (after V-agg normalize). For the down projection, $S_{\text{act}}[m] = S_{\text{post}}[m]$ (dynamic).
 
 ---
 
@@ -232,16 +217,16 @@ Note: $S_{\text{act}}[m]$ is per-row (dynamic), not per-model. For the O project
 
 ## 5.1 Format
 
-The cache stores K data (VNNI-formatted u8), V data (row-major i8), and per-head dynamic scales for K and Q:
+The cache stores K data (VNNI-formatted u8), V data (row-major i8), and per-head per-position dynamic scales for K and V:
 
 | Region | Layout | Element type |
 |--------|--------|-------------|
 | K data | $[\text{num\_kv\_heads}][\text{tiles}][\text{k\_slices} \times \text{TILE\_BYTES}]$ | u8 (VNNI) |
 | V data | $[\text{num\_kv\_heads}][\text{max\_seq}][\text{head\_dim}]$ | i8 |
 | K scales | $[\text{num\_kv\_heads}][\text{max\_seq}]$ | f32 |
-| Q scales | $[\text{num\_q\_heads}][\text{max\_seq}]$ | f32 |
+| V scales | $[\text{num\_kv\_heads}][\text{max\_seq}]$ | f32 |
 
-Per-position storage overhead from scales: $(\text{num\_kv\_heads} + \text{num\_q\_heads}) \times 4$ bytes.
+Per-position storage overhead from scales: $2 \times \text{num\_kv\_heads} \times 4$ bytes.
 
 ## 5.2 Cache Write (K)
 
@@ -257,13 +242,14 @@ The scale $S_K[g, \text{pos}]$ is stored in the cache for use during score dequa
 
 ## 5.3 Cache Write (V)
 
-Identical to K without RoPE, using fixed scale $S_V$:
+Identical to K without RoPE:
 
 $$v = V_{\text{bf16}}[g \cdot d_k : (g+1) \cdot d_k]$$
 $$\tilde{v} = \text{FWHT}(v)$$
-$$\texttt{cache}[\text{pos}, i] = Q_{S_V}(\tilde{v}[i])$$
+$$S_V[g, \text{pos}] = \max_i |\tilde{v}[i]|$$
+$$\texttt{cache}[\text{pos}, i] = Q_{S_V[g, \text{pos}]}(\tilde{v}[i])$$
 
-V is stored as i8 directly (no XOR — signed B operand of `tdpbusd`).
+The scale $S_V[g, \text{pos}]$ is stored in the cache. V is stored as i8 directly (no XOR — signed B operand of `tdpbusd`).
 
 ## 5.4 RoPE Convention
 
@@ -275,7 +261,7 @@ RoPE is applied in the original domain (before FWHT). By Parseval, $\langle \tex
 
 ## 5.5 Cache Read
 
-No dequantization at read time. K bytes are loaded directly into AMX tile registers as u8. V bytes are loaded as i8 for VNNI packing. Dequantization is deferred to the scoring epilogue (K) and final normalize (V).
+No dequantization at read time. K bytes are loaded directly into AMX tile registers as u8. V bytes are loaded as i8 for VNNI packing. K scales are applied per-position during scoring dequant. V scales are folded into the attention weights before the V-agg VNNI pass (see §6.5).
 
 ---
 
@@ -308,25 +294,31 @@ $$\boxed{s_t = (r_t - b_q) \cdot \frac{S_Q[h, \text{pos}_q]}{127^2 \cdot \sqrt{d
 
 The Q factor $S_Q[h, \text{pos}_q] / (127^2 \cdot \sqrt{d_k})$ is constant for a given query row and can be hoisted out of the position loop. The K factor $S_K[g, t]$ is per-position, loaded from the cache's K scale array (L1-resident).
 
-## 6.4 Softmax
+## 6.4 Softmax + V-Scale Folding
 
-Online softmax with two passes. Identical to the previous design except the score dequant includes the per-position K scale factor:
+Online softmax with single fused pass per position group. For each position group of WIDTH positions:
 
-**Pass 1 (max):** $(r_t - b_q) \cdot q_{\text{partial}} \cdot S_K[g, t]$, track max.
+**Score:** $(r_t - b_q) \cdot q_{\text{partial}} \cdot S_K[g, t]$, track running max $m$ and sum $\ell$.
 
-**Pass 2 (exp → u8):** $w_t = \text{round}(\exp(s_t - m) \cdot 255)$.
+**V-scale absorption:** The unnormalized attention weight $w_t = \exp(s_t - m)$ is multiplied by the per-position V scale before u8 quantization:
+
+$$w'_t = \exp(s_t - m) \cdot S_V[g, t]$$
+$$S_w = \max_t w'_t$$
+$$w'_{\text{u8}}[t] = \text{round}(w'_t \cdot 255 / S_w)$$
+
+This folds the per-position V scale into the attention weight. The V scale $S_V[g, t]$ is loaded from the cache's V scale array (L1-resident, alongside the K scale array). The cost is one multiply per position — the same as the K scale application during scoring.
 
 ## 6.5 V Aggregation
 
-$$p_d = \sum_{t} w_t \cdot v_{\text{i8}}[t, d]$$
+$$p_d = \sum_{t} w'_{\text{u8}}[t] \cdot v_{\text{i8}}[t, d]$$
 
-Unchanged from previous design. V uses fixed scale; no per-position dequant needed inside the sum.
+The VNNI `tdpbusd` accumulation is structurally identical to the fixed-scale design. The per-position V scale has already been absorbed into $w'_{\text{u8}}$, so the kernel sees a standard u8×i8 multiply-accumulate with no per-position dequant inside the sum.
 
 ## 6.6 Final Normalize
 
-$$\boxed{\text{output}_d = o_d \cdot \frac{\sigma_v}{\ell}, \quad \sigma_v = \frac{S_V}{255 \cdot 127}}$$
+$$\boxed{\text{output}_d = p_d \cdot \frac{S_w}{255 \cdot 127 \cdot \ell}}$$
 
-Unchanged. The attention output is then quantized with $S_V$ for the O projection.
+where $S_w = \max_t(\exp(s_t - m) \cdot S_V[g, t])$ is a per-query scalar and $\ell = \sum_t \exp(s_t - m)$ is the standard softmax normalizer. The attention output is then quantized with a dynamic absmax scale for the O projection.
 
 ---
 
@@ -336,10 +328,10 @@ Unchanged. The attention output is then quantized with $S_V$ for the O projectio
 |----------|-----------|-------|
 | $q_{\text{partial}} = S_Q / (127^2 \cdot \sqrt{d_k})$ | Q-side score dequant | Per query head, per position |
 | $S_K[g, t]$ | K-side score dequant | Per KV head, per position (from cache) |
-| $\sigma_v = S_V / (255 \cdot 127)$ | V-agg dequant | Per layer (fixed) |
-| $127 / S_V$ | Attention output quantize | Per layer (fixed) |
+| $S_V[g, t]$ | V-scale, folded into attention weight | Per KV head, per position (from cache) |
+| $S_w / (255 \cdot 127 \cdot \ell)$ | V-agg dequant + normalize | Per query (runtime) |
 
-Per-query-row runtime quantities: $b_q$ (bias correction), $S_Q$ (Q scale). Per-position: $S_K$ (from cache).
+Per-query-row runtime quantities: $b_q$ (bias correction), $S_Q$ (Q scale), $S_w$ (V-absorbed weight max), $\ell$ (softmax sum). Per-position: $S_K$, $S_V$ (from cache).
 
 ---
 
@@ -351,14 +343,14 @@ Per-query-row runtime quantities: $b_q$ (bias correction), $S_Q$ (Q scale). Per-
 | 2 | $x_{\text{i8}} = Q_{S_{\text{act}}[m]}(\text{FWHT}(x_n))$ | Dynamic absmax | Hadamard, i8 |
 | 3–5 | QKV GEMV: $x_{\text{i8}} \times W'_{Q/K/V}$ | $S_{\text{act}}[m] / 127 \times s_w[n]$ | Original, bf16 |
 | 6 | Cache $K$: RoPE + FWHT + $Q_{S_K[g,m]}$ + store | Dynamic absmax | Hadamard, u8 |
-| 7 | Cache $V$: FWHT + $Q_{S_V}$ + store | Fixed $S_V$ | Hadamard, i8 |
+| 7 | Cache $V$: FWHT + $Q_{S_V[g,m]}$ + store | Dynamic absmax | Hadamard, i8 |
 | 8 | Q prep: RoPE + FWHT + $Q_{S_Q[h,m]}$ + $b_q$ | Dynamic absmax | Hadamard, i8 |
 | 9 | Score: $(r_t - b_q) \cdot q_{\text{partial}} \cdot S_K[g,t]$ | Per-position | f32 |
-| 10 | Softmax → u8 weights | 255 | u8 |
-| 11 | V-agg: $o_d = \sum_t w_t \cdot v_{\text{i8}}[t,d]$ | Deferred | i32 → f32 |
-| 12 | Normalize: $o_d \cdot \sigma_v / \ell$ | Fixed $S_V$ | Hadamard, f32 |
-| 13 | Quantize attn output: $Q_{S_V}(\text{out})$ | Fixed $S_V$ | Hadamard, i8 |
-| 14 | O GEMV: $\text{out}_{\text{i8}} \times W'_O$ | $S_V / 127 \times s_w[n]$ | Original, bf16 |
+| 10 | Softmax + V-fold: $w'_t = \exp(s_t - m) \cdot S_V[g,t]$ → u8 | Per-position | u8 |
+| 11 | V-agg: $p_d = \sum_t w'_{\text{u8}}[t] \cdot v_{\text{i8}}[t,d]$ | Deferred | i32 → f32 |
+| 12 | Normalize: $p_d \cdot S_w / (255 \cdot 127 \cdot \ell)$ | Per-query | Hadamard, f32 |
+| 13 | Quantize attn output: dynamic absmax | Dynamic absmax | Hadamard, i8 |
+| 14 | O GEMV: $\text{out}_{\text{i8}} \times W'_O$ | $S_{\text{attn}} / 127 \times s_w[n]$ | Original, bf16 |
 | 15 | $r = x^{(\ell)} + z_{\text{attn}}$ | — | Original, f32 |
 | 16 | $r_n = r / \text{rms}(r)$ | — | Original, f32 |
 | 17 | $r_{\text{i8}} = Q_{S_{\text{act}}[m]}(\text{FWHT}(r_n))$ | Dynamic absmax | Hadamard, i8 |
@@ -402,7 +394,7 @@ Cosine similarity remains above 0.999 through all 30 layers with no degradation 
 |-------------------|----------------|------------------|
 | Q heads | 0.894–0.980 | 0.99998 |
 | K heads | 0.897–0.969 | 0.99999 |
-| V heads (fixed) | 0.984–0.999 | — |
+| V heads | 0.984–0.999 | 0.99999 |
 | Silu output | 0.879 | 0.9999 |
 | RMSNorm activation | 0.997 | 0.9999 |
 
@@ -410,27 +402,17 @@ Cosine similarity remains above 0.999 through all 30 layers with no degradation 
 
 # XI. Design Notes
 
-## Why dynamic scales for Q/K but not V
+## V-scale folding into attention weights
 
-Q and K projection outputs exhibit high per-head norm variance (measured 2.1× max/min ratio for Q, 1.8× for K in SmolLM2). This is inherent to the attention mechanism: Q/K magnitudes control attention score sharpness, and different heads specialize in different patterns, producing divergent norms. A single fixed scale clips the large heads severely (measured 45% magnitude loss, dot product ratio 0.53).
+The V-aggregation VNNI kernel accumulates across positions: $p_d = \sum_t w_t \cdot v_{\text{i8}}[t, d]$. A naive per-position V scale $S_V[t]$ would require dequantization inside this sum, breaking the AMX tile accumulation. The solution: multiply $S_V[t]$ into the attention weight $w_t$ before u8 quantization, producing $w'_t = w_t \cdot S_V[t]$. Since both factors are per-position scalars, this is a pointwise product during the softmax→u8 pass. The VNNI accumulation then operates on $w'_{\text{u8}} \times v_{\text{i8}}$ with no per-position dequant in the inner loop.
 
-V projection outputs have small, uniform norms (measured 1.5× max/min ratio). V carries content weighted by softmax; its magnitude affects only the residual update scale, not the attention distribution. The model has no incentive to make V large. A fixed scale derived from $\|W'_V\|_F / \sqrt{M_V} \cdot C(d_k)$ produces cos ≈ 0.993, adequate for the convex-combination output.
-
-Additionally, per-position V scales would require dequantization inside the V-aggregation AMX GEMM summation ($S_V[t]$ varies per position inside $\sum_t w_t \cdot v_{\text{i8}}[t,d] \cdot S_V[t]$), breaking the tile accumulation pattern.
+The precision cost is small: the u8 attention weight now encodes the product of attention probability and V magnitude. If V norms vary by ~1.5× across positions, the effective u8 dynamic range widens by the same factor, reducing attention weight resolution from 256 to ~170 effective levels. This is far better than the alternative: a fixed V scale derived from weight norms that underestimates actual magnitudes, producing cos ≈ 0.993 (vs cos ≈ 0.99999 with dynamic scales).
 
 ## Why dynamic scales for S_act and S_post
 
 The fixed $S_{\text{act}} = C(n)$ derivation assumes isotropic per-component magnitudes after RMSNorm + FWHT. Measured ratio of actual absmax to $C(n)$ is ~1.4× — marginal but improvable. Dynamic absmax raises cos from 0.997 to 0.9999 for essentially zero compute cost (one SIMD reduction fused into the existing quantize loop).
 
 The fixed $S_{\text{post}}$ prediction was 3.26× too small for actual silu(gate)×up values, causing cos = 0.879. This is because the analytical formula $S_{\text{post}} = \sqrt{M_2(\text{silu}, \sigma_{\text{gate}}) \cdot \sigma_{\text{up}}^2} \cdot C(n)$ assumes isotropic input to the gate/up projections, which does not hold for real activations. Dynamic absmax eliminates the prediction entirely.
-
-## V scale derivation
-
-The corrected V scale formula uses $\sqrt{M_V}$ (output dimension) as the denominator, not $\sqrt{K}$ (input dimension). The general formula for per-component RMS of $y = W'x$ with isotropic input:
-
-$$\text{RMS}(y) = \frac{\|W'\|_F}{\sqrt{M}}$$
-
-This equals $\|W'\|_F / \sqrt{K}$ only when $M = K$ (e.g., Q projection where $M = K = \text{HIDDEN}$). For V with $M = \text{KV\_HIDDEN} \neq K$, the distinction matters by a factor of $\sqrt{K/M} = \sqrt{\text{GQA\_FACTOR}}$.
 
 ---
 
@@ -444,9 +426,7 @@ This equals $\|W'\|_F / \sqrt{K}$ only when $M = K$ (e.g., Q projection where $M
 
 4. **Block size is a power of 2.** Must divide all tensor dimensions including under tensor parallelism.
 
-5. **V scale derived from checkpoint.** $\|W'_V\|_F$ from Frobenius norm + $C(n)$. All other scales are runtime dynamic.
-
-6. **Tensor parallelism and V scale.** Under TP, each rank holds a V weight shard. The full norm is recovered by all-reduce at load time.
+5. **All scales are runtime dynamic.** No checkpoint-derived fixed scales. All quantization points use per-row or per-position dynamic absmax.
 
 ---
 
@@ -467,7 +447,7 @@ The LM head projection uses the embedding matrix (tied weights) with a bf16 matm
 | Architecture | Compatible | Notes |
 |-------------|-----------|-------|
 | LLaMA / Mistral / DeepSeek | Yes | RMSNorm, standard GQA |
-| Mixture of Experts | Yes | Per-expert V scales; dynamic scales adapt per-token |
+| Mixture of Experts | Yes | Dynamic scales adapt per-token |
 | Multi-head Latent Attention | Yes | Block size = latent dim |
 | Sliding window attention | Yes | Cache format unchanged (scales indexed by position) |
 | GPT-2 / BERT (LayerNorm) | No | Mean subtraction breaks commutativity |
