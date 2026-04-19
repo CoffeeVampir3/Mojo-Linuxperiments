@@ -92,11 +92,23 @@ $\alpha\,\tilde{x} = \mathcal{H}(\alpha x)$ by linearity. Covers $1/\sqrt{d_k}$ 
 
 By Parseval: $\text{rms}(\tilde{x}) = \text{rms}(x)$. The norm is computable in either domain.
 
-**Gain absorption.** The elementwise gain $\gamma$ does not commute with $\mathcal{H}$. Resolution: define $W' = W \cdot \text{diag}(\gamma)$ offline. Runtime RMSNorm reduces to division by RMS (no gamma multiply).
+**Gain split.** The elementwise gain $\gamma$ does not commute with $\mathcal{H}$. Full offline absorption,
+$W' = W \cdot \text{diag}(\gamma)$, is algebraically valid in exact arithmetic, but it concentrates the full
+gain distribution into the quantized weight operand. ButterQuant intentionally splits the gain between the
+two quantized operands:
 
-**Absorption mapping:**
+$$\gamma_k = \text{sign}(\gamma_k)\sqrt{|\gamma_k|}\;\sqrt{|\gamma_k|}$$
 
-| Gamma source | Absorbed into |
+Offline, weights are multiplied by the unsigned factor $\sqrt{|\gamma|}$ before FWHT rotation and int8
+quantization. Runtime RMSNorm multiplies the normalized activation by the signed factor
+$\text{sign}(\gamma)\sqrt{|\gamma|}$ before FWHT rotation and dynamic int8 quantization. The exact real-valued
+dot product is unchanged, but the quantized computation is not equivalent to full absorption: both operands
+carry a balanced part of the gain, which stabilizes per-row absmax scales and avoids pushing the entire
+gain range into the static weight quantizer.
+
+**Split mapping:**
+
+| Gamma source | Split across runtime activation and offline weights |
 |-------------|---------------|
 | input\_layernorm.$\gamma$ | $W_Q$, $W_K$, $W_V$ (shared input) |
 | post\_attention\_layernorm.$\gamma$ | $W_{\text{gate}}$, $W_{\text{up}}$ (shared input) |
@@ -181,9 +193,21 @@ Weights use per-row symmetric int8 quantization with Hadamard rotation on the co
 
 For each weight matrix $W$:
 
-**Step 1. Gamma absorption** (if preceded by RMSNorm):
+**Step 1. Gamma split** (if preceded by RMSNorm):
 
-$$W'_{n,k} = W_{n,k} \cdot \gamma_k$$
+$$W'_{n,k} = W_{n,k} \cdot \sqrt{|\gamma_k|}$$
+
+The matching runtime activation path uses:
+
+$$x'_{m,k} = \frac{x_{m,k}}{\text{rms}(x_m)} \cdot \text{sign}(\gamma_k)\sqrt{|\gamma_k|}$$
+
+so in exact arithmetic:
+
+$$\sum_k W'_{n,k}x'_{m,k} = \sum_k W_{n,k}\gamma_k\frac{x_{m,k}}{\text{rms}(x_m)}$$
+
+This equality holds before quantization. After FWHT and int8 quantization, the split path is intentionally
+different from full absorption because the weight and activation quantizers see $\sqrt{|\gamma|}$-balanced
+operands instead of placing the entire gain on the weight side.
 
 **Step 2. FWHT rotation** (contraction dimension $K$, per row):
 
@@ -420,7 +444,8 @@ The fixed $S_{\text{post}}$ prediction was 3.26× too small for actual silu(gate
 
 1. **RMSNorm required.** $\|x / \text{rms}(x)\| = \sqrt{d}$ is exact. LayerNorm's mean subtraction does not commute with $\mathcal{H}$.
 
-2. **Gamma absorption required.** Offline: $W' = W \cdot \text{diag}(\gamma)$. See §2.4 for the mapping.
+2. **Gamma split required.** Offline weights receive $\sqrt{|\gamma|}$ and runtime RMSNorm+quantize receives
+   $\text{sign}(\gamma)\sqrt{|\gamma|}$. See §2.4 for the mapping and stability rationale.
 
 3. **Block size = head\_dim.** Per-head attention requires FWHT blocks to align with head boundaries.
 

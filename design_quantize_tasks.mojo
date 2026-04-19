@@ -124,12 +124,12 @@ struct ButterquantI8PerRow(QuantizeTask, Copyable, Movable):
 
 
 # =============================================================================
-# ButterquantI8PerRowAbsorbed — same as PerRow, gamma absorbed first
+# ButterquantI8PerRowAbsorbed — same as PerRow, weight-side gamma split
 #
 # Reads: source-declared input tensors + the gamma tensor at gamma_src.
 # Writes: same as PerRow.
-# The gamma is applied as W' = W * sqrt(|gamma|) before rotation, so the
-# runtime RMSNorm can skip the gamma multiply at inference time.
+# The weight side receives W' = W * sqrt(|gamma|) before rotation. Runtime
+# RMSNorm+quantize must apply sign(gamma) * sqrt(|gamma|) to the activation.
 # =============================================================================
 
 
@@ -169,7 +169,7 @@ struct ButterquantI8PerBlock(QuantizeTask, Copyable, Movable):
 
 
 # =============================================================================
-# ButterquantI8PerBlockAbsorbed — same as PerBlock, gamma absorbed first
+# ButterquantI8PerBlockAbsorbed — same as PerBlock, weight-side gamma split
 # =============================================================================
 
 

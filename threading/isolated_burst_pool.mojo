@@ -21,7 +21,7 @@ from std.sys.info import size_of
 from std.memory import UnsafePointer, memcpy
 from std.time import perf_counter_ns
 import linux.sys as linux
-from std.os.atomic import Atomic, Consistency
+from std.atomic import Atomic, Ordering
 from numa import NumaInfo, CpuMask
 from notstdcollections import HeapMoveArray
 from .threading_traits import BurstThreadPool, SleepableThreadPool
@@ -313,7 +313,7 @@ struct IsolatedBurstPool[mask_size: Int = 128](BurstThreadPool, SleepableThreadP
 
         # Pass 2: set all job_ready flags
         for i in range(jobs):
-            AtomicInt32.store[ordering=Consistency.RELEASE](
+            AtomicInt32.store[ordering=Ordering.RELEASE](
                 UnsafePointer(to=(self.mailboxes + i)[].job_ready.value), 1)
 
     # ----------------------------------------------------------------
@@ -325,9 +325,9 @@ struct IsolatedBurstPool[mask_size: Int = 128](BurstThreadPool, SleepableThreadP
         var sys = linux.linux_sys()
         for i in range(self.active_jobs):
             var done_ptr = UnsafePointer(to=(self.join_flags + i)[].done.value)
-            while AtomicInt32.load[ordering=Consistency.ACQUIRE](done_ptr) == 0:
+            while AtomicInt32.load[ordering=Ordering.ACQUIRE](done_ptr) == 0:
                 sys.arch_cpu_relax()
-            AtomicInt32.store[ordering=Consistency.MONOTONIC](done_ptr, 0)
+            AtomicInt32.store[ordering=Ordering.RELAXED](done_ptr, 0)
         self.active_jobs = 0
 
     def get_capacity(self) -> Int:
@@ -350,13 +350,13 @@ struct IsolatedBurstPool[mask_size: Int = 128](BurstThreadPool, SleepableThreadP
     def wake(mut self):
         """Unpark workers from sleep."""
         var parked_ptr = UnsafePointer(to=self.shared[].parked.value)
-        AtomicInt32.store[ordering=Consistency.RELEASE](parked_ptr, 0)
+        AtomicInt32.store[ordering=Ordering.RELEASE](parked_ptr, 0)
         var sys = linux.linux_sys()
         _ = sys.sys_futex_wake(Int(parked_ptr), self.capacity, self.futex_flags)
 
     def sleep(mut self):
         """Park workers. They futex_wait until wake() is called."""
-        AtomicInt32.store[ordering=Consistency.RELEASE](
+        AtomicInt32.store[ordering=Ordering.RELEASE](
             UnsafePointer(to=self.shared[].parked.value), 1)
 
     # ----------------------------------------------------------------
@@ -366,7 +366,7 @@ struct IsolatedBurstPool[mask_size: Int = 128](BurstThreadPool, SleepableThreadP
     def __del__(deinit self):
         if not self.workers_alive:
             return
-        AtomicInt32.store[ordering=Consistency.RELEASE](
+        AtomicInt32.store[ordering=Ordering.RELEASE](
             UnsafePointer(to=self.shared[].shutdown.value), 1)
         # Unpark in case workers are sleeping
         self.wake()
@@ -436,22 +436,22 @@ def isolated_worker_main[mask_size: Int](stack_head_ptr: Int):
 
     # --- Main loop: spin on local mailbox, write done to remote join flag ---
     while True:
-        if AtomicInt32.load[ordering=Consistency.ACQUIRE](ready_ptr) != 0:
+        if AtomicInt32.load[ordering=Ordering.ACQUIRE](ready_ptr) != 0:
             # Read dispatch data (local)
             var func_addr = mailbox[].func_ptr
             var data_ptr = Int(UnsafePointer(to=mailbox[].data[0]))
             # Clear job_ready (local write)
-            AtomicInt32.store[ordering=Consistency.RELEASE](ready_ptr, 0)
+            AtomicInt32.store[ordering=Ordering.RELEASE](ready_ptr, 0)
             # Execute kernel — single pointer to NUMA-local data area
             UnsafePointer(to=func_addr).bitcast[KernelFn]()[](data_ptr)
             # Signal completion (remote writes to main's NUMA node)
             # Timestamp first, then done — TSO orders these stores
             join_flag[].timestamp = Int(perf_counter_ns())
-            AtomicInt32.store[ordering=Consistency.RELEASE](done_ptr, 1)
+            AtomicInt32.store[ordering=Ordering.RELEASE](done_ptr, 1)
         else:
-            if shared[].shutdown.load[ordering=Consistency.MONOTONIC]() != 0:
+            if shared[].shutdown.load[ordering=Ordering.RELAXED]() != 0:
                 break
-            if shared[].parked.load[ordering=Consistency.ACQUIRE]() != 0:
+            if shared[].parked.load[ordering=Ordering.ACQUIRE]() != 0:
                 var parked_ptr = UnsafePointer(to=shared[].parked.value)
                 _ = sys.sys_futex_wait(Int(parked_ptr), 1, futex_flags)
             else:

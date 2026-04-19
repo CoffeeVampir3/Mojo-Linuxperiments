@@ -30,6 +30,7 @@ rsync -av \
     --exclude='test_rings_bin' \
     --exclude='fence_experiment_bin' \
     --exclude='tp_param_bin' \
+    --exclude='checkpoints/**/*.safetensors' \
     . \
     $REMOTE_USER@$REMOTE_HOST:$REMOTE_PATH/
 

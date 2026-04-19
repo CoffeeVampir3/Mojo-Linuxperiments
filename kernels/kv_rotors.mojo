@@ -12,6 +12,26 @@ from simd_math import sincos
 
 
 # =============================================================================
+# Shared rotation primitive
+# =============================================================================
+
+
+@always_inline
+def rotate_pair[dtype: DType, width: Int, pair_stride: Int](
+    ptr: UnsafePointer[Scalar[dtype], MutAnyOrigin],
+    cos: UnsafePointer[Float32, MutAnyOrigin],
+    sin: UnsafePointer[Float32, MutAnyOrigin],
+    j: Int,
+):
+    var x_lo = (ptr + j).load[width=width]().cast[DType.float32]()
+    var x_hi = (ptr + pair_stride + j).load[width=width]().cast[DType.float32]()
+    var cv = (cos + j).load[width=width]()
+    var sv = (sin + j).load[width=width]()
+    (ptr + j).store((x_lo * cv - x_hi * sv).cast[dtype]())
+    (ptr + pair_stride + j).store((x_hi * cv + x_lo * sv).cast[dtype]())
+
+
+# =============================================================================
 # Table initialization
 # =============================================================================
 
@@ -171,21 +191,13 @@ def rope_apply[
         for b in range(num_blocks):
             var base = row_base + b * block_stride + block_offset
             for j in range(0, half, width):
-                var x_lo = (base + j).load[width=width]().cast[DType.float32]()
-                var x_hi = (base + half + j).load[width=width]().cast[DType.float32]()
-                var cv = (cos_row + j).load[width=width]()
-                var sv = (sin_row + j).load[width=width]()
-                (base + j).store(
-                    (x_lo * cv - x_hi * sv).cast[DType.bfloat16]()
-                )
-                (base + half + j).store(
-                    (x_hi * cv + x_lo * sv).cast[DType.bfloat16]()
-                )
+                rotate_pair[DType.bfloat16, width, half](base, cos_row, sin_row, j)
 
 
 def rope_apply_partial[
     head_dim: Int,
     rotary_dim: Int,
+    pair_stride: Int,
     num_blocks: Int,
     block_stride: Int,
     block_offset: Int,
@@ -199,10 +211,9 @@ def rope_apply_partial[
 ) where CosT.DTYPE == DType.float32:
     """Apply RoPE in-place to only the leading rotary_dim channels of each head.
 
-    The input still uses the standard rotate_half layout for the full head_dim:
-    the first rotary_dim/2 entries of the low half are rotated against the
-    first rotary_dim/2 entries of the high half, while the remaining channels
-    are left untouched.
+    pair_stride controls the distance between paired elements for rotation.
+    Gemma4 proportional RoPE uses head_dim // 2, standard rotate_half uses
+    rotary_dim // 2.
     """
     comptime assert SinT.DTYPE == DType.float32, "rope partial: sin must be f32"
     comptime assert head_dim % 2 == 0, "rope partial: head_dim must be even"
@@ -220,7 +231,6 @@ def rope_apply_partial[
 
     var cp = cos_table.as_ptr[DType.float32]()
     var sn = sin_table.as_ptr[DType.float32]()
-    comptime full_half = head_dim // 2
     comptime rotary_half = rotary_dim // 2
     comptime width = simd_width_of[DType.float32]()
 
@@ -233,16 +243,7 @@ def rope_apply_partial[
         for b in range(num_blocks):
             var base = row_base + b * block_stride + block_offset
             for j in range(0, rotary_half, width):
-                var x_lo = (base + j).load[width=width]().cast[DType.float32]()
-                var x_hi = (base + full_half + j).load[width=width]().cast[DType.float32]()
-                var cv = (cos_row + j).load[width=width]()
-                var sv = (sin_row + j).load[width=width]()
-                (base + j).store(
-                    (x_lo * cv - x_hi * sv).cast[DType.bfloat16]()
-                )
-                (base + full_half + j).store(
-                    (x_hi * cv + x_lo * sv).cast[DType.bfloat16]()
-                )
+                rotate_pair[DType.bfloat16, width, pair_stride](base, cos_row, sin_row, j)
 
 
 # =============================================================================
@@ -264,7 +265,7 @@ def rope[head_dim: Int, num_heads: Int,
     )
 
 
-def rope_partial[head_dim: Int, rotary_dim: Int, num_heads: Int,
+def rope_partial[head_dim: Int, rotary_dim: Int, pair_stride: Int, num_heads: Int,
     XT: Encoding & Shaped, CosT: Encoding & Shaped, SinT: Encoding & Shaped](
     x: DynView[XT], cos_table: Bound[CosT], sin_table: Bound[SinT], pos: Int,
 ) where CosT.DTYPE == DType.float32:
@@ -273,7 +274,7 @@ def rope_partial[head_dim: Int, rotary_dim: Int, num_heads: Int,
     comptime assert XT.COLS == head_dim * num_heads, "rope partial: cols != heads * dim"
 
     var xp = x.as_ptr[DType.bfloat16]()
-    rope_apply_partial[head_dim, rotary_dim, num_heads, head_dim, 0](
+    rope_apply_partial[head_dim, rotary_dim, pair_stride, num_heads, head_dim, 0](
         xp, XT.COLS, x.seq_len, cos_table, sin_table, pos,
     )
 

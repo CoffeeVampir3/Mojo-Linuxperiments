@@ -65,7 +65,7 @@ comptime Untiled = Kernel2DTiling[1, 1]
 #
 # Lifecycle traits — a weight tag declares the full pipeline disposition:
 #   Quantizable      : quantized (FWHT + int8), per-row scale in output
-#   Gamma             : quantized with gamma absorption from preceding norm
+#   Gamma             : quantized with the weight side of a sqrt-gamma split
 #   Passthrough       : copied through quantizer unchanged, loaded, used
 #   Absorbed          : consumed during quantization (gamma source), absent
 # =============================================================================
@@ -446,8 +446,8 @@ struct ButterquantI8PerRow(Copyable, Movable, ImplicitlyCopyable):
 struct ButterquantI8PerRowAbsorbed(Copyable, Movable, ImplicitlyCopyable):
     """Same as PerRow but first multiplies the weight row-wise by
     sqrt(|gamma|) where gamma is loaded from the tensor named by
-    `gamma_src`. The runtime RMSNorm consuming this weight can then
-    skip the gamma multiply.
+    `gamma_src`. Runtime RMSNorm+quantize must apply the matching
+    sign(gamma) * sqrt(|gamma|) activation-side factor.
     """
     var name: String
     var source: Int
@@ -469,8 +469,8 @@ struct ButterquantI8PerBlock(Copyable, Movable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct ButterquantI8PerBlockAbsorbed(Copyable, Movable, ImplicitlyCopyable):
-    """Gamma-absorbed PerBlock — absorbs sqrt(|gamma|) from `gamma_src`
-    before FWHT + per-block absmax i8.
+    """PerBlock with the weight side of the sqrt-gamma split from
+    `gamma_src` before FWHT + per-block absmax i8.
     """
     var name: String
     var source: Int

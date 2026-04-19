@@ -8,13 +8,14 @@ execute time.
 
 Per quantizable weight:
   1. Read source panel through SourceFormat converter → f32
-  2. Optional gamma absorption: row *= sqrt(|gamma|)
+     (FP8 sources stage through a BF16 decompression panel first)
+  2. Optional gamma split: row *= sqrt(|gamma|)
   3. FWHT rotation at comptime block size
   4. Per-row or per-block symmetric absmax i8 quantization
   5. Write int8 weights + f32 scales to output
 
-Gamma is resolved through a one-slot cache keyed by tensor name.
-Sibling absorbed tasks sharing the same gamma hit the cache.
+Gamma is resolved through a one-slot cache keyed by tensor name. Sibling
+split-gamma tasks sharing the same gamma hit the cache.
 """
 
 from std.memory import UnsafePointer
@@ -41,7 +42,7 @@ from simd_math import quantize_i8, quantize_i8_scalar, sqrt as simd_sqrt
 from quant.source_format import (
     source_dtype, source_element_bytes,
     source_aux_dtype, source_aux_bytes, source_aux_name,
-    source_aux_row_block, convert_to_f32,
+    source_aux_row_block, source_bf16_work_bytes, convert_to_f32,
 )
 
 comptime PtrU8 = UnsafePointer[UInt8, MutAnyOrigin]
@@ -692,6 +693,10 @@ def execute_butterquant(
 
     var src_buf = List[UInt8](
         length=panel_rows * plan.cols * src_elem_bytes, fill=UInt8(0))
+    var bf16_work_buf = List[Scalar[DType.bfloat16]](
+        length=max(1, source_bf16_work_bytes(
+            plan.source, panel_rows, plan.cols) // 2),
+        fill=Scalar[DType.bfloat16](0))
     var work_buf = List[Float32](
         length=panel_rows * plan.cols, fill=Float32(0))
     var qi_buf = List[Scalar[DType.int8]](
@@ -700,6 +705,7 @@ def execute_butterquant(
         length=panel_rows * num_blocks, fill=Float32(0))
 
     var src = u8_addr(src_buf)
+    var bf16_work = PtrU8(unsafe_from_address=Int(bf16_work_buf.unsafe_ptr()))
     var work = f32_addr(work_buf)
     var qi = i8_addr(qi_buf)
     var scales = f32_addr(scales_buf)
@@ -721,7 +727,8 @@ def execute_butterquant(
         if companion_rb > 0:
             companion_panel = companion_base + (rows_done // companion_rb) * companion_row_stride
 
-        convert_to_f32(plan.source, src, companion_panel, work, panel, plan.cols)
+        convert_to_f32(plan.source, src, companion_panel, bf16_work,
+            work, panel, plan.cols)
 
         if gamma_ptr:
             for r in range(panel):
@@ -741,6 +748,7 @@ def execute_butterquant(
         rows_done += panel
 
     _ = src_buf^
+    _ = bf16_work_buf^
     _ = work_buf^
     _ = qi_buf^
     _ = scales_buf^

@@ -90,4 +90,4 @@ def apply_full_rope[num_heads: Int,
     comptime assert XT.DTYPE == DType.bfloat16, "full rope: input must be bf16"
     comptime assert XT.COLS == num_heads * 512, "full rope: cols != heads * 512"
 
-    rope_partial[512, 128, num_heads](x, cos_table, sin_table, pos)
+    rope_partial[512, 128, 256, num_heads](x, cos_table, sin_table, pos)

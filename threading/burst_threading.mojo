@@ -21,7 +21,7 @@ from std.sys.info import size_of
 from std.memory import UnsafePointer, memcpy
 from std.time import perf_counter_ns
 import linux.sys as linux
-from std.os.atomic import Consistency
+from std.atomic import Ordering
 from numa import NumaInfo, CpuMask
 from notstdcollections import HeapMoveArray
 from .threading_traits import BurstThreadPool
@@ -334,7 +334,7 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
 
         # Pass 2: set job_ready flags (remote writes, RELEASE ordering)
         for i in range(jobs):
-            AtomicInt32.store[ordering=Consistency.RELEASE](
+            AtomicInt32.store[ordering=Ordering.RELEASE](
                 UnsafePointer(to=(self.mailboxes + i)[].job_ready.value), 1)
 
         # Pass 3: Dekker wake — check sleeping, futex_wake if needed
@@ -343,7 +343,7 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
         # returns EAGAIN). So this is an optimization, not a correctness requirement.
         var sys = linux.linux_sys()
         for i in range(jobs):
-            if AtomicInt32.load[ordering=Consistency.ACQUIRE](
+            if AtomicInt32.load[ordering=Ordering.ACQUIRE](
                 UnsafePointer(to=(self.mailboxes + i)[].sleeping.value)
             ) != 0:
                 _ = sys.sys_futex_wake(
@@ -359,9 +359,9 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
         var sys = linux.linux_sys()
         for i in range(self.active_jobs):
             var done_ptr = UnsafePointer(to=(self.join_flags + i)[].done.value)
-            while AtomicInt32.load[ordering=Consistency.ACQUIRE](done_ptr) == 0:
+            while AtomicInt32.load[ordering=Ordering.ACQUIRE](done_ptr) == 0:
                 sys.arch_cpu_relax()
-            AtomicInt32.store[ordering=Consistency.MONOTONIC](done_ptr, 0)
+            AtomicInt32.store[ordering=Ordering.RELAXED](done_ptr, 0)
         self.active_jobs = 0
 
     def get_capacity(self) -> Int:
@@ -387,12 +387,12 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
 
         var sys = linux.linux_sys()
         if self.workers_alive:
-            AtomicInt32.store[ordering=Consistency.RELEASE](
+            AtomicInt32.store[ordering=Ordering.RELEASE](
                 UnsafePointer(to=self.shared[].shutdown.value), 1)
             # Wake all sleeping workers so they see the shutdown flag
             for i in range(self.capacity):
                 var ready_ptr = UnsafePointer(to=(self.mailboxes + i)[].job_ready.value)
-                AtomicInt32.store[ordering=Consistency.RELEASE](ready_ptr, 1)
+                AtomicInt32.store[ordering=Ordering.RELEASE](ready_ptr, 1)
                 _ = sys.sys_futex_wake(Int(ready_ptr), 1, self.futex_flags)
             for i in range(self.capacity):
                 while self.slots[i].is_alive():
@@ -555,26 +555,26 @@ def worker_main[mask_size: Int](stack_head_ptr: Int):
     # sleeping workers, and stale job_ready must not trigger execution of
     # a freed dispatch.
     while True:
-        if shared[].shutdown.load[ordering=Consistency.ACQUIRE]() != 0:
+        if shared[].shutdown.load[ordering=Ordering.ACQUIRE]() != 0:
             break
 
-        if AtomicInt32.load[ordering=Consistency.ACQUIRE](ready_ptr) != 0:
+        if AtomicInt32.load[ordering=Ordering.ACQUIRE](ready_ptr) != 0:
             # Read dispatch data (local reads from worker's NUMA node)
             var func_addr = mailbox[].func_ptr
             var data_ptr = Int(UnsafePointer(to=mailbox[].data[0]))
             # Clear job_ready (local write)
-            AtomicInt32.store[ordering=Consistency.RELEASE](ready_ptr, 0)
+            AtomicInt32.store[ordering=Ordering.RELEASE](ready_ptr, 0)
             # Execute kernel — single pointer to NUMA-local data area
             UnsafePointer(to=func_addr).bitcast[KernelFn]()[](data_ptr)
             # Signal completion (remote writes to main's NUMA node)
             join_flag[].timestamp = Int(perf_counter_ns())
-            AtomicInt32.store[ordering=Consistency.RELEASE](done_ptr, 1)
+            AtomicInt32.store[ordering=Ordering.RELEASE](done_ptr, 1)
             continue
 
         # Spin phase — brief spin on local job_ready
         var spins = 0
-        while AtomicInt32.load[ordering=Consistency.MONOTONIC](ready_ptr) == 0:
-            if shared[].shutdown.load[ordering=Consistency.MONOTONIC]() != 0:
+        while AtomicInt32.load[ordering=Ordering.RELAXED](ready_ptr) == 0:
+            if shared[].shutdown.load[ordering=Ordering.RELAXED]() != 0:
                 break
             if spins < SPIN_LIMIT:
                 sys.arch_cpu_relax()
@@ -584,15 +584,15 @@ def worker_main[mask_size: Int](stack_head_ptr: Int):
                 # Dispatcher publishes job_ready=1 then checks sleeping.
                 # If both miss (x86 store-load reordering), futex_wait's
                 # atomic check sees job_ready=1 and returns EAGAIN.
-                AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 1)
-                if AtomicInt32.load[ordering=Consistency.ACQUIRE](ready_ptr) != 0:
-                    AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 0)
+                AtomicInt32.store[ordering=Ordering.RELEASE](sleeping_ptr, 1)
+                if AtomicInt32.load[ordering=Ordering.ACQUIRE](ready_ptr) != 0:
+                    AtomicInt32.store[ordering=Ordering.RELEASE](sleeping_ptr, 0)
                     break
-                if shared[].shutdown.load[ordering=Consistency.ACQUIRE]() != 0:
-                    AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 0)
+                if shared[].shutdown.load[ordering=Ordering.ACQUIRE]() != 0:
+                    AtomicInt32.store[ordering=Ordering.RELEASE](sleeping_ptr, 0)
                     break
                 _ = sys.sys_futex_wait(Int(ready_ptr), 0, futex_flags)
-                AtomicInt32.store[ordering=Consistency.RELEASE](sleeping_ptr, 0)
+                AtomicInt32.store[ordering=Ordering.RELEASE](sleeping_ptr, 0)
                 spins = 0
 
     sys.sys_exit()

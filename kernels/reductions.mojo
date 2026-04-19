@@ -13,7 +13,7 @@ per node, no synchronization between reduce and gather phases.
 from std.memory import UnsafePointer, memcpy
 from std.collections import InlineArray
 from std.sys.info import simd_width_of
-from std.os.atomic import Atomic, Consistency
+from std.atomic import Atomic, Ordering
 from threading import BurstPool
 from threading.threading_shared import ptr as tptr
 import linux.sys as linux
@@ -168,11 +168,11 @@ def fused_reduce_gather_kernel(args: FusedReduceGatherArgs):
         i += 1
 
     # --- Signal completion ---
-    var old = AtomicInt32.fetch_add[ordering=Consistency.ACQUIRE_RELEASE](
+    var old = AtomicInt32.fetch_add[ordering=Ordering.ACQUIRE_RELEASE](
         counter_ptr(state_base, my_rank), -1
     )
     if old == 1:
-        AtomicInt32.store[ordering=Consistency.RELEASE](
+        AtomicInt32.store[ordering=Ordering.RELEASE](
             done_ptr(state_base, my_rank), 1
         )
 
@@ -183,7 +183,7 @@ def fused_reduce_gather_kernel(args: FusedReduceGatherArgs):
         if src_rank == my_rank:
             continue
 
-        while AtomicInt32.load[ordering=Consistency.ACQUIRE](done_ptr(state_base, src_rank)) == 0:
+        while AtomicInt32.load[ordering=Ordering.ACQUIRE](done_ptr(state_base, src_rank)) == 0:
             sys.arch_cpu_relax()
 
         var src_chunk_start = src_rank * chunk
@@ -298,7 +298,7 @@ def ring_allreduce[T: Encoding & Shaped, tp: Int](
     # Initialize counters.
     for r in range(tp):
         var num_workers = pool_ptrs[r][].capacity
-        AtomicInt32.store[ordering=Consistency.RELEASE](
+        AtomicInt32.store[ordering=Ordering.RELEASE](
             counter_ptr(state_base, r), Int32(num_workers)
         )
 

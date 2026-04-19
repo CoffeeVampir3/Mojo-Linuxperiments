@@ -1,6 +1,6 @@
 from std.sys.info import size_of
 from std.memory import UnsafePointer
-from std.os.atomic import Atomic
+from std.atomic import Atomic, Ordering
 
 comptime AtomicInt32 = Atomic[DType.int32]
 

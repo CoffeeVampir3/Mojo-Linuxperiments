@@ -8,6 +8,7 @@ from experimental3.kv_cache import Gemma4KVCache
 from experimental3.kernels.fwht import fwht_block
 from experimental3.common_math import rms_normalize_inplace
 from experimental3.kernels.quantize import absmax_quantize_i8
+from kernels.kv_rotors import rotate_pair
 
 
 # ============================================================================
@@ -15,7 +16,7 @@ from experimental3.kernels.quantize import absmax_quantize_i8
 # ============================================================================
 
 
-def write_k_head_normed[head_dim: Int, rope_dims: Int = head_dim](
+def write_k_head_normed[head_dim: Int, rope_dims: Int = head_dim, pair_stride: Int = head_dim // 2](
     src_bf16: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     k_norm: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     cos: UnsafePointer[Float32, MutAnyOrigin],
@@ -27,13 +28,7 @@ def write_k_head_normed[head_dim: Int, rope_dims: Int = head_dim](
     head: Int,
     eps: Float32,
 ):
-    """K head: bf16 -> f32 -> /rms -> *k_norm -> RoPE -> FWHT -> cache.
-
-    rope_dims controls how many dimensions are rotated (default: all).
-    Unrotated dimensions pass through unchanged.
-    """
     comptime width = simd_width_of[DType.float32]()
-    comptime half = head_dim // 2
     comptime rope_half = rope_dims // 2
 
     var k = 0
@@ -50,12 +45,7 @@ def write_k_head_normed[head_dim: Int, rope_dims: Int = head_dim](
 
     k = 0
     while k + width <= rope_half:
-        var x_lo = (work + k).load[width=width]()
-        var x_hi = (work + half + k).load[width=width]()
-        var cv = (cos + k).load[width=width]()
-        var sv = (sin + k).load[width=width]()
-        (work + k).store(x_lo * cv - x_hi * sv)
-        (work + half + k).store(x_hi * cv + x_lo * sv)
+        rotate_pair[DType.float32, width, pair_stride](work, cos, sin, k)
         k += width
 
     fwht_block[head_dim](work)
