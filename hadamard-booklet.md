@@ -455,3 +455,152 @@ $$\hat{q}^T \hat{k} - q^T k
 If the approximations are formed in transformed coordinates and reconstructed
 orthogonally, the same identity holds after inserting Hadamard transforms, since
 inner products are preserved.
+
+---
+
+# X. QK RMSNorm Collection and Hadamard Residency
+
+This section isolates the decode-time attention boundary where the representation
+is forced to leave transformed coordinates.
+
+## 10.1 The Exact Boundary
+
+For one attention layer, let the quantized input activation already be stored in
+Hadamard coordinates:
+
+$$\tilde{x} = \mathcal{H}_{hidden} x.$$
+
+With single-sided ButterQuant projection weights,
+
+$$W_Q^\sharp = W_Q \mathcal{H}_{hidden}^T,$$
+
+the projection emits the original-domain query
+
+$$q = W_Q^\sharp \tilde{x} = W_Q x.$$
+
+The MiniMax-M2.7 QK path then applies full-vector RMSNorm:
+
+$$q_n = \frac{q}{\sqrt{\frac{1}{D_Q}\sum_i q_i^2 + \epsilon}}
+\odot \gamma_Q,$$
+
+and similarly for $k$. After that, RoPE is applied in the original coordinate
+basis, followed by a per-head Hadamard re-entry:
+
+$$\tilde{q}_{attn,h}
+= H_{head} R_p \operatorname{diag}(\gamma_{Q,h})
+\frac{q_h}{\operatorname{rms}(q)}.$$
+
+The scalar denominator is a reduction and is not the hard boundary. The hard
+boundary is the coordinatewise gain and RoPE:
+
+$$H \operatorname{diag}(\gamma) H^T$$
+
+is generally dense, and $H R_p H^T$ is generally dense for the partial-RoPE
+layout. Therefore an exact VNNI-friendly attention path still needs the
+per-head exit/re-entry around gain plus RoPE.
+
+## 10.2 Pre-Collecting the RMS Denominator
+
+The RMS denominator can be collected before the QK-prep phase because it depends
+only on the squared norm:
+
+$$\|q\|_2^2 = \|\mathcal{H}_Q q\|_2^2.$$
+
+Thus the projection epilogue can accumulate
+
+$$s_Q^{local} = \sum_{i \in shard} q_i^2,
+\qquad
+s_K^{local} = \sum_{i \in shard} k_i^2,$$
+
+while it writes the projected Q and K buffers. A small cross-rank sum gives
+
+$$s_Q = \sum_r s_Q^{(r)}, \qquad s_K = \sum_r s_K^{(r)},$$
+
+and the prep phase uses
+
+$$\alpha_Q = \frac{1}{\sqrt{s_Q / D_Q + \epsilon}},
+\qquad
+\alpha_K = \frac{1}{\sqrt{s_K / D_K + \epsilon}}.$$
+
+After these two scalars are known, each head can be processed independently:
+
+$$q_h \mapsto H_{head} R_p (\gamma_{Q,h} \odot \alpha_Q q_h),$$
+
+$$k_h \mapsto H_{head} R_p (\gamma_{K,h} \odot \alpha_K k_h).$$
+
+This removes the standalone "read Q/K only to compute RMS" pass. It does not
+remove the later read needed to apply gain, RoPE, FWHT, and quantization.
+
+## 10.3 Decode Traffic for MiniMax-M2.7
+
+MiniMax-M2.7 uses
+
+$$D_Q = 6144,\qquad D_K = 1024,\qquad d_{head} = 128.$$
+
+For one token and one layer, the projected Q+K buffers contain
+
+$$2(D_Q + D_K) = 14336 \text{ bytes} = 14 \text{ KiB}$$
+
+when stored as bf16.
+
+A naive full-vector QK RMSNorm schedule performs:
+
+1. write Q+K projection buffers: 14 KiB,
+2. read Q+K to collect RMS denominators: 14 KiB,
+3. read Q+K again for gain, RoPE, FWHT, and quantize: 14 KiB.
+
+The pre-collect schedule performs:
+
+1. write Q+K projection buffers and accumulate two local sums: 14 KiB,
+2. allreduce two scalar sums,
+3. read Q+K once for gain, RoPE, FWHT, and quantize: 14 KiB.
+
+So the exact saving is one Q+K read:
+
+$$14336 \text{ bytes per layer per decoded token}.$$
+
+Across 62 layers this is
+
+$$62 \cdot 14336 = 888832 \text{ bytes} \approx 868 \text{ KiB per token}.$$
+
+With tensor parallelism this byte count is split across ranks, but the global
+traffic reduction is unchanged. For example, at TP=4 each rank avoids a
+3584-byte Q+K read per layer.
+
+## 10.4 Phase Schedule
+
+An exact low-traffic decode schedule is:
+
+1. Hidden RMSNorm plus FWHT plus quantize emits $\tilde{x}_{i8}$.
+2. Q and K projection GEMV epilogues write projected bf16 values and accumulate
+   local squared sums. V projection can proceed independently.
+3. Reduce the Q and K squared sums. This is a scalar collective, not a tensor
+   collective.
+4. Q/K prep reads the projected buffers once, applies the global inverse RMS,
+   applies gain, applies RoPE, re-enters Hadamard coordinates per head, and
+   quantizes.
+5. K and V cache remain in Hadamard coordinates. Attention scoring and V
+   aggregation operate on the rotated cache.
+
+This preserves the main ButterQuant principle: large long-lived tensors,
+especially the KV cache, stay rotated. The QK RMSNorm only forces a small
+per-token, per-layer exit/re-entry around the freshly projected Q/K vectors.
+
+## 10.5 Exactness Notes and Hypothetical Reductions
+
+If the projection epilogue accumulates squared sums from f32 values but stores
+bf16 Q/K, the denominator corresponds to the pre-rounded projection. To match a
+bf16-reference implementation exactly, accumulate the square of the bf16-rounded
+value in the epilogue, or store the projection in f32 scratch until QK prep
+consumes it.
+
+If $\gamma$ were constant per head or per Hadamard block, then the corresponding
+gain would commute with that block's Hadamard transform and could be folded into
+the scalar scale path. Learned coordinatewise QK gains do not generally have
+this property.
+
+If a much smaller Hadamard block were chosen to align with RoPE pairs, the
+conjugated RoPE operator would become local rather than head-dense. That is an
+algebraically valid direction, but it trades away the quantization benefits and
+packing simplicity of full-head Hadamard blocks. With the current 128-wide
+attention block, partial RoPE is not a cheap transformed-domain operator.

@@ -39,12 +39,12 @@ from experimental3.kernels.dispatch_args import (
 
 
 def int8_gemv_worker[N: Int, K: Int](cfg: WorkerConfig):
-    var act = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=cfg.act_ptr)
-    var wpacked = UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=cfg.wpacked_ptr)
-    var colsum = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cfg.colsum_ptr)
-    var wscale = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cfg.weight_scale_ptr)
-    var dst = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=cfg.dst_ptr)
-    var act_scales = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=cfg.act_scale_ptr)
+    var act = cfg.act_ptr
+    var wpacked = cfg.wpacked_ptr
+    var colsum = cfg.colsum_ptr
+    var wscale = cfg.weight_scale_ptr
+    var dst = cfg.dst_ptr
+    var act_scales = cfg.act_scale_ptr
     var start = cfg.start_row
 
     for m in range(cfg.row_count):
@@ -233,12 +233,12 @@ def fused_gu_gelu_tanh_worker_wa[intermediate: Int, K: Int, fwht_blk: Int](
 
 def lm_head_worker[K: Int, fwht_blk: Int](args: LmHeadArgs):
     comptime num_blocks = K // fwht_blk
-    var act = I8Ptr(unsafe_from_address=args.act)
-    var weight = I8Ptr(unsafe_from_address=args.weight)
-    var act_blk_scales = F32Ptr(unsafe_from_address=args.act_blk_scales)
-    var w_blk_scales = F32Ptr(unsafe_from_address=args.w_blk_scales)
-    var w_blk_colsums = F32Ptr(unsafe_from_address=args.w_blk_colsums)
-    var dst = BF16Ptr(unsafe_from_address=args.dst)
+    var act = args.act
+    var weight = args.weight
+    var act_blk_scales = args.act_blk_scales
+    var w_blk_scales = args.w_blk_scales
+    var w_blk_colsums = args.w_blk_colsums
+    var dst = args.dst
 
     for n in range(args.n_start, args.n_start + args.n_count):
         var weight_row = weight + n * K
@@ -250,5 +250,4 @@ def lm_head_worker[K: Int, fwht_blk: Int](args: LmHeadArgs):
             w_blk_scales_row,
             w_blk_colsums_row)
         dst[n] = dot_f32.cast[DType.bfloat16]()
-
 

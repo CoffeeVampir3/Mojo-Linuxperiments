@@ -221,11 +221,11 @@ def rmsnorm_fwht_quant_worker[cols: Int, block: Int,
     has_gamma: Bool, per_block: Bool](
     args: RmsNormFwhtQuantArgs,
 ):
-    var inp = BF16Ptr(unsafe_from_address=args.in_ptr)
-    var gamma = BF16Ptr(unsafe_from_address=args.gamma_ptr)
-    var qi = I8Ptr(unsafe_from_address=args.qi_ptr)
-    var work = F32Ptr(unsafe_from_address=args.work_ptr)
-    var scales = F32Ptr(unsafe_from_address=args.scale_ptr)
+    var inp = args.in_ptr
+    var gamma = args.gamma_ptr
+    var qi = args.qi_ptr
+    var work = args.work_ptr
+    var scales = args.scale_ptr
 
     comptime scale_stride = (cols // block) if per_block else 1
     for m in range(args.start_row, args.end_row):
@@ -242,15 +242,15 @@ def rmsnorm_fwht_quant_worker[cols: Int, block: Int,
 def rmsnorm_dual_gamma_fwht_quant_worker[cols: Int, block: Int](
     args: RmsNormDualGammaFwhtArgs,
 ):
-    var inp = BF16Ptr(unsafe_from_address=args.in_ptr)
-    var gamma_a = BF16Ptr(unsafe_from_address=args.gamma_a_ptr)
-    var gamma_b = BF16Ptr(unsafe_from_address=args.gamma_b_ptr)
-    var qi_a = I8Ptr(unsafe_from_address=args.qi_a_ptr)
-    var qi_b = I8Ptr(unsafe_from_address=args.qi_b_ptr)
-    var work_a = F32Ptr(unsafe_from_address=args.work_a_ptr)
-    var work_b = F32Ptr(unsafe_from_address=args.work_b_ptr)
-    var scale_a = F32Ptr(unsafe_from_address=args.scale_a_ptr)
-    var scale_b = F32Ptr(unsafe_from_address=args.scale_b_ptr)
+    var inp = args.in_ptr
+    var gamma_a = args.gamma_a_ptr
+    var gamma_b = args.gamma_b_ptr
+    var qi_a = args.qi_a_ptr
+    var qi_b = args.qi_b_ptr
+    var work_a = args.work_a_ptr
+    var work_b = args.work_b_ptr
+    var scale_a = args.scale_a_ptr
+    var scale_b = args.scale_b_ptr
 
     for m in range(args.start_row, args.end_row):
         rmsnorm_dual_gamma_fwht_quant_row[cols, block](
@@ -303,57 +303,66 @@ def rmsnorm_per_head_kernel[head_dim: Int, num_heads: Int](args: RMSNormPerHeadA
 def post_attn_norm_kernel[hidden: Int](args: PostAttnNormArgs):
     """RMSNorm + residual add: x_main += rmsnorm(src, norm_w)."""
     rmsnorm_bf16_row[hidden, True, True](
-        BF16Ptr(unsafe_from_address=args.src_ptr),
-        BF16Ptr(unsafe_from_address=args.norm_w_ptr),
-        BF16Ptr(unsafe_from_address=args.x_main_ptr),
+        args.src_ptr,
+        args.norm_w_ptr,
+        args.x_main_ptr,
         args.eps)
 
 
 @fieldwise_init
 struct PreReduceArgs(Copyable, ImplicitlyCopyable):
-    var expert_out_ptr: Int
+    var expert_out_ptr: BF16Ptr
     var local_count: Int
-    var dst_ptr: Int
-    var dense_ptr: Int
-    var norm_w_ptr: Int
-    var normed_ptr: Int
+    var dst_ptr: BF16Ptr
+    var dense_ptr: BF16Ptr
+    var norm_w_ptr: BF16Ptr
+    var normed_ptr: BF16Ptr
     var eps: Float32
+
+    def __init__(out self):
+        self.expert_out_ptr = BF16Ptr()
+        self.local_count = 0
+        self.dst_ptr = BF16Ptr()
+        self.dense_ptr = BF16Ptr()
+        self.norm_w_ptr = BF16Ptr()
+        self.normed_ptr = BF16Ptr()
+        self.eps = Float32(0)
 
 def pre_reduce_kernel[hidden: Int](args: PreReduceArgs):
     """Accumulate local experts into dst + rmsnorm(dense, norm_w) into normed."""
-    var expert_buf = BF16Ptr(unsafe_from_address=args.expert_out_ptr)
-    var dst = BF16Ptr(unsafe_from_address=args.dst_ptr)
+    var expert_buf = args.expert_out_ptr
+    var dst = args.dst_ptr
     accumulate_expert_outputs[hidden](expert_buf, args.local_count, dst)
-    var dense = BF16Ptr(unsafe_from_address=args.dense_ptr)
+    var dense = args.dense_ptr
     rmsnorm_bf16_row[hidden, True, False](
         dense,
-        BF16Ptr(unsafe_from_address=args.norm_w_ptr),
-        BF16Ptr(unsafe_from_address=args.normed_ptr),
+        args.norm_w_ptr,
+        args.normed_ptr,
         args.eps)
 
 
 def expert_sum_kernel[hidden: Int](args: ExpertSumArgs):
     """Accumulate local expert outputs into dst."""
-    var expert_buf = BF16Ptr(unsafe_from_address=args.expert_out_ptr)
-    var dst = BF16Ptr(unsafe_from_address=args.dst_ptr)
+    var expert_buf = args.expert_out_ptr
+    var dst = args.dst_ptr
     accumulate_expert_outputs[hidden](expert_buf, args.local_count, dst)
 
 
 def dense_norm_kernel[hidden: Int](args: DenseNormArgs):
     """RMSNorm dense output (no residual add)."""
     rmsnorm_bf16_row[hidden, True, False](
-        BF16Ptr(unsafe_from_address=args.src_ptr),
-        BF16Ptr(unsafe_from_address=args.norm_w_ptr),
-        BF16Ptr(unsafe_from_address=args.dst_ptr),
+        args.src_ptr,
+        args.norm_w_ptr,
+        args.dst_ptr,
         args.eps)
 
 
 def post_reduce_kernel[hidden: Int](args: PostReduceArgs):
     """Post-allreduce: norms + combine + residual + scalar."""
     moe_combine[hidden](
-        BF16Ptr(unsafe_from_address=args.moe_out_ptr),
-        BF16Ptr(unsafe_from_address=args.moe_norm_w_ptr),
-        BF16Ptr(unsafe_from_address=args.dense_normed_ptr),
-        BF16Ptr(unsafe_from_address=args.combine_norm_w_ptr),
-        BF16Ptr(unsafe_from_address=args.x_main_ptr),
+        args.moe_out_ptr,
+        args.moe_norm_w_ptr,
+        args.dense_normed_ptr,
+        args.combine_norm_w_ptr,
+        args.x_main_ptr,
         args.layer_scalar, args.eps)

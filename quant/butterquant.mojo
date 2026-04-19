@@ -35,9 +35,11 @@ from modeling.model_spec import (
     Task, SourceFormat,
     Passthrough, ButterquantI8PerRow, ButterquantI8PerRowAbsorbed,
     ButterquantI8PerBlock, ButterquantI8PerBlockAbsorbed,
+    ButterquantI8TwoSidedAbsorbed,
 )
 from modeling.loader import discover_shards
-from experimental3.kernels.fwht import fwht_row
+from std.memory.unsafe_pointer import alloc
+from experimental3.kernels.fwht import fwht_block, fwht_row
 from simd_math import quantize_i8, quantize_i8_scalar, sqrt as simd_sqrt
 from quant.source_format import (
     source_dtype, source_element_bytes,
@@ -239,30 +241,48 @@ def quantize_inv(work: PtrF32, qi: PtrI8, inv: Float32, n: Int):
         k += WIDTH
 
 
-def rotate_and_quant_per_row[block: Int](
-    work: PtrF32, qi: PtrI8, scales: PtrF32,
-    rows: Int, cols: Int,
-):
+def fwht_rotate_rows[block: Int](work: PtrF32, rows: Int, cols: Int):
+    for r in range(rows):
+        fwht_row[block](work + r * cols, cols)
+
+
+def fwht_rotate_columns[head_dim: Int](work: PtrF32, rows: Int, cols: Int):
+    """Apply FWHT along the row dimension per head block of `head_dim` rows.
+
+    Row-major layout [rows, cols]. For each head block and each column,
+    gathers the column into contiguous scratch, applies FWHT, scatters back.
+    Offline quantizer only — not performance-critical.
+    """
+    var scratch = alloc[Float32](head_dim)
+    var num_heads = rows // head_dim
+    for h in range(num_heads):
+        var base = h * head_dim
+        for c in range(cols):
+            for r in range(head_dim):
+                (scratch + r).store((work + (base + r) * cols + c).load())
+            fwht_block[head_dim](scratch)
+            for r in range(head_dim):
+                (work + (base + r) * cols + c).store((scratch + r).load())
+
+
+def quant_rows_per_row(work: PtrF32, qi: PtrI8, scales: PtrF32,
+                       rows: Int, cols: Int):
     for r in range(rows):
         var work_row = work + r * cols
         var qi_row = qi + r * cols
-        fwht_row[block](work_row, cols)
         var amax = row_absmax(work_row, cols)
         scales[r] = amax / Float32(127.0)
         var inv = Float32(127.0) / amax if amax > Float32(0) else Float32(0)
         quantize_inv(work_row, qi_row, inv, cols)
 
 
-def rotate_and_quant_per_block[block: Int](
-    work: PtrF32, qi: PtrI8, scales: PtrF32,
-    rows: Int, cols: Int,
-):
+def quant_rows_per_block[block: Int](work: PtrF32, qi: PtrI8, scales: PtrF32,
+                                     rows: Int, cols: Int):
     var num_blocks = cols // block
     for r in range(rows):
         var work_row = work + r * cols
         var qi_row = qi + r * cols
         var scale_row = scales + r * num_blocks
-        fwht_row[block](work_row, cols)
         for b in range(num_blocks):
             var off = b * block
             var amax = row_absmax(work_row + off, block)
@@ -271,16 +291,35 @@ def rotate_and_quant_per_block[block: Int](
             quantize_inv(work_row + off, qi_row + off, inv, block)
 
 
+def rotate_and_quant_per_row[block: Int](
+    work: PtrF32, qi: PtrI8, scales: PtrF32,
+    rows: Int, cols: Int,
+):
+    fwht_rotate_rows[block](work, rows, cols)
+    quant_rows_per_row(work, qi, scales, rows, cols)
+
+
+def rotate_and_quant_per_block[block: Int](
+    work: PtrF32, qi: PtrI8, scales: PtrF32,
+    rows: Int, cols: Int,
+):
+    fwht_rotate_rows[block](work, rows, cols)
+    quant_rows_per_block[block](work, qi, scales, rows, cols)
+
+
 def rotate_and_quant[per_block: Bool](
     block: Int, work: PtrF32, qi: PtrI8, scales: PtrF32,
-    rows: Int, cols: Int,
+    rows: Int, cols: Int, two_sided_head_dim: Int = 0,
 ):
     @parameter
     def go[b: Int]():
+        fwht_rotate_rows[b](work, rows, cols)
+        if two_sided_head_dim == 128:
+            fwht_rotate_columns[128](work, rows, cols)
         comptime if per_block:
-            rotate_and_quant_per_block[b](work, qi, scales, rows, cols)
+            quant_rows_per_block[b](work, qi, scales, rows, cols)
         else:
-            rotate_and_quant_per_row[b](work, qi, scales, rows, cols)
+            quant_rows_per_row(work, qi, scales, rows, cols)
     if block == 512: go[512]()
     elif block == 256: go[256]()
     elif block == 128: go[128]()
@@ -400,6 +439,8 @@ struct QuantizePlan(Copyable, Movable, ImplicitlyCopyable):
     var scale_out_off: Int
     var scale_out_bytes: Int
 
+    var two_sided_head_dim: Int
+
     @always_inline
     def is_passthrough(self) -> Bool:
         return self.scale_out_off < 0
@@ -454,6 +495,7 @@ def plan_passthrough(
         companion_shard=-1, companion_start=0, companion_bytes=0,
         weight_out_off=weight_off, weight_out_bytes=byte_size,
         scale_out_off=-1, scale_out_bytes=0,
+        two_sided_head_dim=0,
     ))
     return True
 
@@ -573,7 +615,22 @@ def plan_butterquant(
         companion_bytes=companion_bytes,
         weight_out_off=weight_off, weight_out_bytes=weight_bytes,
         scale_out_off=scale_off, scale_out_bytes=scale_bytes,
+        two_sided_head_dim=0,
     ))
+    return True
+
+
+def plan_butterquant_two_sided(
+    name: String, source: Int, block: Int,
+    gamma_src: String, head_dim: Int, mut offset: Int,
+    ref headers: List[SafetensorsHeader],
+    mut plans: List[QuantizePlan],
+    mut entries: List[OutputEntry],
+) -> Bool:
+    if not plan_butterquant(name, source, block, False,
+            gamma_src, offset, headers, plans, entries):
+        return False
+    plans[len(plans) - 1].two_sided_head_dim = head_dim
     return True
 
 
@@ -603,6 +660,10 @@ def plan_task(
         var t = task[ButterquantI8PerBlockAbsorbed]
         return plan_butterquant(t.name, t.source, t.block, True,
             t.gamma_src, offset, headers, plans, entries)
+    if task.isa[ButterquantI8TwoSidedAbsorbed]():
+        var t = task[ButterquantI8TwoSidedAbsorbed]
+        return plan_butterquant_two_sided(t.name, t.source, t.block,
+            t.gamma_src, t.head_dim, offset, headers, plans, entries)
     print("quantize: unknown task variant")
     return False
 
@@ -735,9 +796,11 @@ def execute_butterquant(
                 apply_gamma_in_place(work + r * plan.cols, gamma_ptr, plan.cols)
 
         if plan.per_block:
-            rotate_and_quant[True](plan.block, work, qi, scales, panel, plan.cols)
+            rotate_and_quant[True](plan.block, work, qi, scales, panel, plan.cols,
+                plan.two_sided_head_dim)
         else:
-            rotate_and_quant[False](plan.block, work, qi, scales, panel, plan.cols)
+            rotate_and_quant[False](plan.block, work, qi, scales, panel, plan.cols,
+                plan.two_sided_head_dim)
 
         var dst_w = data_start + plan.weight_out_off + rows_done * plan.cols
         if not rio.write(output_file_idx, dst_w, qi_u8, panel * plan.cols):

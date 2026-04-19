@@ -478,6 +478,29 @@ struct ButterquantI8PerBlockAbsorbed(Copyable, Movable, ImplicitlyCopyable):
     var gamma_src: String
 
 
+@fieldwise_init
+struct ButterquantI8TwoSidedAbsorbed(Copyable, Movable, ImplicitlyCopyable):
+    """Two-sided ButterQuant: FWHT on BOTH contraction and output dimensions.
+
+    Offline: W' = W · diag(sqrt(|gamma|)), then FWHT on contraction dim (cols)
+    per row, then FWHT on output dim (rows) per head block, then per-row
+    absmax i8 quantize.
+
+    At runtime the GEMV output arrives pre-rotated in the Hadamard domain,
+    eliminating the explicit per-head FWHT. Valid only for projections
+    with no post-projection nonlinearity in the output domain (no norm,
+    no RoPE, no activation). MiniMax V projection is the primary use case.
+
+    The output-dim FWHT is block-diagonal with block = `head_dim`. Rows are
+    mixed only within each head block, not across heads.
+    """
+    var name: String
+    var source: Int
+    var block: Int
+    var gamma_src: String
+    var head_dim: Int
+
+
 # --- Task variant umbrella --------------------------------------------------
 
 
@@ -489,6 +512,7 @@ comptime Task = Variant[
     ButterquantI8PerRowAbsorbed,
     ButterquantI8PerBlock,
     ButterquantI8PerBlockAbsorbed,
+    ButterquantI8TwoSidedAbsorbed,
 ]
 
 

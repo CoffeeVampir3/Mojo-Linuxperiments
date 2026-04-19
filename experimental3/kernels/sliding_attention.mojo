@@ -216,11 +216,12 @@ def sliding_attn_group_kernel[
     Output: i8[heads_per_group × head_dim] + f32[heads_per_group] per-head scales.
     Ready for int8_gemv_blocked O projection with block=head_dim.
     """
-    var cache = Gemma4KVCache[max_seq, head_dim, num_kv_heads, num_q_heads](args.cache_base)
-    var cos = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.cos_ptr)
-    var sin = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.sin_ptr)
-    var qi_out = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](unsafe_from_address=args.qi_out_ptr)
-    var head_scales = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.head_scale_ptr)
+    var cache = Gemma4KVCache[max_seq, head_dim, num_kv_heads, num_q_heads](
+        Int(args.cache_base))
+    var cos = args.cos_ptr
+    var sin = args.sin_ptr
+    var qi_out = args.qi_out_ptr
+    var head_scales = args.head_scale_ptr
 
     # Stack buffers for K/V cache write
     var work_arr = InlineArray[Float32, head_dim](fill=Float32(0))
@@ -230,28 +231,27 @@ def sliding_attn_group_kernel[
 
     # 1. Write K to cache
     write_k_head_normed[head_dim](
-        UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.k_bf16_ptr),
-        UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.k_norm_ptr),
+        args.k_bf16_ptr,
+        args.k_norm_ptr,
         cos, sin, work, qi_buf,
         cache, args.cache_pos, args.kv_head, args.eps)
 
     # 2. Write V to cache (per-token absmax, scale stored in cache)
     write_v_head_normed[head_dim](
-        UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.v_bf16_ptr),
+        args.v_bf16_ptr,
         work, qi_buf,
         cache, args.cache_pos, args.kv_head, args.eps)
 
     # 3. Process each Q head: score → V-agg → FWHT → quantize to i8
     for qh in range(heads_per_group):
-        var q_bf16 = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-            unsafe_from_address=args.q_bf16_ptr + qh * head_dim * 2)
+        var q_bf16 = args.q_bf16_ptr + qh * head_dim
 
         # Prep Q: /rms → RoPE → FWHT → quantize
         var q_i8_arr = InlineArray[Scalar[DType.int8], head_dim](uninitialized=True)
         var q_i8 = UnsafePointer(to=q_i8_arr).bitcast[Scalar[DType.int8]]()
         var result = prep_q_row_normed[head_dim](
             q_bf16.bitcast[BFloat16](),
-            UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=args.q_norm_ptr),
+            args.q_norm_ptr,
             cos, sin,
             q_i8.bitcast[Int8](), args.eps)
         var qi_bias = result[0]
@@ -264,5 +264,4 @@ def sliding_attn_group_kernel[
             work)
 
         head_scales[qh] = absmax_quantize_i8[head_dim](work, qi_out + qh * head_dim)
-
 

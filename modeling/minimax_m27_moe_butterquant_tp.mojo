@@ -20,7 +20,7 @@ from modeling.model_spec import (
     WeightDesc, DEFAULT_ALIGNMENT, LogitsView,
     Task, SourceFormat,
     Passthrough, ButterquantI8PerRow, ButterquantI8PerRowAbsorbed,
-    ButterquantI8PerBlockAbsorbed,
+    ButterquantI8PerBlockAbsorbed, ButterquantI8TwoSidedAbsorbed,
     HOST_RANK,
 )
 from modeling.modeling_common import (
@@ -631,8 +631,8 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
                 FP8_BLOCK, FWHT_BLK_HIDDEN, input_gamma))
             tasks.append(ButterquantI8PerRowAbsorbed(p + "self_attn.k_proj.weight",
                 FP8_BLOCK, FWHT_BLK_HIDDEN, input_gamma))
-            tasks.append(ButterquantI8PerRowAbsorbed(p + "self_attn.v_proj.weight",
-                FP8_BLOCK, FWHT_BLK_HIDDEN, input_gamma))
+            tasks.append(ButterquantI8TwoSidedAbsorbed(p + "self_attn.v_proj.weight",
+                FP8_BLOCK, FWHT_BLK_HIDDEN, input_gamma, C.HEAD_DIM))
             tasks.append(ButterquantI8PerRow(p + "self_attn.o_proj.weight",
                 FP8_BLOCK, C.HEAD_DIM))
 
@@ -802,7 +802,212 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         return model^
 
     def forward_decode(mut self, tokens_ptr: Int, pos: Int) -> Int32:
+        # =====================================================================
+        # MiniMax M2.7 ButterQuant decode — fused operation plan
+        #
+        # Design constraints:
+        #   - Gamma split is load-bearing for int8 quality. The residual stream
+        #     stays in the original domain; FWHT at norm boundaries is mandatory.
+        #   - RoPE does not commute with FWHT. Forced exit-reentry per head.
+        #   - SiLU is a nonlinearity. Forced exit-reentry (§6.2).
+        #   - Attention scoring and V-agg operate in the Hadamard domain
+        #     via Parseval (§4.2, §4.3). Cache stores rotated i8.
+        #
+        # Memory traffic principles:
+        #   - Fuse to minimize full-tensor read/write passes.
+        #   - Collect scalar reductions (rms) during producing operations
+        #     (GEMV epilogue) to avoid separate read passes.
+        #   - Two-sided V weights: V has no norm, no RoPE in MiniMax, so
+        #     GEMV can output pre-rotated. Requires validation (see phase 4).
+        # =====================================================================
+        #
+        # embed(host):     bf16 lookup → x_main[HIDDEN]
+        # broadcast:       x_main → all ranks
+        #
+        # for layer in 0..62:
+        #
+        # ── phase 1: input norm + quantize ───────────────────────
+        #
+        #   tp_parallel: rmsnorm_gamma_fwht_quantize
+        #     x_main[HIDDEN] (original domain, bf16)
+        #       → /rms(x) · sign(γ_in)√|γ_in| → FWHT(HIDDEN) → quantize
+        #       → act_i8[HIDDEN] (Hadamard domain, i8) + S_act (f32 scalar)
+        #     Existing kernel. γ_in split: √|γ_in| absorbed into Q/K/V
+        #     weights offline.
+        #
+        # ── phase 2: Q/K/V projections ──────────────────────────
+        #
+        #   tp_parallel: int8_gemv × 3
+        #     Q: act_i8 × W_Q → q_bf16[Q_LOCAL]  (single-sided, original domain)
+        #     K: act_i8 × W_K → k_bf16[KV_LOCAL] (single-sided, original domain)
+        #     V: act_i8 × W̃_V → ṽ_bf16[KV_LOCAL] (two-sided, Hadamard domain)
+        #
+        #     Q/K: single-sided (W·H^T on contraction dim). Output in original
+        #     domain because QK norm gamma and RoPE both require it.
+        #
+        #     V: two-sided (H_out·W_V·H^T_in). Output pre-rotated because
+        #     MiniMax V has no norm and no RoPE — nothing forces original
+        #     domain. The output-dim FWHT is baked into the weight matrix
+        #     offline via ButterquantI8TwoSidedAbsorbed. Validated on real
+        #     checkpoint weights: MSE ratio 0.997 vs single-sided across
+        #     layers 0/15/30/45/61, end-to-end V cache cos > 0.99994.
+        #     The row mixing slightly reduces per-row absmax variance.
+        #
+        #   Q/K GEMV epilogue (NEW — sum-of-squares pre-collection):
+        #     Each GEMV worker accumulates Σ(output_i²) as it writes output
+        #     rows. After join, local sum_sq is available with no separate
+        #     read pass. Under TP: cross-rank scalar allreduce (4 bytes each)
+        #     to get global sum_sq for the full-vector rms over Q_DIM / KV_DIM.
+        #     Precision note: the GEMV dequant produces f32 values which are
+        #     then rounded to bf16 for storage. The sum_sq should be
+        #     accumulated from the f32 pre-round values for exact rms. If
+        #     instead accumulated from bf16-rounded values, the rms will have
+        #     a small bf16 rounding bias. For int8 inference this is likely
+        #     negligible, but an A/B should confirm.
+        #
+        # ── phase 3: QK norm + RoPE + quantize (fused per head) ─
+        #
+        #   scalar_allreduce: q_sum_sq, k_sum_sq across ranks (8 bytes total)
+        #     → inv_rms_q = 1/√(q_sum_sq / Q_DIM)
+        #     → inv_rms_k = 1/√(k_sum_sq / KV_DIM)
+        #
+        #   tp_parallel: fused_qk_norm_rope_quantize (NEW KERNEL)
+        #     For each Q head h (NUM_HEADS/tp per rank, 128 dims each):
+        #       read q_bf16[h*128 : (h+1)*128]
+        #       · inv_rms_q · γ_q[h*128 : (h+1)*128]  — full-vector norm scalar,
+        #                                                 per-element gamma (not split,
+        #                                                 this is the actual QK norm γ)
+        #       partial_rope(64/128, pair_stride=32)
+        #       FWHT(128) → absmax_quantize
+        #       → q_i8[h], S_Q[h], qi_bias[h]
+        #     One read of Q, one write of Q_i8. Norm scalar pre-collected.
+        #
+        #     For each K head g (NUM_KV_HEADS/tp per rank, 128 dims each):
+        #       same: read k → · inv_rms_k · γ_k → rope → FWHT → quantize
+        #       → write k_i8 to VNNI KV cache + store S_K[g, pos]
+        #
+        # ── phase 4: V cache write ──────────────────────────────
+        #
+        #   tp_parallel: v_cache_write
+        #     ṽ_bf16 already in Hadamard domain from two-sided GEMV.
+        #     Per head: absmax_quantize → v_i8 → cache + S_V[g, pos].
+        #     No FWHT needed — the rotation is baked into the weights.
+        #
+        # ── phase 5: attention scoring + V aggregation ──────────
+        #
+        #   tp_parallel: attention_group_dispatch (NEW KERNEL)
+        #     For each KV group (1 KV head, HPG=6 Q heads):
+        #       For each Q head h in the group:
+        #         Existing single_pass_attention primitive with q_scale
+        #         set to S_Q[h] / sqrt(128). The primitive computes
+        #         q_factor = q_scale / (127.0 * 127.0), so the effective
+        #         dequant is S_Q / (127² · √128) · S_K — matching the
+        #         MiniMax 1/√d_k attention scale. No change to
+        #         single_pass_attention itself; the caller pre-folds
+        #         1/√128 into q_scale.
+        #         V-agg, V-scale folding, online softmax: all existing.
+        #         Output: f32[128] in Hadamard domain → quantize → attn_i8[h]
+        #
+        # ── phase 6: O projection + residual ────────────────────
+        #
+        #   tp_parallel: int8_gemv_blocked
+        #     attn_i8[Q_LOCAL] × W_O → x_residual[HIDDEN]
+        #     Single-sided weights. Output in original domain.
+        #     Existing kernel.
+        #
+        #   allreduce: sum x_residual across ranks
+        #   residual_add: x_main += x_residual
+        #
+        # ── phase 7: post-attention norm (dual output) ──────────
+        #
+        #   tp_parallel: rmsnorm_dual_output (NEW KERNEL)
+        #     x_main[HIDDEN] →
+        #       output 1: /rms · sign(γ_post)√|γ_post| → FWHT → quantize
+        #                 → moe_i8[HIDDEN] + S_moe
+        #                 (gamma-split activation for expert w1/w3 GEMVs)
+        #       output 2: /rms · γ_post → normed_bf16[HIDDEN]
+        #                 (full-gamma normalized bf16 for F32 router projection)
+        #
+        #     These are NOT the same tensor. The MoE quantization path uses
+        #     the split gamma: sign(γ)√|γ|, with √|γ| absorbed into w1/w3
+        #     weights. The router is passthrough F32 and needs the true
+        #     post-attention norm: x/rms(x) · γ_post (full gamma, no split).
+        #
+        #     Single-pass implementation: compute rms once, then in one
+        #     sweep over HIDDEN: for each element k, compute x[k]/rms,
+        #     write normed_bf16[k] = x[k]/rms · γ_post[k],
+        #     write work[k] = x[k]/rms · sign(γ_post[k])√|γ_post[k]|,
+        #     then FWHT(work) → quantize → moe_i8.
+        #     One read of x_main, two writes (normed_bf16 + moe_i8).
+        #
+        #     Scratch budget: normed_bf16 costs C.HIDDEN * 2 bytes = 6KB.
+        #     Must be accounted in calculate_peak_scratch.
+        #
+        # ── phase 8: router ─────────────────────────────────────
+        #
+        #   tp_parallel: f32_router_dispatch (NEW KERNEL)
+        #     f32_gemv: router_proj_f32[256, HIDDEN] × normed_bf16 → logits_f32[256]
+        #     sigmoid(logits) → weights[256]
+        #     weights + correction_bias → selection_scores[256]
+        #     topk(selection_scores, 8) → indices[8]
+        #     gather weights[indices] → raw_weights[8]  (NOT biased scores)
+        #     raw_weights /= sum(raw_weights) → routing_weights[8]
+        #
+        # ── phase 9: expert gate + up (w1, w3, SiLU) ────────────
+        #
+        #   tp_parallel: minimax_moe_phase1 (NEW KERNEL)
+        #     For each selected expert local to this rank:
+        #       gate = int8_gemv(moe_i8, w1[expert])  → f32[MOE_INTERMEDIATE]
+        #       up   = int8_gemv(moe_i8, w3[expert])  → f32[MOE_INTERMEDIATE]
+        #       activated = silu(gate) * up            → f32[MOE_INTERMEDIATE]
+        #       FWHT(MOE_INTERMEDIATE) → per-block absmax quantize → i8
+        #     Single-sided w1/w3. Separate matrices (not fused gate_up).
+        #     SiLU is a nonlinearity — original domain (§6.1).
+        #
+        # ── phase 10: expert down (w2) ──────────────────────────
+        #
+        #   tp_parallel: minimax_moe_phase2 (NEW KERNEL)
+        #     For each selected expert local to this rank:
+        #       int8_gemv_blocked(activated_i8, w2[expert])
+        #       → expert_out_bf16[HIDDEN] · routing_weight[expert]
+        #     Existing int8_gemv_blocked for the GEMV. Routing weight
+        #     applied as scalar multiply on bf16 output.
+        #
+        # ── phase 11: expert reduce + residual ──────────────────
+        #
+        #   tp_parallel: expert_sum
+        #     Sum local weighted expert outputs → x_residual[HIDDEN]
+        #     Existing accumulate_expert_outputs kernel.
+        #
+        #   allreduce: sum x_residual across ranks
+        #   residual_add: x_main += x_residual
+        #
+        # ── final (host rank only) ──────────────────────────────
+        #
+        # final_norm:  rmsnorm_gamma_fwht_per_block_quantize
+        #   x_main → /rms · sqrt_gamma → FWHT → per-block quantize → lm_i8
+        #   Existing kernel.
+        #
+        # lm_head:     int8_gemv_blocked(lm_i8, lm_output_head) → logits[VOCAB]
+        #   Untied weights. Existing kernel.
+        #
+        # argmax:      argmax(logits) → token_id
+        #   No softcap. Inline on main thread.
+        #
+        # =====================================================================
+        # New kernels required:
+        #   1. int8_gemv with sum_sq epilogue (for Q/K rms pre-collection)
+        #   2. fused_qk_norm_rope_quantize (full-vector norm + per-head rope/fwht/quant)
+        #   3. rmsnorm_dual_output (split-gamma i8 + full-gamma bf16)
+        #   4. f32_router_dispatch (bf16×f32 GEMV + sigmoid + bias + topk)
+        #   5. minimax_moe_phase1 (separate w1/w3 + silu, not fused gate_up)
+        #   6. minimax_moe_phase2 (w2 down-proj with routing weight)
+        #   7. minimax_attn_group_dispatch (wraps existing scoring primitives
+        #      with MiniMax-specific q_scale = S_Q/√128)
+        #
+        # =====================================================================
+
         _ = tokens_ptr
         _ = pos
-        print("MiniMaxM27ButterQuant.forward_decode: not implemented")
+        print("MiniMaxM27ButterQuant.forward_decode: not yet wired")
         return Int32(0)

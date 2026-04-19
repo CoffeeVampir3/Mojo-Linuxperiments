@@ -13,7 +13,7 @@ Compute files export Args structs + worker functions; this file orchestrates.
 """
 
 from std.memory import UnsafePointer
-from std.sys.info import simd_width_of, size_of
+from std.sys.info import simd_width_of
 from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
 
@@ -107,15 +107,22 @@ def int8_gemv[N: Int, K: Int, P: BurstThreadPool](
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
+    var act = I8Ptr(unsafe_from_address=act_ptr)
+    var wpacked = U8Ptr(unsafe_from_address=wpacked_ptr)
+    var colsum = F32Ptr(unsafe_from_address=colsum_ptr)
+    var weight_scale = F32Ptr(unsafe_from_address=weight_scale_ptr)
+    var dst = BF16Ptr(unsafe_from_address=dst_ptr)
+    var act_scale = F32Ptr(unsafe_from_address=act_scale_ptr)
+
     var jobs = InlineArray[WorkerConfig, MAX_POOL_CAPACITY](
-        fill=WorkerConfig(0, 0, 0, 0, 0, 0, 0, 0))
+        fill=WorkerConfig())
     for i in range(num_jobs):
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
         jobs[i] = WorkerConfig(
-            act_ptr + start * K, wpacked_ptr, colsum_ptr,
-            weight_scale_ptr, dst_ptr + start * N * 2,
-            act_scale_ptr, start, end - start)
+            act + start * K, wpacked, colsum,
+            weight_scale, dst + start * N,
+            act_scale, start, end - start)
 
     pool.dispatch[WorkerConfig, int8_gemv_worker[N, K]](
         UnsafePointer(to=jobs[0]), num_jobs)
@@ -146,9 +153,8 @@ def int8_gemv_blocked[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
-    var zero_args = Int8GemvBlockedArgs(
-        I8Ptr(), U8Ptr(), F32Ptr(), F32Ptr(), F32Ptr(), BF16Ptr(), Float32(0))
-    var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](fill=zero_args)
+    var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](
+        fill=Int8GemvBlockedArgs())
     for i in range(num_jobs):
         var start = i * rows_per_job
         jobs[i] = Int8GemvBlockedArgs(
@@ -177,9 +183,8 @@ def int8_gemv_blocked_wa[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
     var num_jobs = min(seq_len, pool.get_capacity())
     comptime num_blocks = K // fwht_blk
 
-    var zero_args = Int8GemvBlockedArgs(
-        I8Ptr(), U8Ptr(), F32Ptr(), F32Ptr(), F32Ptr(), BF16Ptr(), Float32(0))
-    var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](fill=zero_args)
+    var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](
+        fill=Int8GemvBlockedArgs())
     for i in range(num_jobs):
         var start = i
         jobs[i] = Int8GemvBlockedArgs(
@@ -221,10 +226,8 @@ def fused_gu_gelu_tanh[intermediate: Int, K: Int, fwht_blk: Int,
     comptime n_tiles = intermediate // fwht_blk
     comptime num_blk_per_row = intermediate // fwht_blk
 
-    var zero_args = FusedGuGeluTanhArgs(
-        I8Ptr(), F32Ptr(), U8Ptr(), F32Ptr(), F32Ptr(),
-        I8Ptr(), F32Ptr(), 0, 0, 0)
-    var jobs = InlineArray[FusedGuGeluTanhArgs, MAX_POOL_CAPACITY](fill=zero_args)
+    var jobs = InlineArray[FusedGuGeluTanhArgs, MAX_POOL_CAPACITY](
+        fill=FusedGuGeluTanhArgs())
 
     if seq_len == 1:
         var num_workers = min(n_tiles, pool.get_capacity())
@@ -275,10 +278,8 @@ def fused_gu_gelu_tanh_wa[intermediate: Int, K: Int, fwht_blk: Int,
     comptime n_tiles = intermediate // GEMV_TILE
     comptime num_blk_per_row = intermediate // fwht_blk
 
-    var zero_args = FusedGuGeluTanhArgs(
-        I8Ptr(), F32Ptr(), U8Ptr(), F32Ptr(), F32Ptr(),
-        I8Ptr(), F32Ptr(), 0, 0, 0)
-    var jobs = InlineArray[FusedGuGeluTanhArgs, MAX_POOL_CAPACITY](fill=zero_args)
+    var jobs = InlineArray[FusedGuGeluTanhArgs, MAX_POOL_CAPACITY](
+        fill=FusedGuGeluTanhArgs())
 
     if seq_len == 1:
         var num_workers = min(n_tiles, pool.get_capacity())
@@ -336,8 +337,14 @@ def lm_head_gemv[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
     var num_workers = min(N, pool.get_capacity())
     var rows_per_worker = (N + num_workers - 1) // num_workers
 
-    var zero_args = LmHeadArgs(0, 0, 0, 0, 0, 0, 0, 0)
-    var jobs = InlineArray[LmHeadArgs, MAX_POOL_CAPACITY](fill=zero_args)
+    var act_ptr = I8Ptr(unsafe_from_address=act)
+    var weight_ptr = I8Ptr(unsafe_from_address=weight)
+    var act_blk_scales_ptr = F32Ptr(unsafe_from_address=act_blk_scales)
+    var w_blk_scales_ptr = F32Ptr(unsafe_from_address=w_blk_scales)
+    var w_blk_colsums_ptr = F32Ptr(unsafe_from_address=w_blk_colsums)
+    var dst_ptr = BF16Ptr(unsafe_from_address=dst)
+
+    var jobs = InlineArray[LmHeadArgs, MAX_POOL_CAPACITY](fill=LmHeadArgs())
     var actual_jobs = 0
     for i in range(num_workers):
         var n_start = i * rows_per_worker
@@ -345,7 +352,8 @@ def lm_head_gemv[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
             break
         var n_count = min(rows_per_worker, N - n_start)
         jobs[i] = LmHeadArgs(
-            act, weight, act_blk_scales, w_blk_scales, w_blk_colsums, dst,
+            act_ptr, weight_ptr, act_blk_scales_ptr,
+            w_blk_scales_ptr, w_blk_colsums_ptr, dst_ptr,
             n_start, n_count)
         actual_jobs += 1
 
@@ -408,10 +416,8 @@ def gemma4_moe_phase1[
         workers_per_expert = n_tiles
     var tiles_per_worker = (n_tiles + workers_per_expert - 1) // workers_per_expert
 
-    var zero_args = FusedGuGeluTanhArgs(
-        I8Ptr(), F32Ptr(), U8Ptr(), F32Ptr(), F32Ptr(),
-        I8Ptr(), F32Ptr(), 0, 0, 0)
-    var jobs = InlineArray[FusedGuGeluTanhArgs, MAX_POOL_CAPACITY](fill=zero_args)
+    var jobs = InlineArray[FusedGuGeluTanhArgs, MAX_POOL_CAPACITY](
+        fill=FusedGuGeluTanhArgs())
 
     var num_jobs = 0
     for li in range(local_count):
@@ -474,9 +480,8 @@ def gemma4_moe_phase2[
     comptime experts_per_rank = num_experts // tp
     var expert_base = rank * experts_per_rank
 
-    var zero_args = Int8GemvBlockedArgs(
-        I8Ptr(), U8Ptr(), F32Ptr(), F32Ptr(), F32Ptr(), BF16Ptr(), Float32(0))
-    var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](fill=zero_args)
+    var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](
+        fill=Int8GemvBlockedArgs())
 
     var local_count = 0
     for s in range(top_k):
@@ -507,7 +512,8 @@ def gemma4_moe_phase2[
 def router_topk_dispatch[num_experts: Int, k: Int, P: BurstThreadPool](
     logits: BF16Ptr, per_expert_scale: BF16Ptr, result_ptr: Int, mut pool: P,
 ) -> PoolFence[P]:
-    var args = RouterTopkArgs(logits, per_expert_scale, result_ptr)
+    var args = RouterTopkArgs(
+        logits, per_expert_scale, U8Ptr(unsafe_from_address=result_ptr))
     pool.dispatch[RouterTopkArgs, router_topk_kernel[num_experts, k]](
         UnsafePointer(to=args), 1)
     return pool_fence(pool)
@@ -531,17 +537,27 @@ def sliding_attn_dispatch[
 ) -> PoolFence[P]:
     comptime NKV = num_kv_heads
     var jobs = InlineArray[AttnGroupArgs, 8](fill=AttnGroupArgs())
+    var q = BF16Ptr(unsafe_from_address=q_base)
+    var k = BF16Ptr(unsafe_from_address=k_base)
+    var v = BF16Ptr(unsafe_from_address=v_base)
+    var q_norm = BF16Ptr(unsafe_from_address=q_norm_ptr)
+    var k_norm = BF16Ptr(unsafe_from_address=k_norm_ptr)
+    var cos = F32Ptr(unsafe_from_address=cos_ptr)
+    var sin = F32Ptr(unsafe_from_address=sin_ptr)
+    var cache = U8Ptr(unsafe_from_address=cache_base)
+    var qi_out = I8Ptr(unsafe_from_address=qi_out_ptr)
+    var head_scale = F32Ptr(unsafe_from_address=head_scale_ptr)
     for g in range(NKV):
         jobs[g] = AttnGroupArgs(
-            q_base + g * heads_per_group * head_dim * 2,
-            k_base + g * head_dim * 2,
-            v_base + g * head_dim * 2,
-            q_norm_ptr, k_norm_ptr,
-            cos_ptr, sin_ptr,
-            cache_base, g,
+            q + g * heads_per_group * head_dim,
+            k + g * head_dim,
+            v + g * head_dim,
+            q_norm, k_norm,
+            cos, sin,
+            cache, g,
             cache_pos, context_len,
-            qi_out_ptr + g * heads_per_group * head_dim,
-            head_scale_ptr + g * heads_per_group * 4,
+            qi_out + g * heads_per_group * head_dim,
+            head_scale + g * heads_per_group,
             eps)
     pool.dispatch[AttnGroupArgs,
         sliding_attn_group_kernel[head_dim, heads_per_group,
@@ -569,12 +585,18 @@ def cp_attn_prep_dispatch[
     mut pool: P,
 ) -> PoolFence[P]:
     var args = CpAttnPrepArgs(
-        q_bf16_base=q_bf16_base, k_bf16_ptr=k_bf16_ptr,
-        q_norm_ptr=q_norm_ptr, k_norm_ptr=k_norm_ptr,
-        cos_ptr=cos_ptr, sin_ptr=sin_ptr,
-        cache_base=cache_base, cache_pos=local_pos, kv_head=kv_head,
+        q_bf16_base=BF16Ptr(unsafe_from_address=q_bf16_base),
+        k_bf16_ptr=BF16Ptr(unsafe_from_address=k_bf16_ptr),
+        q_norm_ptr=BF16Ptr(unsafe_from_address=q_norm_ptr),
+        k_norm_ptr=BF16Ptr(unsafe_from_address=k_norm_ptr),
+        cos_ptr=F32Ptr(unsafe_from_address=cos_ptr),
+        sin_ptr=F32Ptr(unsafe_from_address=sin_ptr),
+        cache_base=U8Ptr(unsafe_from_address=cache_base),
+        cache_pos=local_pos, kv_head=kv_head,
         eps=eps,
-        q_i8_out=q_i8_out, qi_biases_out=qi_biases_out, q_scales_out=q_scales_out,
+        q_i8_out=I8Ptr(unsafe_from_address=q_i8_out),
+        qi_biases_out=F32Ptr(unsafe_from_address=qi_biases_out),
+        q_scales_out=F32Ptr(unsafe_from_address=q_scales_out),
         write_kv=Int32(1) if write_kv else Int32(0))
     pool.dispatch[CpAttnPrepArgs,
         cp_attn_prep_kernel[head_dim, rope_dims, heads_per_group,
@@ -603,19 +625,24 @@ def cp_chunked_attn_dispatch[
         return PoolFence[P].completed()
     var pgs_per_chunk = (num_pg + num_chunks - 1) // num_chunks
     comptime CHUNK_F32_STRIDE = heads_per_group * (2 + head_dim)
+    var q_i8 = I8Ptr(unsafe_from_address=q_i8_base)
+    var qi_biases = F32Ptr(unsafe_from_address=qi_biases_base)
+    var q_scales = F32Ptr(unsafe_from_address=q_scales_base)
+    var cache = U8Ptr(unsafe_from_address=cache_base)
+    var partial_out = F32Ptr(unsafe_from_address=partial_out_base)
     var chunk_args = InlineArray[ChunkedAttnArgs, MAX_CHUNKS](fill=ChunkedAttnArgs())
     for c in range(num_chunks):
         var start = c * pgs_per_chunk
         var end = min((c + 1) * pgs_per_chunk, num_pg)
         chunk_args[c] = ChunkedAttnArgs(
-            q_i8_base=q_i8_base,
-            qi_biases_base=qi_biases_base,
-            q_scales_base=q_scales_base,
-            cache_base=cache_base,
+            q_i8_base=q_i8,
+            qi_biases_base=qi_biases,
+            q_scales_base=q_scales,
+            cache_base=cache,
             kv_head=kv_head,
             start_pg=start,
             end_pg=end,
-            partial_out=partial_out_base + c * CHUNK_F32_STRIDE * 4,
+            partial_out=partial_out + c * CHUNK_F32_STRIDE,
             context_len=local_context_len)
     pool.dispatch[ChunkedAttnArgs,
         cp_chunked_attn_kernel[head_dim, local_max_seq, num_kv_heads, num_q_heads, heads_per_group]](
@@ -633,8 +660,11 @@ def merge_local_chunks_dispatch[
     if num_chunks <= 0:
         return PoolFence[P].completed()
     var args = MergeChunksArgs(
-        partial_base=partial_base, num_chunks=num_chunks,
-        out_m=out_m, out_l=out_l, out_v=out_v)
+        partial_base=F32Ptr(unsafe_from_address=partial_base),
+        num_chunks=num_chunks,
+        out_m=F32Ptr(unsafe_from_address=out_m),
+        out_l=F32Ptr(unsafe_from_address=out_l),
+        out_v=F32Ptr(unsafe_from_address=out_v))
     pool.dispatch[MergeChunksArgs,
         merge_local_chunks_kernel[head_dim, heads_per_group]](
         UnsafePointer(to=args), 1)
@@ -652,10 +682,21 @@ def cp_gather_dispatch[
     head_start: Int, head_count: Int,
     mut pool: P,
 ) -> PoolFence[P]:
+    var all_m_ptrs = InlineArray[F32Ptr, MAX_CP_RANKS](fill=F32Ptr())
+    var all_l_ptrs = InlineArray[F32Ptr, MAX_CP_RANKS](fill=F32Ptr())
+    var all_v_ptrs = InlineArray[F32Ptr, MAX_CP_RANKS](fill=F32Ptr())
+    for r in range(MAX_CP_RANKS):
+        if all_m[r] != 0:
+            all_m_ptrs[r] = F32Ptr(unsafe_from_address=all_m[r])
+        if all_l[r] != 0:
+            all_l_ptrs[r] = F32Ptr(unsafe_from_address=all_l[r])
+        if all_v[r] != 0:
+            all_v_ptrs[r] = F32Ptr(unsafe_from_address=all_v[r])
     var args = CpGatherArgs(
         rank=rank, head_start=head_start, head_count=head_count,
-        qi_out=qi_out, head_scales=head_scales,
-        all_m=all_m, all_l=all_l, all_v=all_v)
+        qi_out=I8Ptr(unsafe_from_address=qi_out),
+        head_scales=F32Ptr(unsafe_from_address=head_scales),
+        all_m=all_m_ptrs, all_l=all_l_ptrs, all_v=all_v_ptrs)
     pool.dispatch[CpGatherArgs,
         cp_gather_kernel[head_dim, num_heads, tp]](
         UnsafePointer(to=args), 1)
@@ -679,15 +720,22 @@ def rmsnorm_fwht_quant[cols: Int, block: Int,
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
+    var inp = BF16Ptr(unsafe_from_address=in_ptr)
+    var gamma = BF16Ptr()
+    if gamma_ptr != 0:
+        gamma = BF16Ptr(unsafe_from_address=gamma_ptr)
+    var qi = I8Ptr(unsafe_from_address=qi_ptr)
+    var work = F32Ptr(unsafe_from_address=work_ptr)
+    var scales = F32Ptr(unsafe_from_address=scale_ptr)
     var jobs = InlineArray[RmsNormFwhtQuantArgs, MAX_POOL_CAPACITY](
         fill=RmsNormFwhtQuantArgs())
     for i in range(num_jobs):
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
         jobs[i] = RmsNormFwhtQuantArgs(
-            in_ptr, gamma_ptr, qi_ptr,
-            work_ptr + i * cols * size_of[Float32](),
-            scale_ptr, eps, start, end)
+            inp, gamma, qi,
+            work + i * cols,
+            scales, eps, start, end)
 
     pool.dispatch[RmsNormFwhtQuantArgs,
         rmsnorm_fwht_quant_worker[cols, block, has_gamma, per_block]](
@@ -737,17 +785,26 @@ def rmsnorm_dual_gamma_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
+    var inp = BF16Ptr(unsafe_from_address=in_ptr)
+    var gamma_a = BF16Ptr(unsafe_from_address=gamma_a_ptr)
+    var gamma_b = BF16Ptr(unsafe_from_address=gamma_b_ptr)
+    var qi_a = I8Ptr(unsafe_from_address=qi_a_ptr)
+    var qi_b = I8Ptr(unsafe_from_address=qi_b_ptr)
+    var work_a = F32Ptr(unsafe_from_address=work_a_ptr)
+    var work_b = F32Ptr(unsafe_from_address=work_b_ptr)
+    var scale_a = F32Ptr(unsafe_from_address=scale_a_ptr)
+    var scale_b = F32Ptr(unsafe_from_address=scale_b_ptr)
     var jobs = InlineArray[RmsNormDualGammaFwhtArgs, MAX_POOL_CAPACITY](
         fill=RmsNormDualGammaFwhtArgs())
     for i in range(num_jobs):
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
         jobs[i] = RmsNormDualGammaFwhtArgs(
-            in_ptr, gamma_a_ptr, gamma_b_ptr,
-            qi_a_ptr, qi_b_ptr,
-            work_a_ptr + i * cols * size_of[Float32](),
-            work_b_ptr + i * cols * size_of[Float32](),
-            scale_a_ptr, scale_b_ptr,
+            inp, gamma_a, gamma_b,
+            qi_a, qi_b,
+            work_a + i * cols,
+            work_b + i * cols,
+            scale_a, scale_b,
             eps, start, end)
 
     pool.dispatch[RmsNormDualGammaFwhtArgs,
@@ -777,7 +834,8 @@ def rmsnorm_no_scale[InT: Encoding & Shaped, OutT: Encoding & Shaped,
 
     var ip = input.as_ptr[DType.bfloat16]()
     var op = output.as_ptr[DType.bfloat16]()
-    var jobs = InlineArray[RMSNormNoScaleArgs, MAX_POOL_CAPACITY](uninitialized=True)
+    var jobs = InlineArray[RMSNormNoScaleArgs, MAX_POOL_CAPACITY](
+        fill=RMSNormNoScaleArgs())
     for i in range(num_jobs):
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
@@ -813,7 +871,8 @@ def rmsnorm_per_head[head_dim: Int, num_heads: Int,
     var ip = input.as_ptr[DType.bfloat16]()
     var wp = weight.as_ptr[DType.bfloat16]()
     var op = output.as_ptr[DType.bfloat16]()
-    var jobs = InlineArray[RMSNormPerHeadArgs, MAX_POOL_CAPACITY](uninitialized=True)
+    var jobs = InlineArray[RMSNormPerHeadArgs, MAX_POOL_CAPACITY](
+        fill=RMSNormPerHeadArgs())
     for i in range(num_jobs):
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
@@ -827,7 +886,11 @@ def rmsnorm_per_head[head_dim: Int, num_heads: Int,
 def post_attn_norm_dispatch[hidden: Int, P: BurstThreadPool](
     src_ptr: Int, norm_w_ptr: Int, x_main_ptr: Int, eps: Float32, mut pool: P,
 ) -> PoolFence[P]:
-    var args = PostAttnNormArgs(src_ptr, norm_w_ptr, x_main_ptr, eps)
+    var args = PostAttnNormArgs(
+        BF16Ptr(unsafe_from_address=src_ptr),
+        BF16Ptr(unsafe_from_address=norm_w_ptr),
+        BF16Ptr(unsafe_from_address=x_main_ptr),
+        eps)
     pool.dispatch[PostAttnNormArgs, post_attn_norm_kernel[hidden]](
         UnsafePointer(to=args), 1)
     return pool_fence(pool)
@@ -836,7 +899,10 @@ def post_attn_norm_dispatch[hidden: Int, P: BurstThreadPool](
 def expert_sum_dispatch[hidden: Int, P: BurstThreadPool](
     expert_out_ptr: Int, local_count: Int, dst_ptr: Int, mut pool: P,
 ) -> PoolFence[P]:
-    var args = ExpertSumArgs(expert_out_ptr, local_count, dst_ptr)
+    var args = ExpertSumArgs(
+        BF16Ptr(unsafe_from_address=expert_out_ptr),
+        local_count,
+        BF16Ptr(unsafe_from_address=dst_ptr))
     pool.dispatch[ExpertSumArgs, expert_sum_kernel[hidden]](
         UnsafePointer(to=args), 1)
     return pool_fence(pool)
@@ -845,7 +911,11 @@ def expert_sum_dispatch[hidden: Int, P: BurstThreadPool](
 def dense_norm_dispatch[hidden: Int, P: BurstThreadPool](
     src_ptr: Int, norm_w_ptr: Int, dst_ptr: Int, eps: Float32, mut pool: P,
 ) -> PoolFence[P]:
-    var args = DenseNormArgs(src_ptr, norm_w_ptr, dst_ptr, eps)
+    var args = DenseNormArgs(
+        BF16Ptr(unsafe_from_address=src_ptr),
+        BF16Ptr(unsafe_from_address=norm_w_ptr),
+        BF16Ptr(unsafe_from_address=dst_ptr),
+        eps)
     pool.dispatch[DenseNormArgs, dense_norm_kernel[hidden]](
         UnsafePointer(to=args), 1)
     return pool_fence(pool)
@@ -856,8 +926,13 @@ def post_reduce_dispatch[hidden: Int, P: BurstThreadPool](
     combine_norm_w_ptr: Int, x_main_ptr: Int,
     layer_scalar: Float32, eps: Float32, mut pool: P,
 ) -> PoolFence[P]:
-    var args = PostReduceArgs(moe_out_ptr, moe_norm_w_ptr, dense_normed_ptr,
-        combine_norm_w_ptr, x_main_ptr, layer_scalar, eps)
+    var args = PostReduceArgs(
+        BF16Ptr(unsafe_from_address=moe_out_ptr),
+        BF16Ptr(unsafe_from_address=moe_norm_w_ptr),
+        BF16Ptr(unsafe_from_address=dense_normed_ptr),
+        BF16Ptr(unsafe_from_address=combine_norm_w_ptr),
+        BF16Ptr(unsafe_from_address=x_main_ptr),
+        layer_scalar, eps)
     pool.dispatch[PostReduceArgs, post_reduce_kernel[hidden]](
         UnsafePointer(to=args), 1)
     return pool_fence(pool)

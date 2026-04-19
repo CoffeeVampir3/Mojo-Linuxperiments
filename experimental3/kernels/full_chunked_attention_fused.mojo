@@ -110,9 +110,9 @@ def cp_attn_prep_kernel[
     prep runs — used on non-owning CP ranks.
     """
     var cache = Gemma4KVCache[local_max_seq, head_dim, num_kv_heads, num_q_heads](
-        args.cache_base)
-    var cos = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.cos_ptr)
-    var sin = UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.sin_ptr)
+        Int(args.cache_base))
+    var cos = args.cos_ptr
+    var sin = args.sin_ptr
 
     if args.write_kv != 0:
         var work_arr = InlineArray[Float32, head_dim](uninitialized=True)
@@ -121,36 +121,28 @@ def cp_attn_prep_kernel[
         var qi_buf = UnsafePointer(to=qi_arr).bitcast[Scalar[DType.int8]]()
 
         write_k_head_normed[head_dim, rope_dims](
-            UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-                unsafe_from_address=args.k_bf16_ptr),
-            UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-                unsafe_from_address=args.k_norm_ptr),
+            args.k_bf16_ptr,
+            args.k_norm_ptr,
             cos, sin, work, qi_buf,
             cache, args.cache_pos, args.kv_head, args.eps)
 
         write_v_head_normed[head_dim](
-            UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-                unsafe_from_address=args.k_bf16_ptr),
+            args.k_bf16_ptr,
             work, qi_buf,
             cache, args.cache_pos, args.kv_head, args.eps)
 
         _ = work_arr
         _ = qi_arr
 
-    var qi_biases = UnsafePointer[Float32, MutAnyOrigin](
-        unsafe_from_address=args.qi_biases_out)
-    var q_scales = UnsafePointer[Float32, MutAnyOrigin](
-        unsafe_from_address=args.q_scales_out)
+    var qi_biases = args.qi_biases_out
+    var q_scales = args.q_scales_out
 
     for qh in range(heads_per_group):
-        var q_bf16 = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-            unsafe_from_address=args.q_bf16_base + qh * head_dim * 2)
-        var q_i8_dst = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](
-            unsafe_from_address=args.q_i8_out + qh * head_dim)
+        var q_bf16 = args.q_bf16_base + qh * head_dim
+        var q_i8_dst = args.q_i8_out + qh * head_dim
         var result = prep_q_row_normed_partial[head_dim, rope_dims](
             q_bf16.bitcast[BFloat16](),
-            UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
-                unsafe_from_address=args.q_norm_ptr),
+            args.q_norm_ptr,
             cos, sin,
             q_i8_dst.bitcast[Int8](), args.eps)
         qi_biases[qh] = result[0]
@@ -175,14 +167,12 @@ def cp_chunked_attn_kernel[
     (local_max_seq instead of global max_seq, all KV heads).
     """
     var cache = Gemma4KVCache[local_max_seq, head_dim, num_kv_heads, num_q_heads](
-        args.cache_base)
+        Int(args.cache_base))
     var k_scales = cache.k_scale_ptr(args.kv_head)
     var v_scales = cache.v_scale_ptr(args.kv_head)
 
-    var qi_biases = UnsafePointer[Float32, MutAnyOrigin](
-        unsafe_from_address=args.qi_biases_base)
-    var q_scales = UnsafePointer[Float32, MutAnyOrigin](
-        unsafe_from_address=args.q_scales_base)
+    var qi_biases = args.qi_biases_base
+    var q_scales = args.q_scales_base
 
     comptime WIDTH = CACHE_WIDTH
     var running_max = InlineArray[Float32, heads_per_group](fill=Float32(-1e30))
@@ -209,8 +199,7 @@ def cp_chunked_attn_kernel[
         var valid = cp_group_valid_mask[WIDTH](group_start, args.context_len)
 
         for qh in range(heads_per_group):
-            var q_i8 = UnsafePointer[Scalar[DType.int8], MutAnyOrigin](
-                unsafe_from_address=args.q_i8_base + qh * head_dim)
+            var q_i8 = args.q_i8_base + qh * head_dim
 
             var scores_vec = valid.select(
                 score_group[head_dim](
@@ -236,8 +225,7 @@ def cp_chunked_attn_kernel[
             running_sum[qh] += exp_scores.reduce_add()
             v_agg_group[head_dim](exp_scores, v_sc_pg, v_pg, v_acc)
 
-    var out = UnsafePointer[Float32, MutAnyOrigin](
-        unsafe_from_address=args.partial_out)
+    var out = args.partial_out
     comptime HEAD_STRIDE = partial_head_stride[head_dim]()
 
     for qh in range(heads_per_group):
@@ -415,11 +403,11 @@ def merge_local_chunks_kernel[head_dim: Int, heads_per_group: Int](
     args: MergeChunksArgs,
 ):
     merge_local_chunks[head_dim, heads_per_group](
-        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.partial_base),
+        args.partial_base,
         args.num_chunks,
-        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.out_m),
-        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.out_l),
-        UnsafePointer[Float32, MutAnyOrigin](unsafe_from_address=args.out_v))
+        args.out_m,
+        args.out_l,
+        args.out_v)
 
 
 def cp_gather_kernel[head_dim: Int, num_heads: Int, tp: Int](
@@ -432,17 +420,12 @@ def cp_gather_kernel[head_dim: Int, num_heads: Int, tp: Int](
     var all_v_ptrs = InlineArray[UnsafePointer[Float32, MutAnyOrigin], tp](
         fill=UnsafePointer[Float32, MutAnyOrigin]())
     for r in range(tp):
-        all_m_ptrs[r] = UnsafePointer[Float32, MutAnyOrigin](
-            unsafe_from_address=args.all_m[r])
-        all_l_ptrs[r] = UnsafePointer[Float32, MutAnyOrigin](
-            unsafe_from_address=args.all_l[r])
-        all_v_ptrs[r] = UnsafePointer[Float32, MutAnyOrigin](
-            unsafe_from_address=args.all_v[r])
+        all_m_ptrs[r] = args.all_m[r]
+        all_l_ptrs[r] = args.all_l[r]
+        all_v_ptrs[r] = args.all_v[r]
     cp_gather_and_quantize[head_dim, num_heads, tp](
         args.rank,
         all_m_ptrs, all_l_ptrs, all_v_ptrs,
-        UnsafePointer[Scalar[DType.int8], MutAnyOrigin](
-            unsafe_from_address=args.qi_out),
-        UnsafePointer[Float32, MutAnyOrigin](
-            unsafe_from_address=args.head_scales),
+        args.qi_out,
+        args.head_scales,
         args.head_start, args.head_count)
