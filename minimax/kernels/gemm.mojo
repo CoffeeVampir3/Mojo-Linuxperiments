@@ -1,7 +1,7 @@
-"""MiniMax GEMM-shaped workers — fused w1/w3 SiLU for SwiGLU experts.
+"""MiniMax GEMM-shaped workers.
 
-Structurally follows experimental3/kernels/gemm.mojo but with MiniMax-specific
-weight layout (separate w1/w3) and SiLU activation instead of GELU-tanh.
+fused_w1_w3_silu_worker: SwiGLU expert phase 1 (int8 activation × int8 weights).
+f32_gemv_worker: router projection (bf16 activation × f32 weights → f32 output).
 """
 
 from std.sys.info import simd_width_of
@@ -10,8 +10,9 @@ from std.collections import InlineArray
 from experimental3.kernels.gemv import gemv_row
 from experimental3.kernels.fwht import fwht_block
 from experimental3.kernels.quantize import absmax_quantize_i8
+from experimental3.common_math import F32Ptr, BF16Ptr
 from minimax.kernels.activations import silu_mul
-from minimax.kernels.dispatch_args import FusedW1W3SiluArgs
+from minimax.kernels.dispatch_args import FusedW1W3SiluArgs, F32GemvArgs
 
 
 def fused_w1_w3_silu_worker[intermediate: Int, K: Int, fwht_blk: Int](
@@ -73,3 +74,32 @@ def fused_w1_w3_silu_worker[intermediate: Int, K: Int, fwht_blk: Int](
                 gate, qi_row + local_n)
 
             local_n += fwht_blk
+
+
+# ============================================================================
+# f32 GEMV — bf16 activation × f32 weight → f32 output (router projection)
+# ============================================================================
+
+
+@always_inline
+def f32_gemv_row[K: Int](
+    act: BF16Ptr, weight_row: F32Ptr,
+) -> Float32:
+    """Dot product: bf16[K] · f32[K] → f32 scalar."""
+    comptime width = simd_width_of[DType.float32]()
+    var acc = SIMD[DType.float32, width](0)
+    var k = 0
+    while k + width <= K:
+        var a = (act + k).load[width=width]().cast[DType.float32]()
+        var w = (weight_row + k).load[width=width]()
+        acc = a.fma(w, acc)
+        k += width
+    return acc.reduce_add()
+
+
+def f32_gemv_worker[N: Int, K: Int](args: F32GemvArgs):
+    """N-parallel bf16 × f32 GEMV. Processes rows [n_start, n_start + n_count)."""
+    for n in range(args.n_count):
+        var row = args.n_start + n
+        args.dst_f32[row] = f32_gemv_row[K](
+            args.act_bf16, args.weight_f32 + row * K)

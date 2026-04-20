@@ -8,11 +8,13 @@ partial RoPE (64 of 128 dims), full-vector Q/K RMSNorm, sigmoid-routed MoE
 from std.pathlib import Path
 from std.memory import UnsafePointer
 from std.sys.info import size_of, simd_width_of
+from std.time import perf_counter_ns
 from std.collections import InlineArray
 
 from numa import NumaArena, NumaInfo
 from notstdcollections import HeapMoveArray
 from threading import BurstPool
+from threading.threading_traits import BurstThreadPool
 
 from modeling.model_spec import (
     Encoding, Shaped, BF16, F32, I8,
@@ -30,13 +32,44 @@ from modeling.modeling_common import (
     scratch_tensor_view, scratch_ptr,
     LayerShard, LayerBuilder,
 )
+from kernels.kernel_ops import PoolFence
+from kernels.reductions import small_allreduce, ring_broadcast
 from modeling.linear_borrow_pool import ScratchPool, ScratchLease
 from modeling.loader import discover_shards, load_weights_from_descs
-from experimental3.profiler import ForwardLogger
+
+from experimental3.profiler import (
+    PhaseTiming, phase_timing_from_points, finish_single_pool_fence,
+    ForwardSample, ForwardLogger,
+)
 from experimental3.init_weights import colsum_at, block_colsum_at, block_colsum_row_major_at, pack_at
 from experimental3.gamma import compute_sqrt_gamma, compute_inv_sqrt_gamma
-from experimental3.common_math import BF16Ptr, F32Ptr
+from experimental3.common_math import BF16Ptr, F32Ptr, I8Ptr, U8Ptr
+from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
+from experimental3.kernels.dispatch_kernels import (
+    rmsnorm_gamma_fwht_quantize,
+    rmsnorm_gamma_fwht_per_block_quantize,
+    expert_sum_dispatch,
+    int8_gemv, int8_gemv_blocked,
+    lm_head_gemv,
+)
+from experimental3.common_math import rms_reduce_bf16, inv_rms_from_sum_sq
+from kernels.kernel_ops import embed_lookup
+
+from minimax.kernels.router import TopKResult
+from minimax.kernels.dispatch_kernels import (
+    f32_gemv_dispatch,
+    router_topk_dispatch,
+    rmsnorm_dual_output_dispatch,
+    kv_write_dispatch,
+    q_prep_dispatch,
+    chunked_score_dispatch,
+    merge_quantize_dispatch,
+    minimax_moe_phase1,
+    minimax_moe_phase2,
+    norm_prep_dispatch,
+)
 from kernels.kv_rotors import init_rope_tables
+from simd_math import sqrt
 
 
 # =============================================================================
@@ -61,7 +94,7 @@ struct MiniMaxM27Config:
     # Gemma4 proportional RoPE uses HEAD_DIM // 2 = 256. The pair_stride
     # parameter on write_k_head_normed / rope_apply_partial controls this.
     # inv_freq[i] = 1 / (ROPE_THETA ^ (2i / ROPE_DIM)) for i in 0..31.
-    comptime ROPE_PAIR_STRIDE = ROPE_DIM // 2
+    comptime ROPE_PAIR_STRIDE = Self.ROPE_DIM // 2
 
     comptime MOE_INTERMEDIATE = 1536
     comptime NUM_EXPERTS = 256
@@ -90,6 +123,7 @@ comptime MOE_DOWN_NUM_BLK = C.MOE_INTERMEDIATE // FWHT_BLK_MOE_DOWN
 struct MiniMaxShapes[tp: Int]:
     comptime Q_LOCAL = C.Q_DIM // Self.tp
     comptime KV_LOCAL = C.KV_DIM // Self.tp
+    comptime QKV_LOCAL = Self.Q_LOCAL + 2 * Self.KV_LOCAL
     comptime NUM_HEADS_LOCAL = C.NUM_HEADS // Self.tp
     comptime NUM_KV_HEADS_LOCAL = C.NUM_KV_HEADS // Self.tp
     comptime EXPERTS_LOCAL = C.NUM_EXPERTS // Self.tp
@@ -102,23 +136,17 @@ struct MiniMaxShapes[tp: Int]:
 
 @fieldwise_init
 struct AttnRefs[tp: Int](Copyable, ImplicitlyCopyable):
-    var q_proj:      SlotOffset[I8,  Shape[C.Q_DIM,  C.HIDDEN]]
-    var k_proj:      SlotOffset[I8,  Shape[C.KV_DIM, C.HIDDEN]]
-    var v_proj:      SlotOffset[I8,  Shape[C.KV_DIM, C.HIDDEN]]
+    comptime S = MiniMaxShapes[Self.tp]
+
+    var qkv_proj:    SlotOffset[I8,  Shape[C.Q_DIM + 2 * C.KV_DIM, C.HIDDEN]]
+    var qkv_proj_sc: SlotOffset[F32, Shape[C.Q_DIM + 2 * C.KV_DIM, 1]]
     var o_proj:      SlotOffset[I8,  Shape[C.HIDDEN, C.Q_DIM]]
-    var q_proj_sc:   SlotOffset[F32, Shape[C.Q_DIM,  1]]
-    var k_proj_sc:   SlotOffset[F32, Shape[C.KV_DIM, 1]]
-    var v_proj_sc:   SlotOffset[F32, Shape[C.KV_DIM, 1]]
     var o_proj_sc:   SlotOffset[F32, Shape[C.HIDDEN, 1]]
 
-    # Full-vector RMSNorm over concatenated Q (6144) / K (1024).
-    # Under TP the RMS denominator needs a cross-rank sum-of-squares reduce.
     var q_norm:      SlotOffset[BF16, Shape[C.Q_DIM,  1]]
     var k_norm:      SlotOffset[BF16, Shape[C.KV_DIM, 1]]
 
-    var q_colsum:    Int
-    var k_colsum:    Int
-    var v_colsum:    Int
+    var qkv_colsum:  Int
     var o_colsum:    Int
 
 
@@ -207,8 +235,6 @@ struct MiniMaxM27Topology[tp: Int](Copyable, ImplicitlyCopyable):
     var scratch_capacity: Int
     var rope: RopeSlots[C.ROPE_DIM // 2]
 
-    # Placeholder — real layout needs the typed cache struct (VNNI-tiled K,
-    # row-major V, and per-KV-head K/V scale arrays) once forward lands.
     var kv_cache_off: Int
     var kv_cache_stride: Int
     var state_bytes: Int
@@ -337,41 +363,36 @@ def emit_layer[tp: Int](
     comptime o_num_blk = C.NUM_HEADS // tp
     comptime bf16 = size_of[Scalar[DType.bfloat16]]()
 
-    # --- Attention projections ---
-    var q_proj = SlotOffset[I8, Shape[C.Q_DIM, H]](
-        b.q(e, "self_attn.q_proj.weight", C.Q_DIM, H, ROW))
-    var q_proj_sc = SlotOffset[F32, Shape[C.Q_DIM, 1]](
-        b.f(e, "self_attn.q_proj.weight_scale", C.Q_DIM, 1, ROW))
-    var k_proj = SlotOffset[I8, Shape[C.KV_DIM, H]](
-        b.q(e, "self_attn.k_proj.weight", C.KV_DIM, H, ROW))
-    var k_proj_sc = SlotOffset[F32, Shape[C.KV_DIM, 1]](
-        b.f(e, "self_attn.k_proj.weight_scale", C.KV_DIM, 1, ROW))
-    var v_proj = SlotOffset[I8, Shape[C.KV_DIM, H]](
-        b.q(e, "self_attn.v_proj.weight", C.KV_DIM, H, ROW))
-    var v_proj_sc = SlotOffset[F32, Shape[C.KV_DIM, 1]](
-        b.f(e, "self_attn.v_proj.weight_scale", C.KV_DIM, 1, ROW))
+    # --- Attention projections (fused QKV: weights contiguous, scales contiguous) ---
+    comptime qkv_n_loc = q_n_loc + 2 * kv_n_loc
+    var qkv_proj_off = b.q(e, "self_attn.q_proj.weight", C.Q_DIM, H, ROW)
+    _ = b.q(e, "self_attn.k_proj.weight", C.KV_DIM, H, ROW)
+    _ = b.q(e, "self_attn.v_proj.weight", C.KV_DIM, H, ROW)
+    var qkv_proj = SlotOffset[I8, Shape[C.Q_DIM + 2 * C.KV_DIM, H]](qkv_proj_off)
+
+    var qkv_sc_off = b.f(e, "self_attn.q_proj.weight_scale", C.Q_DIM, 1, ROW)
+    _ = b.f(e, "self_attn.k_proj.weight_scale", C.KV_DIM, 1, ROW)
+    _ = b.f(e, "self_attn.v_proj.weight_scale", C.KV_DIM, 1, ROW)
+    var qkv_proj_sc = SlotOffset[F32, Shape[C.Q_DIM + 2 * C.KV_DIM, 1]](qkv_sc_off)
+
     var o_proj = SlotOffset[I8, Shape[H, C.Q_DIM]](
         b.q(e, "self_attn.o_proj.weight", H, C.Q_DIM, COL))
     var o_proj_sc = SlotOffset[F32, Shape[H, 1]](
         b.f(e, "self_attn.o_proj.weight_scale", H, 1, REPL))
 
     var q_norm = SlotOffset[BF16, Shape[C.Q_DIM, 1]](
-        b.bf(e, "self_attn.q_norm.weight", C.Q_DIM, 1, REPL))
+        b.bf(e, "self_attn.q_norm.weight", C.Q_DIM, 1, ROW))
     var k_norm = SlotOffset[BF16, Shape[C.KV_DIM, 1]](
-        b.bf(e, "self_attn.k_norm.weight", C.KV_DIM, 1, REPL))
+        b.bf(e, "self_attn.k_norm.weight", C.KV_DIM, 1, ROW))
 
-    var q_colsum = b.colsum(q_n_loc * 4)
-    var k_colsum = b.colsum(kv_n_loc * 4)
-    var v_colsum = b.colsum(kv_n_loc * 4)
+    var qkv_colsum = b.colsum(qkv_n_loc * 4)
     var o_colsum = b.colsum(H * o_num_blk * 4)
 
     var attn = AttnRefs[tp](
-        q_proj=q_proj, k_proj=k_proj, v_proj=v_proj, o_proj=o_proj,
-        q_proj_sc=q_proj_sc, k_proj_sc=k_proj_sc, v_proj_sc=v_proj_sc,
-        o_proj_sc=o_proj_sc,
+        qkv_proj=qkv_proj, qkv_proj_sc=qkv_proj_sc,
+        o_proj=o_proj, o_proj_sc=o_proj_sc,
         q_norm=q_norm, k_norm=k_norm,
-        q_colsum=q_colsum, k_colsum=k_colsum,
-        v_colsum=v_colsum, o_colsum=o_colsum,
+        qkv_colsum=qkv_colsum, o_colsum=o_colsum,
     )
 
     # --- Norms ---
@@ -440,12 +461,18 @@ def calculate_peak_scratch[tp: Int]() -> Int:
     comptime f32  = 4
     comptime i8   = 1
 
+    comptime HPG = C.HPG
+    comptime MAX_CHUNKS = 32
+    comptime PARTIAL_F32S = MAX_CHUNKS * HPG * (2 + C.HEAD_DIM)
     comptime attn_peak = (
-        C.HIDDEN * i8 + C.HIDDEN * f32 + f32
-        + S.Q_LOCAL * bf16 + 2 * S.KV_LOCAL * bf16
+        f32
+        + S.QKV_LOCAL * bf16
+        + HPG * C.HEAD_DIM * i8
+        + HPG * f32
+        + HPG * f32
         + S.Q_LOCAL * i8
-        + S.NUM_HEADS_LOCAL * f32 * 2
-        + S.NUM_HEADS_LOCAL * C.HEAD_DIM * f32
+        + S.NUM_HEADS_LOCAL * f32
+        + PARTIAL_F32S * f32
     )
 
     comptime moe_peak = (
@@ -510,16 +537,10 @@ def build_minimax_plan[tp: Int]() -> MiniMaxM27LoadPlan[tp]:
         sin=state.reserve[F32, Shape[C.MAX_SEQ_LEN, C.ROPE_DIM // 2]](),
     )
 
-    # KV cache: placeholder byte estimate. The real layout depends on the
-    # butterquant cache struct (VNNI-tiled K, row-major V, per-position
-    # K/V scale arrays) and will change when the forward is implemented.
-    comptime KV_CACHE_PER_POS = (
-        C.NUM_KV_HEADS * C.HEAD_DIM * 1
-        + C.NUM_KV_HEADS * C.HEAD_DIM * 1
-        + C.NUM_KV_HEADS * f32
-        + C.NUM_KV_HEADS * f32
-    )
-    comptime kv_cache_stride = align_up(C.MAX_SEQ_LEN * KV_CACHE_PER_POS)
+    comptime KV_HEADS_LOCAL = C.NUM_KV_HEADS // tp
+    comptime HEADS_LOCAL = C.NUM_HEADS // tp
+    comptime kv_cache_stride = Gemma4KVCache[
+        C.MAX_SEQ_LEN, C.HEAD_DIM, KV_HEADS_LOCAL, HEADS_LOCAL].TOTAL_BYTES
     var kv_cache_off = state.reserve_bytes(C.NUM_LAYERS * kv_cache_stride)
 
     # Host section
@@ -567,6 +588,40 @@ def build_minimax_plan[tp: Int]() -> MiniMaxM27LoadPlan[tp]:
         host=host, host_bytes=host_bytes,
     )
     return MiniMaxM27LoadPlan[tp](topo, descs^)
+
+
+# =============================================================================
+# TP dispatch helper
+# =============================================================================
+
+
+def tp_parallel[tp: Int,
+    body: def[rank: Int](MiniMaxM27Topology[tp], mut BurstPool[]) capturing -> PoolFence[BurstPool[]],
+](
+    topos: InlineArray[MiniMaxM27Topology[tp], tp],
+    pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp],
+) -> PhaseTiming:
+    var ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp](
+        fill=UnsafePointer[BurstPool[], MutAnyOrigin]())
+    var active = InlineArray[Bool, tp](fill=False)
+    var t0 = Int(perf_counter_ns())
+    comptime for rank in range(tp):
+        ptrs[rank] = body[rank](topos[rank], pool_ptrs[rank][]).take()
+    var t1 = Int(perf_counter_ns())
+    for i in range(tp):
+        if ptrs[i]:
+            active[i] = True
+            ptrs[i][].join()
+    var t2 = Int(perf_counter_ns())
+    var max_done_ns = 0
+    var any_active = False
+    for i in range(tp):
+        if active[i]:
+            any_active = True
+            var ts = ptrs[i][].last_worker_timestamp()
+            if ts > max_done_ns:
+                max_done_ns = ts
+    return phase_timing_from_points(t0, t1, max_done_ns, t1, t2, any_active)
 
 
 # =============================================================================
@@ -666,7 +721,7 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         self.profile.clear()
 
     def init_state(mut self):
-        comptime MAX_PACK_BYTES = C.Q_DIM * C.HIDDEN
+        comptime MAX_PACK_BYTES = (C.Q_DIM + 2 * C.KV_DIM) * C.HIDDEN
         var numa = NumaInfo()
         var pack_arena = NumaArena[alignment=DEFAULT_ALIGNMENT](numa.plan_topology(1)[0], MAX_PACK_BYTES)
         var pack_scratch = UnsafePointer[UInt8, MutAnyOrigin](
@@ -691,17 +746,10 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
                 var lb = topo.layer_base(i)
                 var layer = topo.layers.proto
 
-                colsum_at(base, lb - base + layer.attn.q_proj.offset, lb - base + layer.attn.q_colsum,
-                    q_local, C.HIDDEN)
-                pack_at(base, lb - base + layer.attn.q_proj.offset, q_local, C.HIDDEN, pack_scratch)
-
-                colsum_at(base, lb - base + layer.attn.k_proj.offset, lb - base + layer.attn.k_colsum,
-                    kv_local, C.HIDDEN)
-                pack_at(base, lb - base + layer.attn.k_proj.offset, kv_local, C.HIDDEN, pack_scratch)
-
-                colsum_at(base, lb - base + layer.attn.v_proj.offset, lb - base + layer.attn.v_colsum,
-                    kv_local, C.HIDDEN)
-                pack_at(base, lb - base + layer.attn.v_proj.offset, kv_local, C.HIDDEN, pack_scratch)
+                comptime qkv_local = q_local + 2 * kv_local
+                colsum_at(base, lb - base + layer.attn.qkv_proj.offset, lb - base + layer.attn.qkv_colsum,
+                    qkv_local, C.HIDDEN)
+                pack_at(base, lb - base + layer.attn.qkv_proj.offset, qkv_local, C.HIDDEN, pack_scratch)
 
                 block_colsum_at(base, lb - base + layer.attn.o_proj.offset, lb - base + layer.attn.o_colsum,
                     C.HIDDEN, q_local, C.HEAD_DIM)
@@ -785,20 +833,27 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         var loaded = result.take()
         print("loaded", loaded.bytes_loaded // (1024 * 1024), "MB in", loaded.num_ops, "ops")
 
+        print("DBG: prefault begin")
         for rank in range(Self.tp):
             _ = arenas[rank].prefault(plan.topology.distributed_bytes, plan.topology.state_bytes)
+        print("DBG: prefault done")
 
         var main_pools = HeapMoveArray[BurstPool[]](Self.tp)
         for rank in range(Self.tp):
             main_pools.push(BurstPool[].for_numa_node(numa, numa_topo[rank], headroom=2))
+        print("DBG: main_pools done")
 
         var topos = InlineArray[MiniMaxM27Topology[Self.tp], Self.tp](fill=plan.topology)
         for rank in range(Self.tp):
             topos[rank] = plan.topology.bind(Int(arenas[rank].base))
+        print("DBG: topos bind done")
 
         var scratch = ScratchPool(plan.topology.scratch_capacity)
+        print("DBG: scratch pool done")
         var model = Self(arenas^, main_pools^, scratch^, topos)
+        print("DBG: model ctor done, calling init_state")
         model.init_state()
+        print("DBG: init_state returned")
         return model^
 
     def forward_decode(mut self, tokens_ptr: Int, pos: Int) -> Int32:
@@ -835,78 +890,37 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         #     Existing kernel. γ_in split: √|γ_in| absorbed into Q/K/V
         #     weights offline.
         #
-        # ── phase 2: Q/K/V projections ──────────────────────────
+        # ── phase 2: fused QKV projection ──────────────────────
         #
-        #   tp_parallel: int8_gemv × 3
-        #     Q: act_i8 × W_Q → q_bf16[Q_LOCAL]  (single-sided, original domain)
-        #     K: act_i8 × W_K → k_bf16[KV_LOCAL] (single-sided, original domain)
-        #     V: act_i8 × W̃_V → ṽ_bf16[KV_LOCAL] (two-sided, Hadamard domain)
+        #   tp_parallel: int8_gemv (fused [Q_LOCAL+2*KV_LOCAL, HIDDEN])
+        #     Contiguous weight matrix: Q rows, then K rows, then V rows.
+        #     Single dispatch reads act_i8 once, produces contiguous output:
+        #       [q_bf16[Q_LOCAL] | k_bf16[KV_LOCAL] | v_bf16[KV_LOCAL]]
+        #     Consumed locally — no allgather.
         #
-        #     Q/K: single-sided (W·H^T on contraction dim). Output in original
-        #     domain because QK norm gamma and RoPE both require it.
+        # ── phase 3: scalar norm allreduce ──────────────────────
         #
-        #     V: two-sided (H_out·W_V·H^T_in). Output pre-rotated because
-        #     MiniMax V has no norm and no RoPE — nothing forces original
-        #     domain. The output-dim FWHT is baked into the weight matrix
-        #     offline via ButterquantI8TwoSidedAbsorbed. Validated on real
-        #     checkpoint weights: MSE ratio 0.997 vs single-sided across
-        #     layers 0/15/30/45/61, end-to-end V cache cos > 0.99994.
-        #     The row mixing slightly reduces per-row absmax variance.
+        #   norm_prep_dispatch: partial sum_sq on local Q/K shards
+        #   scalar allreduce: 8 bytes (q_sum_sq + k_sum_sq)
+        #   inv_rms_from_sum_sq on main thread (2 divisions)
         #
-        #   Q/K GEMV epilogue (NEW — sum-of-squares pre-collection):
-        #     Each GEMV worker accumulates Σ(output_i²) as it writes output
-        #     rows. After join, local sum_sq is available with no separate
-        #     read pass. Under TP: cross-rank scalar allreduce (4 bytes each)
-        #     to get global sum_sq for the full-vector rms over Q_DIM / KV_DIM.
-        #     Precision note: the GEMV dequant produces f32 values which are
-        #     then rounded to bf16 for storage. The sum_sq should be
-        #     accumulated from the f32 pre-round values for exact rms. If
-        #     instead accumulated from bf16-rounded values, the rms will have
-        #     a small bf16 rounding bias. For int8 inference this is likely
-        #     negligible, but an A/B should confirm.
+        # ── phase 4: K/V cache write ───────────────────────────
         #
-        # ── phase 3: QK norm + RoPE + quantize (fused per head) ─
+        #   tp_parallel: kv_write_dispatch (NKV_LOCAL parallel jobs)
+        #     Per local KV head: inv_rms_k * gamma → RoPE → FWHT → i8 →
+        #     VNNI cache. V: two-sided, just quantize → VNNI cache.
+        #     Head-local cache: full MAX_SEQ_LEN, local heads only.
         #
-        #   scalar_allreduce: q_sum_sq, k_sum_sq across ranks (8 bytes total)
-        #     → inv_rms_q = 1/√(q_sum_sq / Q_DIM)
-        #     → inv_rms_k = 1/√(k_sum_sq / KV_DIM)
+        # ── phase 5: flash-decode attention ─────────────────────
         #
-        #   tp_parallel: fused_qk_norm_rope_quantize (NEW KERNEL)
-        #     For each Q head h (NUM_HEADS/tp per rank, 128 dims each):
-        #       read q_bf16[h*128 : (h+1)*128]
-        #       · inv_rms_q · γ_q[h*128 : (h+1)*128]  — full-vector norm scalar,
-        #                                                 per-element gamma (not split,
-        #                                                 this is the actual QK norm γ)
-        #       partial_rope(64/128, pair_stride=32)
-        #       FWHT(128) → absmax_quantize
-        #       → q_i8[h], S_Q[h], qi_bias[h]
-        #     One read of Q, one write of Q_i8. Norm scalar pre-collected.
-        #
-        #     For each K head g (NUM_KV_HEADS/tp per rank, 128 dims each):
-        #       same: read k → · inv_rms_k · γ_k → rope → FWHT → quantize
-        #       → write k_i8 to VNNI KV cache + store S_K[g, pos]
-        #
-        # ── phase 4: V cache write ──────────────────────────────
-        #
-        #   tp_parallel: v_cache_write
-        #     ṽ_bf16 already in Hadamard domain from two-sided GEMV.
-        #     Per head: absmax_quantize → v_i8 → cache + S_V[g, pos].
-        #     No FWHT needed — the rotation is baked into the weights.
-        #
-        # ── phase 5: attention scoring + V aggregation ──────────
-        #
-        #   tp_parallel: attention_group_dispatch (NEW KERNEL)
-        #     For each KV group (1 KV head, HPG=6 Q heads):
-        #       For each Q head h in the group:
-        #         Existing single_pass_attention primitive with q_scale
-        #         set to S_Q[h] / sqrt(128). The primitive computes
-        #         q_factor = q_scale / (127.0 * 127.0), so the effective
-        #         dequant is S_Q / (127² · √128) · S_K — matching the
-        #         MiniMax 1/√d_k attention scale. No change to
-        #         single_pass_attention itself; the caller pre-folds
-        #         1/√128 into q_scale.
-        #         V-agg, V-scale folding, online softmax: all existing.
-        #         Output: f32[128] in Hadamard domain → quantize → attn_i8[h]
+        #   Per local KV group (KV_PER_RANK groups, 3 dispatches each):
+        #     q_prep_dispatch: 1 job — prep HPG Q heads (inv_rms_q * gamma
+        #       → RoPE → FWHT → quantize, 1/√head_dim folded into q_scale)
+        #     chunked_score_dispatch: num_chunks jobs — each chunk scores
+        #       HPG Q heads against a range of KV cache position groups
+        #       using VNNI (Q·K scoring + online softmax + V-agg)
+        #     merge_quantize_dispatch: 1 job — merge chunk partials
+        #       via online softmax, quantize → i8 for O-projection
         #
         # ── phase 6: O projection + residual ────────────────────
         #
@@ -915,8 +929,8 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         #     Single-sided weights. Output in original domain.
         #     Existing kernel.
         #
-        #   allreduce: sum x_residual across ranks
-        #   residual_add: x_main += x_residual
+        #   allreduce[residual_add=True]: sum x_residual across ranks,
+        #     fused x_main += reduced_x_residual
         #
         # ── phase 7: post-attention norm (dual output) ──────────
         #
@@ -979,8 +993,8 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         #     Sum local weighted expert outputs → x_residual[HIDDEN]
         #     Existing accumulate_expert_outputs kernel.
         #
-        #   allreduce: sum x_residual across ranks
-        #   residual_add: x_main += x_residual
+        #   allreduce[residual_add=True]: sum x_residual across ranks,
+        #     fused x_main += reduced_x_residual
         #
         # ── final (host rank only) ──────────────────────────────
         #
@@ -1007,7 +1021,413 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         #
         # =====================================================================
 
-        _ = tokens_ptr
-        _ = pos
-        print("MiniMaxM27ButterQuant.forward_decode: not yet wired")
-        return Int32(0)
+        comptime S = MiniMaxShapes[Self.tp]
+        comptime EPS = Float32(C.RMS_NORM_EPS)
+        comptime seq_len = 1
+        comptime Q_LOCAL = S.Q_LOCAL
+        comptime KV_LOCAL = S.KV_LOCAL
+        comptime HPG = C.HPG
+        comptime HEADS_PER_RANK = S.NUM_HEADS_LOCAL
+        comptime KV_PER_RANK = S.NUM_KV_HEADS_LOCAL
+        comptime X_SLOT = Mat[BF16, C.MAX_SEQ_LEN, C.HIDDEN]
+        comptime VOCAB_NUM_BLOCKS = C.HIDDEN // LM_OUTPUT_HEAD_FWHT_BLK
+        comptime MAX_CHUNKS = 32
+        comptime Q_GROUP_BF16 = HPG * C.HEAD_DIM * 2
+        comptime K_HEAD_BF16 = C.HEAD_DIM * 2
+        comptime V_HEAD_BF16 = C.HEAD_DIM * 2
+        comptime PARTIAL_F32S = MAX_CHUNKS * HPG * (2 + C.HEAD_DIM)
+
+        var t_forward0 = Int(perf_counter_ns())
+        var sample = ForwardSample(pos)
+        var topos = self.topos
+        var host = topos[0]
+        var mp = self.pool_ptrs()
+
+        # --- Embed (host rank) ---
+        var t_embed0 = Int(perf_counter_ns())
+        var embed_fence = embed_lookup(
+            host.host.embed.bound(host.arena_base),
+            tokens_ptr, host.x_main(seq_len),
+            self.main_pools[0])
+        var t_embed1 = Int(perf_counter_ns())
+        sample.add(self.profile.phase("embed"), finish_single_pool_fence(t_embed0, t_embed1, embed_fence^))
+
+        var t_bcast0 = Int(perf_counter_ns())
+        ring_broadcast[X_SLOT, Self.tp](
+            host.x_main(seq_len).ptr, self.x_main_ptrs(seq_len), seq_len, mp)
+        sample.add(self.profile.phase("broadcast"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_bcast0))
+
+        var act_scale_lease = self.scratch.borrow[Float32, 1]()
+
+        for layer_idx in range(C.NUM_LAYERS):
+
+            # =============================================================
+            # ATTENTION BLOCK
+            # =============================================================
+
+            # Phase 1: input norm + quantize
+            var attn_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.HIDDEN]()
+            var attn_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
+
+            @parameter
+            def do_attn_quantize[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                var layer = topo.layers.proto
+                return rmsnorm_gamma_fwht_quantize[C.HIDDEN, FWHT_BLK_HIDDEN](
+                    topo.x_main(seq_len).ptr, lb + layer.body.input_norm_sqrt_off,
+                    topo.scratch_addr(attn_i8_lease),
+                    topo.scratch_addr(attn_work_lease), topo.scratch_addr(act_scale_lease),
+                    EPS, seq_len, pool)
+            sample.add(self.profile.phase("attn_quantize"), tp_parallel[Self.tp, do_attn_quantize](topos, mp))
+
+            # Phase 2: fused QKV projection (contiguous output)
+            comptime QKV_LOCAL = S.QKV_LOCAL
+            var qkv_lease = self.scratch.borrow[Scalar[DType.bfloat16], QKV_LOCAL]()
+
+            @parameter
+            def do_qkv_gemv[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                var layer = topo.layers.proto
+                return int8_gemv[QKV_LOCAL, C.HIDDEN](
+                    topo.scratch_addr(attn_i8_lease),
+                    layer.attn.qkv_proj.addr(lb),
+                    lb + layer.attn.qkv_colsum,
+                    layer.attn.qkv_proj_sc.addr(lb),
+                    topo.scratch_addr(qkv_lease),
+                    seq_len, topo.scratch_addr(act_scale_lease), pool)
+            sample.add(self.profile.phase("attn_proj"), tp_parallel[Self.tp, do_qkv_gemv](topos, mp))
+
+            attn_work_lease^.release()
+            attn_i8_lease^.release()
+
+            # Offsets into local QKV buffer
+            comptime Q_OFF = 0
+            comptime K_OFF = Q_LOCAL * 2
+            comptime V_OFF = (Q_LOCAL + KV_LOCAL) * 2
+
+            # Phase 3: scalar sum_sq allreduce for full-vector Q/K norm
+            var sum_sq_lease = self.scratch.borrow[Float32, 2]()
+
+            @parameter
+            def do_local_sum_sq[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                return norm_prep_dispatch[Q_LOCAL, KV_LOCAL](
+                    topo.scratch_addr(qkv_lease) + Q_OFF,
+                    topo.scratch_addr(qkv_lease) + K_OFF,
+                    topo.scratch_addr(sum_sq_lease),
+                    EPS, pool)
+            sample.add(self.profile.phase("norm_prep"), tp_parallel[Self.tp, do_local_sum_sq](topos, mp))
+
+            # Scalar allreduce: sum partial sum_sq across ranks (8 bytes)
+            var global_q_ss = Float32(0)
+            var global_k_ss = Float32(0)
+            for r in range(Self.tp):
+                var p = F32Ptr(unsafe_from_address=topos[r].scratch_addr(sum_sq_lease))
+                global_q_ss += p[0]
+                global_k_ss += p[1]
+            var inv_rms_q = inv_rms_from_sum_sq(global_q_ss, C.Q_DIM, EPS)
+            var inv_rms_k = inv_rms_from_sum_sq(global_k_ss, C.KV_DIM, EPS)
+
+            sum_sq_lease^.release()
+
+            # Phase 4: K/V cache write (NKV_LOCAL parallel jobs per rank)
+            @parameter
+            def do_kv_write[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                var layer = topo.layers.proto
+                return kv_write_dispatch[
+                    C.HEAD_DIM, C.ROPE_DIM, C.ROPE_PAIR_STRIDE,
+                    C.MAX_SEQ_LEN, KV_PER_RANK](
+                    topo.scratch_addr(qkv_lease) + Q_OFF,
+                    topo.scratch_addr(qkv_lease) + K_OFF,
+                    topo.scratch_addr(qkv_lease) + V_OFF,
+                    layer.attn.q_norm.addr(lb),
+                    layer.attn.k_norm.addr(lb),
+                    topo.rope_cos_row(pos), topo.rope_sin_row(pos),
+                    inv_rms_q, inv_rms_k,
+                    topo.kv_cache_base(layer_idx), pos,
+                    pool)
+            sample.add(self.profile.phase("kv_write"), tp_parallel[Self.tp, do_kv_write](topos, mp))
+
+            # Phase 5: per-KV-group Q prep + chunked scoring + merge/quantize
+            var q_i8_lease = self.scratch.borrow[Scalar[DType.int8], HPG * C.HEAD_DIM]()
+            var qi_biases_lease = self.scratch.borrow[Float32, HPG]()
+            var q_scales_lease = self.scratch.borrow[Float32, HPG]()
+            var attn_qi_lease = self.scratch.borrow[Scalar[DType.int8], Q_LOCAL]()
+            var attn_head_sc_lease = self.scratch.borrow[Float32, HEADS_PER_RANK]()
+            var partial_lease = self.scratch.borrow[Float32, PARTIAL_F32S]()
+
+            var context_len = pos + 1
+
+            for kv in range(KV_PER_RANK):
+                @parameter
+                def do_q_prep[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                    var lb = topo.layer_base(layer_idx)
+                    var layer = topo.layers.proto
+                    return q_prep_dispatch[
+                        C.HEAD_DIM, C.ROPE_DIM, C.ROPE_PAIR_STRIDE, HPG](
+                        topo.scratch_addr(qkv_lease) + Q_OFF + kv * Q_GROUP_BF16,
+                        layer.attn.q_norm.addr(lb) + kv * HPG * C.HEAD_DIM * 2,
+                        topo.rope_cos_row(pos), topo.rope_sin_row(pos),
+                        inv_rms_q,
+                        topo.scratch_addr(q_i8_lease),
+                        topo.scratch_addr(qi_biases_lease),
+                        topo.scratch_addr(q_scales_lease),
+                        pool)
+                sample.add(self.profile.phase("attention"), tp_parallel[Self.tp, do_q_prep](topos, mp))
+
+                @parameter
+                def do_chunk_score[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                    return chunked_score_dispatch[
+                        C.HEAD_DIM, HPG, C.MAX_SEQ_LEN, KV_PER_RANK](
+                        topo.scratch_addr(q_i8_lease),
+                        topo.scratch_addr(qi_biases_lease),
+                        topo.scratch_addr(q_scales_lease),
+                        topo.kv_cache_base(layer_idx), kv,
+                        context_len, Int(pool.capacity),
+                        topo.scratch_addr(partial_lease),
+                        pool)
+                sample.add(self.profile.phase("attention"), tp_parallel[Self.tp, do_chunk_score](topos, mp))
+
+                @parameter
+                def do_merge_quant[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                    var num_pg = (context_len + CACHE_WIDTH - 1) // CACHE_WIDTH
+                    var nc = min(Int(pool.capacity), MAX_CHUNKS)
+                    if nc > num_pg:
+                        nc = num_pg
+                    return merge_quantize_dispatch[C.HEAD_DIM, HPG](
+                        topo.scratch_addr(partial_lease), nc,
+                        topo.scratch_addr(attn_qi_lease) + kv * HPG * C.HEAD_DIM,
+                        topo.scratch_addr(attn_head_sc_lease) + kv * HPG * 4,
+                        pool)
+                sample.add(self.profile.phase("attention"), tp_parallel[Self.tp, do_merge_quant](topos, mp))
+
+            partial_lease^.release()
+            q_scales_lease^.release()
+            qi_biases_lease^.release()
+            q_i8_lease^.release()
+
+            # Phase 6: O projection
+            @parameter
+            def do_o_proj[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                var layer = topo.layers.proto
+                return int8_gemv_blocked[C.HIDDEN, Q_LOCAL, C.HEAD_DIM](
+                    I8Ptr(unsafe_from_address=topo.scratch_addr(attn_qi_lease)),
+                    U8Ptr(unsafe_from_address=layer.attn.o_proj.addr(lb)),
+                    F32Ptr(unsafe_from_address=topo.scratch_addr(attn_head_sc_lease)),
+                    layer.attn.o_proj_sc.bound(lb).as_ptr(),
+                    F32Ptr(unsafe_from_address=lb + layer.attn.o_colsum),
+                    topo.x_residual(seq_len).as_ptr(),
+                    seq_len, pool)
+            sample.add(self.profile.phase("o_proj"), tp_parallel[Self.tp, do_o_proj](topos, mp))
+
+            attn_head_sc_lease^.release()
+            attn_qi_lease^.release()
+            qkv_lease^.release()
+
+            # Allreduce O-proj + fused residual add: x_main += sum(x_residual)
+            var t_attn_reduce0 = Int(perf_counter_ns())
+            small_allreduce[X_SLOT, Self.tp, residual_add=True](
+                self.x_residual_ptrs(seq_len), seq_len, mp,
+                self.x_main_ptrs(seq_len))
+            sample.add(self.profile.phase("attn_reduce"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_attn_reduce0))
+
+            # =============================================================
+            # FFN BLOCK
+            # =============================================================
+
+            # Phase 7: dual-output norm (split-gamma i8 + full-gamma bf16)
+            var moe_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.HIDDEN]()
+            var moe_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
+            var moe_scale_lease = self.scratch.borrow[Float32, 1]()
+            var normed_bf16_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.HIDDEN]()
+
+            @parameter
+            def do_dual_norm[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                var layer = topo.layers.proto
+                return rmsnorm_dual_output_dispatch[C.HIDDEN, FWHT_BLK_HIDDEN](
+                    topo.x_main(seq_len).ptr,
+                    lb + layer.body.post_attn_norm_sqrt_off,
+                    layer.body.post_attn_norm.addr(lb),
+                    topo.scratch_addr(moe_i8_lease),
+                    topo.scratch_addr(moe_work_lease),
+                    topo.scratch_addr(moe_scale_lease),
+                    topo.scratch_addr(normed_bf16_lease),
+                    EPS, seq_len, pool)
+            sample.add(self.profile.phase("dual_norm"), tp_parallel[Self.tp, do_dual_norm](topos, mp))
+
+            moe_work_lease^.release()
+
+            # Phase 8: router (f32 GEMV + sigmoid + topk)
+            var logits_lease = self.scratch.borrow[Float32, C.NUM_EXPERTS]()
+            var routing_lease = self.scratch.borrow[TopKResult[C.TOP_K], 1]()
+
+            @parameter
+            def do_router_gemv[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                var layer = topo.layers.proto
+                return f32_gemv_dispatch[C.NUM_EXPERTS, C.HIDDEN](
+                    BF16Ptr(unsafe_from_address=topo.scratch_addr(normed_bf16_lease)),
+                    layer.body.router_proj.bound(lb).as_ptr(),
+                    F32Ptr(unsafe_from_address=topo.scratch_addr(logits_lease)),
+                    pool)
+            sample.add(self.profile.phase("router_proj"), tp_parallel[Self.tp, do_router_gemv](topos, mp))
+
+            @parameter
+            def do_router_topk[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                var layer = topo.layers.proto
+                return router_topk_dispatch[C.NUM_EXPERTS, C.TOP_K](
+                    F32Ptr(unsafe_from_address=topo.scratch_addr(logits_lease)),
+                    layer.body.router_bias.bound(lb).as_ptr(),
+                    topo.scratch_addr(routing_lease), pool)
+            sample.add(self.profile.phase("router_topk"), tp_parallel[Self.tp, do_router_topk](topos, mp))
+
+            normed_bf16_lease^.release()
+            logits_lease^.release()
+
+            # Phase 9: expert gate+up (w1/w3 + SiLU)
+            var expert_qi_lease = self.scratch.borrow[Scalar[DType.int8], C.TOP_K * C.MOE_INTERMEDIATE]()
+            var expert_blk_scale_lease = self.scratch.borrow[Float32, C.TOP_K * MOE_DOWN_NUM_BLK]()
+            var expert_out_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.TOP_K * C.HIDDEN]()
+            var local_count_lease = self.scratch.borrow[Int32, 1]()
+
+            @parameter
+            def do_expert_phase1[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                var layer = topo.layers.proto
+                var routing = UnsafePointer[TopKResult[C.TOP_K], MutAnyOrigin](
+                    unsafe_from_address=topo.scratch_addr(routing_lease))[]
+                comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
+                var expert_base = rank * experts_per_rank
+                var lc = 0
+                for s in range(C.TOP_K):
+                    var eid = routing.indices[s]
+                    if eid >= expert_base and eid < expert_base + experts_per_rank:
+                        lc += 1
+                UnsafePointer[Int32, MutAnyOrigin](
+                    unsafe_from_address=topo.scratch_addr(local_count_lease))[] = Int32(lc)
+                return minimax_moe_phase1[
+                    C.MOE_INTERMEDIATE, C.HIDDEN, FWHT_BLK,
+                    C.TOP_K, C.NUM_EXPERTS, Self.tp](
+                    I8Ptr(unsafe_from_address=topo.scratch_addr(moe_i8_lease)),
+                    F32Ptr(unsafe_from_address=topo.scratch_addr(moe_scale_lease)),
+                    routing,
+                    layer.body.experts_w1.addr(lb),
+                    C.MOE_INTERMEDIATE * C.HIDDEN,
+                    layer.body.experts_w1_sc.addr(lb),
+                    C.MOE_INTERMEDIATE * 4,
+                    lb + layer.body.experts_w1_colsum,
+                    C.MOE_INTERMEDIATE * 4,
+                    layer.body.experts_w3.addr(lb),
+                    C.MOE_INTERMEDIATE * C.HIDDEN,
+                    layer.body.experts_w3_sc.addr(lb),
+                    C.MOE_INTERMEDIATE * 4,
+                    lb + layer.body.experts_w3_colsum,
+                    C.MOE_INTERMEDIATE * 4,
+                    I8Ptr(unsafe_from_address=topo.scratch_addr(expert_qi_lease)),
+                    F32Ptr(unsafe_from_address=topo.scratch_addr(expert_blk_scale_lease)),
+                    rank, pool)
+            sample.add(self.profile.phase("expert_phase1"), tp_parallel[Self.tp, do_expert_phase1](topos, mp))
+
+            # Phase 10: expert down (w2)
+            @parameter
+            def do_expert_phase2[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var lb = topo.layer_base(layer_idx)
+                var layer = topo.layers.proto
+                var routing = UnsafePointer[TopKResult[C.TOP_K], MutAnyOrigin](
+                    unsafe_from_address=topo.scratch_addr(routing_lease))[]
+                return minimax_moe_phase2[
+                    C.HIDDEN, C.MOE_INTERMEDIATE, FWHT_BLK_MOE_DOWN,
+                    C.TOP_K, C.NUM_EXPERTS, Self.tp](
+                    I8Ptr(unsafe_from_address=topo.scratch_addr(expert_qi_lease)),
+                    F32Ptr(unsafe_from_address=topo.scratch_addr(expert_blk_scale_lease)),
+                    routing,
+                    layer.body.experts_w2.addr(lb),
+                    C.HIDDEN * C.MOE_INTERMEDIATE,
+                    layer.body.experts_w2_sc.addr(lb),
+                    C.HIDDEN * 4,
+                    lb + layer.body.experts_w2_colsum,
+                    C.HIDDEN * MOE_DOWN_NUM_BLK * 4,
+                    BF16Ptr(unsafe_from_address=topo.scratch_addr(expert_out_lease)),
+                    rank, pool)
+            sample.add(self.profile.phase("expert_phase2"), tp_parallel[Self.tp, do_expert_phase2](topos, mp))
+
+            # Phase 11: expert reduce + fused allreduce + residual add
+            @parameter
+            def do_expert_sum[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                var lc = Int(UnsafePointer[Int32, MutAnyOrigin](
+                    unsafe_from_address=topo.scratch_addr(local_count_lease))[])
+                return expert_sum_dispatch[C.HIDDEN](
+                    topo.scratch_addr(expert_out_lease), lc,
+                    topo.x_residual(seq_len).ptr, pool)
+            sample.add(self.profile.phase("expert_sum"), tp_parallel[Self.tp, do_expert_sum](topos, mp))
+
+            var t_ffn_reduce0 = Int(perf_counter_ns())
+            small_allreduce[X_SLOT, Self.tp, residual_add=True](
+                self.x_residual_ptrs(seq_len), seq_len, mp,
+                self.x_main_ptrs(seq_len))
+            sample.add(self.profile.phase("ffn_reduce"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_ffn_reduce0))
+
+            local_count_lease^.release()
+            expert_out_lease^.release()
+            expert_blk_scale_lease^.release()
+            expert_qi_lease^.release()
+            routing_lease^.release()
+            moe_scale_lease^.release()
+            moe_i8_lease^.release()
+
+        act_scale_lease^.release()
+
+        # --- Final norm + LM head (host rank only) ---
+        var lm_act_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.HIDDEN]()
+        var lm_act_blk_scale_lease = self.scratch.borrow[Float32, VOCAB_NUM_BLOCKS]()
+        var lm_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
+        var t_final0 = Int(perf_counter_ns())
+        var final_fence = rmsnorm_gamma_fwht_per_block_quantize[
+            C.HIDDEN, LM_OUTPUT_HEAD_FWHT_BLK](
+            host.x_main(seq_len).ptr,
+            host.arena_base + host.host.lm_output_head_sqrt_gamma_off,
+            host.scratch_addr(lm_act_i8_lease),
+            host.scratch_addr(lm_work_lease),
+            host.scratch_addr(lm_act_blk_scale_lease),
+            EPS, 1, self.main_pools[0])
+        var t_final1 = Int(perf_counter_ns())
+        sample.add(self.profile.phase("final_norm"), finish_single_pool_fence(t_final0, t_final1, final_fence^))
+
+        var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
+        var logit_view = scratch_tensor_view[BF16, 1, C.VOCAB_SIZE](host.scratch_base(), logit_lease, 1)
+        var t_lm0 = Int(perf_counter_ns())
+        var lm_fence = lm_head_gemv[
+            C.VOCAB_SIZE, C.HIDDEN, LM_OUTPUT_HEAD_FWHT_BLK](
+            host.scratch_addr(lm_act_i8_lease),
+            host.host.lm_output_head.addr(host.arena_base),
+            host.scratch_addr(lm_act_blk_scale_lease),
+            host.host.lm_output_head_sc.addr(host.arena_base),
+            host.arena_base + host.host.lm_output_head_colsum_off,
+            logit_view.ptr,
+            self.main_pools[0])
+        var t_lm1 = Int(perf_counter_ns())
+        sample.add(self.profile.phase("lm_head"), finish_single_pool_fence(t_lm0, t_lm1, lm_fence^))
+
+        lm_work_lease^.release()
+        lm_act_blk_scale_lease^.release()
+        lm_act_i8_lease^.release()
+
+        # Argmax (no softcap in MiniMax)
+        comptime width = simd_width_of[DType.float32]()
+        var logits = LogitsView[C.VOCAB_SIZE](
+            scratch_ptr[Scalar[DType.bfloat16]](host.scratch_base(), logit_lease), logit_lease^)
+        var best_val = Float32(-1e30)
+        var best_idx = Int32(0)
+        for j in range(0, C.VOCAB_SIZE, width):
+            var v = logits.load_f32[width](j)
+            for k in range(width):
+                if v[k] > best_val:
+                    best_val = v[k]
+                    best_idx = Int32(j + k)
+        logits^.release()
+        sample.wall_ns = Int(perf_counter_ns()) - t_forward0
+        self.profile.record(sample)
+        return best_idx

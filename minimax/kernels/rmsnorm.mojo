@@ -1,16 +1,11 @@
-"""MiniMax RMSNorm kernels — dual-output norm for post-attention phase.
+"""MiniMax RMSNorm and residual kernels.
 
-Dual output from one RMS reduction:
+Dual-output norm (post-attention phase 7):
   Path A (MoE):    x/rms · split_gamma → FWHT → per-row i8
   Path B (router): x/rms · full_gamma  → bf16
 
-split_gamma = sign(γ)√|γ| is precomputed at quantize time.
-full_gamma  = γ (the raw learned RMSNorm weight).
-
-Two-pass design:
-  Pass 1: load x (bf16→f32), accumulate sum_sq, store raw x to work
-  Pass 2: read work (f32, L1-hot), apply inv_rms with both gammas
-  Then FWHT + quantize on the split-gamma work buffer.
+Residual add (post-FFN phase 11):
+  x_main += moe_out. No norm, no dense path, no layer scalar.
 """
 
 from std.sys.info import simd_width_of

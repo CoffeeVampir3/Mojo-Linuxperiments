@@ -66,7 +66,7 @@ def sigmoid_topk_renorm[num_experts: Int, k: Int](
                 best_idx = i
         result.indices[sel] = best_idx
         result.weights[sel] = weights[best_idx]
-        scores[best_idx] = Float32(-1.0)
+        scores[best_idx] = Float32(-1e30)
 
     var topk_sum = Float32(0)
     for sel in range(k):

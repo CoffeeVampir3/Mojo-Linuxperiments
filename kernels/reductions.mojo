@@ -50,37 +50,62 @@ def done_ptr(state_base: Int, rank: Int) -> UnsafePointer[Int32, MutAnyOrigin]:
 # =============================================================================
 
 
-def small_allreduce[T: Encoding & Shaped, tp: Int](
+def small_allreduce[T: Encoding & Shaped, tp: Int, residual_add: Bool = False](
     ptrs: InlineArray[Int, tp],
     seq_len: Int,
     pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp],
+    dst_ptrs: InlineArray[Int, tp] = InlineArray[Int, tp](fill=0),
 ):
     """Replicated allreduce for small tensors. Main thread reduces all
     sources into ptrs[0], then parallel broadcast to remaining ranks.
 
-    Same signature as ring_allreduce for easy substitution at call sites.
+    residual_add=True: fused allreduce + residual add. Reduces ptrs[0..tp],
+    adds to dst_ptrs (x_main), broadcasts updated dst_ptrs[0] to other ranks.
+    Saves one full read+write pass of the reduced buffer.
     """
     var total = seq_len * T.COLS
     if total <= 0 or tp <= 1:
+        comptime if residual_add:
+            if total > 0 and tp == 1:
+                comptime width = simd_width_of[DType.bfloat16]()
+                var src = tptr[Scalar[DType.bfloat16]](ptrs[0])
+                var dst = tptr[Scalar[DType.bfloat16]](dst_ptrs[0])
+                for i in range(0, total, width):
+                    var s = src.load[width=width](i).cast[DType.float32]()
+                    var d = dst.load[width=width](i).cast[DType.float32]()
+                    dst.store(i, (d + s).cast[DType.bfloat16]())
         return
 
-    # Reduce all sources into ptrs[0] on the main thread.
-    # ptrs[0] is both src0 and dst — each element is read before overwrite.
     comptime width = simd_width_of[DType.bfloat16]()
-    var dst = tptr[Scalar[DType.bfloat16]](ptrs[0])
-    for i in range(0, total, width):
-        var acc = dst.load[width=width](i).cast[DType.float32]()
-        for r in range(1, tp):
-            acc += tptr[Scalar[DType.bfloat16]](ptrs[r]).load[width=width](i).cast[DType.float32]()
-        dst.store(i, acc.cast[DType.bfloat16]())
 
-    # Broadcast result to remaining ranks via NUMA-local pulls.
+    comptime if residual_add:
+        var dst = tptr[Scalar[DType.bfloat16]](dst_ptrs[0])
+        for i in range(0, total, width):
+            var acc = tptr[Scalar[DType.bfloat16]](ptrs[0]).load[width=width](i).cast[DType.float32]()
+            for r in range(1, tp):
+                acc += tptr[Scalar[DType.bfloat16]](ptrs[r]).load[width=width](i).cast[DType.float32]()
+            var old = dst.load[width=width](i).cast[DType.float32]()
+            dst.store(i, (old + acc).cast[DType.bfloat16]())
+    else:
+        var dst = tptr[Scalar[DType.bfloat16]](ptrs[0])
+        for i in range(0, total, width):
+            var acc = dst.load[width=width](i).cast[DType.float32]()
+            for r in range(1, tp):
+                acc += tptr[Scalar[DType.bfloat16]](ptrs[r]).load[width=width](i).cast[DType.float32]()
+            dst.store(i, acc.cast[DType.bfloat16]())
+
     var total_bytes = total * T.ELEMENT_BYTES
-    var args = InlineArray[MemcpyArgs, tp](fill=MemcpyArgs(0, 0, 0))
-    for r in range(1, tp):
-        args[r] = MemcpyArgs(ptrs[r], ptrs[0], total_bytes)
-        pool_ptrs[r][].dispatch[MemcpyArgs, memcpy_kernel](
-            UnsafePointer(to=args[r]), 1)
+    var bcast = InlineArray[MemcpyArgs, tp](fill=MemcpyArgs(0, 0, 0))
+    comptime if residual_add:
+        for r in range(1, tp):
+            bcast[r] = MemcpyArgs(dst_ptrs[r], dst_ptrs[0], total_bytes)
+            pool_ptrs[r][].dispatch[MemcpyArgs, memcpy_kernel](
+                UnsafePointer(to=bcast[r]), 1)
+    else:
+        for r in range(1, tp):
+            bcast[r] = MemcpyArgs(ptrs[r], ptrs[0], total_bytes)
+            pool_ptrs[r][].dispatch[MemcpyArgs, memcpy_kernel](
+                UnsafePointer(to=bcast[r]), 1)
     for r in range(1, tp):
         pool_ptrs[r][].join()
 
@@ -121,13 +146,18 @@ def memcpy_kernel(args: MemcpyArgs):
 
 
 def fused_reduce_gather_kernel(args: FusedReduceGatherArgs):
+    fused_reduce_gather_impl[False](args)
+
+
+def fused_reduce_gather_add_kernel(args: FusedReduceGatherArgs):
+    fused_reduce_gather_impl[True](args)
+
+
+def fused_reduce_gather_impl[residual_add: Bool](args: FusedReduceGatherArgs):
     """Each BurstPool worker: reduce slice -> signal -> pull from completed ranks.
 
-    Reads FusedConfig from config_addr for buffer pointers, completion state,
-    and chunk layout. The reduce reads from all tp source buffers and writes
-    locally. After the last worker on a rank finishes, it sets the done flag.
-    All workers then pull completed chunks from other ranks, dividing the
-    copy work among themselves.
+    residual_add=True: reduce writes (dst + acc) to dst instead of acc to src.
+    The gather phase copies from dst (x_main) instead of src (x_residual).
     """
     var config_addr = args.config_addr
     var start_element = args.start_element
@@ -144,12 +174,16 @@ def fused_reduce_gather_kernel(args: FusedReduceGatherArgs):
     var tp = cfg[].tp
     var sys = linux.linux_sys()
 
-    var my_buf = ptrs[my_rank]
-    var dst = tptr[Scalar[DType.bfloat16]](my_buf)
+    var my_out_addr = ptrs[my_rank]
+    var gather_src_addr = cfg[].ptrs_addr
+    comptime if residual_add:
+        var dst_ptrs_raw = tptr[Int](cfg[].dst_ptrs_addr)
+        my_out_addr = dst_ptrs_raw[my_rank]
+        gather_src_addr = cfg[].dst_ptrs_addr
+    var dst = tptr[Scalar[DType.bfloat16]](my_out_addr)
+    var gather_src = tptr[Int](gather_src_addr)
     comptime width = simd_width_of[DType.float32]()
 
-    # --- Reduce my slice from all tp sources ---
-    # First source as base, accumulate the rest.
     var src0 = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=ptrs[0])
     var i = start_element
     while i + width <= end_element:
@@ -157,6 +191,8 @@ def fused_reduce_gather_kernel(args: FusedReduceGatherArgs):
         for r in range(1, tp):
             var src_r = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=ptrs[r])
             acc += (src_r + i).load[width=width]().cast[DType.float32]()
+        comptime if residual_add:
+            acc += (dst + i).load[width=width]().cast[DType.float32]()
         (dst + i).store(acc.cast[DType.bfloat16]())
         i += width
     while i < end_element:
@@ -164,10 +200,11 @@ def fused_reduce_gather_kernel(args: FusedReduceGatherArgs):
         for r in range(1, tp):
             var src_r = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](unsafe_from_address=ptrs[r])
             acc += Float32(src_r[i])
+        comptime if residual_add:
+            acc += Float32(dst[i])
         dst[i] = Scalar[DType.bfloat16](acc)
         i += 1
 
-    # --- Signal completion ---
     var old = AtomicInt32.fetch_add[ordering=Ordering.ACQUIRE_RELEASE](
         counter_ptr(state_base, my_rank), -1
     )
@@ -176,7 +213,6 @@ def fused_reduce_gather_kernel(args: FusedReduceGatherArgs):
             done_ptr(state_base, my_rank), 1
         )
 
-    # --- Pull from other ranks as they complete ---
     var workers = num_workers if num_workers > 0 else 1
 
     for src_rank in range(tp):
@@ -195,8 +231,8 @@ def fused_reduce_gather_kernel(args: FusedReduceGatherArgs):
 
         if copy_start < copy_end:
             memcpy(
-                dest=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=my_buf + copy_start * 2),
-                src=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=ptrs[src_rank] + copy_start * 2),
+                dest=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=my_out_addr + copy_start * 2),
+                src=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=gather_src[src_rank] + copy_start * 2),
                 count=(copy_end - copy_start) * 2,
             )
 
@@ -206,6 +242,7 @@ struct FusedConfig:
     Allocated on the caller's stack, accessed by workers via raw pointer.
     Lifetime guaranteed by the caller blocking on pool join."""
     var ptrs_addr: Int
+    var dst_ptrs_addr: Int
     var state_base: Int
     var chunk: Int
     var rem: Int
@@ -213,6 +250,7 @@ struct FusedConfig:
 
     def __init__(out self):
         self.ptrs_addr = 0
+        self.dst_ptrs_addr = 0
         self.state_base = 0
         self.chunk = 0
         self.rem = 0
@@ -262,49 +300,56 @@ def ring_broadcast[T: Encoding & Shaped, tp: Int](
 # =============================================================================
 
 
-def ring_allreduce[T: Encoding & Shaped, tp: Int](
+def ring_allreduce[T: Encoding & Shaped, tp: Int, residual_add: Bool = False](
     ptrs: InlineArray[Int, tp],
     seq_len: Int,
     pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp],
+    dst_ptrs: InlineArray[Int, tp] = InlineArray[Int, tp](fill=0),
 ):
     """Fused allreduce. Each node's full BurstPool reduces its chunk from
     all sources, signals completion, then all workers pull completed chunks
     from other ranks. Single dispatch per node, no sync between phases.
     ~25 GB/s on 4 NUMA nodes.
 
-    Workers partition the chunk into row slices. Each worker reduces its
-    slice by reading from all tp source buffers with f32 SIMD accumulation.
-    The last worker to finish atomically sets a done flag. All workers then
-    transition to the allgather: polling other ranks' done flags and copying
-    their chunks locally, with the copy work divided among all workers.
+    residual_add=True: fused allreduce + residual add. Reduces ptrs[0..tp],
+    adds to dst_ptrs (x_main), gathers from dst_ptrs. x_main must be
+    identical across ranks before the call (replicated residual stream).
     """
     comptime assert T.DTYPE == DType.bfloat16, "ring_allreduce: only bf16 tensors are supported"
     comptime assert T.ELEMENT_BYTES == 2, "ring_allreduce: bf16 byte width mismatch"
     comptime cols = T.COLS
     var total_elements = seq_len * cols
     if total_elements <= 0 or tp <= 1:
+        comptime if residual_add:
+            if total_elements > 0 and tp == 1:
+                comptime width = simd_width_of[DType.bfloat16]()
+                var src = tptr[Scalar[DType.bfloat16]](ptrs[0])
+                var dst = tptr[Scalar[DType.bfloat16]](dst_ptrs[0])
+                comptime fwidth = simd_width_of[DType.float32]()
+                var j = 0
+                while j + fwidth <= total_elements:
+                    var s = (src + j).load[width=fwidth]().cast[DType.float32]()
+                    var d = (dst + j).load[width=fwidth]().cast[DType.float32]()
+                    (dst + j).store((d + s).cast[DType.bfloat16]())
+                    j += fwidth
         return
-
-    var total_bytes = total_elements * T.ELEMENT_BYTES
 
     var chunk = total_elements // tp
     var rem = total_elements - chunk * tp
 
-    # Per-rank completion state (cache-line padded, stack-allocated).
-    # Atomic counters/flags need stronger-than-byte alignment.
     var state_mem = InlineArray[Int64, tp * (RANK_STATE_STRIDE // 8)](fill=0)
     var state_base = Int(UnsafePointer(to=state_mem))
 
-    # Initialize counters.
     for r in range(tp):
         var num_workers = pool_ptrs[r][].capacity
         AtomicInt32.store[ordering=Ordering.RELEASE](
             counter_ptr(state_base, r), Int32(num_workers)
         )
 
-    # Shared config.
     var cfg = FusedConfig()
     cfg.ptrs_addr = Int(UnsafePointer(to=ptrs))
+    comptime if residual_add:
+        cfg.dst_ptrs_addr = Int(UnsafePointer(to=dst_ptrs))
     cfg.state_base = state_base
     cfg.chunk = chunk
     cfg.rem = rem
@@ -332,8 +377,12 @@ def ring_allreduce[T: Encoding & Shaped, tp: Int](
                 config_addr, w_start, w_end, r, w, num_workers
             )
 
-        pool_ptrs[r][].dispatch[FusedReduceGatherArgs, fused_reduce_gather_kernel](
-            UnsafePointer(to=jobs[0]), num_workers)
+        comptime if residual_add:
+            pool_ptrs[r][].dispatch[FusedReduceGatherArgs, fused_reduce_gather_add_kernel](
+                UnsafePointer(to=jobs[0]), num_workers)
+        else:
+            pool_ptrs[r][].dispatch[FusedReduceGatherArgs, fused_reduce_gather_kernel](
+                UnsafePointer(to=jobs[0]), num_workers)
 
     for r in range(tp):
         pool_ptrs[r][].join()
