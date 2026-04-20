@@ -52,7 +52,7 @@ def load_and_dump[tp: Int]():
         arena_bases.append(Int(arena.base))
         arenas.push(arena^)
 
-    var result = load_weights_from_descs(plan.descs, shards, arena_bases)
+    var result = load_weights_from_descs(plan.descs, shards, arena_bases, numa_topo)
     if not result:
         print("  load failed")
         return

@@ -831,7 +831,7 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         for rank in range(Self.tp):
             arena_bases.append(Int(arenas[rank].base))
 
-        var result = load_weights_from_descs(plan.descs, shards, arena_bases)
+        var result = load_weights_from_descs(plan.descs, shards, arena_bases, numa_topo)
         if not result:
             print("weight loading failed")
             return None
@@ -1070,7 +1070,12 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
             # ATTENTION BLOCK
             # =============================================================
 
-            # Phase 1: input norm + quantize
+            # Phase 1: input norm + quantize.
+            # qkv_lease is the longest-lived attention lease (held through the
+            # entire attention block). Borrow it first so transient Phase-1
+            # leases can release in LIFO order after Phase 2.
+            comptime QKV_LOCAL = S.QKV_LOCAL
+            var qkv_lease = self.scratch.borrow[Scalar[DType.bfloat16], QKV_LOCAL]()
             var attn_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.HIDDEN]()
             var attn_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
 
@@ -1086,8 +1091,6 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
             sample.add(self.profile.phase("attn_quantize"), tp_parallel[Self.tp, do_attn_quantize](topos, mp))
 
             # Phase 2: fused QKV projection (contiguous output)
-            comptime QKV_LOCAL = S.QKV_LOCAL
-            var qkv_lease = self.scratch.borrow[Scalar[DType.bfloat16], QKV_LOCAL]()
 
             @parameter
             def do_qkv_gemv[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
@@ -1153,12 +1156,14 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
                     pool)
             sample.add(self.profile.phase("kv_write"), tp_parallel[Self.tp, do_kv_write](topos, mp))
 
-            # Phase 5: per-KV-group Q prep + chunked scoring + merge/quantize
+            # Phase 5: per-KV-group Q prep + chunked scoring + merge/quantize.
+            # LIFO order: persistent leases (live through o_proj) at the bottom,
+            # transient per-iteration leases on top so they release in reverse.
+            var attn_qi_lease = self.scratch.borrow[Scalar[DType.int8], Q_LOCAL]()
+            var attn_head_sc_lease = self.scratch.borrow[Float32, HEADS_PER_RANK]()
             var q_i8_lease = self.scratch.borrow[Scalar[DType.int8], HPG * C.HEAD_DIM]()
             var qi_biases_lease = self.scratch.borrow[Float32, HPG]()
             var q_scales_lease = self.scratch.borrow[Float32, HPG]()
-            var attn_qi_lease = self.scratch.borrow[Scalar[DType.int8], Q_LOCAL]()
-            var attn_head_sc_lease = self.scratch.borrow[Float32, HEADS_PER_RANK]()
             var partial_lease = self.scratch.borrow[Float32, PARTIAL_F32S]()
 
             var context_len = pos + 1
@@ -1241,11 +1246,15 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
             # FFN BLOCK
             # =============================================================
 
-            # Phase 7: dual-output norm (split-gamma i8 + full-gamma bf16)
+            # Phase 7: dual-output norm (split-gamma i8 + full-gamma bf16).
+            # LIFO ordering: borrow in reverse order of release-time. Long-lived
+            # leases (used through Phase 9/10/11) sit at the bottom; transient
+            # scratch (moe_work, only needed during the dual-norm dispatch) is
+            # borrowed last so it can be released first.
             var moe_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.HIDDEN]()
-            var moe_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
             var moe_scale_lease = self.scratch.borrow[Float32, 1]()
             var normed_bf16_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.HIDDEN]()
+            var moe_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
 
             @parameter
             def do_dual_norm[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
@@ -1264,9 +1273,11 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
 
             moe_work_lease^.release()
 
-            # Phase 8: router (f32 GEMV + sigmoid + topk)
-            var logits_lease = self.scratch.borrow[Float32, C.NUM_EXPERTS]()
+            # Phase 8: router (f32 GEMV + sigmoid + topk). routing outlives
+            # logits (Phase 9/10 both dereference routing), so borrow routing
+            # first; logits is transient to Phase 8 and goes on top.
             var routing_lease = self.scratch.borrow[TopKResult[C.TOP_K], 1]()
+            var logits_lease = self.scratch.borrow[Float32, C.NUM_EXPERTS]()
 
             @parameter
             def do_router_gemv[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
@@ -1289,8 +1300,10 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
                     topo.scratch_addr(routing_lease), pool)
             sample.add(self.profile.phase("router_topk"), tp_parallel[Self.tp, do_router_topk](topos, mp))
 
-            normed_bf16_lease^.release()
             logits_lease^.release()
+            # normed_bf16 and routing remain live: routing is read by Phase 9/10;
+            # normed_bf16 is dead after Phase 8a but held to keep the stack LIFO
+            # (it sits below routing). Released at the end of the layer.
 
             # Phase 9: expert gate+up (w1/w3 + SiLU)
             var expert_qi_lease = self.scratch.borrow[Scalar[DType.int8], C.TOP_K * C.MOE_INTERMEDIATE]()
@@ -1380,6 +1393,7 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
             expert_blk_scale_lease^.release()
             expert_qi_lease^.release()
             routing_lease^.release()
+            normed_bf16_lease^.release()
             moe_scale_lease^.release()
             moe_i8_lease^.release()
 
@@ -1401,6 +1415,10 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         var t_final1 = Int(perf_counter_ns())
         sample.add(self.profile.phase("final_norm"), finish_single_pool_fence(t_final0, t_final1, final_fence^))
 
+        # lm_work is dead after final_norm; release now so logit_lease (next
+        # borrow) lands on top of a LIFO-clean stack.
+        lm_work_lease^.release()
+
         var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
         var logit_view = scratch_tensor_view[BF16, 1, C.VOCAB_SIZE](host.scratch_base(), logit_lease, 1)
         var t_lm0 = Int(perf_counter_ns())
@@ -1416,10 +1434,6 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         var t_lm1 = Int(perf_counter_ns())
         sample.add(self.profile.phase("lm_head"), finish_single_pool_fence(t_lm0, t_lm1, lm_fence^))
 
-        lm_work_lease^.release()
-        lm_act_blk_scale_lease^.release()
-        lm_act_i8_lease^.release()
-
         # Argmax (no softcap in MiniMax)
         comptime width = simd_width_of[DType.float32]()
         var logits = LogitsView[C.VOCAB_SIZE](
@@ -1433,6 +1447,8 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
                     best_val = v[k]
                     best_idx = Int32(j + k)
         logits^.release()
+        lm_act_blk_scale_lease^.release()
+        lm_act_i8_lease^.release()
         sample.wall_ns = Int(perf_counter_ns()) - t_forward0
         self.profile.record(sample)
         return best_idx

@@ -7,12 +7,14 @@ from modeling.model_spec import (
     WeightIterable, WeightDesc, weight_desc,
 )
 from safetensors.parser import parse_safetensors_header, SafetensorsHeader, TensorMeta
-from linux.io_uring import IoRing, ReadOp, Completion
-from safetensors.loader import process_read_queue, LoadError
+from linux.io_uring import IoRing, ReadOp, run_reads_multi
 from notstdcollections import HeapMoveArray
+from threading.burst_threading import BurstPool
+from numa import NumaInfo, NumaTopology
 
 
 comptime DEFAULT_IO_DEPTH = 2048
+comptime DEFAULT_MASK_SIZE = 128
 
 
 def discover_shards(path: Path) -> List[Path]:
@@ -46,14 +48,6 @@ def discover_shards(path: Path) -> List[Path]:
                 shards[i] = shards[j]
                 shards[j] = tmp
     return shards^
-
-
-@fieldwise_init
-struct ReadFragment(Copyable):
-    var file_idx: Int
-    var file_offset: Int
-    var dest: Int
-    var length: Int
 
 
 def validate_weight(
@@ -97,21 +91,27 @@ def emit_reads(
     file_data_start: Int,
     arena_base: Int,
     rank: Int,
-    mut ops: List[ReadFragment],
+    mut ops: List[ReadOp[]],
 ):
+    """Append ReadOps for the given weight into `ops`. Each op's id is its
+    local index within `ops` — the ring uses id as a direct lookup index."""
     var dest = arena_base + desc.arena_offset
 
     if desc.data_rows == desc.global_rows and desc.data_cols == desc.global_cols:
         var data_bytes = desc.data_rows * desc.data_cols * desc.element_bytes
-        ops.append(ReadFragment(
-            file_idx=file_idx, file_offset=file_data_start, dest=dest, length=data_bytes,
+        ops.append(ReadOp(
+            file_idx=file_idx, offset=file_data_start, length=data_bytes,
+            dest=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=dest),
+            id=len(ops),
         ))
     elif desc.data_rows != desc.global_rows:
         var row_start = rank * desc.data_rows
         var data_bytes = desc.data_rows * desc.global_cols * desc.element_bytes
         var file_off = file_data_start + row_start * desc.global_cols * desc.element_bytes
-        ops.append(ReadFragment(
-            file_idx=file_idx, file_offset=file_off, dest=dest, length=data_bytes,
+        ops.append(ReadOp(
+            file_idx=file_idx, offset=file_off, length=data_bytes,
+            dest=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=dest),
+            id=len(ops),
         ))
     else:
         var file_cols = desc.data_cols
@@ -122,8 +122,10 @@ def emit_reads(
         for r in range(desc.data_rows):
             var src = file_data_start + (r * desc.global_cols + col_start) * desc.element_bytes
             var dst = dest + r * stride_bytes
-            ops.append(ReadFragment(
-                file_idx=file_idx, file_offset=src, dest=dst, length=file_row_bytes,
+            ops.append(ReadOp(
+                file_idx=file_idx, offset=src, length=file_row_bytes,
+                dest=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=dst),
+                id=len(ops),
             ))
 
 
@@ -143,7 +145,7 @@ def resolve_and_emit(
     ref headers: HeapMoveArray[SafetensorsHeader],
     arena_bases: List[Int],
     ranks: List[Int],
-    mut fragments: List[ReadFragment],
+    mut ops_per_rank: List[List[ReadOp[]]],
 ) -> Bool:
     var found = find_tensor(w.name, headers)
     if not found:
@@ -155,7 +157,8 @@ def resolve_and_emit(
         return False
     var data_start = headers[shard_idx].data_offset + meta.start
     for i in range(len(ranks)):
-        emit_reads(w, shard_idx, data_start, arena_bases[ranks[i]], ranks[i], fragments)
+        var r = ranks[i]
+        emit_reads(w, shard_idx, data_start, arena_bases[r], r, ops_per_rank[r])
     return True
 
 
@@ -168,9 +171,11 @@ struct LoadResult(Movable):
 def load_weights[
     M: WeightIterable,
     io_depth: Int = DEFAULT_IO_DEPTH,
+    mask_size: Int = DEFAULT_MASK_SIZE,
 ](
     paths: List[Path],
     arena_bases: List[Int],
+    numa_topo: NumaTopology,
 ) -> Optional[LoadResult]:
     """Load weights from one or more safetensors files into pre-allocated arenas.
 
@@ -201,8 +206,10 @@ def load_weights[
 
     M.for_each_weight[collect]()
 
-    var fragments = List[ReadFragment]()
     var tp = len(arena_bases)
+    var ops_per_rank = List[List[ReadOp[]]]()
+    for _ in range(tp):
+        ops_per_rank.append(List[ReadOp[]]())
 
     var all_ranks = List[Int]()
     for r in range(tp):
@@ -211,77 +218,40 @@ def load_weights[
     for w in targeted_weights:
         var ranks = List[Int]()
         ranks.append(w.target_rank % tp)
-        if not resolve_and_emit(w, headers, arena_bases, ranks, fragments):
+        if not resolve_and_emit(w, headers, arena_bases, ranks, ops_per_rank):
             return None
-
     for w in distributed_weights:
-        if not resolve_and_emit(w, headers, arena_bases, all_ranks, fragments):
+        if not resolve_and_emit(w, headers, arena_bases, all_ranks, ops_per_rank):
             return None
 
-    var num_fragments = len(fragments)
-    var ops = List[ReadOp[]](capacity=num_fragments)
-    for i in range(num_fragments):
-        var frag = fragments[i].copy()
-        ops.append(ReadOp(
-            file_idx=frag.file_idx,
-            offset=frag.file_offset,
-            length=frag.length,
-            dest=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=frag.dest),
-            id=i,
-        ))
-
-    var ring = IoRing[io_depth]()
-    if not ring:
-        print("io_uring setup failed")
-        return None
-
-    try:
-        _ = ring.register_files(paths)
-    except err:
-        print("register_files failed:", err.error_message())
-        return None
-
-    var bytes_loaded = 0
-
-    @parameter
-    def on_complete(c: Completion):
-        bytes_loaded += Int(c.result)
-
-    var err = process_read_queue[on_complete](ring, ops)
-    if err:
-        print("load error:", err.value().msg)
-        return None
-
-    return LoadResult(bytes_loaded, num_fragments)
+    return run_load[io_depth, mask_size](paths, numa_topo, ops_per_rank^)
 
 
 def load_safetensors[
     M: WeightIterable,
     io_depth: Int = DEFAULT_IO_DEPTH,
+    mask_size: Int = DEFAULT_MASK_SIZE,
 ](
     path: Path,
     arena_bases: List[Int],
+    numa_topo: NumaTopology,
 ) -> Optional[LoadResult]:
     """Load weights from a single safetensors file."""
     var paths = List[Path]()
     paths.append(path)
-    return load_weights[M, io_depth](paths, arena_bases)
+    return load_weights[M, io_depth, mask_size](paths, arena_bases, numa_topo)
 
 
 def load_weights_from_descs[
     io_depth: Int = DEFAULT_IO_DEPTH,
+    mask_size: Int = DEFAULT_MASK_SIZE,
 ](
     descs: List[WeightDesc],
     paths: List[Path],
     arena_bases: List[Int],
+    numa_topo: NumaTopology,
 ) -> Optional[LoadResult]:
-    """Runtime variant of load_weights — takes a prebuilt List[WeightDesc].
-
-    Intended for models that build their weight catalog at runtime rather
-    than through the WeightIterable / for_each_weight comptime template.
-    Shares all the io_uring + validation plumbing with load_weights[M];
-    differs only in how the desc list is produced.
-    """
+    """Runtime variant — takes a prebuilt List[WeightDesc]."""
     var headers = HeapMoveArray[SafetensorsHeader](len(paths))
     for i in range(len(paths)):
         var header_opt = parse_safetensors_header(paths[i])
@@ -301,8 +271,10 @@ def load_weights_from_descs[
         else:
             distributed_weights.append(d^)
 
-    var fragments = List[ReadFragment]()
     var tp = len(arena_bases)
+    var ops_per_rank = List[List[ReadOp[]]]()
+    for _ in range(tp):
+        ops_per_rank.append(List[ReadOp[]]())
 
     var all_ranks = List[Int]()
     for r in range(tp):
@@ -311,45 +283,47 @@ def load_weights_from_descs[
     for w in targeted_weights:
         var ranks = List[Int]()
         ranks.append(w.target_rank % tp)
-        if not resolve_and_emit(w, headers, arena_bases, ranks, fragments):
+        if not resolve_and_emit(w, headers, arena_bases, ranks, ops_per_rank):
             return None
-
     for w in distributed_weights:
-        if not resolve_and_emit(w, headers, arena_bases, all_ranks, fragments):
+        if not resolve_and_emit(w, headers, arena_bases, all_ranks, ops_per_rank):
             return None
 
-    var num_fragments = len(fragments)
-    var ops = List[ReadOp[]](capacity=num_fragments)
-    for i in range(num_fragments):
-        var frag = fragments[i].copy()
-        ops.append(ReadOp(
-            file_idx=frag.file_idx,
-            offset=frag.file_offset,
-            length=frag.length,
-            dest=UnsafePointer[UInt8, MutAnyOrigin](unsafe_from_address=frag.dest),
-            id=i,
-        ))
+    return run_load[io_depth, mask_size](paths, numa_topo, ops_per_rank^)
 
-    var ring = IoRing[io_depth]()
-    if not ring:
-        print("io_uring setup failed")
-        return None
 
-    try:
-        _ = ring.register_files(paths)
-    except err:
-        print("register_files failed:", err.error_message())
-        return None
+def run_load[
+    io_depth: Int,
+    mask_size: Int,
+](
+    paths: List[Path],
+    numa_topo: NumaTopology,
+    var ops_per_rank: List[List[ReadOp[]]],
+) -> Optional[LoadResult]:
+    """Build transient load pools (one 1-capacity pool per NUMA node in
+    numa_topo), run the multi-pool read dispatch, tally bytes/ops. The
+    load pools are destroyed on return; the inference-time pools are a
+    separate concern of the caller."""
+    var total_bytes = 0
+    var total_ops = 0
+    for r in range(len(ops_per_rank)):
+        for i in range(len(ops_per_rank[r])):
+            total_bytes += ops_per_rank[r][i].length
+            total_ops += 1
 
-    var bytes_loaded = 0
+    var numa = NumaInfo()
+    var tp = len(ops_per_rank)
+    var load_pools = HeapMoveArray[BurstPool[mask_size]](tp)
+    for r in range(tp):
+        var mask = numa.get_node_mask[mask_size](numa_topo[r])
+        load_pools.push(BurstPool[mask_size](
+            capacity=1, cpu_mask=mask^, numa_node=numa_topo[r]))
+        if not load_pools[r]:
+            print("load pool setup failed for rank", r)
+            return None
 
-    @parameter
-    def on_complete(c: Completion):
-        bytes_loaded += Int(c.result)
+    var pools_span = Span[BurstPool[mask_size], MutAnyOrigin](
+        ptr=load_pools.ptr, length=len(load_pools))
+    run_reads_multi[io_depth, mask_size](pools_span, paths, ops_per_rank)
 
-    var err = process_read_queue[on_complete](ring, ops)
-    if err:
-        print("load error:", err.value().msg)
-        return None
-
-    return LoadResult(bytes_loaded, num_fragments)
+    return LoadResult(total_bytes, total_ops)

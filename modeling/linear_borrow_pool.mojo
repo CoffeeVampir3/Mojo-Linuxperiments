@@ -41,7 +41,14 @@ struct ScratchLease(Movable):
         self.pool_offset_ptr = pool_offset_ptr
 
     def release(deinit self):
-        """Return the offset range to the pool."""
+        """Return the offset range to the pool. LIFO — must be top of stack."""
+        var top = self.pool_offset_ptr[]
+        if self.offset + self.byte_size != top:
+            print("ScratchPool: non-LIFO release detected. lease_offset=",
+                  self.offset, " byte_size=", self.byte_size,
+                  " expected_top=", self.offset + self.byte_size,
+                  " actual_top=", top)
+            abort("ScratchPool: non-LIFO release")
         self.pool_offset_ptr[] -= self.byte_size
 
 

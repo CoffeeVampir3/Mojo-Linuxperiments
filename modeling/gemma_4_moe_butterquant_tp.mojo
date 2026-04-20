@@ -972,7 +972,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         for rank in range(Self.tp):
             arena_bases.append(Int(arenas[rank].base))
 
-        var result = load_weights_from_descs(plan.descs, shards, arena_bases)
+        var result = load_weights_from_descs(plan.descs, shards, arena_bases, numa_topo)
         if not result:
             print("weight loading failed")
             return None
@@ -1136,7 +1136,11 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 attn_work_lease^.release()
                 attn_i8_lease^.release()
             else:
-                # Full attention — context parallel
+                # Full attention — context parallel only (not head-parallel TP/CP
+                # flash decode as in M27). Gemma4 has only 2 full-attention KV heads,
+                # so head-sharding caps at tp=2 and gives zero benefit beyond that.
+                # CP position-sharding scales to any TP with negligible coordination
+                # cost: 16KB Q allgather + scalar remote reads for cross-rank merge.
                 comptime LOCAL_MAX_SEQ_FULL = (C.MAX_SEQ_LEN + Self.tp - 1) // Self.tp
                 comptime HEADS_PER_RANK = C.NUM_HEADS // Self.tp
                 comptime Q_GROUP_BF16 = FULL_HPG * C.HEAD_DIM_FULL * 2

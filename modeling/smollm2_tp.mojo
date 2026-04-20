@@ -459,7 +459,7 @@ struct SmolLM2TP[tp: Int](Movable):
         for rank in range(Self.tp):
             arena_bases.append(Int(arenas[rank].base))
 
-        var load_result = load_weights_from_descs(plan.descs, shards, arena_bases)
+        var load_result = load_weights_from_descs(plan.descs, shards, arena_bases, numa_topo)
         if not load_result:
             print("weight loading failed")
             return None

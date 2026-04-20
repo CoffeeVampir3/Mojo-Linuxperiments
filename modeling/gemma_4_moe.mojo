@@ -531,7 +531,7 @@ struct Gemma4[tp: Int](Movable):
         var arena_bases = List[Int]()
         arena_bases.append(Int(arena.base))
 
-        var load_result = load_weights_from_descs(plan.descs, shards, arena_bases)
+        var load_result = load_weights_from_descs(plan.descs, shards, arena_bases, nodes)
         if not load_result:
             print("weight loading failed")
             return None

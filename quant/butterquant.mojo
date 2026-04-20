@@ -22,7 +22,7 @@ from safetensors.parser import (
     parse_safetensors_header, SafetensorsHeader,
 )
 from linux.io_uring import (
-    IoRing, ReadOp, WriteOp, ReadWriteMode,
+    IoRing, ReadOp, WriteOp, ReadWriteMode, Completion,
 )
 from modeling.model_spec import QuantizeSpec, TaskVisitor
 from modeling.loader import discover_shards
@@ -111,8 +111,8 @@ struct RingIO(Movable):
                 file_idx=file_idx, offset=offset, length=length,
                 dest=dest, id=0,
             ))
-            var completions = self.ring.wait()
-            return len(completions) > 0 and Int(completions[0].result) == length
+            var c = self.ring.drain_one()
+            return Int(c.result) == length
         except:
             return False
 
@@ -123,8 +123,8 @@ struct RingIO(Movable):
                 file_idx=file_idx, offset=offset, length=length,
                 src=src, id=0,
             ))
-            var completions = self.ring.wait()
-            return len(completions) > 0 and Int(completions[0].result) == length
+            var c = self.ring.drain_one()
+            return Int(c.result) == length
         except:
             return False
 
