@@ -4,7 +4,9 @@ from std.collections import InlineArray
 from experimental3.kernels.gemv import gemv_row
 from experimental3.kernels.fwht import fwht_block
 from experimental3.kernels.quantize import absmax_quantize_i8
-from experimental3.common_math import F32Ptr, BF16Ptr
+from experimental3.common_math import (
+    F32Ptr, BF16Ptr, pick_port_unroll, tree_reduce_accs,
+)
 from minimax.kernels.activations import silu_mul
 from minimax.kernels.dispatch_args import FusedW1W3SiluArgs, F32GemvArgs
 
@@ -81,14 +83,29 @@ def f32_gemv_row[K: Int](
 ) -> Float32:
     """Dot product: bf16[K] · f32[K] → f32 scalar."""
     comptime width = simd_width_of[DType.float32]()
-    var acc = SIMD[DType.float32, width](0)
-    var k = 0
+    comptime port_unroll = pick_port_unroll[width, K]()
+    comptime step = port_unroll * width
+    var accs = InlineArray[SIMD[DType.float32, width], port_unroll](
+        uninitialized=True)
+    comptime for i in range(port_unroll):
+        var off = i * width
+        var a = (act + off).load[width=width]().cast[DType.float32]()
+        var w = (weight_row + off).load[width=width]()
+        accs[i] = a * w
+    var k = step
+    while k + step <= K:
+        comptime for i in range(port_unroll):
+            var off = k + i * width
+            var a = (act + off).load[width=width]().cast[DType.float32]()
+            var w = (weight_row + off).load[width=width]()
+            accs[i] = a.fma(w, accs[i])
+        k += step
     while k + width <= K:
         var a = (act + k).load[width=width]().cast[DType.float32]()
         var w = (weight_row + k).load[width=width]()
-        acc = a.fma(w, acc)
+        accs[0] = a.fma(w, accs[0])
         k += width
-    return acc.reduce_add()
+    return tree_reduce_accs(accs)
 
 
 def f32_gemv_worker[N: Int, K: Int](args: F32GemvArgs):

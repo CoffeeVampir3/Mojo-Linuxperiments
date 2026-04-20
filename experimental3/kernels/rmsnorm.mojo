@@ -10,7 +10,10 @@ from experimental3.common_math import (
     rms_reduce_bf16 as rms_reduce,
     inv_rms_from_sum_sq,
     normalize_inplace,
+    pick_port_unroll,
+    tree_reduce_accs,
 )
+from std.collections import InlineArray
 from experimental3.kernels.dispatch_args import (
     RmsNormFwhtQuantArgs, RmsNormDualGammaFwhtArgs,
     RMSNormNoScaleArgs, RMSNormPerHeadArgs,
@@ -54,19 +57,42 @@ def load_and_reduce[cols: Int, has_gamma: Bool](
     has_gamma=False: work[k] = x[k]. gamma ptr ignored.
     """
     comptime width = simd_width_of[DType.float32]()
+    comptime port_unroll = pick_port_unroll[width, cols]()
+    comptime step = port_unroll * width
     debug_assert(cols % width == 0, "cols must be a multiple of f32 SIMD width")
-    var vsum = SIMD[DType.float32, width](0)
-    var k = 0
+    var accs = InlineArray[SIMD[DType.float32, width], port_unroll](
+        uninitialized=True)
+    comptime for i in range(port_unroll):
+        var off = i * width
+        var x = (src + off).load[width=width]().cast[DType.float32]()
+        accs[i] = x * x
+        comptime if has_gamma:
+            var g = (gamma + off).load[width=width]().cast[DType.float32]()
+            (work + off).store(x * g)
+        else:
+            (work + off).store(x)
+    var k = step
+    while k + step <= cols:
+        comptime for i in range(port_unroll):
+            var off = k + i * width
+            var x = (src + off).load[width=width]().cast[DType.float32]()
+            accs[i] = x.fma(x, accs[i])
+            comptime if has_gamma:
+                var g = (gamma + off).load[width=width]().cast[DType.float32]()
+                (work + off).store(x * g)
+            else:
+                (work + off).store(x)
+        k += step
     while k < cols:
         var x = (src + k).load[width=width]().cast[DType.float32]()
-        vsum = x.fma(x, vsum)
+        accs[0] = x.fma(x, accs[0])
         comptime if has_gamma:
             var g = (gamma + k).load[width=width]().cast[DType.float32]()
             (work + k).store(x * g)
         else:
             (work + k).store(x)
         k += width
-    return vsum.reduce_add()
+    return tree_reduce_accs(accs)
 
 
 @always_inline
@@ -77,18 +103,39 @@ def load_and_reduce_dual[cols: Int](
 ) -> Float32:
     """Load bf16 to two f32 work buffers with two gammas, shared sum(x^2)."""
     comptime width = simd_width_of[DType.float32]()
+    comptime port_unroll = pick_port_unroll[width, cols]()
+    comptime step = port_unroll * width
     debug_assert(cols % width == 0, "cols must be a multiple of f32 SIMD width")
-    var vsum = SIMD[DType.float32, width](0)
-    var k = 0
+    var accs = InlineArray[SIMD[DType.float32, width], port_unroll](
+        uninitialized=True)
+    comptime for i in range(port_unroll):
+        var off = i * width
+        var x = (src + off).load[width=width]().cast[DType.float32]()
+        var ga = (gamma_a + off).load[width=width]().cast[DType.float32]()
+        var gb = (gamma_b + off).load[width=width]().cast[DType.float32]()
+        accs[i] = x * x
+        (work_a + off).store(x * ga)
+        (work_b + off).store(x * gb)
+    var k = step
+    while k + step <= cols:
+        comptime for i in range(port_unroll):
+            var off = k + i * width
+            var x = (src + off).load[width=width]().cast[DType.float32]()
+            var ga = (gamma_a + off).load[width=width]().cast[DType.float32]()
+            var gb = (gamma_b + off).load[width=width]().cast[DType.float32]()
+            accs[i] = x.fma(x, accs[i])
+            (work_a + off).store(x * ga)
+            (work_b + off).store(x * gb)
+        k += step
     while k < cols:
         var x = (src + k).load[width=width]().cast[DType.float32]()
         var ga = (gamma_a + k).load[width=width]().cast[DType.float32]()
         var gb = (gamma_b + k).load[width=width]().cast[DType.float32]()
-        vsum = x.fma(x, vsum)
+        accs[0] = x.fma(x, accs[0])
         (work_a + k).store(x * ga)
         (work_b + k).store(x * gb)
         k += width
-    return vsum.reduce_add()
+    return tree_reduce_accs(accs)
 
 
 @always_inline

@@ -4,6 +4,7 @@ from std.sys.info import simd_width_of
 from simd_math import sqrt, exp_f32
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
 from experimental3.kernels.quantize import absmax_quantize_i8
+from experimental3.kernels.full_chunked_attention_fused import MAX_CHUNKS
 from experimental3.common_math import F32Ptr, BF16Ptr, I8Ptr
 from minimax.kernels.qk_prep import prep_q_head, write_k_head, write_v_direct
 from minimax.kernels.dispatch_args import AttnGroupArgs
@@ -21,8 +22,6 @@ def kv_write_kernel[
     var cache = Gemma4KVCache[max_seq, head_dim, num_kv_heads](
         Int(args.cache_base))
 
-    var work_arr = InlineArray[Float32, head_dim](fill=Float32(0))
-    var work = UnsafePointer(to=work_arr).bitcast[Float32]()
     var qi_arr = InlineArray[Scalar[DType.int8], head_dim](uninitialized=True)
     var qi_buf = UnsafePointer(to=qi_arr).bitcast[Scalar[DType.int8]]()
 
@@ -30,15 +29,14 @@ def kv_write_kernel[
         args.k_bf16_ptr, args.k_norm_ptr,
         args.cos_ptr, args.sin_ptr,
         args.inv_rms_k,
-        work, qi_buf,
+        qi_buf,
         cache, args.cache_pos, args.kv_head)
 
     write_v_direct[head_dim](
         args.v_bf16_ptr,
-        work, qi_buf,
+        qi_buf,
         cache, args.cache_pos, args.kv_head)
 
-    _ = work_arr
     _ = qi_arr
 
 
@@ -73,10 +71,27 @@ def merge_and_quantize_kernel[head_dim: Int, heads_per_group: Int](
     var work_arr = InlineArray[Float32, head_dim](fill=Float32(0))
     var wp = UnsafePointer(to=work_arr).bitcast[Float32]()
 
+    var m_arr = InlineArray[Float32, MAX_CHUNKS](fill=Float32(-1e30))
+    var cs_arr = InlineArray[Float32, MAX_CHUNKS](uninitialized=True)
+    var rescale_arr = InlineArray[Float32, MAX_CHUNKS](uninitialized=True)
+
     for qh in range(heads_per_group):
+        # Gather per-chunk (max, sum) for this head; compute gmax.
         var gmax = Float32(-1e30)
         for c in range(num_chunks):
-            gmax = max(gmax, (partial_base + c * CHUNK_STRIDE + qh * HEAD_STRIDE)[])
+            var p = partial_base + c * CHUNK_STRIDE + qh * HEAD_STRIDE
+            var m = p[]
+            m_arr[c] = m
+            cs_arr[c] = (p + 1)[]
+            gmax = max(gmax, m)
+
+        # One batched SIMD exp covers all chunks; inactive lanes stay at -1e30.
+        var gmax_vec = SIMD[DType.float32, width](gmax)
+        var cg = 0
+        while cg < MAX_CHUNKS:
+            var mv = UnsafePointer(to=m_arr[cg]).load[width=width]()
+            UnsafePointer(to=rescale_arr[cg]).store(exp_f32[width](mv - gmax_vec))
+            cg += width
 
         var d = 0
         while d + width <= head_dim:
@@ -85,12 +100,12 @@ def merge_and_quantize_kernel[head_dim: Int, heads_per_group: Int](
 
         var total_sum = Float32(0)
         for c in range(num_chunks):
-            var p = partial_base + c * CHUNK_STRIDE + qh * HEAD_STRIDE
-            var cs = (p + 1)[]
+            var cs = cs_arr[c]
             if cs <= 0:
                 continue
-            var rescale = Float32(exp_f32[1](p[] - gmax))
+            var rescale = rescale_arr[c]
             total_sum += cs * rescale
+            var p = partial_base + c * CHUNK_STRIDE + qh * HEAD_STRIDE
             d = 0
             while d + width <= head_dim:
                 (wp + d).store((p + 2 + d).load[width=width]().fma(

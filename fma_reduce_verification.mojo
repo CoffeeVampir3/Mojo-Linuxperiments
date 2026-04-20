@@ -125,6 +125,55 @@ def rms_reduce_bf16_unrolled[cols: Int, n_acc: Int](
 # -----------------------------------------------------------------------------
 
 
+# -----------------------------------------------------------------------------
+# Partial extraction: callers keep the FMA body explicit (different loads and
+# side effects at each site) but share the mechanical bits.
+# -----------------------------------------------------------------------------
+
+
+@always_inline
+def pick_port_unroll_local[width: Int, cols: Int]() -> Int:
+    comptime n = cols // width
+    return 8 if n >= 8 else 4 if n >= 4 else 2 if n >= 2 else 1
+
+
+@always_inline
+def tree_reduce_accs[T: DType, width: Int, port_unroll: Int](
+    mut accs: InlineArray[SIMD[T, width], port_unroll],
+) -> Scalar[T]:
+    """Pairwise add accumulator bank into lane-0 register, horizontal reduce."""
+    comptime for stride in range(1, port_unroll):
+        comptime if (stride & (stride - 1)) == 0:
+            comptime for i in range(0, port_unroll, 2 * stride):
+                accs[i] += accs[i + stride]
+    return accs[0].reduce_add()
+
+
+@always_inline
+def rms_reduce_bf16_skeleton[cols: Int](
+    src: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
+) -> Float32:
+    comptime width = simd_width_of[DType.float32]()
+    comptime port_unroll = pick_port_unroll_local[width, cols]()
+    comptime step = port_unroll * width
+    var accs = InlineArray[SIMD[DType.float32, width], port_unroll](
+        uninitialized=True)
+    comptime for i in range(port_unroll):
+        var x = (src + i * width).load[width=width]().cast[DType.float32]()
+        accs[i] = x * x
+    var k = step
+    while k + step <= cols:
+        comptime for i in range(port_unroll):
+            var x = (src + k + i * width).load[width=width]().cast[DType.float32]()
+            accs[i] = x.fma(x, accs[i])
+        k += step
+    while k + width <= cols:
+        var x = (src + k).load[width=width]().cast[DType.float32]()
+        accs[0] = x.fma(x, accs[0])
+        k += width
+    return tree_reduce_accs[DType.float32, width, port_unroll](accs)
+
+
 @always_inline
 def rms_reduce_bf16_vectorize[cols: Int, unroll: Int](
     src: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
@@ -218,14 +267,12 @@ def run_correctness():
     var r1 = rms_reduce_bf16_serial[COLS](xp)
     var r4 = rms_reduce_bf16_unrolled[COLS, 4](xp)
     var r8 = rms_reduce_bf16_unrolled[COLS, 8](xp)
-    var rv1 = rms_reduce_bf16_vectorize[COLS, 1](xp)
-    var rv4 = rms_reduce_bf16_vectorize[COLS, 4](xp)
+    var rsk = rms_reduce_bf16_skeleton[COLS](xp)
     print("  rms_reduce_bf16")
     print("    serial          :", r1)
     print("    4-accum         :", r4, " rel:", abs(r1 - r4) / abs(r1))
     print("    8-accum         :", r8, " rel:", abs(r1 - r8) / abs(r1))
-    print("    vectorize u=1   :", rv1, " rel:", abs(r1 - rv1) / abs(r1))
-    print("    vectorize u=4   :", rv4, " rel:", abs(r1 - rv4) / abs(r1))
+    print("    skeleton        :", rsk, " rel:", abs(r1 - rsk) / abs(r1))
 
     var g1 = f32_gemv_row_serial[COLS](xp, wp)
     var g4 = f32_gemv_row_unrolled[COLS, 4](xp, wp)
@@ -265,12 +312,12 @@ def time_rms_unrolled[n_acc: Int](
     return Int(t1 - t0)
 
 
-def time_rms_vectorize[unroll: Int](
+def time_rms_skeleton(
     xp: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin], iters: Int,
 ) -> Int:
     var t0 = perf_counter_ns()
     for _ in range(iters):
-        var r = rms_reduce_bf16_vectorize[COLS, unroll](xp)
+        var r = rms_reduce_bf16_skeleton[COLS](xp)
         keep(r)
     var t1 = perf_counter_ns()
     return Int(t1 - t0)
@@ -316,8 +363,7 @@ def run_benchmark():
     _ = time_rms_serial(xp, WARMUP)
     _ = time_rms_unrolled[4](xp, WARMUP)
     _ = time_rms_unrolled[8](xp, WARMUP)
-    _ = time_rms_vectorize[1](xp, WARMUP)
-    _ = time_rms_vectorize[4](xp, WARMUP)
+    _ = time_rms_skeleton(xp, WARMUP)
     _ = time_gemv_serial(xp, wp, WARMUP)
     _ = time_gemv_unrolled[4](xp, wp, WARMUP)
     _ = time_gemv_unrolled[8](xp, wp, WARMUP)
@@ -325,8 +371,7 @@ def run_benchmark():
     var r_s = time_rms_serial(xp, TRIALS)
     var r_4 = time_rms_unrolled[4](xp, TRIALS)
     var r_8 = time_rms_unrolled[8](xp, TRIALS)
-    var r_v1 = time_rms_vectorize[1](xp, TRIALS)
-    var r_v4 = time_rms_vectorize[4](xp, TRIALS)
+    var r_sk = time_rms_skeleton(xp, TRIALS)
     var g_s = time_gemv_serial(xp, wp, TRIALS)
     var g_4 = time_gemv_unrolled[4](xp, wp, TRIALS)
     var g_8 = time_gemv_unrolled[8](xp, wp, TRIALS)
@@ -339,10 +384,8 @@ def run_benchmark():
           " speedup:", Float32(r_s) / Float32(r_4), "x")
     print("    8-accum        ns/call:", r_8 // TRIALS,
           " speedup:", Float32(r_s) / Float32(r_8), "x")
-    print("    vectorize u=1  ns/call:", r_v1 // TRIALS,
-          " speedup:", Float32(r_s) / Float32(r_v1), "x")
-    print("    vectorize u=4  ns/call:", r_v4 // TRIALS,
-          " speedup:", Float32(r_s) / Float32(r_v4), "x")
+    print("    skeleton       ns/call:", r_sk // TRIALS,
+          " speedup:", Float32(r_s) / Float32(r_sk), "x")
     print("  f32_gemv_row")
     print("    serial  ns/call:", g_s // TRIALS)
     print("    4-accum ns/call:", g_4 // TRIALS,

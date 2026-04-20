@@ -233,13 +233,13 @@ def sliding_attn_group_kernel[
     write_k_head_normed[head_dim](
         args.k_bf16_ptr,
         args.k_norm_ptr,
-        cos, sin, work, qi_buf,
+        cos, sin, qi_buf,
         cache, args.cache_pos, args.kv_head, args.eps)
 
     # 2. Write V to cache (per-token absmax, scale stored in cache)
     write_v_head_normed[head_dim](
         args.v_bf16_ptr,
-        work, qi_buf,
+        qi_buf,
         cache, args.cache_pos, args.kv_head, args.eps)
 
     # 3. Process each Q head: score → V-agg → FWHT → quantize to i8

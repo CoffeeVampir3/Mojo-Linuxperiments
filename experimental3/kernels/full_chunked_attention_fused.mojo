@@ -115,23 +115,20 @@ def cp_attn_prep_kernel[
     var sin = args.sin_ptr
 
     if args.write_kv != 0:
-        var work_arr = InlineArray[Float32, head_dim](uninitialized=True)
-        var work = UnsafePointer(to=work_arr).bitcast[Float32]()
         var qi_arr = InlineArray[Scalar[DType.int8], head_dim](uninitialized=True)
         var qi_buf = UnsafePointer(to=qi_arr).bitcast[Scalar[DType.int8]]()
 
         write_k_head_normed[head_dim, rope_dims](
             args.k_bf16_ptr,
             args.k_norm_ptr,
-            cos, sin, work, qi_buf,
+            cos, sin, qi_buf,
             cache, args.cache_pos, args.kv_head, args.eps)
 
         write_v_head_normed[head_dim](
             args.k_bf16_ptr,
-            work, qi_buf,
+            qi_buf,
             cache, args.cache_pos, args.kv_head, args.eps)
 
-        _ = work_arr
         _ = qi_arr
 
     var qi_biases = args.qi_biases_out
@@ -190,6 +187,12 @@ def cp_chunked_attn_kernel[
     for qh in range(heads_per_group):
         q_factors[qh] = q_scales[qh] / Q_DENOM
 
+    comptime EXP_W = simd_width_of[DType.float32]()
+    debug_assert(heads_per_group <= EXP_W, "heads_per_group must fit in one SIMD vector")
+    var scores_storage = InlineArray[
+        SIMD[DType.float32, WIDTH], heads_per_group](uninitialized=True)
+    var new_max_arr = InlineArray[Float32, heads_per_group](uninitialized=True)
+
     for pg in range(args.start_pg, args.end_pg):
         var k_pg = cache.k_pg_ptr(args.kv_head, pg)
         var v_pg = cache.v_pg_ptr(args.kv_head, pg)
@@ -198,20 +201,30 @@ def cp_chunked_attn_kernel[
         var group_start = pg * WIDTH
         var valid = cp_group_valid_mask[WIDTH](group_start, args.context_len)
 
+        # Phase A: score all heads, compute new_max per head.
+        var diff_vec = SIMD[DType.float32, EXP_W](0)
         for qh in range(heads_per_group):
             var q_i8 = args.q_i8_base + qh * head_dim
-
             var scores_vec = valid.select(
                 score_group[head_dim](
                     q_i8, k_pg, qi_biases[qh], q_factors[qh], k_sc_pg),
                 neg_inf,
             )
-            var group_max = scores_vec.reduce_max()
-            var new_max = max(running_max[qh], group_max)
+            scores_storage[qh] = scores_vec
+            var new_max = max(running_max[qh], scores_vec.reduce_max())
+            new_max_arr[qh] = new_max
+            diff_vec[qh] = running_max[qh] - new_max
+
+        # One batched SIMD exp replaces heads_per_group scalar exp calls.
+        var rescales = exp_f32[EXP_W](diff_vec)
+
+        # Phase B: rescale v_acc, accumulate scores into running state.
+        for qh in range(heads_per_group):
+            var new_max = new_max_arr[qh]
             var v_acc = v_acc_base + qh * head_dim
 
             if running_sum[qh] > 0:
-                var rescale = Float32(exp_f32[1](running_max[qh] - new_max))
+                var rescale = rescales[qh]
                 var d = 0
                 while d + WIDTH <= head_dim:
                     (v_acc + d).store((v_acc + d).load[width=WIDTH]() * rescale)
@@ -220,7 +233,7 @@ def cp_chunked_attn_kernel[
 
             running_max[qh] = new_max
             var exp_scores = valid.select(
-                exp_f32[WIDTH](scores_vec - new_max), zero)
+                exp_f32[WIDTH](scores_storage[qh] - new_max), zero)
 
             running_sum[qh] += exp_scores.reduce_add()
             v_agg_group[head_dim](exp_scores, v_sc_pg, v_pg, v_acc)
@@ -256,10 +269,27 @@ def merge_local_chunks[head_dim: Int, heads_per_group: Int](
     comptime CHUNK_STRIDE = partial_chunk_stride[head_dim, heads_per_group]()
     comptime width = simd_width_of[DType.float32]()
 
+    var m_arr = InlineArray[Float32, MAX_CHUNKS](fill=Float32(-1e30))
+    var cs_arr = InlineArray[Float32, MAX_CHUNKS](uninitialized=True)
+    var rescale_arr = InlineArray[Float32, MAX_CHUNKS](uninitialized=True)
+
     for qh in range(heads_per_group):
+        # Gather (max, sum) from each chunk; compute gmax.
         var gmax = Float32(-1e30)
         for c in range(num_chunks):
-            gmax = max(gmax, (partial_base + c * CHUNK_STRIDE + qh * HEAD_STRIDE)[])
+            var p = partial_base + c * CHUNK_STRIDE + qh * HEAD_STRIDE
+            var m = p[]
+            m_arr[c] = m
+            cs_arr[c] = (p + 1)[]
+            gmax = max(gmax, m)
+
+        # Batched SIMD exp across all chunks — unused slots are -1e30 → 0.
+        var gmax_vec = SIMD[DType.float32, width](gmax)
+        var cg = 0
+        while cg < MAX_CHUNKS:
+            var mv = UnsafePointer(to=m_arr[cg]).load[width=width]()
+            UnsafePointer(to=rescale_arr[cg]).store(exp_f32[width](mv - gmax_vec))
+            cg += width
 
         var vp = out_v + qh * head_dim
         var d = 0
@@ -269,12 +299,12 @@ def merge_local_chunks[head_dim: Int, heads_per_group: Int](
 
         var total_sum = Float32(0)
         for c in range(num_chunks):
-            var p = partial_base + c * CHUNK_STRIDE + qh * HEAD_STRIDE
-            var cs = (p + 1)[]
+            var cs = cs_arr[c]
             if cs <= 0:
                 continue
-            var rescale = Float32(exp_f32[1](p[] - gmax))
+            var rescale = rescale_arr[c]
             total_sum += cs * rescale
+            var p = partial_base + c * CHUNK_STRIDE + qh * HEAD_STRIDE
             d = 0
             while d + width <= head_dim:
                 (vp + d).store((p + 2 + d).load[width=width]().fma(

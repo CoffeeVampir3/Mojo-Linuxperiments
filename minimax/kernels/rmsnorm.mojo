@@ -9,10 +9,13 @@ Residual add (post-FFN phase 11):
 """
 
 from std.sys.info import simd_width_of
+from std.collections import InlineArray
 
 from experimental3.common_math import (
     F32Ptr, BF16Ptr, I8Ptr,
     inv_rms_from_sum_sq,
+    pick_port_unroll,
+    tree_reduce_accs,
 )
 from experimental3.kernels.fwht import fwht_block
 from experimental3.kernels.quantize import absmax_quantize_i8
@@ -38,17 +41,32 @@ def rmsnorm_dual_output_row[cols: Int, block: Int](
     Then FWHT + per-row quantize on work → i8.
     """
     comptime width = simd_width_of[DType.float32]()
+    comptime port_unroll = pick_port_unroll[width, cols]()
+    comptime step = port_unroll * width
 
     # Pass 1: load x, store raw f32 to work, reduce sum_sq
-    var vsum = SIMD[DType.float32, width](0)
-    var k = 0
+    var accs = InlineArray[SIMD[DType.float32, width], port_unroll](
+        uninitialized=True)
+    comptime for i in range(port_unroll):
+        var off = i * width
+        var x = (src + off).load[width=width]().cast[DType.float32]()
+        accs[i] = x * x
+        (work + off).store(x)
+    var k = step
+    while k + step <= cols:
+        comptime for i in range(port_unroll):
+            var off = k + i * width
+            var x = (src + off).load[width=width]().cast[DType.float32]()
+            accs[i] = x.fma(x, accs[i])
+            (work + off).store(x)
+        k += step
     while k < cols:
         var x = (src + k).load[width=width]().cast[DType.float32]()
-        vsum = x.fma(x, vsum)
+        accs[0] = x.fma(x, accs[0])
         (work + k).store(x)
         k += width
-
-    var inv = inv_rms_from_sum_sq(vsum.reduce_add(), cols, eps)
+    var sum_sq = tree_reduce_accs(accs)
+    var inv = inv_rms_from_sum_sq(sum_sq, cols, eps)
     var vinv = SIMD[DType.float32, width](inv)
 
     # Pass 2: apply inv_rms with both gammas from the L1-hot work buffer
