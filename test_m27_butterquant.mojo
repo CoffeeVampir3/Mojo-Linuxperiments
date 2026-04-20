@@ -20,7 +20,7 @@ from modeling.minimax_m27_moe_butterquant_tp import (
 comptime TOKENIZER_PATH = "checkpoints/Minimax-M2.7/tokenizer.json"
 comptime MODEL_DIR = "quantized_models"
 comptime VOCAB = MiniMaxM27Config.VOCAB_SIZE
-comptime MAX_NEW_TOKENS = 1
+comptime MAX_NEW_TOKENS = 32
 comptime TP = 4
 
 
@@ -31,13 +31,16 @@ def main():
         return
     var tok = tok_opt.take()
 
-    var prompt = "The capital of France"
-    var token_ids = List[Int]()
-    token_ids.append(1)  # <bos> — verify against tokenizer config
-    var encoded = tok.encode(prompt)
-    for i in range(len(encoded)):
-        token_ids.append(encoded[i])
-    print("prompt:", repr(prompt))
+    var user_prompt = "The capital of France"
+    var prompt = (
+        "]~!b[]~b]system\n"
+        + "You are a helpful assistant. Your name is MiniMax-M2.7 and is built by MiniMax."
+        + "[e~[\n]~b]user\n"
+        + user_prompt
+        + "[e~[\n]~b]ai\n<think>\n"
+    )
+    var token_ids = tok.encode(prompt)
+    print("prompt:", repr(user_prompt))
     print("tokens:", len(token_ids), "ids:", end="")
     for i in range(len(token_ids)):
         print("", token_ids[i], end="")
@@ -79,18 +82,21 @@ def main():
     var pos = prompt_len
     var decode_start = perf_counter_ns()
 
-    for step in range(1, MAX_NEW_TOKENS):
-        tp[0] = Scalar[DType.int32](next_id)
-        next_id = Int(model.forward_decode(Int(tp), pos))
-        generated.append(next_id)
-        pos += 1
+    if next_id != MiniMaxM27Config.EOS_TOKEN_ID:
+        for step in range(1, MAX_NEW_TOKENS):
+            tp[0] = Scalar[DType.int32](next_id)
+            next_id = Int(model.forward_decode(Int(tp), pos))
+            generated.append(next_id)
+            pos += 1
 
-        if next_id == 1 or next_id == 2:
-            break
+            if next_id == MiniMaxM27Config.EOS_TOKEN_ID:
+                break
 
     var decode_elapsed_ms = (perf_counter_ns() - decode_start) / 1_000_000
     var decode_tokens = len(generated) - 1
-    var decode_tps = Float64(decode_tokens) / (Float64(decode_elapsed_ms) / 1000.0)
+    var decode_tps = Float64(0.0)
+    if decode_tokens > 0 and decode_elapsed_ms > 0:
+        decode_tps = Float64(decode_tokens) / (Float64(decode_elapsed_ms) / 1000.0)
     print(
         "decode  |", decode_tokens, "tokens |",
         decode_elapsed_ms, "ms |",
@@ -104,7 +110,15 @@ def main():
     for i in range(len(generated)):
         all_ids.append(generated[i])
 
+    var generated_text = tok.decode(generated)
     var full_text = tok.decode(all_ids)
     print()
+    print("generated ids:", end="")
+    for i in range(len(generated)):
+        print("", generated[i], end="")
+    print()
     print("=== generated", len(generated), "tokens ===")
+    print(generated_text)
+    print()
+    print("=== full text ===")
     print(full_text)

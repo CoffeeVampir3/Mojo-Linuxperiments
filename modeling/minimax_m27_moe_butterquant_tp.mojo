@@ -101,6 +101,9 @@ struct MiniMaxM27Config:
     comptime TOP_K = 8
 
     comptime VOCAB_SIZE = 200064
+    comptime BOS_TOKEN_ID = 200034
+    comptime ROLE_TOKEN_ID = 200019
+    comptime EOS_TOKEN_ID = 200020
     comptime RMS_NORM_EPS = 1e-6
 
     comptime MAX_SEQ_LEN = 4096
