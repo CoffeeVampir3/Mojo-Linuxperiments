@@ -109,6 +109,7 @@ def parse_meminfo(path: String, field: String) raises -> Int:
 struct NumaNode(Copyable, Writable):
     var id: Int
     var cpu_ids: List[Int]
+    var logical_cpu_ids: List[Int]
     var distances: List[Int]
     var mem_total_kb: Int
     var mem_free_kb: Int
@@ -116,6 +117,7 @@ struct NumaNode(Copyable, Writable):
     def __init__(out self, id: Int):
         self.id = id
         self.cpu_ids = List[Int]()
+        self.logical_cpu_ids = List[Int]()
         self.distances = List[Int]()
         self.mem_total_kb = 0
         self.mem_free_kb = 0
@@ -154,8 +156,9 @@ struct NumaInfo:
             for node_id in node_ids:
                 var base = "/sys/devices/system/node/node" + String(node_id)
                 var node = NumaNode(node_id)
-                node.cpu_ids = filter_to_physical_primaries(
-                    parse_cpulist(read_sysfs(base + "/cpulist")))
+                var all_cpus = parse_cpulist(read_sysfs(base + "/cpulist"))
+                node.logical_cpu_ids = all_cpus.copy()
+                node.cpu_ids = filter_to_physical_primaries(all_cpus)
                 node.distances = parse_distances(read_sysfs(base + "/distance"))
                 node.mem_total_kb = parse_meminfo(base + "/meminfo", "MemTotal")
                 node.mem_free_kb = parse_meminfo(base + "/meminfo", "MemFree")
@@ -200,10 +203,11 @@ struct NumaInfo:
         return self.nodes[node_id].cpu_ids.copy()
 
     def get_node_mask[mask_size: Int = 128](self, node_id: Int) -> CpuMask[mask_size]:
+        """Full logical CPU mask for node-level affinity (includes HT siblings)."""
         var mask = CpuMask[mask_size]()
         if node_id < 0 or node_id >= self.num_nodes:
             return mask^
-        for cpu in self.nodes[node_id].cpu_ids:
+        for cpu in self.nodes[node_id].logical_cpu_ids:
             mask.set(cpu)
         return mask^
 

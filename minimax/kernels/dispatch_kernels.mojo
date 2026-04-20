@@ -14,7 +14,8 @@ from simd_math import sqrt
 from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY
 from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr, BF16Ptr
 from experimental3.kernels.dispatch_args import Int8GemvBlockedArgs, ChunkedAttnArgs
-from experimental3.kernels.gemm import int8_gemv_blocked_worker
+from experimental3.kernels.gemm import int8_gemv_blocked_worker, int8_gemv_blocked_decode_worker
+from kernels.vnni import VNNI_N_STEP
 from experimental3.kv_cache import CACHE_WIDTH
 from experimental3.kernels.full_chunked_attention_fused import (
     cp_chunked_attn_kernel, MAX_CHUNKS,
@@ -430,37 +431,67 @@ def minimax_moe_phase2[
     rank: Int,
     mut pool: P,
 ) -> PoolFence[P]:
-    """Per-local-expert down GEMV with routing weight folded into output scale."""
+    """Per-local-expert down GEMV with routing weight folded into output scale.
+
+    N-tile sharded: each expert's hidden-dimension output is split across
+    workers, matching the phase1 pattern.
+    """
     comptime num_blocks = intermediate // fwht_blk
     comptime experts_per_rank = num_experts // tp
+    var pool_capacity = pool.get_capacity()
     var expert_base = rank * experts_per_rank
 
-    var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](
-        fill=Int8GemvBlockedArgs())
-
     var local_count = 0
+    var local_slots = InlineArray[Int, top_k](fill=0)
     for s in range(top_k):
         var eid = routing.indices[s]
-        if eid < expert_base or eid >= expert_base + experts_per_rank:
-            continue
-        var local_idx = eid - expert_base
-
-        jobs[local_count] = Int8GemvBlockedArgs(
-            expert_qi + local_count * intermediate,
-            U8Ptr(unsafe_from_address=down_base + local_idx * down_stride),
-            expert_blk_scale + local_count * num_blocks,
-            F32Ptr(unsafe_from_address=down_sc_base + local_idx * down_sc_stride),
-            F32Ptr(unsafe_from_address=down_bcs_base + local_idx * down_bcs_stride),
-            expert_out_buf + local_count * hidden,
-            routing.weights[s],
-        )
-        local_count += 1
+        if eid >= expert_base and eid < expert_base + experts_per_rank:
+            local_slots[local_count] = s
+            local_count += 1
 
     if local_count == 0:
         return PoolFence[P].completed()
 
-    pool.dispatch[Int8GemvBlockedArgs, int8_gemv_blocked_worker[hidden, intermediate, fwht_blk]](
-        UnsafePointer(to=jobs[0]), local_count)
+    var workers_per_expert = pool_capacity // local_count
+    if workers_per_expert < 1:
+        workers_per_expert = 1
+    comptime max_n_workers = hidden // VNNI_N_STEP
+    if workers_per_expert > max_n_workers:
+        workers_per_expert = max_n_workers
+    var n_per_worker = ((max_n_workers + workers_per_expert - 1) // workers_per_expert) * VNNI_N_STEP
+
+    var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](
+        fill=Int8GemvBlockedArgs())
+
+    var num_jobs = 0
+    for li in range(local_count):
+        var s = local_slots[li]
+        var eid = routing.indices[s]
+        var local_idx = eid - expert_base
+
+        var act = expert_qi + li * intermediate
+        var wpacked = U8Ptr(unsafe_from_address=down_base + local_idx * down_stride)
+        var blk_scale = expert_blk_scale + li * num_blocks
+        var wscale = F32Ptr(unsafe_from_address=down_sc_base + local_idx * down_sc_stride)
+        var blk_colsum = F32Ptr(unsafe_from_address=down_bcs_base + local_idx * down_bcs_stride)
+        var dst = expert_out_buf + li * hidden
+        var weight = routing.weights[s]
+
+        for w in range(workers_per_expert):
+            var n_start = w * n_per_worker
+            if n_start >= hidden:
+                break
+            var n_count = min(n_per_worker, hidden - n_start)
+            jobs[num_jobs] = Int8GemvBlockedArgs(
+                act, wpacked + n_start * intermediate,
+                blk_scale, wscale + n_start,
+                blk_colsum + n_start, dst + n_start,
+                weight, n_count, hidden)
+            num_jobs += 1
+
+    pool.dispatch[Int8GemvBlockedArgs,
+        int8_gemv_blocked_decode_worker[hidden, intermediate, fwht_blk]](
+        UnsafePointer(to=jobs[0]), num_jobs)
     return pool_fence(pool)
 
 

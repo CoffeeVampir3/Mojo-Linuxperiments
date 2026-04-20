@@ -46,12 +46,14 @@ from experimental3.kernels.dispatch_args import (
     PostReduceArgs,
 )
 from experimental3.kernels.gemm import (
-    int8_gemv_worker,
-    int8_gemv_blocked_worker, int8_gemv_blocked_wa_worker,
+    int8_gemv_worker, int8_gemv_decode_worker,
+    int8_gemv_blocked_worker, int8_gemv_blocked_decode_worker,
+    int8_gemv_blocked_wa_worker,
     fused_gu_gelu_tanh_worker, fused_gu_gelu_tanh_worker_wa,
     GEMV_TILE,
     lm_head_worker,
 )
+from kernels.vnni import VNNI_N_STEP
 from experimental3.moe import router_topk_kernel
 from experimental3.kernels.sliding_attention import sliding_attn_group_kernel
 from experimental3.kernels.full_chunked_attention_fused import (
@@ -98,14 +100,13 @@ def int8_gemv[N: Int, K: Int, P: BurstThreadPool](
 ) -> PoolFence[P]:
     """Dispatch int8 GEMV: [seq_len, K] x [N, K]^T -> [seq_len, N] bf16.
 
-    act_scale_ptr: f32[seq_len] per-row activation scales (absmax from quantize).
-    Dequant per row: (raw - 128*colsum) * (act_scale[m]/127) * weight_scale[n].
+    Decode (seq_len=1): N-split across workers. Each worker computes a
+    sub-range of output elements from the same activation row.
+    Prefill (seq_len>1): M-split across workers. Each worker computes
+    full N outputs for a subset of rows.
     """
     if seq_len == 0:
         return PoolFence[P].completed()
-
-    var num_jobs = min(seq_len, pool.get_capacity())
-    var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
     var act = I8Ptr(unsafe_from_address=act_ptr)
     var wpacked = U8Ptr(unsafe_from_address=wpacked_ptr)
@@ -114,8 +115,28 @@ def int8_gemv[N: Int, K: Int, P: BurstThreadPool](
     var dst = BF16Ptr(unsafe_from_address=dst_ptr)
     var act_scale = F32Ptr(unsafe_from_address=act_scale_ptr)
 
-    var jobs = InlineArray[WorkerConfig, MAX_POOL_CAPACITY](
-        fill=WorkerConfig())
+    if seq_len == 1:
+        var num_workers = min(N // VNNI_N_STEP, pool.get_capacity())
+        var n_per_worker = ((N // VNNI_N_STEP + num_workers - 1) // num_workers) * VNNI_N_STEP
+        var jobs = InlineArray[WorkerConfig, MAX_POOL_CAPACITY](fill=WorkerConfig())
+        var actual = 0
+        for i in range(num_workers):
+            var n_start = i * n_per_worker
+            if n_start >= N:
+                break
+            var n_count = min(n_per_worker, N - n_start)
+            jobs[actual] = WorkerConfig(
+                act, wpacked + n_start * K, colsum + n_start,
+                weight_scale + n_start, dst + n_start,
+                act_scale, 0, n_count)
+            actual += 1
+        pool.dispatch[WorkerConfig, int8_gemv_decode_worker[N, K]](
+            UnsafePointer(to=jobs[0]), actual)
+        return pool_fence(pool)
+
+    var num_jobs = min(seq_len, pool.get_capacity())
+    var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
+    var jobs = InlineArray[WorkerConfig, MAX_POOL_CAPACITY](fill=WorkerConfig())
     for i in range(num_jobs):
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
@@ -123,7 +144,6 @@ def int8_gemv[N: Int, K: Int, P: BurstThreadPool](
             act + start * K, wpacked, colsum,
             weight_scale, dst + start * N,
             act_scale, start, end - start)
-
     pool.dispatch[WorkerConfig, int8_gemv_worker[N, K]](
         UnsafePointer(to=jobs[0]), num_jobs)
     return pool_fence(pool)
@@ -145,27 +165,47 @@ def int8_gemv_blocked[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
     mut pool: P,
     output_scale: Float32 = Float32(1.0),
 ) -> PoolFence[P]:
-    """Dispatch int8 GEMV with per-block activation scales."""
+    """Dispatch int8 GEMV with per-block activation scales.
+
+    Decode (seq_len=1): N-split across workers.
+    Prefill (seq_len>1): M-split across workers.
+    """
     if seq_len == 0:
         return PoolFence[P].completed()
 
     comptime num_blocks = K // fwht_blk
+
+    if seq_len == 1:
+        var num_workers = min(N // VNNI_N_STEP, pool.get_capacity())
+        var n_per_worker = ((N // VNNI_N_STEP + num_workers - 1) // num_workers) * VNNI_N_STEP
+        var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](
+            fill=Int8GemvBlockedArgs())
+        var actual = 0
+        for i in range(num_workers):
+            var n_start = i * n_per_worker
+            if n_start >= N:
+                break
+            var n_count = min(n_per_worker, N - n_start)
+            jobs[actual] = Int8GemvBlockedArgs(
+                act, wpacked + n_start * K, blk_scale,
+                wscale + n_start, blk_colsum + n_start,
+                dst + n_start, output_scale, n_count, N)
+            actual += 1
+        pool.dispatch[Int8GemvBlockedArgs,
+            int8_gemv_blocked_decode_worker[N, K, fwht_blk]](
+            UnsafePointer(to=jobs[0]), actual)
+        return pool_fence(pool)
+
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
-
     var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](
         fill=Int8GemvBlockedArgs())
     for i in range(num_jobs):
         var start = i * rows_per_job
         jobs[i] = Int8GemvBlockedArgs(
-            act + start * K,
-            wpacked,
-            blk_scale + start * num_blocks,
-            wscale,
-            blk_colsum,
-            dst + start * N,
-            output_scale)
-
+            act + start * K, wpacked,
+            blk_scale + start * num_blocks, wscale, blk_colsum,
+            dst + start * N, output_scale, N, N)
     pool.dispatch[Int8GemvBlockedArgs, int8_gemv_blocked_worker[N, K, fwht_blk]](
         UnsafePointer(to=jobs[0]), num_jobs)
     return pool_fence(pool)
@@ -191,7 +231,7 @@ def int8_gemv_blocked_wa[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
             act + start * K, wpacked,
             blk_scale + start * num_blocks,
             wscale, blk_colsum,
-            dst + start * N, Float32(1.0))
+            dst + start * N, Float32(1.0), N, N)
 
     pool.dispatch[Int8GemvBlockedArgs, int8_gemv_blocked_wa_worker[N, K, fwht_blk]](
         UnsafePointer(to=jobs[0]), num_jobs)
@@ -497,7 +537,7 @@ def gemma4_moe_phase2[
             F32Ptr(unsafe_from_address=down_sc_base + local_idx * down_sc_stride),
             F32Ptr(unsafe_from_address=down_bcs_base + local_idx * down_bcs_stride),
             expert_out_buf + local_count * hidden,
-            routing.weights[s],
+            routing.weights[s], hidden, hidden,
         )
         local_count += 1
 

@@ -36,8 +36,8 @@ struct WorkerConfig(Copyable, ImplicitlyCopyable):
     var weight_scale_ptr: F32Ptr
     var dst_ptr: BF16Ptr
     var act_scale_ptr: F32Ptr
-    var start_row: Int
-    var row_count: Int
+    var start: Int
+    var count: Int
 
     def __init__(out self):
         self.act_ptr = I8Ptr()
@@ -46,8 +46,8 @@ struct WorkerConfig(Copyable, ImplicitlyCopyable):
         self.weight_scale_ptr = F32Ptr()
         self.dst_ptr = BF16Ptr()
         self.act_scale_ptr = F32Ptr()
-        self.start_row = 0
-        self.row_count = 0
+        self.start = 0
+        self.count = 0
 
 
 @fieldwise_init
@@ -59,6 +59,8 @@ struct Int8GemvBlockedArgs(Copyable, ImplicitlyCopyable):
     var blk_colsum: F32Ptr
     var dst: BF16Ptr
     var output_scale: Float32
+    var n_out: Int
+    var colsum_stride: Int
 
     def __init__(out self):
         self.act = I8Ptr()
@@ -68,6 +70,8 @@ struct Int8GemvBlockedArgs(Copyable, ImplicitlyCopyable):
         self.blk_colsum = F32Ptr()
         self.dst = BF16Ptr()
         self.output_scale = Float32(0)
+        self.n_out = 0
+        self.colsum_stride = 0
 
 
 @fieldwise_init

@@ -479,13 +479,23 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
     @staticmethod
     def for_topology(numa: NumaInfo, node: Int,
                      stack_size: Int = SlotLayout.DEFAULT_STACK) -> Self:
-        """Create pool from topology discovery. Uses isolated cores on the node
-        if isolation is configured, otherwise all cores on the node."""
-        var mask = numa.get_worker_mask[Self.mask_size](node)
-        var cap = mask.count()
+        """Create pool from topology discovery.
+
+        With isolation: pin workers to isolated physical cores on the node.
+        Without isolation: capacity = physical core count, affinity = whole
+        NUMA node (all logical cores including HT siblings).
+        """
+        if numa.has_isolation():
+            var mask = numa.get_worker_mask[Self.mask_size](node)
+            var cap = mask.count()
+            if cap == 0:
+                cap = 1
+                mask = numa.get_node_mask[Self.mask_size](node)
+            return Self(cap, mask^, node, stack_size)
+        var cap = numa.cpus_on_node(node)
         if cap == 0:
             cap = 1
-            mask = numa.get_node_mask[Self.mask_size](node)
+        var mask = numa.get_node_mask[Self.mask_size](node)
         return Self(cap, mask^, node, stack_size)
 
     @staticmethod

@@ -36,25 +36,27 @@ def gemv_row[N: Int, K: Int, OutDType: DType](
     wsc: UnsafePointer[Float32, MutAnyOrigin],
     wcs: UnsafePointer[Float32, MutAnyOrigin],
     dst: UnsafePointer[Scalar[OutDType], MutAnyOrigin],
+    subrange: Int = N,
 ):
-    """One activation row x VNNI-packed weight -> N output elements.
+    """One activation row x VNNI-packed weight -> subrange output elements.
 
-    Epilogue: (raw_i32 - 128*colsum[n]) * act_sc * weight_scale[n] -> OutDType.
+    subrange defaults to N. For N-split decode, pre-offset pointers to
+    n_start and pass the sub-range count. Must be a multiple of VNNI_N_STEP.
     """
     debug_assert(K % VNNI_K_STEP == 0,
         "gemv_row: K must be a multiple of VNNI_K_STEP (64)")
-    debug_assert(N % VNNI_N_STEP == 0,
-        "gemv_row: N must be a multiple of VNNI_N_STEP (32)")
+    debug_assert(subrange % VNNI_N_STEP == 0,
+        "gemv_row: subrange must be a multiple of VNNI_N_STEP (32)")
     comptime width = simd_width_of[DType.int32]()
     comptime passes_per_subtile = VNNI_TILE_N // width
     comptime bytes_per_pass = width * VNNI_BLK
     comptime acc_count = VNNI_N_STEP // width
 
-    var n_block = compute_n_block(N, K)
+    var n_block = compute_n_block(subrange, K)
     var packed_off = 0
 
-    for nb in range(0, N, n_block):
-        var nb_size = min(n_block, N - nb)
+    for nb in range(0, subrange, n_block):
+        var nb_size = min(n_block, subrange - nb)
 
         for ns in range(0, nb_size, VNNI_N_STEP):
             var acc_buf = InlineArray[SIMD[DType.int32, width], acc_count](
@@ -102,26 +104,34 @@ def gemv_row_blocked[N: Int, K: Int, fwht_block_size: Int](
     wsc: UnsafePointer[Float32, MutAnyOrigin],
     block_colsums: UnsafePointer[Float32, MutAnyOrigin],
     dst: UnsafePointer[Float32, MutAnyOrigin],
+    subrange: Int = N,
+    colsum_stride: Int = N,
 ):
     """GEMV with per-K-block activation scales. Accumulates per block in i32,
-    dequants to f32 per block, then applies per-row weight scale."""
+    dequants to f32 per block, then applies per-row weight scale.
+
+    subrange defaults to N. For N-split decode, pre-offset pointers and
+    pass the sub-range count. colsum_stride is the row-stride of
+    block_colsums (always full matrix N, since colsums are not split).
+    subrange must be a multiple of VNNI_N_STEP (32).
+    """
     debug_assert(K % fwht_block_size == 0,
         "gemv_row_blocked: K must be a multiple of fwht_block_size")
     debug_assert(fwht_block_size >= VNNI_K_STEP,
         "gemv_row_blocked: fwht_block_size must be >= VNNI_K_STEP (64)")
-    debug_assert(N % VNNI_N_STEP == 0,
-        "gemv_row_blocked: N must be a multiple of VNNI_N_STEP (32)")
+    debug_assert(subrange % VNNI_N_STEP == 0,
+        "gemv_row_blocked: subrange must be a multiple of VNNI_N_STEP (32)")
     comptime num_blocks = K // fwht_block_size
     comptime width = simd_width_of[DType.int32]()
     comptime passes_per_subtile = VNNI_TILE_N // width
     comptime bytes_per_pass = width * VNNI_BLK
     comptime acc_count = VNNI_N_STEP // width
 
-    var n_block = compute_n_block(N, K)
+    var n_block = compute_n_block(subrange, K)
     var packed_off = 0
 
-    for nb in range(0, N, n_block):
-        var nb_size = min(n_block, N - nb)
+    for nb in range(0, subrange, n_block):
+        var nb_size = min(n_block, subrange - nb)
         for ns in range(0, nb_size, VNNI_N_STEP):
             var f32_acc = InlineArray[SIMD[DType.float32, width], acc_count](
                 fill=SIMD[DType.float32, width](0))
@@ -148,7 +158,7 @@ def gemv_row_blocked[N: Int, K: Int, fwht_block_size: Int](
                 var blk_dequant = block_scales[blk] / 127.0
                 for a in range(acc_count):
                     var n_base = nb + ns + a * width
-                    var corrected = i32_acc[a].cast[DType.float32]() - 128.0 * (block_colsums + blk * N + n_base).load[width=width]()
+                    var corrected = i32_acc[a].cast[DType.float32]() - 128.0 * (block_colsums + blk * colsum_stride + n_base).load[width=width]()
                     f32_acc[a] += corrected * blk_dequant
             for a in range(acc_count):
                 var n_base = nb + ns + a * width
@@ -167,6 +177,8 @@ def gemv_row_blocked_wa[N: Int, K: Int, fwht_blk: Int](
     wsc: UnsafePointer[Float32, MutAnyOrigin],
     block_colsums: UnsafePointer[Float32, MutAnyOrigin],
     dst: UnsafePointer[Float32, MutAnyOrigin],
+    subrange: Int = N,
+    colsum_stride: Int = N,
 ):
     """Blocked GEMV supporting fwht_blk <= VNNI_K_STEP.
 
@@ -177,7 +189,7 @@ def gemv_row_blocked_wa[N: Int, K: Int, fwht_blk: Int](
     within each K_STEP."""
     debug_assert(K % VNNI_K_STEP == 0, "K must be a multiple of VNNI_K_STEP")
     debug_assert(K % fwht_blk == 0, "K must be a multiple of fwht_blk")
-    debug_assert(N % VNNI_N_STEP == 0, "N must be a multiple of VNNI_N_STEP")
+    debug_assert(subrange % VNNI_N_STEP == 0, "subrange must be a multiple of VNNI_N_STEP")
     debug_assert(VNNI_K_STEP % fwht_blk == 0, "VNNI_K_STEP must be a multiple of fwht_blk")
 
     comptime width = gemv_tile_width[DType.int32, VNNI_TILE_N]()
@@ -186,11 +198,11 @@ def gemv_row_blocked_wa[N: Int, K: Int, fwht_blk: Int](
     comptime sub_blks_per_kstep = VNNI_K_STEP // fwht_blk
     comptime tiles_per_nstep = VNNI_N_STEP // VNNI_TILE_N
 
-    var n_block = compute_n_block(N, K)
+    var n_block = compute_n_block(subrange, K)
     var packed_off = 0
 
-    for nb in range(0, N, n_block):
-        var nb_size = min(n_block, N - nb)
+    for nb in range(0, subrange, n_block):
+        var nb_size = min(n_block, subrange - nb)
         for ns in range(0, nb_size, VNNI_N_STEP):
             var f32_tiles = InlineArray[SIMD[DType.float32, VNNI_TILE_N], tiles_per_nstep](
                 fill=SIMD[DType.float32, VNNI_TILE_N](0))
@@ -217,7 +229,7 @@ def gemv_row_blocked_wa[N: Int, K: Int, fwht_blk: Int](
                     comptime for tile in range(tiles_per_nstep):
                         var idx = sb * tiles_per_nstep + tile
                         comptime tile_off = tile * VNNI_TILE_N
-                        var cs = (block_colsums + blk_idx * N + n0 + tile_off).load[width=VNNI_TILE_N]()
+                        var cs = (block_colsums + blk_idx * colsum_stride + n0 + tile_off).load[width=VNNI_TILE_N]()
                         f32_tiles[tile] += (
                             block_tiles[idx].cast[DType.float32]() - 128.0 * cs
                         ) * dq

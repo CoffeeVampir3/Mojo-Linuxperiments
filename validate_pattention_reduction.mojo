@@ -248,7 +248,7 @@ def run_baseline(
         fl.attn.o_proj_sc.bound(lb).as_ptr(),
         F32Ptr(unsafe_from_address=lb + fl.attn.o_colsum),
         BF16Ptr(unsafe_from_address=Int(dst_bf16)),
-        Float32(1.0))
+        Float32(1.0), HIDDEN, HIDDEN)
     int8_gemv_blocked_worker[HIDDEN, Q_DIM_LOCAL, HEAD_DIM](args)
 
 
@@ -348,7 +348,7 @@ def run_fused(
             fl.attn.o_proj_sc.bound(lb).as_ptr(),
             F32Ptr(unsafe_from_address=lb + fl.attn.o_colsum),
             BF16Ptr(unsafe_from_address=Int(rank_out)),
-            Float32(1.0))
+            Float32(1.0), HIDDEN, HIDDEN)
         int8_gemv_blocked_worker[HIDDEN, Q_DIM_LOCAL, HEAD_DIM](args)
 
         var k = 0
