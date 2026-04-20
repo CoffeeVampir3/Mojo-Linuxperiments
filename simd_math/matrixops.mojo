@@ -16,6 +16,7 @@ dimensions. Register counts and widths fall out of simd_width_of[T]().
 from std.collections import InlineArray
 from std.memory import UnsafePointer
 from std.utils import IndexList
+from std.math import iota
 
 
 def log2[N: Int]() -> Int:
@@ -184,24 +185,20 @@ def reduce_top_k[T: DType, width: Int, regs: Int, k: Int](
     `out_values`. Each call runs k independent butterfly reductions plus a
     one-lane mask update between them — O(k · log(regs · width)) SIMD ops.
     """
-    # Persistent workspace: masked between iterations.
-    var work_v = InlineArray[SIMD[T, width], regs](fill=SIMD[T, width](0))
-    var work_i = InlineArray[SIMD[DType.int32, width], regs](
-        fill=SIMD[DType.int32, width](0))
+    # Persistent workspace, written fully from source on the next line.
+    var work_v = InlineArray[SIMD[T, width], regs](uninitialized=True)
+    var work_i = InlineArray[SIMD[DType.int32, width], regs](uninitialized=True)
     comptime for r in range(regs):
         work_v[r] = source_values[r]
         work_i[r] = source_indices[r]
 
-    var lane_iota = SIMD[DType.int32, width]()
-    comptime for lane in range(width):
-        lane_iota[lane] = Int32(lane)
+    var lane_iota = iota[DType.int32, width]()
     var sentinel_vec = SIMD[T, width](sentinel)
 
     for sel in range(k):
         # reduce_argmax consumes its inputs; copy work into tournament buffers.
-        var tv = InlineArray[SIMD[T, width], regs](fill=SIMD[T, width](0))
-        var ti = InlineArray[SIMD[DType.int32, width], regs](
-            fill=SIMD[DType.int32, width](0))
+        var tv = InlineArray[SIMD[T, width], regs](uninitialized=True)
+        var ti = InlineArray[SIMD[DType.int32, width], regs](uninitialized=True)
         comptime for r in range(regs):
             tv[r] = work_v[r]
             ti[r] = work_i[r]
@@ -224,8 +221,5 @@ def fill_lane_iota[width: Int, regs: Int](
 ):
     """Initialize an index bank so lane `w` of register `r` holds `r*width + w`.
     """
-    var lane_iota = SIMD[DType.int32, width]()
-    comptime for lane in range(width):
-        lane_iota[lane] = Int32(lane)
     comptime for r in range(regs):
-        indices[r] = lane_iota + SIMD[DType.int32, width](Int32(r * width))
+        indices[r] = iota[DType.int32, width](offset=Int32(r * width))

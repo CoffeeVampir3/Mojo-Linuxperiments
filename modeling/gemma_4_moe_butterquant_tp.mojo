@@ -1574,6 +1574,11 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             EPS, 1, self.main_pools[0])
         var t_final1 = Int(perf_counter_ns())
         sample.add(self.profile.phase("final_norm"), finish_single_pool_fence(t_final0, t_final1, final_fence^))
+
+        # lm_work is dead after final_norm, so release it before placing logits
+        # above the remaining LM-head input leases.
+        lm_work_lease^.release()
+
         var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
         var logit_view = scratch_tensor_view[BF16, 1, C.VOCAB_SIZE](host.scratch_base(), logit_lease, 1)
         var t_lm0 = Int(perf_counter_ns())
@@ -1588,9 +1593,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             self.main_pools[0])
         var t_lm1 = Int(perf_counter_ns())
         sample.add(self.profile.phase("lm_head"), finish_single_pool_fence(t_lm0, t_lm1, lm_fence^))
-        lm_work_lease^.release()
-        lm_act_blk_scale_lease^.release()
-        lm_act_i8_lease^.release()
         var t_softcap0 = Int(perf_counter_ns())
         logit_softcap(logit_view)
         sample.add(self.profile.phase("softcap"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_softcap0))
@@ -1607,6 +1609,8 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     best_val = v[k]
                     best_idx = Int32(j + k)
         logits^.release()
+        lm_act_blk_scale_lease^.release()
+        lm_act_i8_lease^.release()
         sample.wall_ns = Int(perf_counter_ns()) - t_forward0
         self.profile.record(sample)
         return best_idx

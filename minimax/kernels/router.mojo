@@ -52,11 +52,11 @@ def sigmoid_topk_renorm[num_experts: Int, k: Int](
     var wp = UnsafePointer(to=weights[0])
 
     # Score bank (sigmoid + bias) lives in SIMD registers, tagged with the
-    # per-lane global expert index.
+    # per-lane global expert index. Both banks are fully written below.
     var score_regs = InlineArray[SIMD[DType.float32, width], regs](
-        fill=SIMD[DType.float32, width](0))
+        uninitialized=True)
     var index_regs = InlineArray[SIMD[DType.int32, width], regs](
-        fill=SIMD[DType.int32, width](0))
+        uninitialized=True)
     fill_lane_iota[width, regs](index_regs)
 
     comptime for r in range(regs):
@@ -67,13 +67,13 @@ def sigmoid_topk_renorm[num_experts: Int, k: Int](
         score_regs[r] = w + bias
 
     var result = TopKResult[k](
-        indices=InlineArray[Int, k](fill=0),
-        weights=InlineArray[Float32, k](fill=Float32(0)),
+        indices=InlineArray[Int, k](uninitialized=True),
+        weights=InlineArray[Float32, k](uninitialized=True),
     )
     # reduce_top_k writes winners in descending-score order; values are
     # discarded (we renormalize the raw sigmoid weights, not the biased
     # scores).
-    var topk_scores = InlineArray[Float32, k](fill=Float32(0))
+    var topk_scores = InlineArray[Float32, k](uninitialized=True)
     reduce_top_k[DType.float32, width, regs, k](
         score_regs, index_regs,
         Float32(-1e30),
