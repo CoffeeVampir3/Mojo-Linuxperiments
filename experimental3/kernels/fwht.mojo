@@ -6,7 +6,7 @@ from std.utils import IndexList
 from std.sys.info import simd_width_of
 
 from simd_math import sqrt
-from simd_math.matrixops import log2
+from simd_math.matrixops import log2, butterfly_partner, butterfly_shuffle
 
 
 def fwht_width[T: DType, block: Int]() -> Int:
@@ -15,17 +15,6 @@ def fwht_width[T: DType, block: Int]() -> Int:
         return block
     else:
         return hw
-
-
-def butterfly_partner[i: Int, stride: Int]() -> Int:
-    return i ^ stride
-
-
-def butterfly_shuffle[width: Int, stride: Int]() -> IndexList[width]:
-    var result = IndexList[width]()
-    comptime for i in range(width):
-        result[i] = butterfly_partner[i, stride]()
-    return result
 
 
 @always_inline
