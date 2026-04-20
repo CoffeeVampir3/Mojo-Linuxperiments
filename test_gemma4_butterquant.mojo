@@ -18,7 +18,7 @@ from modeling.gemma_4_moe_butterquant_tp import (
 comptime TOKENIZER_PATH = "checkpoints/gemma-4-26B-A4B/tokenizer.json"
 comptime MODEL_DIR = "quantized_models"
 comptime VOCAB = Gemma4Config.VOCAB_SIZE
-comptime MAX_NEW_TOKENS = 15
+comptime MAX_NEW_TOKENS = 100
 comptime TP = 1
 
 

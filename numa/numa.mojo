@@ -32,6 +32,35 @@ def parse_cpulist(cpulist: String) raises -> List[Int]:
             cpus.append(atol(String(part)))
     return cpus^
 
+
+def primary_sibling(cpu: Int) -> Int:
+    """Return the lowest-numbered SMT sibling of cpu (its physical-core primary).
+
+    Every SMT sibling of a core reports the same thread_siblings_list; the first
+    entry is the primary. If the topology file is unreadable, fall back to cpu
+    itself so the CPU is kept (safer than dropping it on exotic systems).
+    """
+    try:
+        var raw = read_sysfs(
+            "/sys/devices/system/cpu/cpu" + String(cpu) + "/topology/thread_siblings_list")
+        if raw.byte_length() == 0:
+            return cpu
+        var siblings = parse_cpulist(raw)
+        if len(siblings) == 0:
+            return cpu
+        return siblings[0]
+    except:
+        return cpu
+
+
+def filter_to_physical_primaries(cpus: List[Int]) -> List[Int]:
+    """Keep only the primary SMT sibling of each physical core."""
+    var primaries = List[Int]()
+    for cpu in cpus:
+        if primary_sibling(cpu) == cpu:
+            primaries.append(cpu)
+    return primaries^
+
 def parse_distances(s: String) raises -> List[Int]:
     var distances = List[Int]()
     var parts = s.split(" ")
@@ -125,7 +154,8 @@ struct NumaInfo:
             for node_id in node_ids:
                 var base = "/sys/devices/system/node/node" + String(node_id)
                 var node = NumaNode(node_id)
-                node.cpu_ids = parse_cpulist(read_sysfs(base + "/cpulist"))
+                node.cpu_ids = filter_to_physical_primaries(
+                    parse_cpulist(read_sysfs(base + "/cpulist")))
                 node.distances = parse_distances(read_sysfs(base + "/distance"))
                 node.mem_total_kb = parse_meminfo(base + "/meminfo", "MemTotal")
                 node.mem_free_kb = parse_meminfo(base + "/meminfo", "MemFree")

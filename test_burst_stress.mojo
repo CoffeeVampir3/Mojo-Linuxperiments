@@ -1,6 +1,9 @@
-"""BurstPool stress test — correctness + timing comparison with jthread."""
+"""BurstPool stress test — correctness + timing across all NUMA nodes."""
 
+from threading.threading_traits import BurstThreadPool
 from threading.burst_threading import BurstPool
+from threading.isolated_burst_pool import IsolatedBurstPool
+from numa import NumaInfo
 from notstdcollections import HeapMoveArray
 from std.memory import UnsafePointer
 from std.collections import InlineArray
@@ -47,18 +50,35 @@ def stress_kernel(args: StressArgs):
     args.out_addr[] = x + scratch_sum
 
 
-def main():
-    comptime CAPACITY = 15
-    comptime ITERATIONS = 5000
+comptime ITERATIONS = 5000
 
-    var pool = BurstPool[](CAPACITY)
-    if not pool:
-        print("BurstPool creation failed")
-        return
 
-    var output = HeapMoveArray[Int](CAPACITY)
-    for _ in range(CAPACITY):
-        output.push(0)
+def jobs_for_iter(cap: Int, iter_i: Int) -> Int:
+    var jobs = cap
+    if iter_i % 5 == 1:
+        jobs = cap // 2
+    elif iter_i % 5 == 2:
+        jobs = 1
+    elif iter_i % 5 == 3:
+        jobs = (cap * 3) // 4
+    return max(1, jobs)
+
+
+def run_stress[P: BurstThreadPool](mut pools: HeapMoveArray[P], num_nodes: Int):
+    var node_args = HeapMoveArray[HeapMoveArray[StressArgs]](num_nodes)
+    var node_outputs = HeapMoveArray[HeapMoveArray[Int]](num_nodes)
+    for i in range(num_nodes):
+        var cap = pools[i].get_capacity()
+        var args = HeapMoveArray[StressArgs](cap)
+        var outs = HeapMoveArray[Int](cap)
+        for j in range(cap):
+            args.push(StressArgs(UnsafePointer[Int, MutAnyOrigin](), 0, 0))
+            outs.push(0)
+        for j in range(cap):
+            (args.ptr + j)[].out_addr = UnsafePointer[Int, MutAnyOrigin](
+                unsafe_from_address=Int(outs.ptr + j))
+        node_args.push(args^)
+        node_outputs.push(outs^)
 
     var total_dispatch_ns = 0
     var total_join_ns = 0
@@ -68,24 +88,19 @@ def main():
 
     var bench_start_ns = Int(perf_counter_ns())
     for iter_i in range(ITERATIONS):
-        var jobs = CAPACITY
-        if iter_i % 5 == 1:
-            jobs = CAPACITY // 2
-        elif iter_i % 5 == 2:
-            jobs = 1
-        elif iter_i % 5 == 3:
-            jobs = (CAPACITY * 3) // 4
-
-        var job_args = InlineArray[StressArgs, CAPACITY](uninitialized=True)
-        for j in range(jobs):
-            job_args[j] = StressArgs(
-                UnsafePointer[Int, MutAnyOrigin](unsafe_from_address=Int(output.ptr + j)),
-                iter_i, j)
+        for n in range(num_nodes):
+            var jobs = jobs_for_iter(pools[n].get_capacity(), iter_i)
+            for j in range(jobs):
+                (node_args[n].ptr + j)[].iter = iter_i
+                (node_args[n].ptr + j)[].job_idx = j
 
         var t0 = Int(perf_counter_ns())
-        pool.dispatch[StressArgs, stress_kernel](UnsafePointer(to=job_args[0]), jobs)
+        for n in range(num_nodes):
+            var jobs = jobs_for_iter(pools[n].get_capacity(), iter_i)
+            pools[n].dispatch[StressArgs, stress_kernel](node_args[n].ptr, jobs)
         var t1 = Int(perf_counter_ns())
-        pool.join()
+        for n in range(num_nodes):
+            pools[n].join()
         var t2 = Int(perf_counter_ns())
 
         var dispatch_ns = t1 - t0
@@ -98,23 +113,56 @@ def main():
         if join_ns > max_join_ns:
             max_join_ns = join_ns
 
-        for j in range(jobs):
-            var got = (output.ptr + j)[]
-            var exp = calc_result(iter_i, j) + calc_scratch_sum(iter_i, j)
-            if got != exp:
-                print("Mismatch at iter", iter_i, "job", j, "got", got, "expected", exp)
-                return
+        for n in range(num_nodes):
+            var jobs = jobs_for_iter(pools[n].get_capacity(), iter_i)
+            for j in range(jobs):
+                var got = (node_outputs[n].ptr + j)[]
+                var exp = calc_result(iter_i, j) + calc_scratch_sum(iter_i, j)
+                if got != exp:
+                    print("Mismatch at iter", iter_i, "node", n, "job", j,
+                          "got", got, "expected", exp)
+                    return
 
         if iter_i % 1000 == 0 and iter_i != 0:
             print("ok through iter", iter_i)
 
     var bench_end_ns = Int(perf_counter_ns())
     var total_ns = bench_end_ns - bench_start_ns
+    var total_workers = 0
+    for n in range(num_nodes):
+        total_workers += pools[n].get_capacity()
 
     print("Stress test passed.")
-    print("  iterations:", ITERATIONS, " workers:", CAPACITY)
+    print("  iterations:", ITERATIONS, " nodes:", num_nodes,
+          " total workers:", total_workers)
     print("  avg dispatch:", total_dispatch_ns // total_dispatches, "ns")
     print("  avg join:    ", total_join_ns // total_dispatches, "ns")
     print("  max dispatch:", max_dispatch_ns, "ns")
     print("  max join:    ", max_join_ns, "ns")
     print("  total:       ", total_ns // 1_000_000, "ms")
+
+
+def main():
+    var numa = NumaInfo()
+    var topo = numa.plan_topology(numa.num_nodes)
+    var num_nodes = numa.num_nodes
+
+    print(String(num_nodes) + " NUMA nodes, "
+        + String(len(numa.isolated_cpus)) + " isolated cpus")
+
+    if numa.has_isolation():
+        print("mode: isolated (spin-only)")
+        var pools = HeapMoveArray[IsolatedBurstPool[]](num_nodes)
+        for i in range(num_nodes):
+            pools.push(IsolatedBurstPool[].for_topology(numa, topo[i]))
+            print("  node " + String(topo[i]) + ": "
+                + String(pools[i].get_capacity()) + " workers")
+        run_stress(pools, num_nodes)
+    else:
+        print("mode: cold (spin-backoff)")
+        var pools = HeapMoveArray[BurstPool[]](num_nodes)
+        for i in range(num_nodes):
+            pools.push(BurstPool[].for_topology(numa, topo[i]))
+            print("  node " + String(topo[i]) + ": "
+                + String(pools[i].get_capacity()) + " workers")
+        run_stress(pools, num_nodes)
