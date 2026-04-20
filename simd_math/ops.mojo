@@ -1,9 +1,3 @@
-"""SIMD math primitives — no libc, all LLVM intrinsics or manual SIMD.
-
-These are the atomic math operations used across the quantization pipeline
-and inference kernels. Each is fully vectorized and branchless.
-"""
-
 from std.memory import UnsafePointer
 from std.sys import llvm_intrinsic
 

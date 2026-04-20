@@ -1,18 +1,3 @@
-"""SIMD matrix operations — generic transpose, butterfly primitives, and
-tagged butterfly reductions.
-
-- Transpose: generic butterfly-network transpose for any power-of-2 N and
-  any DType (int8 for byte transpose, int32 for dword).
-- Butterfly shuffle helpers: XOR-partner permutation masks used by both
-  FWHT and argmax-reduce networks.
-- reduce_argmax / reduce_top_k: tagged horizontal reduction on a register
-  bank of SIMD values with a parallel index bank. log2(regs) across-register
-  stages plus log2(width) in-lane stages; tie-break favors the smaller index.
-
-All generic over DType and size, comptime-driven by log2 of the problem
-dimensions. Register counts and widths fall out of simd_width_of[T]().
-"""
-
 from std.collections import InlineArray
 from std.memory import UnsafePointer
 from std.utils import IndexList

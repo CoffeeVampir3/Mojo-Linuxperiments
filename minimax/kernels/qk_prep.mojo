@@ -1,15 +1,3 @@
-"""MiniMax Q/K head preparation — full-vector norm + per-head RoPE/FWHT/quantize.
-
-MiniMax normalizes Q over all Q_DIM elements and K over all KV_DIM elements
-(full concatenated projection), unlike Gemma4 which normalizes per-head.
-The inv_rms scalar is pre-computed by the caller (local rms_reduce_bf16 +
-allreduce under TP), then passed to these per-head functions.
-
-Per-head pipeline: apply inv_rms * gamma → partial RoPE → FWHT → quantize.
-Q stays register-resident (same approach as Gemma4 prep_q_row_normed_impl).
-K uses a work buffer because the output goes to VNNI cache.
-"""
-
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 from std.collections import InlineArray

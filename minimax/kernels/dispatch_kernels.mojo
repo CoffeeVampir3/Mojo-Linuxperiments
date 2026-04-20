@@ -1,10 +1,3 @@
-"""Pool-facing dispatch wrappers for MiniMax kernels.
-
-Follows experimental3/kernels/dispatch_kernels.mojo: each dispatcher checks
-for zero work, partitions into jobs, fills an InlineArray of Args, calls
-pool.dispatch, and returns a PoolFence.
-"""
-
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 from std.collections import InlineArray

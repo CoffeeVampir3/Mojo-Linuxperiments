@@ -1,3 +1,5 @@
+Do not use module-level comments (top level comments) -- remove them if they're present.
+
 Avoid leading underscores in names (_blah should be blah -- this includes members, in general, just never use leading underscores.)
 
 This project emphasies NUMA awareness. The principle here is that the data should live closest to the most-frequent operation. If there's a frequent-reader but infrequent-writer, we should localize the data to the reader. This can often be done with left-right or dekker patterns in places one might tend to reach for atomics. Even at the large scale for machine learning, we should respect that remote-reads are expensive but manageable. Remote writes are very expensive and should be avoided if possible, prefer remote-reads over remote-writes, and prefer neither if possible.

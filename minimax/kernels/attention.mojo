@@ -1,21 +1,3 @@
-"""MiniMax head-local flash-decode attention.
-
-Head-parallel TP across NUMA domains, chunked flash-decode within each domain.
-Each rank handles its local KV heads with a full-sequence cache.
-
-Three dispatch phases per KV group:
-  Phase A: K/V cache write (NKV_LOCAL jobs — one per local KV head)
-  Phase B: Chunked scoring (num_chunks jobs per KV group, each scores all
-           HPG Q heads against a range of position groups)
-  Phase C: Merge chunks + quantize (1 job per KV group)
-
-Phases B and C reuse the existing chunked attention and merge primitives
-from experimental3 — the only change is no cross-rank gather step.
-
-inv_rms_q and inv_rms_k are full-vector norm scalars obtained via scalar
-allreduce of partial sum-of-squares across TP ranks.
-"""
-
 from std.collections import InlineArray
 from std.sys.info import simd_width_of
 

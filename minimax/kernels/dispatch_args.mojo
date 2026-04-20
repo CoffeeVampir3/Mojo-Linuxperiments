@@ -1,9 +1,3 @@
-"""Argument structs for MiniMax pool-dispatched workers.
-
-Mirrors the pattern in experimental3/kernels/dispatch_args.mojo: each struct
-is Copyable + ImplicitlyCopyable for InlineArray packing through BurstPool.
-"""
-
 from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr, BF16Ptr
 
 

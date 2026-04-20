@@ -1,9 +1,3 @@
-"""MiniMax GEMM-shaped workers.
-
-fused_w1_w3_silu_worker: SwiGLU expert phase 1 (int8 activation × int8 weights).
-f32_gemv_worker: router projection (bf16 activation × f32 weights → f32 output).
-"""
-
 from std.sys.info import simd_width_of
 from std.collections import InlineArray
 

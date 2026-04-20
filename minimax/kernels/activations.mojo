@@ -1,10 +1,3 @@
-"""Activation primitives for MiniMax M2.7.
-
-sigmoid: 1 / (1 + exp(-x))       — used by the sigmoid router
-silu:    x * sigmoid(x)           — SwiGLU expert activation
-silu_mul: silu(gate) * up         — fused SwiGLU combination
-"""
-
 from simd_math import exp_f32
 
 

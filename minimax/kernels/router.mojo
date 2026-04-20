@@ -1,15 +1,3 @@
-"""MiniMax M2.7 sigmoid router: sigmoid + correction bias + top-k + renormalize.
-
-MiniMax routing (differs from Gemma4 softmax routing):
-  1. sigmoid(logits) -> weights
-  2. weights + correction_bias -> selection scores
-  3. top-k from selection scores
-  4. gather raw sigmoid weights at selected indices (NOT biased scores)
-  5. renormalize selected weights to sum=1
-
-No per-expert learned scale (unlike Gemma4).
-"""
-
 from std.sys.info import simd_width_of
 from std.collections import InlineArray
 
@@ -35,24 +23,15 @@ def sigmoid_topk_renorm[num_experts: Int, k: Int](
 
     Returns top-k (index, weight) pairs where weights are the raw sigmoid
     values (without bias), renormalized to sum=1.
-
-    Argmax selection uses simd_math.matrixops.reduce_top_k — a tagged
-    butterfly reduction over a SIMD score bank, log2(regs)+log2(width)
-    stages per extraction. Bit-identical to a scalar leftmost-wins scan
-    on any input with nonzero top-k gaps (see router_simd_verification.mojo
-    for the correctness/fuzz harness).
     """
     comptime width = simd_width_of[DType.float32]()
     comptime regs = num_experts // width
     comptime assert num_experts % width == 0, "num_experts must be simd-aligned"
     comptime assert k <= num_experts, "k must be <= num_experts"
 
-    # Raw sigmoid weights retained in memory for scatter-gather after top-k.
     var weights = InlineArray[Float32, num_experts](uninitialized=True)
     var wp = UnsafePointer(to=weights[0])
 
-    # Score bank (sigmoid + bias) lives in SIMD registers, tagged with the
-    # per-lane global expert index. Both banks are fully written below.
     var score_regs = InlineArray[SIMD[DType.float32, width], regs](
         uninitialized=True)
     var index_regs = InlineArray[SIMD[DType.int32, width], regs](
