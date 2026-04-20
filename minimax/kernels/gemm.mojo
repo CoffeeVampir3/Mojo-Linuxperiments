@@ -50,7 +50,7 @@ def fused_w1_w3_silu_worker[intermediate: Int, K: Int, fwht_blk: Int](
                 dequant,
                 args.w1_scale + n_off,
                 args.w1_colsum + n_off,
-                gate.bitcast[Scalar[DType.float32]]())
+                gate)
 
             var up_buf = InlineArray[Float32, fwht_blk](fill=Float32(0))
             var up = UnsafePointer(to=up_buf).bitcast[Float32]()
@@ -60,7 +60,7 @@ def fused_w1_w3_silu_worker[intermediate: Int, K: Int, fwht_blk: Int](
                 dequant,
                 args.w3_scale + n_off,
                 args.w3_colsum + n_off,
-                up.bitcast[Scalar[DType.float32]]())
+                up)
 
             var k = 0
             while k + width <= fwht_blk:

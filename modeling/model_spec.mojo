@@ -389,131 +389,231 @@ trait WeightIterable:
 
 
 # =============================================================================
-# Quantizer tasks — one concrete variant per real operation.
+# Quantizer tasks
 #
-# The quantizer's task list is a heterogeneous `List[Task]` where `Task`
-# is the `Variant` over the five structs below. Each variant is
-# self-describing: read the fields at the call site, you know the full
-# scope of what hits disk for that weight. No `to_op()` indirection, no
-# flag-bag struct, no "is this combination legitimate" check at runtime.
+# Each task struct is parameterized on `[Src: Converter]` and conforms to
+# `QuantizeSpec`. The quantizer processes tasks through a `TaskVisitor`
+# trait — generic processor functions that receive `T: QuantizeSpec` with
+# full comptime access to source format and typed convert, zero runtime
+# switches.
 #
-# Adding a variant is one new struct here + one arm in the dispatch
-# match in quant/butterquant.mojo. Nothing else moves.
+# User code is declarative: `visitor.quantize(PerRow[Bf16](name, block))`.
 # =============================================================================
 
 
-struct SourceFormat:
-    """Vendor-side disk encoding for a quantizable tensor.
-
-    A runtime tag that picks the `Converter` used to dequant source bytes
-    into f32. The converter traits live in `quant/source_format.mojo`;
-    this module only exposes the tag so modeling files can declare
-    source formats without depending on the quantizer pipeline.
-    """
-    comptime BF16 = 0
-    comptime F32 = 1
-    comptime FP8_E4M3_BLOCK128 = 2
+from std.memory import UnsafePointer
+from quant.source_format import Converter
 
 
-# --- Concrete task variants -------------------------------------------------
+trait QuantizeSpec:
+    comptime SOURCE_DTYPE: DType
+    comptime AUX_DTYPE: DType
+    comptime SOURCE_ELEMENT_BYTES: Int
+    comptime AUX_SUFFIX: StaticString
+    comptime AUX_ROW_BLOCK: Int
+
+    @staticmethod
+    def aux_bytes_for(rows: Int, cols: Int) -> Int: ...
+
+    @staticmethod
+    def convert[dst_dtype: DType](
+        src: UnsafePointer[Scalar[Self.SOURCE_DTYPE], MutAnyOrigin],
+        aux: UnsafePointer[Scalar[Self.AUX_DTYPE], MutAnyOrigin],
+        dst: UnsafePointer[Scalar[dst_dtype], MutAnyOrigin],
+        rows: Int, cols: Int,
+    ): ...
+
+    def weight_name(self) -> String: ...
+    def fwht_block(self) -> Int: ...
+    def is_per_block(self) -> Bool: ...
+    def gamma_source(self) -> String: ...
+    def two_sided_head_dim(self) -> Int: ...
 
 
-@fieldwise_init
-struct Passthrough(Copyable, Movable, ImplicitlyCopyable):
-    """Copy bytes from source to output unchanged.
+trait TaskVisitor:
+    def quantize[T: QuantizeSpec](mut self, task: T) -> Bool: ...
+    def passthrough(mut self, name: String, expected_dtype: DType) -> Bool: ...
 
-    `expected_dtype` is a plan-time sanity gate: the planner fails hard
-    if the on-disk tensor's dtype doesn't match. Catches the "thought
-    this was bf16 but it's f32" class of mistake without coupling the
-    passthrough path to any decode logic.
-    """
+
+# --- Concrete task types, parameterized on Converter -----------------------
+
+
+struct PerRow[Src: Converter](QuantizeSpec):
+    comptime SOURCE_DTYPE = Self.Src.SOURCE_DTYPE
+    comptime AUX_DTYPE = Self.Src.AUX_DTYPE
+    comptime SOURCE_ELEMENT_BYTES = Self.Src.SOURCE_ELEMENT_BYTES
+    comptime AUX_SUFFIX = Self.Src.AUX_SUFFIX
+    comptime AUX_ROW_BLOCK = Self.Src.AUX_ROW_BLOCK
+
     var name: String
-    var expected_dtype: DType
-
-
-@fieldwise_init
-struct ButterquantI8PerRow(Copyable, Movable, ImplicitlyCopyable):
-    """FWHT rotate at `block`, emit int8 weight + f32 per-row scale.
-
-    Output entries: `<name>` int8, `<name>_scale` f32 shape (rows,).
-    """
-    var name: String
-    var source: Int   # SourceFormat tag
-    var block: Int    # FWHT rotation block (power of 2)
-
-
-@fieldwise_init
-struct ButterquantI8PerRowAbsorbed(Copyable, Movable, ImplicitlyCopyable):
-    """Same as PerRow but first multiplies the weight row-wise by
-    sqrt(|gamma|) where gamma is loaded from the tensor named by
-    `gamma_src`. Runtime RMSNorm+quantize must apply the matching
-    sign(gamma) * sqrt(|gamma|) activation-side factor.
-    """
-    var name: String
-    var source: Int
-    var block: Int
-    var gamma_src: String
-
-
-@fieldwise_init
-struct ButterquantI8PerBlock(Copyable, Movable, ImplicitlyCopyable):
-    """FWHT rotate at `block`, emit int8 weight + f32 per-block scale
-    grid. One scale per (row, col_block) pair.
-
-    Output entries: `<name>` int8, `<name>_scale` f32 shape (rows, cols/block).
-    """
-    var name: String
-    var source: Int
     var block: Int
 
+    def __init__(out self, name: String, block: Int):
+        self.name = name
+        self.block = block
 
-@fieldwise_init
-struct ButterquantI8PerBlockAbsorbed(Copyable, Movable, ImplicitlyCopyable):
-    """PerBlock with the weight side of the sqrt-gamma split from
-    `gamma_src` before FWHT + per-block absmax i8.
-    """
+    @staticmethod
+    def aux_bytes_for(rows: Int, cols: Int) -> Int:
+        return Self.Src.aux_bytes_for(rows, cols)
+
+    @staticmethod
+    def convert[dst_dtype: DType](
+        src: UnsafePointer[Scalar[Self.Src.SOURCE_DTYPE], MutAnyOrigin],
+        aux: UnsafePointer[Scalar[Self.Src.AUX_DTYPE], MutAnyOrigin],
+        dst: UnsafePointer[Scalar[dst_dtype], MutAnyOrigin],
+        rows: Int, cols: Int,
+    ):
+        Self.Src.convert[dst_dtype](src, aux, dst, rows, cols)
+
+    def weight_name(self) -> String: return self.name
+    def fwht_block(self) -> Int: return self.block
+    def is_per_block(self) -> Bool: return False
+    def gamma_source(self) -> String: return String("")
+    def two_sided_head_dim(self) -> Int: return 0
+
+
+struct PerRowAbsorbed[Src: Converter](QuantizeSpec):
+    comptime SOURCE_DTYPE = Self.Src.SOURCE_DTYPE
+    comptime AUX_DTYPE = Self.Src.AUX_DTYPE
+    comptime SOURCE_ELEMENT_BYTES = Self.Src.SOURCE_ELEMENT_BYTES
+    comptime AUX_SUFFIX = Self.Src.AUX_SUFFIX
+    comptime AUX_ROW_BLOCK = Self.Src.AUX_ROW_BLOCK
+
     var name: String
-    var source: Int
     var block: Int
-    var gamma_src: String
+    var gamma: String
+
+    def __init__(out self, name: String, block: Int, gamma: String):
+        self.name = name
+        self.block = block
+        self.gamma = gamma
+
+    @staticmethod
+    def aux_bytes_for(rows: Int, cols: Int) -> Int:
+        return Self.Src.aux_bytes_for(rows, cols)
+
+    @staticmethod
+    def convert[dst_dtype: DType](
+        src: UnsafePointer[Scalar[Self.Src.SOURCE_DTYPE], MutAnyOrigin],
+        aux: UnsafePointer[Scalar[Self.Src.AUX_DTYPE], MutAnyOrigin],
+        dst: UnsafePointer[Scalar[dst_dtype], MutAnyOrigin],
+        rows: Int, cols: Int,
+    ):
+        Self.Src.convert[dst_dtype](src, aux, dst, rows, cols)
+
+    def weight_name(self) -> String: return self.name
+    def fwht_block(self) -> Int: return self.block
+    def is_per_block(self) -> Bool: return False
+    def gamma_source(self) -> String: return self.gamma
+    def two_sided_head_dim(self) -> Int: return 0
 
 
-@fieldwise_init
-struct ButterquantI8TwoSidedAbsorbed(Copyable, Movable, ImplicitlyCopyable):
-    """Two-sided ButterQuant: FWHT on BOTH contraction and output dimensions.
+struct PerBlock[Src: Converter](QuantizeSpec):
+    comptime SOURCE_DTYPE = Self.Src.SOURCE_DTYPE
+    comptime AUX_DTYPE = Self.Src.AUX_DTYPE
+    comptime SOURCE_ELEMENT_BYTES = Self.Src.SOURCE_ELEMENT_BYTES
+    comptime AUX_SUFFIX = Self.Src.AUX_SUFFIX
+    comptime AUX_ROW_BLOCK = Self.Src.AUX_ROW_BLOCK
 
-    Offline: W' = W · diag(sqrt(|gamma|)), then FWHT on contraction dim (cols)
-    per row, then FWHT on output dim (rows) per head block, then per-row
-    absmax i8 quantize.
-
-    At runtime the GEMV output arrives pre-rotated in the Hadamard domain,
-    eliminating the explicit per-head FWHT. Valid only for projections
-    with no post-projection nonlinearity in the output domain (no norm,
-    no RoPE, no activation). MiniMax V projection is the primary use case.
-
-    The output-dim FWHT is block-diagonal with block = `head_dim`. Rows are
-    mixed only within each head block, not across heads.
-    """
     var name: String
-    var source: Int
     var block: Int
-    var gamma_src: String
-    var head_dim: Int
+
+    def __init__(out self, name: String, block: Int):
+        self.name = name
+        self.block = block
+
+    @staticmethod
+    def aux_bytes_for(rows: Int, cols: Int) -> Int:
+        return Self.Src.aux_bytes_for(rows, cols)
+
+    @staticmethod
+    def convert[dst_dtype: DType](
+        src: UnsafePointer[Scalar[Self.Src.SOURCE_DTYPE], MutAnyOrigin],
+        aux: UnsafePointer[Scalar[Self.Src.AUX_DTYPE], MutAnyOrigin],
+        dst: UnsafePointer[Scalar[dst_dtype], MutAnyOrigin],
+        rows: Int, cols: Int,
+    ):
+        Self.Src.convert[dst_dtype](src, aux, dst, rows, cols)
+
+    def weight_name(self) -> String: return self.name
+    def fwht_block(self) -> Int: return self.block
+    def is_per_block(self) -> Bool: return True
+    def gamma_source(self) -> String: return String("")
+    def two_sided_head_dim(self) -> Int: return 0
 
 
-# --- Task variant umbrella --------------------------------------------------
+struct PerBlockAbsorbed[Src: Converter](QuantizeSpec):
+    comptime SOURCE_DTYPE = Self.Src.SOURCE_DTYPE
+    comptime AUX_DTYPE = Self.Src.AUX_DTYPE
+    comptime SOURCE_ELEMENT_BYTES = Self.Src.SOURCE_ELEMENT_BYTES
+    comptime AUX_SUFFIX = Self.Src.AUX_SUFFIX
+    comptime AUX_ROW_BLOCK = Self.Src.AUX_ROW_BLOCK
+
+    var name: String
+    var block: Int
+    var gamma: String
+
+    def __init__(out self, name: String, block: Int, gamma: String):
+        self.name = name
+        self.block = block
+        self.gamma = gamma
+
+    @staticmethod
+    def aux_bytes_for(rows: Int, cols: Int) -> Int:
+        return Self.Src.aux_bytes_for(rows, cols)
+
+    @staticmethod
+    def convert[dst_dtype: DType](
+        src: UnsafePointer[Scalar[Self.Src.SOURCE_DTYPE], MutAnyOrigin],
+        aux: UnsafePointer[Scalar[Self.Src.AUX_DTYPE], MutAnyOrigin],
+        dst: UnsafePointer[Scalar[dst_dtype], MutAnyOrigin],
+        rows: Int, cols: Int,
+    ):
+        Self.Src.convert[dst_dtype](src, aux, dst, rows, cols)
+
+    def weight_name(self) -> String: return self.name
+    def fwht_block(self) -> Int: return self.block
+    def is_per_block(self) -> Bool: return True
+    def gamma_source(self) -> String: return self.gamma
+    def two_sided_head_dim(self) -> Int: return 0
 
 
-from std.utils.variant import Variant
+struct TwoSidedAbsorbed[Src: Converter](QuantizeSpec):
+    comptime SOURCE_DTYPE = Self.Src.SOURCE_DTYPE
+    comptime AUX_DTYPE = Self.Src.AUX_DTYPE
+    comptime SOURCE_ELEMENT_BYTES = Self.Src.SOURCE_ELEMENT_BYTES
+    comptime AUX_SUFFIX = Self.Src.AUX_SUFFIX
+    comptime AUX_ROW_BLOCK = Self.Src.AUX_ROW_BLOCK
 
-comptime Task = Variant[
-    Passthrough,
-    ButterquantI8PerRow,
-    ButterquantI8PerRowAbsorbed,
-    ButterquantI8PerBlock,
-    ButterquantI8PerBlockAbsorbed,
-    ButterquantI8TwoSidedAbsorbed,
-]
+    var name: String
+    var block: Int
+    var gamma: String
+    var hdim: Int
+
+    def __init__(out self, name: String, block: Int, gamma: String, hdim: Int):
+        self.name = name
+        self.block = block
+        self.gamma = gamma
+        self.hdim = hdim
+
+    @staticmethod
+    def aux_bytes_for(rows: Int, cols: Int) -> Int:
+        return Self.Src.aux_bytes_for(rows, cols)
+
+    @staticmethod
+    def convert[dst_dtype: DType](
+        src: UnsafePointer[Scalar[Self.Src.SOURCE_DTYPE], MutAnyOrigin],
+        aux: UnsafePointer[Scalar[Self.Src.AUX_DTYPE], MutAnyOrigin],
+        dst: UnsafePointer[Scalar[dst_dtype], MutAnyOrigin],
+        rows: Int, cols: Int,
+    ):
+        Self.Src.convert[dst_dtype](src, aux, dst, rows, cols)
+
+    def weight_name(self) -> String: return self.name
+    def fwht_block(self) -> Int: return self.block
+    def is_per_block(self) -> Bool: return False
+    def gamma_source(self) -> String: return self.gamma
+    def two_sided_head_dim(self) -> Int: return self.hdim
 
 
 trait Dims:

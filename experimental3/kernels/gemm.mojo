@@ -174,7 +174,7 @@ def fused_gu_gelu_tanh_worker[intermediate: Int, K: Int, fwht_blk: Int,
                 dequant,
                 args.wscale + n_off,
                 args.wcolsum + n_off,
-                gate.bitcast[Scalar[DType.float32]]())
+                gate)
 
             var up_buf = InlineArray[Float32, fwht_blk](fill=Float32(0))
             var up = UnsafePointer(to=up_buf).bitcast[Float32]()
@@ -184,7 +184,7 @@ def fused_gu_gelu_tanh_worker[intermediate: Int, K: Int, fwht_blk: Int,
                 dequant,
                 args.wscale + intermediate + n_off,
                 args.wcolsum + intermediate + n_off,
-                up.bitcast[Scalar[DType.float32]]())
+                up)
 
             var k = 0
             while k + width <= fwht_blk:
@@ -238,7 +238,7 @@ def fused_gu_gelu_tanh_worker_wa[intermediate: Int, K: Int, fwht_blk: Int](
             gemv_row[GEMV_TILE, K, DType.float32](
                 act_i8, args.wpacked + n_off * K, dequant,
                 args.wscale + n_off, args.wcolsum + n_off,
-                gate.bitcast[Scalar[DType.float32]]())
+                gate)
 
             var up_buf = InlineArray[Float32, GEMV_TILE](fill=Float32(0))
             var up = UnsafePointer(to=up_buf).bitcast[Float32]()
@@ -246,7 +246,7 @@ def fused_gu_gelu_tanh_worker_wa[intermediate: Int, K: Int, fwht_blk: Int](
                 act_i8, args.wpacked + (intermediate + n_off) * K, dequant,
                 args.wscale + intermediate + n_off,
                 args.wcolsum + intermediate + n_off,
-                up.bitcast[Scalar[DType.float32]]())
+                up)
 
             var k = 0
             while k + width <= GEMV_TILE:

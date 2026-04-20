@@ -20,10 +20,9 @@ from modeling.model_spec import (
     Encoding, Shaped, BF16, F32, I8,
     Shape, ShapeLike, Mat, DynView, Bound,
     WeightDesc, DEFAULT_ALIGNMENT, LogitsView,
-    Task, SourceFormat,
-    Passthrough, ButterquantI8PerRow, ButterquantI8PerRowAbsorbed,
-    ButterquantI8PerBlock, ButterquantI8PerBlockAbsorbed,
+    TaskVisitor, PerRow, PerBlockAbsorbed,
 )
+from quant.source_format import Bf16Converter
 from modeling.gemma4_common import (
     Gemma4BaseConfig, is_full_layer,
 )
@@ -781,62 +780,51 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             unsafe_from_address=self.topos[0].scratch_base())
 
     @staticmethod
-    def build_quantizer_tasks() -> List[Task]:
-        var tasks = List[Task]()
+    def describe_quantization[V: TaskVisitor](mut visitor: V) -> Bool:
+        comptime Bf16 = Bf16Converter
         comptime HB = FWHT_BLK_HIDDEN
         comptime LB = LM_HEAD_FWHT_BLK
+        var ok = True
 
         for i in range(C.NUM_LAYERS):
             var p = "model.language_model.layers." + String(i) + "."
             var is_full = is_full_layer(i)
 
-            tasks.append(ButterquantI8PerRow(p + "self_attn.q_proj.weight",
-                SourceFormat.BF16, HB))
-            tasks.append(ButterquantI8PerRow(p + "self_attn.k_proj.weight",
-                SourceFormat.BF16, HB))
+            ok &= visitor.quantize(PerRow[Bf16](p + "self_attn.q_proj.weight", HB))
+            ok &= visitor.quantize(PerRow[Bf16](p + "self_attn.k_proj.weight", HB))
             if not is_full:
-                tasks.append(ButterquantI8PerRow(p + "self_attn.v_proj.weight",
-                    SourceFormat.BF16, HB))
+                ok &= visitor.quantize(PerRow[Bf16](p + "self_attn.v_proj.weight", HB))
             if is_full:
-                tasks.append(ButterquantI8PerRow(p + "self_attn.o_proj.weight",
-                    SourceFormat.BF16, 512))
+                ok &= visitor.quantize(PerRow[Bf16](p + "self_attn.o_proj.weight", 512))
             else:
-                tasks.append(ButterquantI8PerRow(p + "self_attn.o_proj.weight",
-                    SourceFormat.BF16, HB))
+                ok &= visitor.quantize(PerRow[Bf16](p + "self_attn.o_proj.weight", HB))
 
-            tasks.append(ButterquantI8PerRow(p + "mlp.gate_proj.weight",
-                SourceFormat.BF16, HB))
-            tasks.append(ButterquantI8PerRow(p + "mlp.up_proj.weight",
-                SourceFormat.BF16, HB))
-            tasks.append(ButterquantI8PerRow(p + "mlp.down_proj.weight",
-                SourceFormat.BF16, FWHT_BLK_DENSE_DOWN))
+            ok &= visitor.quantize(PerRow[Bf16](p + "mlp.gate_proj.weight", HB))
+            ok &= visitor.quantize(PerRow[Bf16](p + "mlp.up_proj.weight", HB))
+            ok &= visitor.quantize(PerRow[Bf16](p + "mlp.down_proj.weight", FWHT_BLK_DENSE_DOWN))
 
-            tasks.append(ButterquantI8PerRow(p + "router.proj.weight",
-                SourceFormat.BF16, HB))
-            tasks.append(ButterquantI8PerRow(p + "experts.gate_up_proj",
-                SourceFormat.BF16, HB))
-            tasks.append(ButterquantI8PerRow(p + "experts.down_proj",
-                SourceFormat.BF16, FWHT_BLK))
+            ok &= visitor.quantize(PerRow[Bf16](p + "router.proj.weight", HB))
+            ok &= visitor.quantize(PerRow[Bf16](p + "experts.gate_up_proj", HB))
+            ok &= visitor.quantize(PerRow[Bf16](p + "experts.down_proj", FWHT_BLK))
 
-            tasks.append(Passthrough(p + "input_layernorm.weight", DType.bfloat16))
-            tasks.append(Passthrough(p + "post_attention_layernorm.weight", DType.bfloat16))
-            tasks.append(Passthrough(p + "pre_feedforward_layernorm.weight", DType.bfloat16))
-            tasks.append(Passthrough(p + "pre_feedforward_layernorm_2.weight", DType.bfloat16))
-            tasks.append(Passthrough(p + "post_feedforward_layernorm.weight", DType.bfloat16))
-            tasks.append(Passthrough(p + "post_feedforward_layernorm_1.weight", DType.bfloat16))
-            tasks.append(Passthrough(p + "post_feedforward_layernorm_2.weight", DType.bfloat16))
-            tasks.append(Passthrough(p + "self_attn.q_norm.weight", DType.bfloat16))
-            tasks.append(Passthrough(p + "self_attn.k_norm.weight", DType.bfloat16))
-            tasks.append(Passthrough(p + "router.scale", DType.bfloat16))
-            tasks.append(Passthrough(p + "router.per_expert_scale", DType.bfloat16))
-            tasks.append(Passthrough(p + "layer_scalar", DType.bfloat16))
+            ok &= visitor.passthrough(p + "input_layernorm.weight", DType.bfloat16)
+            ok &= visitor.passthrough(p + "post_attention_layernorm.weight", DType.bfloat16)
+            ok &= visitor.passthrough(p + "pre_feedforward_layernorm.weight", DType.bfloat16)
+            ok &= visitor.passthrough(p + "pre_feedforward_layernorm_2.weight", DType.bfloat16)
+            ok &= visitor.passthrough(p + "post_feedforward_layernorm.weight", DType.bfloat16)
+            ok &= visitor.passthrough(p + "post_feedforward_layernorm_1.weight", DType.bfloat16)
+            ok &= visitor.passthrough(p + "post_feedforward_layernorm_2.weight", DType.bfloat16)
+            ok &= visitor.passthrough(p + "self_attn.q_norm.weight", DType.bfloat16)
+            ok &= visitor.passthrough(p + "self_attn.k_norm.weight", DType.bfloat16)
+            ok &= visitor.passthrough(p + "router.scale", DType.bfloat16)
+            ok &= visitor.passthrough(p + "router.per_expert_scale", DType.bfloat16)
+            ok &= visitor.passthrough(p + "layer_scalar", DType.bfloat16)
 
-        tasks.append(Passthrough("model.language_model.norm.weight", DType.bfloat16))
-        tasks.append(ButterquantI8PerBlockAbsorbed(
-            "model.language_model.embed_tokens.weight",
-            SourceFormat.BF16, LB,
+        ok &= visitor.passthrough("model.language_model.norm.weight", DType.bfloat16)
+        ok &= visitor.quantize(PerBlockAbsorbed[Bf16](
+            "model.language_model.embed_tokens.weight", LB,
             "model.language_model.norm.weight"))
-        return tasks^
+        return ok
 
     def report_profile(self, label: String):
         self.profile.report(label)

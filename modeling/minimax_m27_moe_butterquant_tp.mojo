@@ -20,11 +20,11 @@ from modeling.model_spec import (
     Encoding, Shaped, BF16, F32, I8,
     Shape, ShapeLike, Mat, DynView, Bound,
     WeightDesc, DEFAULT_ALIGNMENT, LogitsView,
-    Task, SourceFormat,
-    Passthrough, ButterquantI8PerRow, ButterquantI8PerRowAbsorbed,
-    ButterquantI8PerBlockAbsorbed, ButterquantI8TwoSidedAbsorbed,
+    TaskVisitor, QuantizeSpec,
+    PerRow, PerRowAbsorbed, PerBlockAbsorbed, TwoSidedAbsorbed,
     HOST_RANK,
 )
+from quant.source_format import Bf16Converter, Fp8E4M3Block128Converter
 from modeling.modeling_common import (
     SlotOffset, Repeated, SectionBuilder, align_up,
     StaticTensorView, DynamicTensorView,
@@ -673,46 +673,48 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
             unsafe_from_address=self.topos[0].scratch_base())
 
     @staticmethod
-    def build_quantizer_tasks() -> List[Task]:
-        var tasks = List[Task]()
-        comptime FP8_BLOCK = SourceFormat.FP8_E4M3_BLOCK128
+    @staticmethod
+    def describe_quantization[V: TaskVisitor](mut visitor: V) -> Bool:
+        comptime Fp8 = Fp8E4M3Block128Converter
+        comptime Bf16 = Bf16Converter
+        var ok = True
 
         for i in range(C.NUM_LAYERS):
             var p = "model.layers." + String(i) + "."
             var input_gamma = p + "input_layernorm.weight"
             var post_attn_gamma = p + "post_attention_layernorm.weight"
 
-            tasks.append(ButterquantI8PerRowAbsorbed(p + "self_attn.q_proj.weight",
-                FP8_BLOCK, FWHT_BLK_HIDDEN, input_gamma))
-            tasks.append(ButterquantI8PerRowAbsorbed(p + "self_attn.k_proj.weight",
-                FP8_BLOCK, FWHT_BLK_HIDDEN, input_gamma))
-            tasks.append(ButterquantI8TwoSidedAbsorbed(p + "self_attn.v_proj.weight",
-                FP8_BLOCK, FWHT_BLK_HIDDEN, input_gamma, C.HEAD_DIM))
-            tasks.append(ButterquantI8PerRow(p + "self_attn.o_proj.weight",
-                FP8_BLOCK, C.HEAD_DIM))
+            ok &= visitor.quantize(PerRowAbsorbed[Fp8](p + "self_attn.q_proj.weight",
+                FWHT_BLK_HIDDEN, input_gamma))
+            ok &= visitor.quantize(PerRowAbsorbed[Fp8](p + "self_attn.k_proj.weight",
+                FWHT_BLK_HIDDEN, input_gamma))
+            ok &= visitor.quantize(TwoSidedAbsorbed[Fp8](p + "self_attn.v_proj.weight",
+                FWHT_BLK_HIDDEN, input_gamma, C.HEAD_DIM))
+            ok &= visitor.quantize(PerRow[Fp8](p + "self_attn.o_proj.weight",
+                C.HEAD_DIM))
 
             for j in range(C.NUM_EXPERTS):
                 var ep = p + "block_sparse_moe.experts." + String(j) + "."
-                tasks.append(ButterquantI8PerRowAbsorbed(ep + "w1.weight",
-                    FP8_BLOCK, FWHT_BLK_HIDDEN, post_attn_gamma))
-                tasks.append(ButterquantI8PerRowAbsorbed(ep + "w3.weight",
-                    FP8_BLOCK, FWHT_BLK_HIDDEN, post_attn_gamma))
-                tasks.append(ButterquantI8PerRow(ep + "w2.weight",
-                    FP8_BLOCK, FWHT_BLK_MOE_DOWN))
+                ok &= visitor.quantize(PerRowAbsorbed[Fp8](ep + "w1.weight",
+                    FWHT_BLK_HIDDEN, post_attn_gamma))
+                ok &= visitor.quantize(PerRowAbsorbed[Fp8](ep + "w3.weight",
+                    FWHT_BLK_HIDDEN, post_attn_gamma))
+                ok &= visitor.quantize(PerRow[Fp8](ep + "w2.weight",
+                    FWHT_BLK_MOE_DOWN))
 
-            tasks.append(Passthrough(p + "input_layernorm.weight", DType.bfloat16))
-            tasks.append(Passthrough(p + "post_attention_layernorm.weight", DType.bfloat16))
-            tasks.append(Passthrough(p + "self_attn.q_norm.weight", DType.bfloat16))
-            tasks.append(Passthrough(p + "self_attn.k_norm.weight", DType.bfloat16))
-            tasks.append(Passthrough(p + "block_sparse_moe.gate.weight", DType.float32))
-            tasks.append(Passthrough(p + "block_sparse_moe.e_score_correction_bias",
-                DType.float32))
+            ok &= visitor.passthrough(p + "input_layernorm.weight", DType.bfloat16)
+            ok &= visitor.passthrough(p + "post_attention_layernorm.weight", DType.bfloat16)
+            ok &= visitor.passthrough(p + "self_attn.q_norm.weight", DType.bfloat16)
+            ok &= visitor.passthrough(p + "self_attn.k_norm.weight", DType.bfloat16)
+            ok &= visitor.passthrough(p + "block_sparse_moe.gate.weight", DType.float32)
+            ok &= visitor.passthrough(p + "block_sparse_moe.e_score_correction_bias",
+                DType.float32)
 
-        tasks.append(Passthrough("model.norm.weight", DType.bfloat16))
-        tasks.append(Passthrough("model.embed_tokens.weight", DType.bfloat16))
-        tasks.append(ButterquantI8PerBlockAbsorbed("lm_head.weight",
-            SourceFormat.BF16, LM_OUTPUT_HEAD_FWHT_BLK, "model.norm.weight"))
-        return tasks^
+        ok &= visitor.passthrough("model.norm.weight", DType.bfloat16)
+        ok &= visitor.passthrough("model.embed_tokens.weight", DType.bfloat16)
+        ok &= visitor.quantize(PerBlockAbsorbed[Bf16]("lm_head.weight",
+            LM_OUTPUT_HEAD_FWHT_BLK, "model.norm.weight"))
+        return ok
 
     def report_profile(self, label: String):
         self.profile.report(label)

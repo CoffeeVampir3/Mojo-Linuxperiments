@@ -21,7 +21,7 @@ from std.sys.info import size_of
 from std.memory import UnsafePointer, memcpy
 from std.time import perf_counter_ns
 import linux.sys as linux
-from std.atomic import Ordering
+from std.atomic import Ordering, fence
 from numa import NumaInfo, CpuMask
 from notstdcollections import HeapMoveArray
 from .threading_traits import BurstThreadPool
@@ -336,6 +336,12 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
         for i in range(jobs):
             AtomicInt32.store[ordering=Ordering.RELEASE](
                 UnsafePointer(to=(self.mailboxes + i)[].job_ready.value), 1)
+
+        # This is forced, we need to ensure that memory ordering is published here to avoid
+        # an edge-case race between our dekker handshake, as it's possible both sides can
+        # be in a state where the other side wasn't observed yet, and thus not wake and
+        # simultaneously sleep, ending in a deadlock.
+        fence[ordering=Ordering.SEQUENTIAL]()
 
         # Pass 3: Dekker wake — check sleeping, futex_wake if needed
         # If worker stored sleeping=1 but missed our job_ready store (x86 store-load
