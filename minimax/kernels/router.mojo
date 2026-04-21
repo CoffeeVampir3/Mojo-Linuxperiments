@@ -1,9 +1,12 @@
 from std.sys.info import simd_width_of
 from std.collections import InlineArray
 
-from experimental3.common_math import F32Ptr
-from simd_math.matrixops import reduce_top_k, fill_lane_iota
+from experimental3.common_math import F32Ptr, BF16Ptr
 from minimax.kernels.activations import sigmoid_f32
+from minimax.kernels.gemm import f32_gemv_row
+from minimax.kernels.dispatch_args import (
+    RouterCandidate, RouterFusedArgs, RouterMergeArgs,
+)
 
 
 @fieldwise_init
@@ -12,59 +15,82 @@ struct TopKResult[k: Int](Copyable, ImplicitlyCopyable, Movable):
     var weights: InlineArray[Float32, Self.k]
 
 
-def sigmoid_topk_renorm[num_experts: Int, k: Int](
-    logits_ptr: F32Ptr,
-    correction_bias_ptr: F32Ptr,
-) -> TopKResult[k]:
-    """Sigmoid routing: sigmoid -> bias-shifted selection -> top-k -> renorm.
+def router_fused_worker[hidden: Int, k: Int](args: RouterFusedArgs):
+    """Phase 1: f32 GEMV + sigmoid + bias + local top-K.
 
-    logits_ptr:          f32[num_experts] router projection output
-    correction_bias_ptr: f32[num_experts] learned bias for expert selection
-
-    Returns top-k (index, weight) pairs where weights are the raw sigmoid
-    values (without bias), renormalized to sum=1.
+    For each assigned expert row e in [n_start, n_start + n_count):
+      dot   = bf16[hidden] · f32[hidden]
+      raw   = sigmoid(dot)
+      score = raw + bias[e]
+    Maintain a K-slot sorted buffer (descending by score, lowest-eid
+    wins ties), write it to candidates[0..K).
     """
-    comptime width = simd_width_of[DType.float32]()
-    comptime regs = num_experts // width
-    comptime assert num_experts % width == 0, "num_experts must be simd-aligned"
-    comptime assert k <= num_experts, "k must be <= num_experts"
+    var eid_buf = InlineArray[Int32, k](fill=Int32(-1))
+    var score_buf = InlineArray[Float32, k](fill=Float32(-1e30))
+    var raw_buf = InlineArray[Float32, k](fill=Float32(0))
 
-    var weights = InlineArray[Float32, num_experts](uninitialized=True)
-    var wp = UnsafePointer(to=weights[0])
+    for n in range(args.n_count):
+        var eid = args.n_start + n
+        var dot = f32_gemv_row[hidden](
+            args.act_bf16, args.weight_f32 + eid * hidden)
+        var raw = sigmoid_f32[1](SIMD[DType.float32, 1](dot))[0]
+        var score = raw + args.bias_f32[eid]
+        if score > score_buf[k - 1]:
+            var slot = k - 1
+            while slot > 0 and score > score_buf[slot - 1]:
+                eid_buf[slot] = eid_buf[slot - 1]
+                score_buf[slot] = score_buf[slot - 1]
+                raw_buf[slot] = raw_buf[slot - 1]
+                slot -= 1
+            eid_buf[slot] = Int32(eid)
+            score_buf[slot] = score
+            raw_buf[slot] = raw
 
-    var score_regs = InlineArray[SIMD[DType.float32, width], regs](
-        uninitialized=True)
-    var index_regs = InlineArray[SIMD[DType.int32, width], regs](
-        uninitialized=True)
-    fill_lane_iota[width, regs](index_regs)
+    var out = UnsafePointer[RouterCandidate, MutAnyOrigin](
+        unsafe_from_address=Int(args.candidates))
+    for s in range(k):
+        out[s] = RouterCandidate(eid_buf[s], score_buf[s], raw_buf[s])
 
-    comptime for r in range(regs):
-        var logits = (logits_ptr + r * width).load[width=width]()
-        var w = sigmoid_f32(logits)
-        (wp + r * width).store(w)
-        var bias = (correction_bias_ptr + r * width).load[width=width]()
-        score_regs[r] = w + bias
+
+def router_merge_and_renorm[k: Int](args: RouterMergeArgs):
+    """Phase 2: merge worker candidates → TopKResult[k], renormalize.
+
+    Scalar insert each candidate into a K-slot sorted buffer, then
+    normalize the raw sigmoid weights of the winners to sum = 1.
+    """
+    var eid_buf = InlineArray[Int32, k](fill=Int32(-1))
+    var score_buf = InlineArray[Float32, k](fill=Float32(-1e30))
+    var raw_buf = InlineArray[Float32, k](fill=Float32(0))
+
+    var cands = UnsafePointer[RouterCandidate, MutAnyOrigin](
+        unsafe_from_address=Int(args.candidates))
+    for c in range(args.num_candidates):
+        var score = cands[c].score
+        if score > score_buf[k - 1]:
+            var eid = cands[c].eid
+            var raw = cands[c].raw
+            var slot = k - 1
+            while slot > 0 and score > score_buf[slot - 1]:
+                eid_buf[slot] = eid_buf[slot - 1]
+                score_buf[slot] = score_buf[slot - 1]
+                raw_buf[slot] = raw_buf[slot - 1]
+                slot -= 1
+            eid_buf[slot] = eid
+            score_buf[slot] = score
+            raw_buf[slot] = raw
+
+    var sum_raw = Float32(0)
+    for s in range(k):
+        sum_raw += raw_buf[s]
+    var inv = Float32(1.0) / sum_raw
 
     var result = TopKResult[k](
         indices=InlineArray[Int, k](uninitialized=True),
         weights=InlineArray[Float32, k](uninitialized=True),
     )
-    # reduce_top_k writes winners in descending-score order; values are
-    # discarded (we renormalize the raw sigmoid weights, not the biased
-    # scores).
-    var topk_scores = InlineArray[Float32, k](uninitialized=True)
-    reduce_top_k[DType.float32, width, regs, k](
-        score_regs, index_regs,
-        Float32(-1e30),
-        result.indices, topk_scores)
+    for s in range(k):
+        result.indices[s] = Int(eid_buf[s])
+        result.weights[s] = raw_buf[s] * inv
 
-    for sel in range(k):
-        result.weights[sel] = weights[result.indices[sel]]
-    var topk_sum = Float32(0)
-    for sel in range(k):
-        topk_sum += result.weights[sel]
-    var inv_topk = 1.0 / topk_sum
-    for sel in range(k):
-        result.weights[sel] *= inv_topk
-
-    return result^
+    UnsafePointer[TopKResult[k], MutAnyOrigin](
+        unsafe_from_address=Int(args.result_ptr))[] = result

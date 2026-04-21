@@ -1,5 +1,5 @@
 from std.memory import UnsafePointer
-from std.sys.info import simd_width_of
+from std.sys.info import simd_width_of, size_of
 from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
 
@@ -21,18 +21,21 @@ from minimax.kernels.dispatch_args import (
     FusedW1W3SiluArgs,
     RmsNormDualOutputArgs,
     AttnGroupArgs,
-    F32GemvArgs,
-    RouterTopkArgs,
+    RouterCandidate,
+    RouterFusedArgs,
+    RouterMergeArgs,
     NormPrepArgs,
 )
-from minimax.kernels.gemm import fused_w1_w3_silu_worker, f32_gemv_worker
+from minimax.kernels.gemm import fused_w1_w3_silu_worker
 from minimax.kernels.rmsnorm import rmsnorm_dual_output_worker
 from minimax.kernels.attention import (
     kv_write_kernel,
     merge_and_quantize_kernel,
     partial_chunk_stride,
 )
-from minimax.kernels.router import sigmoid_topk_renorm, TopKResult
+from minimax.kernels.router import (
+    TopKResult, router_fused_worker, router_merge_and_renorm,
+)
 
 
 @always_inline
@@ -43,55 +46,62 @@ def pool_fence[P: BurstThreadPool](mut pool: P) -> PoolFence[P]:
 
 
 # ============================================================================
-# f32 GEMV — router projection (bf16 act × f32 weight → f32 logits)
+# Fused router — f32 GEMV + sigmoid + bias + local top-K (phase 1)
+# and cross-worker merge + renorm (phase 2).
 # ============================================================================
 
 
-def f32_gemv_dispatch[N: Int, K: Int, P: BurstThreadPool](
+@always_inline
+def router_num_workers[num_experts: Int, k: Int](pool_capacity: Int) -> Int:
+    """Shared formula: phase-1 worker count = min(num_experts/k, pool cap).
+    Constrained by k so every worker has ≥ k rows and produces a full
+    local top-K."""
+    comptime max_workers = num_experts // k
+    return min(max_workers, pool_capacity)
+
+
+def router_fused_dispatch[num_experts: Int, hidden: Int, k: Int, P: BurstThreadPool](
     act_bf16: BF16Ptr,
     weight_f32: F32Ptr,
-    dst_f32: F32Ptr,
+    bias_f32: F32Ptr,
+    candidates: U8Ptr,
     mut pool: P,
 ) -> PoolFence[P]:
-    var num_workers = min(N, pool.get_capacity())
-    var rows_per_worker = (N + num_workers - 1) // num_workers
+    var num_workers = router_num_workers[num_experts, k](pool.get_capacity())
+    var rows_per_worker = (num_experts + num_workers - 1) // num_workers
 
-    var jobs = InlineArray[F32GemvArgs, MAX_POOL_CAPACITY](fill=F32GemvArgs())
+    var jobs = InlineArray[RouterFusedArgs, MAX_POOL_CAPACITY](
+        fill=RouterFusedArgs())
     var actual = 0
     for i in range(num_workers):
         var start = i * rows_per_worker
-        if start >= N:
+        if start >= num_experts:
             break
-        var count = min(rows_per_worker, N - start)
-        jobs[i] = F32GemvArgs(act_bf16, weight_f32, dst_f32, start, count)
+        var count = min(rows_per_worker, num_experts - start)
+        var slot = candidates + i * k * size_of[RouterCandidate]()
+        jobs[actual] = RouterFusedArgs(
+            act_bf16, weight_f32, bias_f32, slot, start, count)
         actual += 1
 
-    pool.dispatch[F32GemvArgs, f32_gemv_worker[N, K]](
+    pool.dispatch[RouterFusedArgs, router_fused_worker[hidden, k]](
         UnsafePointer(to=jobs[0]), actual)
     return pool_fence(pool)
 
 
-# ============================================================================
-# Router top-k — sigmoid + correction bias + top-k + renorm
-# ============================================================================
-
-
-def router_topk_kernel[num_experts: Int, k: Int](args: RouterTopkArgs):
-    var result = sigmoid_topk_renorm[num_experts, k](
-        args.logits, args.correction_bias)
-    UnsafePointer[TopKResult[k], MutAnyOrigin](
-        unsafe_from_address=Int(args.result_ptr))[] = result
-
-
-def router_topk_dispatch[num_experts: Int, k: Int, P: BurstThreadPool](
-    logits: F32Ptr,
-    correction_bias: F32Ptr,
+def router_merge_dispatch[num_experts: Int, k: Int, P: BurstThreadPool](
+    candidates: U8Ptr,
     result_ptr: Int,
     mut pool: P,
 ) -> PoolFence[P]:
-    var args = RouterTopkArgs(
-        logits, correction_bias, U8Ptr(unsafe_from_address=result_ptr))
-    pool.dispatch[RouterTopkArgs, router_topk_kernel[num_experts, k]](
+    """Phase 2: single-job merge of num_workers × k candidates into
+    TopKResult[k]. num_workers is recomputed from the same pool capacity
+    that phase 1 used."""
+    var num_workers = router_num_workers[num_experts, k](pool.get_capacity())
+    var args = RouterMergeArgs(
+        candidates,
+        U8Ptr(unsafe_from_address=result_ptr),
+        num_workers * k)
+    pool.dispatch[RouterMergeArgs, router_merge_and_renorm[k]](
         UnsafePointer(to=args), 1)
     return pool_fence(pool)
 

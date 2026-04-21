@@ -7,7 +7,7 @@ from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.common_math import F32Ptr, BF16Ptr
 from simd_math.matrixops import pick_port_unroll, tree_reduce_accs
 from minimax.kernels.activations import silu_mul
-from minimax.kernels.dispatch_args import FusedW1W3SiluArgs, F32GemvArgs
+from minimax.kernels.dispatch_args import FusedW1W3SiluArgs
 
 
 def fused_w1_w3_silu_worker[intermediate: Int, K: Int, fwht_blk: Int](
@@ -107,9 +107,3 @@ def f32_gemv_row[K: Int](
     return tree_reduce_accs(accs)
 
 
-def f32_gemv_worker[N: Int, K: Int](args: F32GemvArgs):
-    """N-parallel bf16 × f32 GEMV. Processes rows [n_start, n_start + n_count)."""
-    for n in range(args.n_count):
-        var row = args.n_start + n
-        args.dst_f32[row] = f32_gemv_row[K](
-            args.act_bf16, args.weight_f32 + row * K)

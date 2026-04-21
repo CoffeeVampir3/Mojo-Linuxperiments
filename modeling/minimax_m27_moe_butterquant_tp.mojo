@@ -32,7 +32,7 @@ from modeling.modeling_common import (
     scratch_tensor_view, scratch_ptr,
     LayerShard, LayerBuilder,
 )
-from kernels.kernel_ops import PoolFence
+from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY
 from kernels.reductions import small_allreduce, ring_broadcast
 from modeling.linear_borrow_pool import ScratchPool, ScratchLease
 from modeling.loader import discover_shards, load_weights_from_descs
@@ -56,9 +56,10 @@ from experimental3.common_math import rms_reduce_bf16, inv_rms_from_sum_sq
 from kernels.kernel_ops import embed_lookup
 
 from minimax.kernels.router import TopKResult
+from minimax.kernels.dispatch_args import RouterCandidate
 from minimax.kernels.dispatch_kernels import (
-    f32_gemv_dispatch,
-    router_topk_dispatch,
+    router_fused_dispatch,
+    router_merge_dispatch,
     rmsnorm_dual_output_dispatch,
     kv_write_dispatch,
     q_prep_dispatch,
@@ -483,9 +484,12 @@ def calculate_peak_scratch[tp: Int]() -> Int:
         + PARTIAL_F32S * f32
     )
 
+    comptime router_candidate_bytes = 16   # RouterCandidate: i32 + f32 + f32 + pad
+    comptime topk_result_bytes = C.TOP_K * (8 + f32)   # Int + Float32 per slot
     comptime moe_peak = (
         C.HIDDEN * i8 + C.HIDDEN * f32 + f32
-        + C.NUM_EXPERTS * f32 + C.NUM_EXPERTS * f32
+        + MAX_POOL_CAPACITY * C.TOP_K * router_candidate_bytes
+        + topk_result_bytes
         + C.TOP_K * 2 * f32
         + C.TOP_K * C.MOE_INTERMEDIATE * i8
         + C.TOP_K * MOE_DOWN_NUM_BLK * f32
@@ -969,13 +973,21 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         #
         # ── phase 8: router ─────────────────────────────────────
         #
-        #   tp_parallel: f32_router_dispatch (NEW KERNEL)
-        #     f32_gemv: router_proj_f32[256, HIDDEN] × normed_bf16 → logits_f32[256]
-        #     sigmoid(logits) → weights[256]
-        #     weights + correction_bias → selection_scores[256]
-        #     topk(selection_scores, 8) → indices[8]
-        #     gather weights[indices] → raw_weights[8]  (NOT biased scores)
-        #     raw_weights /= sum(raw_weights) → routing_weights[8]
+        #   tp_parallel phase 8a: router_fused_dispatch
+        #     Per worker (fanned across pool): for each assigned expert row e,
+        #       dot  = f32_gemv_row(normed_bf16, router_proj[e])
+        #       raw  = sigmoid(dot)
+        #       score = raw + router_bias[e]
+        #       scalar-insert into K-slot sorted local buffer
+        #     Write K candidates (eid, score, raw) to candidates scratch.
+        #
+        #   tp_parallel phase 8b: router_merge_dispatch (single job)
+        #     Scalar-insert num_workers × K candidates into TopKResult[K],
+        #     renormalize raw sigmoid weights to sum=1.
+        #
+        #   Router f32 is load-bearing: see minimax-router.md. The gate.weight
+        #   distribution is bf16-friendly in isolation, but the 8/9 selection
+        #   margin routinely lives below bf16's score-rounding noise floor.
         #
         # ── phase 9: expert gate + up (w1, w3, SiLU) ────────────
         #
@@ -1277,34 +1289,34 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
 
             moe_work_lease^.release()
 
-            # Phase 8: router (f32 GEMV + sigmoid + topk). routing outlives
-            # logits (Phase 9/10 both dereference routing), so borrow routing
-            # first; logits is transient to Phase 8 and goes on top.
+            # Phase 8: fused router (f32 GEMV + sigmoid + bias + local top-K
+            # per worker) + merge. routing outlives candidates (Phase 9/10
+            # dereference routing), so routing is borrowed first; candidates
+            # is transient to Phase 8.
             var routing_lease = self.scratch.borrow[TopKResult[C.TOP_K], 1]()
-            var logits_lease = self.scratch.borrow[Float32, C.NUM_EXPERTS]()
+            var candidates_lease = self.scratch.borrow[
+                RouterCandidate, MAX_POOL_CAPACITY * C.TOP_K]()
 
             @parameter
-            def do_router_gemv[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            def do_router_fused[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
-                return f32_gemv_dispatch[C.NUM_EXPERTS, C.HIDDEN](
+                return router_fused_dispatch[C.NUM_EXPERTS, C.HIDDEN, C.TOP_K](
                     BF16Ptr(unsafe_from_address=topo.scratch_addr(normed_bf16_lease)),
                     layer.body.router_proj.bound(lb).as_ptr(),
-                    F32Ptr(unsafe_from_address=topo.scratch_addr(logits_lease)),
+                    layer.body.router_bias.bound(lb).as_ptr(),
+                    U8Ptr(unsafe_from_address=topo.scratch_addr(candidates_lease)),
                     pool)
-            sample.add(self.profile.phase("router_proj"), tp_parallel[Self.tp, do_router_gemv](topos, mp))
+            sample.add(self.profile.phase("router_proj"), tp_parallel[Self.tp, do_router_fused](topos, mp))
 
             @parameter
-            def do_router_topk[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                var lb = topo.layer_base(layer_idx)
-                var layer = topo.layers.proto
-                return router_topk_dispatch[C.NUM_EXPERTS, C.TOP_K](
-                    F32Ptr(unsafe_from_address=topo.scratch_addr(logits_lease)),
-                    layer.body.router_bias.bound(lb).as_ptr(),
+            def do_router_merge[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                return router_merge_dispatch[C.NUM_EXPERTS, C.TOP_K](
+                    U8Ptr(unsafe_from_address=topo.scratch_addr(candidates_lease)),
                     topo.scratch_addr(routing_lease), pool)
-            sample.add(self.profile.phase("router_topk"), tp_parallel[Self.tp, do_router_topk](topos, mp))
+            sample.add(self.profile.phase("router_topk"), tp_parallel[Self.tp, do_router_merge](topos, mp))
 
-            logits_lease^.release()
+            candidates_lease^.release()
             # normed_bf16 and routing remain live: routing is read by Phase 9/10;
             # normed_bf16 is dead after Phase 8a but held to keep the stack LIFO
             # (it sits below routing). Released at the end of the layer.

@@ -114,33 +114,60 @@ struct AttnGroupArgs(Copyable, ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct F32GemvArgs(Copyable, ImplicitlyCopyable):
-    """Args for bf16 × f32 GEMV (router projection)."""
+struct RouterCandidate(Copyable, ImplicitlyCopyable):
+    """One (expert_id, score, raw) entry in a worker-local top-K buffer.
+
+    score = raw + correction_bias (used for selection).
+    raw   = sigmoid(dot) pre-bias (used for renormalization).
+    """
+    var eid: Int32
+    var score: Float32
+    var raw: Float32
+
+    def __init__(out self):
+        self.eid = Int32(-1)
+        self.score = Float32(-1e30)
+        self.raw = Float32(0)
+
+
+@fieldwise_init
+struct RouterFusedArgs(Copyable, ImplicitlyCopyable):
+    """Args for fused router worker: f32 GEMV + sigmoid + local top-K.
+
+    Each worker owns rows [n_start, n_start + n_count) and writes K
+    candidates to candidates[0..K) in descending score order.
+    """
     var act_bf16: BF16Ptr
     var weight_f32: F32Ptr
-    var dst_f32: F32Ptr
+    var bias_f32: F32Ptr
+    var candidates: U8Ptr
     var n_start: Int
     var n_count: Int
 
     def __init__(out self):
         self.act_bf16 = BF16Ptr()
         self.weight_f32 = F32Ptr()
-        self.dst_f32 = F32Ptr()
+        self.bias_f32 = F32Ptr()
+        self.candidates = U8Ptr()
         self.n_start = 0
         self.n_count = 0
 
 
 @fieldwise_init
-struct RouterTopkArgs(Copyable, ImplicitlyCopyable):
-    """Args for MiniMax sigmoid router top-k."""
-    var logits: F32Ptr
-    var correction_bias: F32Ptr
+struct RouterMergeArgs(Copyable, ImplicitlyCopyable):
+    """Args for router candidate-merge + renorm.
+
+    candidates: num_candidates × RouterCandidate scratch from phase 1.
+    result_ptr: TopKResult[k] destination.
+    """
+    var candidates: U8Ptr
     var result_ptr: U8Ptr
+    var num_candidates: Int
 
     def __init__(out self):
-        self.logits = F32Ptr()
-        self.correction_bias = F32Ptr()
+        self.candidates = U8Ptr()
         self.result_ptr = U8Ptr()
+        self.num_candidates = 0
 
 
 @fieldwise_init
