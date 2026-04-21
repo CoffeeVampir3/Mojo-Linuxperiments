@@ -170,20 +170,3 @@ struct RouterMergeArgs(Copyable, ImplicitlyCopyable):
         self.num_candidates = 0
 
 
-@fieldwise_init
-struct NormPrepArgs(Copyable, ImplicitlyCopyable):
-    """Args for full-vector Q/K norm preparation.
-
-    Reads bf16 Q and K buffers, computes inv_rms for each, writes two
-    f32 scalars to dst (dst[0] = inv_rms_q, dst[1] = inv_rms_k).
-    """
-    var q_ptr: BF16Ptr
-    var k_ptr: BF16Ptr
-    var dst: F32Ptr
-    var eps: Float32
-
-    def __init__(out self):
-        self.q_ptr = BF16Ptr()
-        self.k_ptr = BF16Ptr()
-        self.dst = F32Ptr()
-        self.eps = Float32(0)

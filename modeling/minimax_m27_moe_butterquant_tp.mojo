@@ -1,10 +1,3 @@
-"""MiniMax-M2.7 ButterQuant — int8 MoE, NUMA-aware tensor parallel.
-
-62 uniform decoder layers: full causal GQA (48 Q heads, 8 KV heads, head_dim 128),
-partial RoPE (64 of 128 dims), full-vector Q/K RMSNorm, sigmoid-routed MoE
-(256 experts, top-8, SwiGLU). Untied embeddings.
-"""
-
 from std.pathlib import Path
 from std.memory import UnsafePointer
 from std.sys.info import size_of, simd_width_of
@@ -32,10 +25,12 @@ from modeling.modeling_common import (
     scratch_tensor_view, scratch_ptr,
     LayerShard, LayerBuilder,
 )
-from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY
+from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY, embed_lookup
 from kernels.reductions import small_allreduce, ring_broadcast
+from kernels.kv_rotors import init_rope_tables
 from modeling.linear_borrow_pool import ScratchPool, ScratchLease
 from modeling.loader import discover_shards, load_weights_from_descs
+from simd_math import sqrt
 
 from experimental3.profiler import (
     PhaseTiming, phase_timing_from_points, finish_single_pool_fence,
@@ -43,34 +38,32 @@ from experimental3.profiler import (
 )
 from experimental3.init_weights import colsum_at, block_colsum_at, block_colsum_row_major_at, pack_at
 from experimental3.gamma import compute_sqrt_gamma, compute_inv_sqrt_gamma
-from experimental3.common_math import BF16Ptr, F32Ptr, I8Ptr, U8Ptr
+from experimental3.common_math import BF16Ptr, F32Ptr, I8Ptr, U8Ptr, rms_reduce_bf16, inv_rms_from_sum_sq
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
 from experimental3.kernels.dispatch_kernels import (
-    rmsnorm_gamma_fwht_quantize,
     rmsnorm_gamma_fwht_per_block_quantize,
-    expert_sum_dispatch,
     int8_gemv, int8_gemv_blocked,
     lm_head_gemv,
 )
-from experimental3.common_math import rms_reduce_bf16, inv_rms_from_sum_sq
-from kernels.kernel_ops import embed_lookup
+from experimental3.kernels.dispatch_args import RmsNormFwhtQuantArgs
+from experimental3.kernels.rmsnorm import (
+    rmsnorm_fwht_quant_worker, accumulate_expert_outputs,
+)
 
-from minimax.kernels.router import TopKResult
-from minimax.kernels.dispatch_args import RouterCandidate
+from minimax.kernels.router import TopKResult, router_merge_and_renorm
+from minimax.kernels.dispatch_args import (
+    RouterCandidate, RouterMergeArgs, RmsNormDualOutputArgs, AttnGroupArgs,
+)
 from minimax.kernels.dispatch_kernels import (
     router_fused_dispatch,
-    router_merge_dispatch,
-    rmsnorm_dual_output_dispatch,
     kv_write_dispatch,
-    q_prep_dispatch,
+    q_prep_kernel,
     chunked_score_dispatch,
-    merge_quantize_dispatch,
     minimax_moe_phase1,
     minimax_moe_phase2,
-    norm_prep_dispatch,
 )
-from kernels.kv_rotors import init_rope_tables
-from simd_math import sqrt
+from minimax.kernels.rmsnorm import rmsnorm_dual_output_worker
+from minimax.kernels.attention import merge_and_quantize_kernel
 
 
 # =============================================================================
@@ -871,178 +864,6 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         return model^
 
     def forward_decode(mut self, tokens_ptr: Int, pos: Int) -> Int32:
-        # =====================================================================
-        # MiniMax M2.7 ButterQuant decode — fused operation plan
-        #
-        # Design constraints:
-        #   - Gamma split is load-bearing for int8 quality. The residual stream
-        #     stays in the original domain; FWHT at norm boundaries is mandatory.
-        #   - RoPE does not commute with FWHT. Forced exit-reentry per head.
-        #   - SiLU is a nonlinearity. Forced exit-reentry (§6.2).
-        #   - Attention scoring and V-agg operate in the Hadamard domain
-        #     via Parseval (§4.2, §4.3). Cache stores rotated i8.
-        #
-        # Memory traffic principles:
-        #   - Fuse to minimize full-tensor read/write passes.
-        #   - Collect scalar reductions (rms) during producing operations
-        #     (GEMV epilogue) to avoid separate read passes.
-        #   - Two-sided V weights: V has no norm, no RoPE in MiniMax, so
-        #     GEMV can output pre-rotated. Requires validation (see phase 4).
-        # =====================================================================
-        #
-        # embed(host):     bf16 lookup → x_main[HIDDEN]
-        # broadcast:       x_main → all ranks
-        #
-        # for layer in 0..62:
-        #
-        # ── phase 1: input norm + quantize ───────────────────────
-        #
-        #   tp_parallel: rmsnorm_gamma_fwht_quantize
-        #     x_main[HIDDEN] (original domain, bf16)
-        #       → /rms(x) · sign(γ_in)√|γ_in| → FWHT(HIDDEN) → quantize
-        #       → act_i8[HIDDEN] (Hadamard domain, i8) + S_act (f32 scalar)
-        #     Existing kernel. γ_in split: √|γ_in| absorbed into Q/K/V
-        #     weights offline.
-        #
-        # ── phase 2: fused QKV projection ──────────────────────
-        #
-        #   tp_parallel: int8_gemv (fused [Q_LOCAL+2*KV_LOCAL, HIDDEN])
-        #     Contiguous weight matrix: Q rows, then K rows, then V rows.
-        #     Single dispatch reads act_i8 once, produces contiguous output:
-        #       [q_bf16[Q_LOCAL] | k_bf16[KV_LOCAL] | v_bf16[KV_LOCAL]]
-        #     Consumed locally — no allgather.
-        #
-        # ── phase 3: scalar norm allreduce ──────────────────────
-        #
-        #   norm_prep_dispatch: partial sum_sq on local Q/K shards
-        #   scalar allreduce: 8 bytes (q_sum_sq + k_sum_sq)
-        #   inv_rms_from_sum_sq on main thread (2 divisions)
-        #
-        # ── phase 4: K/V cache write ───────────────────────────
-        #
-        #   tp_parallel: kv_write_dispatch (NKV_LOCAL parallel jobs)
-        #     Per local KV head: inv_rms_k * gamma → RoPE → FWHT → i8 →
-        #     VNNI cache. V: two-sided, just quantize → VNNI cache.
-        #     Head-local cache: full MAX_SEQ_LEN, local heads only.
-        #
-        # ── phase 5: flash-decode attention ─────────────────────
-        #
-        #   Per local KV group (KV_PER_RANK groups, 3 dispatches each):
-        #     q_prep_dispatch: 1 job — prep HPG Q heads (inv_rms_q * gamma
-        #       → RoPE → FWHT → quantize, 1/√head_dim folded into q_scale)
-        #     chunked_score_dispatch: num_chunks jobs — each chunk scores
-        #       HPG Q heads against a range of KV cache position groups
-        #       using VNNI (Q·K scoring + online softmax + V-agg)
-        #     merge_quantize_dispatch: 1 job — merge chunk partials
-        #       via online softmax, quantize → i8 for O-projection
-        #
-        # ── phase 6: O projection + residual ────────────────────
-        #
-        #   tp_parallel: int8_gemv_blocked
-        #     attn_i8[Q_LOCAL] × W_O → x_residual[HIDDEN]
-        #     Single-sided weights. Output in original domain.
-        #     Existing kernel.
-        #
-        #   allreduce[residual_add=True]: sum x_residual across ranks,
-        #     fused x_main += reduced_x_residual
-        #
-        # ── phase 7: post-attention norm (dual output) ──────────
-        #
-        #   tp_parallel: rmsnorm_dual_output (NEW KERNEL)
-        #     x_main[HIDDEN] →
-        #       output 1: /rms · sign(γ_post)√|γ_post| → FWHT → quantize
-        #                 → moe_i8[HIDDEN] + S_moe
-        #                 (gamma-split activation for expert w1/w3 GEMVs)
-        #       output 2: /rms · γ_post → normed_bf16[HIDDEN]
-        #                 (full-gamma normalized bf16 for F32 router projection)
-        #
-        #     These are NOT the same tensor. The MoE quantization path uses
-        #     the split gamma: sign(γ)√|γ|, with √|γ| absorbed into w1/w3
-        #     weights. The router is passthrough F32 and needs the true
-        #     post-attention norm: x/rms(x) · γ_post (full gamma, no split).
-        #
-        #     Single-pass implementation: compute rms once, then in one
-        #     sweep over HIDDEN: for each element k, compute x[k]/rms,
-        #     write normed_bf16[k] = x[k]/rms · γ_post[k],
-        #     write work[k] = x[k]/rms · sign(γ_post[k])√|γ_post[k]|,
-        #     then FWHT(work) → quantize → moe_i8.
-        #     One read of x_main, two writes (normed_bf16 + moe_i8).
-        #
-        #     Scratch budget: normed_bf16 costs C.HIDDEN * 2 bytes = 6KB.
-        #     Must be accounted in calculate_peak_scratch.
-        #
-        # ── phase 8: router ─────────────────────────────────────
-        #
-        #   tp_parallel phase 8a: router_fused_dispatch
-        #     Per worker (fanned across pool): for each assigned expert row e,
-        #       dot  = f32_gemv_row(normed_bf16, router_proj[e])
-        #       raw  = sigmoid(dot)
-        #       score = raw + router_bias[e]
-        #       scalar-insert into K-slot sorted local buffer
-        #     Write K candidates (eid, score, raw) to candidates scratch.
-        #
-        #   tp_parallel phase 8b: router_merge_dispatch (single job)
-        #     Scalar-insert num_workers × K candidates into TopKResult[K],
-        #     renormalize raw sigmoid weights to sum=1.
-        #
-        #   Router f32 is load-bearing: see minimax-router.md. The gate.weight
-        #   distribution is bf16-friendly in isolation, but the 8/9 selection
-        #   margin routinely lives below bf16's score-rounding noise floor.
-        #
-        # ── phase 9: expert gate + up (w1, w3, SiLU) ────────────
-        #
-        #   tp_parallel: minimax_moe_phase1 (NEW KERNEL)
-        #     For each selected expert local to this rank:
-        #       gate = int8_gemv(moe_i8, w1[expert])  → f32[MOE_INTERMEDIATE]
-        #       up   = int8_gemv(moe_i8, w3[expert])  → f32[MOE_INTERMEDIATE]
-        #       activated = silu(gate) * up            → f32[MOE_INTERMEDIATE]
-        #       FWHT(MOE_INTERMEDIATE) → per-block absmax quantize → i8
-        #     Single-sided w1/w3. Separate matrices (not fused gate_up).
-        #     SiLU is a nonlinearity — original domain (§6.1).
-        #
-        # ── phase 10: expert down (w2) ──────────────────────────
-        #
-        #   tp_parallel: minimax_moe_phase2 (NEW KERNEL)
-        #     For each selected expert local to this rank:
-        #       int8_gemv_blocked(activated_i8, w2[expert])
-        #       → expert_out_bf16[HIDDEN] · routing_weight[expert]
-        #     Existing int8_gemv_blocked for the GEMV. Routing weight
-        #     applied as scalar multiply on bf16 output.
-        #
-        # ── phase 11: expert reduce + residual ──────────────────
-        #
-        #   tp_parallel: expert_sum
-        #     Sum local weighted expert outputs → x_residual[HIDDEN]
-        #     Existing accumulate_expert_outputs kernel.
-        #
-        #   allreduce[residual_add=True]: sum x_residual across ranks,
-        #     fused x_main += reduced_x_residual
-        #
-        # ── final (host rank only) ──────────────────────────────
-        #
-        # final_norm:  rmsnorm_gamma_fwht_per_block_quantize
-        #   x_main → /rms · sqrt_gamma → FWHT → per-block quantize → lm_i8
-        #   Existing kernel.
-        #
-        # lm_head:     int8_gemv_blocked(lm_i8, lm_output_head) → logits[VOCAB]
-        #   Untied weights. Existing kernel.
-        #
-        # argmax:      argmax(logits) → token_id
-        #   No softcap. Inline on main thread.
-        #
-        # =====================================================================
-        # New kernels required:
-        #   1. int8_gemv with sum_sq epilogue (for Q/K rms pre-collection)
-        #   2. fused_qk_norm_rope_quantize (full-vector norm + per-head rope/fwht/quant)
-        #   3. rmsnorm_dual_output (split-gamma i8 + full-gamma bf16)
-        #   4. f32_router_dispatch (bf16×f32 GEMV + sigmoid + bias + topk)
-        #   5. minimax_moe_phase1 (separate w1/w3 + silu, not fused gate_up)
-        #   6. minimax_moe_phase2 (w2 down-proj with routing weight)
-        #   7. minimax_attn_group_dispatch (wraps existing scoring primitives
-        #      with MiniMax-specific q_scale = S_Q/√128)
-        #
-        # =====================================================================
-
         comptime S = MiniMaxShapes[Self.tp]
         comptime EPS = Float32(C.RMS_NORM_EPS)
         comptime seq_len = 1
@@ -1095,16 +916,19 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
             var attn_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.HIDDEN]()
             var attn_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
 
-            @parameter
-            def do_attn_quantize[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                var lb = topo.layer_base(layer_idx)
-                var layer = topo.layers.proto
-                return rmsnorm_gamma_fwht_quantize[C.HIDDEN, FWHT_BLK_HIDDEN](
-                    topo.x_main(seq_len).ptr, lb + layer.body.input_norm_sqrt_off,
-                    topo.scratch_addr(attn_i8_lease),
-                    topo.scratch_addr(attn_work_lease), topo.scratch_addr(act_scale_lease),
-                    EPS, seq_len, pool)
-            sample.add(self.profile.phase("attn_quantize"), tp_parallel[Self.tp, do_attn_quantize](topos, mp))
+            var t_attn_quant0 = Int(perf_counter_ns())
+            for r in range(Self.tp):
+                var lb = topos[r].layer_base(layer_idx)
+                var layer = topos[r].layers.proto
+                var args = RmsNormFwhtQuantArgs(
+                    BF16Ptr(unsafe_from_address=topos[r].x_main(seq_len).ptr),
+                    BF16Ptr(unsafe_from_address=lb + layer.body.input_norm_sqrt_off),
+                    I8Ptr(unsafe_from_address=topos[r].scratch_addr(attn_i8_lease)),
+                    F32Ptr(unsafe_from_address=topos[r].scratch_addr(attn_work_lease)),
+                    F32Ptr(unsafe_from_address=topos[r].scratch_addr(act_scale_lease)),
+                    EPS, 0, seq_len)
+                rmsnorm_fwht_quant_worker[C.HIDDEN, FWHT_BLK_HIDDEN, True, False](args)
+            sample.add(self.profile.phase("attn_quantize"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_attn_quant0))
 
             # Phase 2: fused QKV projection (contiguous output)
 
@@ -1130,28 +954,17 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
             comptime V_OFF = (Q_LOCAL + KV_LOCAL) * 2
 
             # Phase 3: scalar sum_sq allreduce for full-vector Q/K norm
-            var sum_sq_lease = self.scratch.borrow[Float32, 2]()
-
-            @parameter
-            def do_local_sum_sq[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                return norm_prep_dispatch[Q_LOCAL, KV_LOCAL](
-                    topo.scratch_addr(qkv_lease) + Q_OFF,
-                    topo.scratch_addr(qkv_lease) + K_OFF,
-                    topo.scratch_addr(sum_sq_lease),
-                    EPS, pool)
-            sample.add(self.profile.phase("norm_prep"), tp_parallel[Self.tp, do_local_sum_sq](topos, mp))
-
-            # Scalar allreduce: sum partial sum_sq across ranks (8 bytes)
+            var t_norm_prep0 = Int(perf_counter_ns())
             var global_q_ss = Float32(0)
             var global_k_ss = Float32(0)
             for r in range(Self.tp):
-                var p = F32Ptr(unsafe_from_address=topos[r].scratch_addr(sum_sq_lease))
-                global_q_ss += p[0]
-                global_k_ss += p[1]
+                var q_ptr = BF16Ptr(unsafe_from_address=topos[r].scratch_addr(qkv_lease) + Q_OFF)
+                var k_ptr = BF16Ptr(unsafe_from_address=topos[r].scratch_addr(qkv_lease) + K_OFF)
+                global_q_ss += rms_reduce_bf16[Q_LOCAL](q_ptr)
+                global_k_ss += rms_reduce_bf16[KV_LOCAL](k_ptr)
+            sample.add(self.profile.phase("norm_prep"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_norm_prep0))
             var inv_rms_q = inv_rms_from_sum_sq(global_q_ss, C.Q_DIM, EPS)
             var inv_rms_k = inv_rms_from_sum_sq(global_k_ss, C.KV_DIM, EPS)
-
-            sum_sq_lease^.release()
 
             # Phase 4: K/V cache write (NKV_LOCAL parallel jobs per rank)
             @parameter
@@ -1185,21 +998,21 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
             var context_len = pos + 1
 
             for kv in range(KV_PER_RANK):
-                @parameter
-                def do_q_prep[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                    var lb = topo.layer_base(layer_idx)
-                    var layer = topo.layers.proto
-                    return q_prep_dispatch[
-                        C.HEAD_DIM, C.ROPE_DIM, C.ROPE_PAIR_STRIDE, HPG](
-                        topo.scratch_addr(qkv_lease) + Q_OFF + kv * Q_GROUP_BF16,
-                        layer.attn.q_norm.addr(lb) + kv * HPG * C.HEAD_DIM * 2,
-                        topo.rope_cos_row(pos), topo.rope_sin_row(pos),
-                        inv_rms_q,
-                        topo.scratch_addr(q_i8_lease),
-                        topo.scratch_addr(qi_biases_lease),
-                        topo.scratch_addr(q_scales_lease),
-                        pool)
-                sample.add(self.profile.phase("attention"), tp_parallel[Self.tp, do_q_prep](topos, mp))
+                var t_qprep0 = Int(perf_counter_ns())
+                for r in range(Self.tp):
+                    var lb = topos[r].layer_base(layer_idx)
+                    var layer = topos[r].layers.proto
+                    var qp_args = AttnGroupArgs()
+                    qp_args.q_bf16_base = BF16Ptr(unsafe_from_address=topos[r].scratch_addr(qkv_lease) + Q_OFF + kv * Q_GROUP_BF16)
+                    qp_args.q_norm_ptr = BF16Ptr(unsafe_from_address=layer.attn.q_norm.addr(lb) + kv * HPG * C.HEAD_DIM * 2)
+                    qp_args.cos_ptr = F32Ptr(unsafe_from_address=topos[r].rope_cos_row(pos))
+                    qp_args.sin_ptr = F32Ptr(unsafe_from_address=topos[r].rope_sin_row(pos))
+                    qp_args.inv_rms_q = inv_rms_q
+                    qp_args.qi_out = I8Ptr(unsafe_from_address=topos[r].scratch_addr(q_i8_lease))
+                    qp_args.head_scale_ptr = F32Ptr(unsafe_from_address=topos[r].scratch_addr(qi_biases_lease))
+                    qp_args.context_len = topos[r].scratch_addr(q_scales_lease)
+                    q_prep_kernel[C.HEAD_DIM, C.ROPE_DIM, C.ROPE_PAIR_STRIDE, HPG](qp_args)
+                sample.add(self.profile.phase("q_prep"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_qprep0))
 
                 @parameter
                 def do_chunk_score[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
@@ -1214,18 +1027,19 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
                         pool)
                 sample.add(self.profile.phase("attention"), tp_parallel[Self.tp, do_chunk_score](topos, mp))
 
-                @parameter
-                def do_merge_quant[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                    var num_pg = (context_len + CACHE_WIDTH - 1) // CACHE_WIDTH
-                    var nc = min(Int(pool.capacity), C.MAX_ATTN_CHUNKS)
+                var t_merge_q0 = Int(perf_counter_ns())
+                var num_pg = (context_len + CACHE_WIDTH - 1) // CACHE_WIDTH
+                for r in range(Self.tp):
+                    var nc = min(Int(self.main_pools[r].capacity), C.MAX_ATTN_CHUNKS)
                     if nc > num_pg:
                         nc = num_pg
-                    return merge_quantize_dispatch[C.HEAD_DIM, HPG, C.MAX_ATTN_CHUNKS](
-                        topo.scratch_addr(partial_lease), nc,
-                        topo.scratch_addr(attn_qi_lease) + kv * HPG * C.HEAD_DIM,
-                        topo.scratch_addr(attn_head_sc_lease) + kv * HPG * 4,
-                        pool)
-                sample.add(self.profile.phase("attention"), tp_parallel[Self.tp, do_merge_quant](topos, mp))
+                    if nc > 0:
+                        merge_and_quantize_kernel[C.HEAD_DIM, HPG, C.MAX_ATTN_CHUNKS](
+                            F32Ptr(unsafe_from_address=topos[r].scratch_addr(partial_lease)),
+                            nc,
+                            I8Ptr(unsafe_from_address=topos[r].scratch_addr(attn_qi_lease) + kv * HPG * C.HEAD_DIM),
+                            F32Ptr(unsafe_from_address=topos[r].scratch_addr(attn_head_sc_lease) + kv * HPG * 4))
+                sample.add(self.profile.phase("merge_quant"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_merge_q0))
 
             partial_lease^.release()
             q_scales_lease^.release()
@@ -1272,20 +1086,21 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
             var normed_bf16_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.HIDDEN]()
             var moe_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
 
-            @parameter
-            def do_dual_norm[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                var lb = topo.layer_base(layer_idx)
-                var layer = topo.layers.proto
-                return rmsnorm_dual_output_dispatch[C.HIDDEN, FWHT_BLK_HIDDEN](
-                    topo.x_main(seq_len).ptr,
-                    lb + layer.body.post_attn_norm_sqrt_off,
-                    layer.body.post_attn_norm.addr(lb),
-                    topo.scratch_addr(moe_i8_lease),
-                    topo.scratch_addr(moe_work_lease),
-                    topo.scratch_addr(moe_scale_lease),
-                    topo.scratch_addr(normed_bf16_lease),
-                    EPS, seq_len, pool)
-            sample.add(self.profile.phase("dual_norm"), tp_parallel[Self.tp, do_dual_norm](topos, mp))
+            var t_dual_norm0 = Int(perf_counter_ns())
+            for r in range(Self.tp):
+                var lb = topos[r].layer_base(layer_idx)
+                var layer = topos[r].layers.proto
+                var args = RmsNormDualOutputArgs(
+                    BF16Ptr(unsafe_from_address=topos[r].x_main(seq_len).ptr),
+                    BF16Ptr(unsafe_from_address=lb + layer.body.post_attn_norm_sqrt_off),
+                    BF16Ptr(unsafe_from_address=layer.body.post_attn_norm.addr(lb)),
+                    I8Ptr(unsafe_from_address=topos[r].scratch_addr(moe_i8_lease)),
+                    F32Ptr(unsafe_from_address=topos[r].scratch_addr(moe_work_lease)),
+                    F32Ptr(unsafe_from_address=topos[r].scratch_addr(moe_scale_lease)),
+                    BF16Ptr(unsafe_from_address=topos[r].scratch_addr(normed_bf16_lease)),
+                    EPS, 0, seq_len)
+                rmsnorm_dual_output_worker[C.HIDDEN, FWHT_BLK_HIDDEN](args)
+            sample.add(self.profile.phase("dual_norm"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_dual_norm0))
 
             moe_work_lease^.release()
 
@@ -1309,12 +1124,15 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
                     pool)
             sample.add(self.profile.phase("router_proj"), tp_parallel[Self.tp, do_router_fused](topos, mp))
 
-            @parameter
-            def do_router_merge[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                return router_merge_dispatch[C.NUM_EXPERTS, C.TOP_K](
-                    U8Ptr(unsafe_from_address=topo.scratch_addr(candidates_lease)),
-                    topo.scratch_addr(routing_lease), pool)
-            sample.add(self.profile.phase("router_topk"), tp_parallel[Self.tp, do_router_merge](topos, mp))
+            var t_merge0 = Int(perf_counter_ns())
+            for r in range(Self.tp):
+                var num_workers = min(C.NUM_EXPERTS // C.TOP_K, Int(self.main_pools[r].capacity))
+                var merge_args = RouterMergeArgs(
+                    U8Ptr(unsafe_from_address=topos[r].scratch_addr(candidates_lease)),
+                    U8Ptr(unsafe_from_address=topos[r].scratch_addr(routing_lease)),
+                    num_workers * C.TOP_K)
+                router_merge_and_renorm[C.TOP_K](merge_args)
+            sample.add(self.profile.phase("router_topk"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_merge0))
 
             candidates_lease^.release()
             # normed_bf16 and routing remain live: routing is read by Phase 9/10;
@@ -1389,14 +1207,15 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
             sample.add(self.profile.phase("expert_phase2"), tp_parallel[Self.tp, do_expert_phase2](topos, mp))
 
             # Phase 11: expert reduce + fused allreduce + residual add
-            @parameter
-            def do_expert_sum[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            var t_expert_sum0 = Int(perf_counter_ns())
+            for r in range(Self.tp):
                 var lc = Int(UnsafePointer[Int32, MutAnyOrigin](
-                    unsafe_from_address=topo.scratch_addr(local_count_lease))[])
-                return expert_sum_dispatch[C.HIDDEN, C.TOP_K](
-                    topo.scratch_addr(expert_out_lease), lc,
-                    topo.x_residual(seq_len).ptr, pool)
-            sample.add(self.profile.phase("expert_sum"), tp_parallel[Self.tp, do_expert_sum](topos, mp))
+                    unsafe_from_address=topos[r].scratch_addr(local_count_lease))[])
+                accumulate_expert_outputs[C.HIDDEN, C.TOP_K](
+                    BF16Ptr(unsafe_from_address=topos[r].scratch_addr(expert_out_lease)),
+                    lc,
+                    BF16Ptr(unsafe_from_address=topos[r].x_residual(seq_len).ptr))
+            sample.add(self.profile.phase("expert_sum"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_expert_sum0))
 
             var t_ffn_reduce0 = Int(perf_counter_ns())
             small_allreduce[X_SLOT, Self.tp, residual_add=True](

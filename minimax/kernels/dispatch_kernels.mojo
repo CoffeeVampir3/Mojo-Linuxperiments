@@ -14,28 +14,16 @@ from experimental3.kernels.full_chunked_attention_fused import (
     cp_chunked_attn_kernel,
 )
 
-from experimental3.common_math import rms_reduce_bf16, inv_rms_from_sum_sq
 from minimax.kernels.qk_prep import prep_q_head
-
 from minimax.kernels.dispatch_args import (
     FusedW1W3SiluArgs,
-    RmsNormDualOutputArgs,
     AttnGroupArgs,
     RouterCandidate,
     RouterFusedArgs,
-    RouterMergeArgs,
-    NormPrepArgs,
 )
 from minimax.kernels.gemm import fused_w1_w3_silu_worker
-from minimax.kernels.rmsnorm import rmsnorm_dual_output_worker
-from minimax.kernels.attention import (
-    kv_write_kernel,
-    merge_and_quantize_kernel,
-    partial_chunk_stride,
-)
-from minimax.kernels.router import (
-    TopKResult, router_fused_worker, router_merge_and_renorm,
-)
+from minimax.kernels.attention import kv_write_kernel
+from minimax.kernels.router import TopKResult, router_fused_worker
 
 
 @always_inline
@@ -85,71 +73,6 @@ def router_fused_dispatch[num_experts: Int, hidden: Int, k: Int, P: BurstThreadP
 
     pool.dispatch[RouterFusedArgs, router_fused_worker[hidden, k]](
         UnsafePointer(to=jobs[0]), actual)
-    return pool_fence(pool)
-
-
-def router_merge_dispatch[num_experts: Int, k: Int, P: BurstThreadPool](
-    candidates: U8Ptr,
-    result_ptr: Int,
-    mut pool: P,
-) -> PoolFence[P]:
-    """Phase 2: single-job merge of num_workers × k candidates into
-    TopKResult[k]. num_workers is recomputed from the same pool capacity
-    that phase 1 used."""
-    var num_workers = router_num_workers[num_experts, k](pool.get_capacity())
-    var args = RouterMergeArgs(
-        candidates,
-        U8Ptr(unsafe_from_address=result_ptr),
-        num_workers * k)
-    pool.dispatch[RouterMergeArgs, router_merge_and_renorm[k]](
-        UnsafePointer(to=args), 1)
-    return pool_fence(pool)
-
-
-# ============================================================================
-# Dual-output RMSNorm — split-gamma i8 + full-gamma bf16
-# ============================================================================
-
-
-def rmsnorm_dual_output_dispatch[cols: Int, block: Int, P: BurstThreadPool](
-    src_ptr: Int,
-    split_gamma_ptr: Int,
-    full_gamma_ptr: Int,
-    qi_ptr: Int,
-    work_ptr: Int,
-    scale_ptr: Int,
-    normed_bf16_ptr: Int,
-    eps: Float32,
-    seq_len: Int,
-    mut pool: P,
-) -> PoolFence[P]:
-    if seq_len == 0:
-        return PoolFence[P].completed()
-
-    var num_jobs = min(seq_len, pool.get_capacity())
-    var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
-
-    var src = BF16Ptr(unsafe_from_address=src_ptr)
-    var sg = BF16Ptr(unsafe_from_address=split_gamma_ptr)
-    var fg = BF16Ptr(unsafe_from_address=full_gamma_ptr)
-    var qi = I8Ptr(unsafe_from_address=qi_ptr)
-    var work = F32Ptr(unsafe_from_address=work_ptr)
-    var scales = F32Ptr(unsafe_from_address=scale_ptr)
-    var nbf16 = BF16Ptr(unsafe_from_address=normed_bf16_ptr)
-
-    var jobs = InlineArray[RmsNormDualOutputArgs, MAX_POOL_CAPACITY](
-        fill=RmsNormDualOutputArgs())
-    for i in range(num_jobs):
-        var start = i * rows_per_job
-        var end = min(start + rows_per_job, seq_len)
-        jobs[i] = RmsNormDualOutputArgs(
-            src, sg, fg, qi,
-            work + i * cols,
-            scales, nbf16, eps, start, end)
-
-    pool.dispatch[RmsNormDualOutputArgs,
-        rmsnorm_dual_output_worker[cols, block]](
-        UnsafePointer(to=jobs[0]), num_jobs)
     return pool_fence(pool)
 
 
@@ -219,31 +142,6 @@ def q_prep_kernel[
         q_scales[qh] = result[1] * inv_sqrt_hd
 
 
-def q_prep_dispatch[
-    head_dim: Int, rope_dim: Int, pair_stride: Int,
-    heads_per_group: Int, P: BurstThreadPool,
-](
-    q_bf16_base: Int, q_norm_ptr: Int,
-    cos_ptr: Int, sin_ptr: Int,
-    inv_rms_q: Float32,
-    q_i8_out: Int, qi_biases_out: Int, q_scales_out: Int,
-    mut pool: P,
-) -> PoolFence[P]:
-    var args = AttnGroupArgs()
-    args.q_bf16_base = BF16Ptr(unsafe_from_address=q_bf16_base)
-    args.q_norm_ptr = BF16Ptr(unsafe_from_address=q_norm_ptr)
-    args.cos_ptr = F32Ptr(unsafe_from_address=cos_ptr)
-    args.sin_ptr = F32Ptr(unsafe_from_address=sin_ptr)
-    args.inv_rms_q = inv_rms_q
-    args.qi_out = I8Ptr(unsafe_from_address=q_i8_out)
-    args.head_scale_ptr = F32Ptr(unsafe_from_address=qi_biases_out)
-    args.context_len = q_scales_out
-    pool.dispatch[AttnGroupArgs,
-        q_prep_kernel[head_dim, rope_dim, pair_stride, heads_per_group]](
-        UnsafePointer(to=args), 1)
-    return pool_fence(pool)
-
-
 def chunked_score_dispatch[
     head_dim: Int, heads_per_group: Int,
     max_seq: Int, num_kv_heads: Int, max_attn_chunks: Int,
@@ -295,35 +193,6 @@ def chunked_score_dispatch[
 # ============================================================================
 # Attention phase C: local merge + quantize — no cross-rank gather
 # ============================================================================
-
-
-def merge_quantize_worker[head_dim: Int, heads_per_group: Int, max_attn_chunks: Int](args: AttnGroupArgs):
-    merge_and_quantize_kernel[head_dim, heads_per_group, max_attn_chunks](
-        F32Ptr(unsafe_from_address=Int(args.cache_base)),
-        args.context_len,
-        args.qi_out,
-        args.head_scale_ptr)
-
-
-def merge_quantize_dispatch[
-    head_dim: Int, heads_per_group: Int, max_attn_chunks: Int,
-    P: BurstThreadPool,
-](
-    partial_base: Int, num_chunks: Int,
-    qi_out: Int, head_scale_ptr: Int,
-    mut pool: P,
-) -> PoolFence[P]:
-    if num_chunks <= 0:
-        return PoolFence[P].completed()
-    var args = AttnGroupArgs()
-    args.cache_base = U8Ptr(unsafe_from_address=partial_base)
-    args.context_len = num_chunks
-    args.qi_out = I8Ptr(unsafe_from_address=qi_out)
-    args.head_scale_ptr = F32Ptr(unsafe_from_address=head_scale_ptr)
-    pool.dispatch[AttnGroupArgs,
-        merge_quantize_worker[head_dim, heads_per_group, max_attn_chunks]](
-        UnsafePointer(to=args), 1)
-    return pool_fence(pool)
 
 
 # ============================================================================
@@ -500,31 +369,3 @@ def minimax_moe_phase2[
     return pool_fence(pool)
 
 
-# ============================================================================
-# Norm prep — full-vector Q/K inv_rms computation
-# ============================================================================
-
-
-def norm_prep_kernel[q_dim: Int, kv_dim: Int](args: NormPrepArgs):
-    """Compute partial sum-of-squares for Q and K.
-
-    Writes dst[0] = q_sum_sq, dst[1] = k_sum_sq. Caller allreduces
-    across ranks then calls inv_rms_from_sum_sq with the global totals.
-    """
-    args.dst[0] = rms_reduce_bf16[q_dim](args.q_ptr)
-    args.dst[1] = rms_reduce_bf16[kv_dim](args.k_ptr)
-
-
-def norm_prep_dispatch[q_dim: Int, kv_dim: Int, P: BurstThreadPool](
-    q_ptr: Int, k_ptr: Int, dst_ptr: Int,
-    eps: Float32,
-    mut pool: P,
-) -> PoolFence[P]:
-    var args = NormPrepArgs(
-        BF16Ptr(unsafe_from_address=q_ptr),
-        BF16Ptr(unsafe_from_address=k_ptr),
-        F32Ptr(unsafe_from_address=dst_ptr),
-        eps)
-    pool.dispatch[NormPrepArgs, norm_prep_kernel[q_dim, kv_dim]](
-        UnsafePointer(to=args), 1)
-    return pool_fence(pool)
