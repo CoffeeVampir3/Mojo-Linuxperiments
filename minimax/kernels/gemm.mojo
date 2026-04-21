@@ -4,9 +4,8 @@ from std.collections import InlineArray
 from experimental3.kernels.gemv import gemv_row
 from experimental3.kernels.fwht import fwht_block
 from experimental3.kernels.quantize import absmax_quantize_i8
-from experimental3.common_math import (
-    F32Ptr, BF16Ptr, pick_port_unroll, tree_reduce_accs,
-)
+from experimental3.common_math import F32Ptr, BF16Ptr
+from simd_math.matrixops import pick_port_unroll, tree_reduce_accs
 from minimax.kernels.activations import silu_mul
 from minimax.kernels.dispatch_args import FusedW1W3SiluArgs, F32GemvArgs
 

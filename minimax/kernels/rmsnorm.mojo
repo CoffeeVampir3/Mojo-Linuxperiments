@@ -14,9 +14,8 @@ from std.collections import InlineArray
 from experimental3.common_math import (
     F32Ptr, BF16Ptr, I8Ptr,
     inv_rms_from_sum_sq,
-    pick_port_unroll,
-    tree_reduce_accs,
 )
+from simd_math.matrixops import pick_port_unroll, tree_reduce_accs
 from experimental3.kernels.fwht import fwht_block
 from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.kernels.rmsnorm import fwht_rotate, emit_quant

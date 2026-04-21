@@ -5,6 +5,7 @@ from std.sys.info import simd_width_of
 from std.collections import InlineArray
 
 from simd_math import sqrt
+from simd_math.matrixops import pick_port_unroll, tree_reduce_accs
 
 
 comptime F32Ptr = UnsafePointer[Float32, MutAnyOrigin]
@@ -22,25 +23,6 @@ comptime U8Ptr = UnsafePointer[UInt8, MutAnyOrigin]
 def inv_rms_from_sum_sq(sum_sq: Float32, n: Int, eps: Float32) -> Float32:
     """Convert sum(x^2) to inverse RMS scalar."""
     return Float32(1.0) / sqrt[DType.float32, 1](sum_sq / Float32(n) + eps)
-
-
-@always_inline
-def pick_port_unroll[width: Int, cols: Int]() -> Int:
-    """Largest power-of-two N in {1,2,4,8} with N*width <= cols."""
-    comptime n = cols // width
-    return 8 if n >= 8 else 4 if n >= 4 else 2 if n >= 2 else 1
-
-
-@always_inline
-def tree_reduce_accs[T: DType, width: Int, port_unroll: Int, //](
-    mut accs: InlineArray[SIMD[T, width], port_unroll],
-) -> Scalar[T]:
-    """Pairwise-add accumulator bank into lane-0, then horizontal reduce."""
-    comptime for stride in range(1, port_unroll):
-        comptime if (stride & (stride - 1)) == 0:
-            comptime for i in range(0, port_unroll, 2 * stride):
-                accs[i] += accs[i + stride]
-    return accs[0].reduce_add()
 
 
 @always_inline

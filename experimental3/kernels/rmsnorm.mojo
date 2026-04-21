@@ -5,15 +5,16 @@ from std.sys.info import simd_width_of
 from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.kernels.fwht import fwht_block
 from experimental3.moe import moe_combine
+from std.collections import InlineArray
 from experimental3.common_math import (
     F32Ptr, BF16Ptr, I8Ptr,
     rms_reduce_bf16 as rms_reduce,
     inv_rms_from_sum_sq,
     normalize_inplace,
-    pick_port_unroll,
-    tree_reduce_accs,
 )
-from std.collections import InlineArray
+from simd_math.matrixops import (
+    pick_port_unroll, tree_reduce_accs, tree_merge_accs, port_unroll_for,
+)
 from experimental3.kernels.dispatch_args import (
     RmsNormFwhtQuantArgs, RmsNormDualGammaFwhtArgs,
     RMSNormNoScaleArgs, RMSNormPerHeadArgs,
@@ -27,18 +28,35 @@ from experimental3.kernels.dispatch_args import (
 
 
 @always_inline
-def accumulate_expert_outputs[hidden: Int](
+def accumulate_expert_outputs[hidden: Int, max_local: Int](
     expert_buf: BF16Ptr,
     local_count: Int,
     dst: BF16Ptr,
 ):
+    """Sum `local_count` bf16 expert outputs (stride=hidden) into bf16 dst.
+
+    Class-B port-saturated accumulation: `port_unroll` independent f32 chains
+    along the expert axis. `port_unroll` derived from the comptime ceiling
+    `max_local` (the upper bound on `local_count`). Main loop steps by
+    `port_unroll`; tail handles the remainder serially.
+    """
     comptime width = simd_width_of[DType.float32]()
+    comptime port_unroll = port_unroll_for[max_local]()
     debug_assert(hidden % width == 0, "hidden must be f32-simd-aligned")
+    debug_assert(local_count <= max_local, "local_count exceeds comptime max_local")
+
     for i in range(0, hidden, width):
-        var acc = SIMD[DType.float32, width](0)
-        for e in range(local_count):
-            acc += (expert_buf + e * hidden + i).load[width=width]().cast[DType.float32]()
-        (dst + i).store(acc.cast[DType.bfloat16]())
+        var accs = InlineArray[SIMD[DType.float32, width], port_unroll](
+            fill=SIMD[DType.float32, width](0))
+        var e = 0
+        while e + port_unroll <= local_count:
+            comptime for u in range(port_unroll):
+                accs[u] += (expert_buf + (e + u) * hidden + i).load[width=width]().cast[DType.float32]()
+            e += port_unroll
+        while e < local_count:
+            accs[0] += (expert_buf + e * hidden + i).load[width=width]().cast[DType.float32]()
+            e += 1
+        (dst + i).store(tree_merge_accs(accs).cast[DType.bfloat16]())
 
 
 # ============================================================================
@@ -375,11 +393,11 @@ struct PreReduceArgs(Copyable, ImplicitlyCopyable):
         self.normed_ptr = BF16Ptr()
         self.eps = Float32(0)
 
-def pre_reduce_kernel[hidden: Int](args: PreReduceArgs):
+def pre_reduce_kernel[hidden: Int, max_local: Int](args: PreReduceArgs):
     """Accumulate local experts into dst + rmsnorm(dense, norm_w) into normed."""
     var expert_buf = args.expert_out_ptr
     var dst = args.dst_ptr
-    accumulate_expert_outputs[hidden](expert_buf, args.local_count, dst)
+    accumulate_expert_outputs[hidden, max_local](expert_buf, args.local_count, dst)
     var dense = args.dense_ptr
     rmsnorm_bf16_row[hidden, True, False](
         dense,
@@ -388,11 +406,11 @@ def pre_reduce_kernel[hidden: Int](args: PreReduceArgs):
         args.eps)
 
 
-def expert_sum_kernel[hidden: Int](args: ExpertSumArgs):
+def expert_sum_kernel[hidden: Int, max_local: Int](args: ExpertSumArgs):
     """Accumulate local expert outputs into dst."""
     var expert_buf = args.expert_out_ptr
     var dst = args.dst_ptr
-    accumulate_expert_outputs[hidden](expert_buf, args.local_count, dst)
+    accumulate_expert_outputs[hidden, max_local](expert_buf, args.local_count, dst)
 
 
 def dense_norm_kernel[hidden: Int](args: DenseNormArgs):

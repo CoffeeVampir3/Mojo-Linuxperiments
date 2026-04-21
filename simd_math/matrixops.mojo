@@ -208,3 +208,56 @@ def fill_lane_iota[width: Int, regs: Int](
     """
     comptime for r in range(regs):
         indices[r] = iota[DType.int32, width](offset=Int32(r * width))
+
+
+# ============================================================================
+# Port-saturating accumulation
+#
+# Two classes of accumulation live here:
+#   A) Reduction along a SIMD axis — `cols` comptime, step = port_unroll*width.
+#      Picker: pick_port_unroll[width, cols]().
+#   B) Reduction along a non-SIMD axis (experts, chunks) — step = port_unroll.
+#      Picker: port_unroll_for[count](), where count is the comptime bound.
+#
+# Both classes merge their register banks via tree_reduce_accs.
+# ============================================================================
+
+
+@always_inline
+def port_unroll_for[count: Int]() -> Int:
+    """Largest power-of-two N in {1,2,4,8} with N <= count."""
+    return 8 if count >= 8 else 4 if count >= 4 else 2 if count >= 2 else 1
+
+
+@always_inline
+def pick_port_unroll[width: Int, cols: Int]() -> Int:
+    """Class-A picker: chains that fit within `cols` at `width` lanes each."""
+    return port_unroll_for[cols // width]()
+
+
+@always_inline
+def tree_reduce_accs[T: DType, width: Int, port_unroll: Int, //](
+    mut accs: InlineArray[SIMD[T, width], port_unroll],
+) -> Scalar[T]:
+    """Pairwise-add accumulator bank into lane-0, then horizontal reduce."""
+    comptime for stride in range(1, port_unroll):
+        comptime if (stride & (stride - 1)) == 0:
+            comptime for i in range(0, port_unroll, 2 * stride):
+                accs[i] += accs[i + stride]
+    return accs[0].reduce_add()
+
+
+@always_inline
+def tree_merge_accs[T: DType, width: Int, port_unroll: Int, //](
+    mut accs: InlineArray[SIMD[T, width], port_unroll],
+) -> SIMD[T, width]:
+    """Pairwise-add accumulator bank into lane-0 as a vector (no horizontal reduce).
+
+    Used when the caller wants to keep the merged SIMD vector (e.g. to cast and
+    store) rather than reduce to a scalar.
+    """
+    comptime for stride in range(1, port_unroll):
+        comptime if (stride & (stride - 1)) == 0:
+            comptime for i in range(0, port_unroll, 2 * stride):
+                accs[i] += accs[i + stride]
+    return accs[0]

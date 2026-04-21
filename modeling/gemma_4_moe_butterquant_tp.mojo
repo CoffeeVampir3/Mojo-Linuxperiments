@@ -1495,7 +1495,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
             def do_expert_sum[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                 var lc = Int(UnsafePointer[Int32, MutAnyOrigin](
                     unsafe_from_address=topo.scratch_addr(local_count_lease))[] )
-                return expert_sum_dispatch[C.HIDDEN](
+                return expert_sum_dispatch[C.HIDDEN, C.TOP_K](
                     topo.scratch_addr(expert_out_lease), lc,
                     topo.x_residual(seq_len).ptr, pool)
             sample.add(self.profile.phase("pre_reduce"), tp_parallel[Self.tp, do_expert_sum](topos, mp))

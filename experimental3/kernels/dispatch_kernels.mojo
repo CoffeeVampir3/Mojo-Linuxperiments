@@ -938,14 +938,14 @@ def post_attn_norm_dispatch[hidden: Int, P: BurstThreadPool](
     return pool_fence(pool)
 
 
-def expert_sum_dispatch[hidden: Int, P: BurstThreadPool](
+def expert_sum_dispatch[hidden: Int, max_local: Int, P: BurstThreadPool](
     expert_out_ptr: Int, local_count: Int, dst_ptr: Int, mut pool: P,
 ) -> PoolFence[P]:
     var args = ExpertSumArgs(
         BF16Ptr(unsafe_from_address=expert_out_ptr),
         local_count,
         BF16Ptr(unsafe_from_address=dst_ptr))
-    pool.dispatch[ExpertSumArgs, expert_sum_kernel[hidden]](
+    pool.dispatch[ExpertSumArgs, expert_sum_kernel[hidden, max_local]](
         UnsafePointer(to=args), 1)
     return pool_fence(pool)
 
