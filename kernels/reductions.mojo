@@ -95,19 +95,18 @@ def small_allreduce[T: Encoding & Shaped, tp: Int, residual_add: Bool = False](
             dst.store(i, acc.cast[DType.bfloat16]())
 
     var total_bytes = total * T.ELEMENT_BYTES
-    var bcast = InlineArray[MemcpyArgs, tp](fill=MemcpyArgs(0, 0, 0))
     comptime if residual_add:
         for r in range(1, tp):
-            bcast[r] = MemcpyArgs(dst_ptrs[r], dst_ptrs[0], total_bytes)
-            pool_ptrs[r][].dispatch[MemcpyArgs, memcpy_kernel](
-                UnsafePointer(to=bcast[r]), 1)
+            memcpy(
+                dest=tptr[Byte](dst_ptrs[r]),
+                src=tptr[Byte](dst_ptrs[0]),
+                count=total_bytes)
     else:
         for r in range(1, tp):
-            bcast[r] = MemcpyArgs(ptrs[r], ptrs[0], total_bytes)
-            pool_ptrs[r][].dispatch[MemcpyArgs, memcpy_kernel](
-                UnsafePointer(to=bcast[r]), 1)
-    for r in range(1, tp):
-        pool_ptrs[r][].join()
+            memcpy(
+                dest=tptr[Byte](ptrs[r]),
+                src=tptr[Byte](ptrs[0]),
+                count=total_bytes)
 
 
 # =============================================================================
