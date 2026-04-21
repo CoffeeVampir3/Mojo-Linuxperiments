@@ -10,9 +10,7 @@ from experimental3.kernels.dispatch_args import Int8GemvBlockedArgs, ChunkedAttn
 from experimental3.kernels.gemm import int8_gemv_blocked_worker, int8_gemv_blocked_decode_worker
 from kernels.vnni import VNNI_N_STEP
 from experimental3.kv_cache import CACHE_WIDTH
-from experimental3.kernels.full_chunked_attention_fused import (
-    cp_chunked_attn_kernel,
-)
+from experimental3.kernels.amx_attention import amx_chunked_attn_kernel
 
 from minimax.kernels.qk_prep import prep_q_head
 from minimax.kernels.dispatch_args import (
@@ -185,7 +183,7 @@ def chunked_score_dispatch[
             partial_out=partial_out + c * CHUNK_F32_STRIDE,
             context_len=context_len)
     pool.dispatch[ChunkedAttnArgs,
-        cp_chunked_attn_kernel[head_dim, max_seq, num_kv_heads, 0, heads_per_group, max_attn_chunks]](
+        amx_chunked_attn_kernel[head_dim, max_seq, num_kv_heads, 0, heads_per_group, max_attn_chunks]](
         UnsafePointer(to=chunk_args[0]), num_chunks)
     return pool_fence(pool)
 

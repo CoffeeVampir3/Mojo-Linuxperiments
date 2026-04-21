@@ -63,6 +63,7 @@ from minimax.kernels.dispatch_kernels import (
     minimax_moe_phase2,
 )
 from minimax.kernels.rmsnorm import rmsnorm_dual_output_worker
+from experimental3.kernels.amx_attention import AmxConfigArgs, amx_config_kernel
 from minimax.kernels.attention import merge_and_quantize_kernel
 
 
@@ -797,6 +798,13 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
                     fn_gamma,
                     BF16Ptr(unsafe_from_address=base + topo.host.lm_output_head_sqrt_gamma_off))
 
+        var amx_jobs = InlineArray[AmxConfigArgs, MAX_POOL_CAPACITY](
+            fill=AmxConfigArgs())
+        for rank in range(Self.tp):
+            var cap = Int(self.main_pools[rank].capacity)
+            self.main_pools[rank].dispatch[AmxConfigArgs, amx_config_kernel](
+                UnsafePointer(to=amx_jobs[0]), cap)
+            self.main_pools[rank].join()
         print("state initialized")
 
     @staticmethod
