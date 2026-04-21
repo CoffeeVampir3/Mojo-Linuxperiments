@@ -39,6 +39,11 @@ struct Gemma4BaseConfig:
     comptime RMS_NORM_EPS = 1e-6
     comptime LOGIT_SOFTCAP = 30.0
 
+    # Comptime ceiling on chunked-attention fan-out for full-attention layers.
+    # Sizes dispatcher/merge stack arrays + cross-chunk partials buffer.
+    # Must be >= any pool_capacity we will ever see at runtime.
+    comptime FULL_ATTN_MAX_CHUNKS = 32
+
 
 # =============================================================================
 # Layer routing

@@ -11,7 +11,7 @@ from experimental3.kernels.gemm import int8_gemv_blocked_worker, int8_gemv_block
 from kernels.vnni import VNNI_N_STEP
 from experimental3.kv_cache import CACHE_WIDTH
 from experimental3.kernels.full_chunked_attention_fused import (
-    cp_chunked_attn_kernel, MAX_CHUNKS,
+    cp_chunked_attn_kernel,
 )
 
 from experimental3.common_math import rms_reduce_bf16, inv_rms_from_sum_sq
@@ -236,7 +236,8 @@ def q_prep_dispatch[
 
 def chunked_score_dispatch[
     head_dim: Int, heads_per_group: Int,
-    max_seq: Int, num_kv_heads: Int, P: BurstThreadPool,
+    max_seq: Int, num_kv_heads: Int, max_attn_chunks: Int,
+    P: BurstThreadPool,
 ](
     q_i8_base: Int, qi_biases_base: Int, q_scales_base: Int,
     cache_base: Int, kv_head: Int,
@@ -247,7 +248,7 @@ def chunked_score_dispatch[
     """Dispatch chunked scoring for one KV group across pool workers."""
     comptime WIDTH = CACHE_WIDTH
     var num_pg = (context_len + WIDTH - 1) // WIDTH
-    var num_chunks = min(pool_capacity, MAX_CHUNKS)
+    var num_chunks = min(pool_capacity, max_attn_chunks)
     if num_chunks > num_pg:
         num_chunks = num_pg
     if num_chunks <= 0:
@@ -261,7 +262,7 @@ def chunked_score_dispatch[
     var cache = U8Ptr(unsafe_from_address=cache_base)
     var partial_out = F32Ptr(unsafe_from_address=partial_out_base)
 
-    var chunk_args = InlineArray[ChunkedAttnArgs, MAX_CHUNKS](fill=ChunkedAttnArgs())
+    var chunk_args = InlineArray[ChunkedAttnArgs, max_attn_chunks](fill=ChunkedAttnArgs())
     for c in range(num_chunks):
         var start = c * pgs_per_chunk
         var end = min((c + 1) * pgs_per_chunk, num_pg)
@@ -276,7 +277,7 @@ def chunked_score_dispatch[
             partial_out=partial_out + c * CHUNK_F32_STRIDE,
             context_len=context_len)
     pool.dispatch[ChunkedAttnArgs,
-        cp_chunked_attn_kernel[head_dim, max_seq, num_kv_heads, 0, heads_per_group]](
+        cp_chunked_attn_kernel[head_dim, max_seq, num_kv_heads, 0, heads_per_group, max_attn_chunks]](
         UnsafePointer(to=chunk_args[0]), num_chunks)
     return pool_fence(pool)
 
@@ -286,8 +287,8 @@ def chunked_score_dispatch[
 # ============================================================================
 
 
-def merge_quantize_worker[head_dim: Int, heads_per_group: Int](args: AttnGroupArgs):
-    merge_and_quantize_kernel[head_dim, heads_per_group](
+def merge_quantize_worker[head_dim: Int, heads_per_group: Int, max_attn_chunks: Int](args: AttnGroupArgs):
+    merge_and_quantize_kernel[head_dim, heads_per_group, max_attn_chunks](
         F32Ptr(unsafe_from_address=Int(args.cache_base)),
         args.context_len,
         args.qi_out,
@@ -295,7 +296,8 @@ def merge_quantize_worker[head_dim: Int, heads_per_group: Int](args: AttnGroupAr
 
 
 def merge_quantize_dispatch[
-    head_dim: Int, heads_per_group: Int, P: BurstThreadPool,
+    head_dim: Int, heads_per_group: Int, max_attn_chunks: Int,
+    P: BurstThreadPool,
 ](
     partial_base: Int, num_chunks: Int,
     qi_out: Int, head_scale_ptr: Int,
@@ -309,7 +311,7 @@ def merge_quantize_dispatch[
     args.qi_out = I8Ptr(unsafe_from_address=qi_out)
     args.head_scale_ptr = F32Ptr(unsafe_from_address=head_scale_ptr)
     pool.dispatch[AttnGroupArgs,
-        merge_quantize_worker[head_dim, heads_per_group]](
+        merge_quantize_worker[head_dim, heads_per_group, max_attn_chunks]](
         UnsafePointer(to=args), 1)
     return pool_fence(pool)
 

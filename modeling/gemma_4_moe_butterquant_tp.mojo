@@ -480,7 +480,6 @@ def calculate_peak_scratch[tp: Int]() -> Int:
 
     comptime full_q_bf16 = S.FullQ.N * bf16
     comptime full_k_bf16 = C.KV_DIM_FULL * bf16
-    comptime FULL_ATTN_MAX_CHUNKS = 32
     comptime full_attn_phase1 = persistent + (
         full_q_bf16 + full_k_bf16
         + C.HIDDEN * i8 + C.HIDDEN * f32 + f32
@@ -496,7 +495,7 @@ def calculate_peak_scratch[tp: Int]() -> Int:
         + (S.FullQ.N // C.HEAD_DIM_FULL) * f32
         + S.FULL_HPG * C.HEAD_DIM_FULL * i8
         + S.FULL_HPG * f32 * 2
-        + FULL_ATTN_MAX_CHUNKS * S.FULL_HPG * (2 + C.HEAD_DIM_FULL) * f32
+        + C.FULL_ATTN_MAX_CHUNKS * S.FULL_HPG * (2 + C.HEAD_DIM_FULL) * f32
         + full_attn_cp_extra
     )
     comptime full_attn_peak = (
@@ -1010,7 +1009,6 @@ struct Gemma4ButterQuant[tp: Int](Movable):
         comptime DENSE_DOWN_NUM_BLK = S.DENSE_DOWN_NUM_BLK
         comptime FULL_HPG = S.FULL_HPG
         comptime ROPE_DIMS_FULL = 128
-        comptime FULL_ATTN_MAX_CHUNKS = 32
         comptime X_SLOT = Mat[BF16, C.MAX_SEQ_LEN, C.HIDDEN]
         comptime VOCAB_NUM_BLOCKS = C.HIDDEN // LM_HEAD_FWHT_BLK
 
@@ -1208,7 +1206,7 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                 var q_i8_prep_lease = self.scratch.borrow[Scalar[DType.int8], FULL_HPG * C.HEAD_DIM_FULL]()
                 var qi_biases_lease = self.scratch.borrow[Float32, FULL_HPG]()
                 var q_scales_lease = self.scratch.borrow[Float32, FULL_HPG]()
-                comptime PARTIAL_F32S = FULL_ATTN_MAX_CHUNKS * FULL_HPG * (2 + C.HEAD_DIM_FULL)
+                comptime PARTIAL_F32S = C.FULL_ATTN_MAX_CHUNKS * FULL_HPG * (2 + C.HEAD_DIM_FULL)
                 var partial_lease = self.scratch.borrow[Float32, PARTIAL_F32S]()
                 var cp_m_lease = self.scratch.borrow[Float32, C.NUM_HEADS]()
                 var cp_l_lease = self.scratch.borrow[Float32, C.NUM_HEADS]()
@@ -1242,7 +1240,8 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                         var local_ctx = cp_local_context_len(pos + 1, rank, Self.tp)
                         return cp_chunked_attn_dispatch[
                             C.HEAD_DIM_FULL, LOCAL_MAX_SEQ_FULL,
-                            C.NUM_KV_HEADS_FULL, C.NUM_HEADS, FULL_HPG](
+                            C.NUM_KV_HEADS_FULL, C.NUM_HEADS, FULL_HPG,
+                            C.FULL_ATTN_MAX_CHUNKS](
                             topo.scratch_addr(q_i8_prep_lease),
                             topo.scratch_addr(qi_biases_lease),
                             topo.scratch_addr(q_scales_lease),
@@ -1256,10 +1255,11 @@ struct Gemma4ButterQuant[tp: Int](Movable):
                     def do_merge_chunks[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                         var local_ctx = cp_local_context_len(pos + 1, rank, Self.tp)
                         var num_pg = (local_ctx + CACHE_WIDTH - 1) // CACHE_WIDTH
-                        var nc = min(Int(pool.capacity), FULL_ATTN_MAX_CHUNKS)
+                        var nc = min(Int(pool.capacity), C.FULL_ATTN_MAX_CHUNKS)
                         if nc > num_pg:
                             nc = num_pg
-                        return merge_local_chunks_dispatch[C.HEAD_DIM_FULL, FULL_HPG](
+                        return merge_local_chunks_dispatch[
+                            C.HEAD_DIM_FULL, FULL_HPG, C.FULL_ATTN_MAX_CHUNKS](
                             topo.scratch_addr(partial_lease), nc,
                             topo.scratch_addr(cp_m_lease) + kv * FULL_HPG * 4,
                             topo.scratch_addr(cp_l_lease) + kv * FULL_HPG * 4,

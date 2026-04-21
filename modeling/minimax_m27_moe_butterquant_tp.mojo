@@ -108,6 +108,12 @@ struct MiniMaxM27Config:
 
     comptime MAX_SEQ_LEN = 4096
 
+    # Comptime ceiling on how many parallel workers the chunked-attention
+    # dispatcher will fan out to for a single KV group. Sizes stack arrays in
+    # the dispatcher, merge kernel, and cross-chunk scratch buffer. Must be
+    # >= any pool_capacity we will ever see at runtime.
+    comptime MAX_ATTN_CHUNKS = 32
+
 
 comptime C = MiniMaxM27Config
 comptime FWHT_BLK = 128
@@ -465,8 +471,7 @@ def calculate_peak_scratch[tp: Int]() -> Int:
     comptime i8   = 1
 
     comptime HPG = C.HPG
-    comptime MAX_CHUNKS = 32
-    comptime PARTIAL_F32S = MAX_CHUNKS * HPG * (2 + C.HEAD_DIM)
+    comptime PARTIAL_F32S = C.MAX_ATTN_CHUNKS * HPG * (2 + C.HEAD_DIM)
     comptime attn_peak = (
         f32
         + S.QKV_LOCAL * bf16
@@ -1036,11 +1041,10 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         comptime KV_PER_RANK = S.NUM_KV_HEADS_LOCAL
         comptime X_SLOT = Mat[BF16, C.MAX_SEQ_LEN, C.HIDDEN]
         comptime VOCAB_NUM_BLOCKS = C.HIDDEN // LM_OUTPUT_HEAD_FWHT_BLK
-        comptime MAX_CHUNKS = 32
         comptime Q_GROUP_BF16 = HPG * C.HEAD_DIM * 2
         comptime K_HEAD_BF16 = C.HEAD_DIM * 2
         comptime V_HEAD_BF16 = C.HEAD_DIM * 2
-        comptime PARTIAL_F32S = MAX_CHUNKS * HPG * (2 + C.HEAD_DIM)
+        comptime PARTIAL_F32S = C.MAX_ATTN_CHUNKS * HPG * (2 + C.HEAD_DIM)
 
         var t_forward0 = Int(perf_counter_ns())
         var sample = ForwardSample(pos)
@@ -1188,7 +1192,7 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
                 @parameter
                 def do_chunk_score[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                     return chunked_score_dispatch[
-                        C.HEAD_DIM, HPG, C.MAX_SEQ_LEN, KV_PER_RANK](
+                        C.HEAD_DIM, HPG, C.MAX_SEQ_LEN, KV_PER_RANK, C.MAX_ATTN_CHUNKS](
                         topo.scratch_addr(q_i8_lease),
                         topo.scratch_addr(qi_biases_lease),
                         topo.scratch_addr(q_scales_lease),
@@ -1201,10 +1205,10 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
                 @parameter
                 def do_merge_quant[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
                     var num_pg = (context_len + CACHE_WIDTH - 1) // CACHE_WIDTH
-                    var nc = min(Int(pool.capacity), MAX_CHUNKS)
+                    var nc = min(Int(pool.capacity), C.MAX_ATTN_CHUNKS)
                     if nc > num_pg:
                         nc = num_pg
-                    return merge_quantize_dispatch[C.HEAD_DIM, HPG](
+                    return merge_quantize_dispatch[C.HEAD_DIM, HPG, C.MAX_ATTN_CHUNKS](
                         topo.scratch_addr(partial_lease), nc,
                         topo.scratch_addr(attn_qi_lease) + kv * HPG * C.HEAD_DIM,
                         topo.scratch_addr(attn_head_sc_lease) + kv * HPG * 4,

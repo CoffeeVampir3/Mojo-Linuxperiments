@@ -29,10 +29,10 @@ from threading import BurstPool
 from kernels.kernel_ops import PoolFence
 from kernels.reductions import ring_allreduce
 
-from experimental3.kernels.full_chunked_attention import (
+from experimental3.kernels.full_chunked_attention_fused import (
     partial_head_stride, partial_chunk_stride,
+    cp_merge_and_quantize,
 )
-from experimental3.kernels.full_chunked_attention_fused import cp_merge_and_quantize
 from experimental3.kernels.dispatch_kernels import int8_gemv_blocked
 from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr, BF16Ptr
 from modeling.model_spec import Mat, BF16
@@ -214,7 +214,7 @@ def bench_fused(
         # =================================================================
         for rank in range(TP):
             var rb = rank_bufs[rank]
-            cp_merge_and_quantize[HEAD_DIM, HPG, NUM_KV, NUM_HEADS, TP](
+            cp_merge_and_quantize[HEAD_DIM, HPG, NUM_KV, NUM_HEADS, TP, CHUNKS_PER_RANK](
                 rank,
                 rb.partials,
                 CHUNKS_PER_RANK,

@@ -58,7 +58,7 @@ from experimental3.moe import router_topk_kernel
 from experimental3.kernels.sliding_attention import sliding_attn_group_kernel
 from experimental3.kernels.full_chunked_attention_fused import (
     cp_attn_prep_kernel,
-    cp_chunked_attn_kernel, MAX_CHUNKS,
+    cp_chunked_attn_kernel,
     merge_local_chunks_kernel,
     cp_gather_kernel,
 )
@@ -648,6 +648,7 @@ def cp_attn_prep_dispatch[
 def cp_chunked_attn_dispatch[
     head_dim: Int, local_max_seq: Int,
     num_kv_heads: Int, num_q_heads: Int, heads_per_group: Int,
+    max_attn_chunks: Int,
     P: BurstThreadPool,
 ](
     q_i8_base: Int, qi_biases_base: Int, q_scales_base: Int,
@@ -658,7 +659,7 @@ def cp_chunked_attn_dispatch[
 ) -> PoolFence[P]:
     """Dispatch chunked attention with CP cache parameters."""
     var num_pg = (local_context_len + CACHE_WIDTH - 1) // CACHE_WIDTH
-    var num_chunks = min(pool_capacity, MAX_CHUNKS)
+    var num_chunks = min(pool_capacity, max_attn_chunks)
     if num_chunks > num_pg:
         num_chunks = num_pg
     if num_chunks <= 0:
@@ -670,7 +671,7 @@ def cp_chunked_attn_dispatch[
     var q_scales = F32Ptr(unsafe_from_address=q_scales_base)
     var cache = U8Ptr(unsafe_from_address=cache_base)
     var partial_out = F32Ptr(unsafe_from_address=partial_out_base)
-    var chunk_args = InlineArray[ChunkedAttnArgs, MAX_CHUNKS](fill=ChunkedAttnArgs())
+    var chunk_args = InlineArray[ChunkedAttnArgs, max_attn_chunks](fill=ChunkedAttnArgs())
     for c in range(num_chunks):
         var start = c * pgs_per_chunk
         var end = min((c + 1) * pgs_per_chunk, num_pg)
@@ -685,13 +686,14 @@ def cp_chunked_attn_dispatch[
             partial_out=partial_out + c * CHUNK_F32_STRIDE,
             context_len=local_context_len)
     pool.dispatch[ChunkedAttnArgs,
-        cp_chunked_attn_kernel[head_dim, local_max_seq, num_kv_heads, num_q_heads, heads_per_group]](
+        cp_chunked_attn_kernel[head_dim, local_max_seq, num_kv_heads, num_q_heads, heads_per_group, max_attn_chunks]](
         UnsafePointer(to=chunk_args[0]), num_chunks)
     return pool_fence(pool)
 
 
 def merge_local_chunks_dispatch[
-    head_dim: Int, heads_per_group: Int, P: BurstThreadPool,
+    head_dim: Int, heads_per_group: Int, max_attn_chunks: Int,
+    P: BurstThreadPool,
 ](
     partial_base: Int, num_chunks: Int,
     out_m: Int, out_l: Int, out_v: Int,
@@ -706,7 +708,7 @@ def merge_local_chunks_dispatch[
         out_l=F32Ptr(unsafe_from_address=out_l),
         out_v=F32Ptr(unsafe_from_address=out_v))
     pool.dispatch[MergeChunksArgs,
-        merge_local_chunks_kernel[head_dim, heads_per_group]](
+        merge_local_chunks_kernel[head_dim, heads_per_group, max_attn_chunks]](
         UnsafePointer(to=args), 1)
     return pool_fence(pool)
 

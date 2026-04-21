@@ -4,7 +4,6 @@ from std.sys.info import simd_width_of
 from simd_math import sqrt, exp_f32
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
 from experimental3.kernels.quantize import absmax_quantize_i8
-from experimental3.kernels.full_chunked_attention_fused import MAX_CHUNKS
 from experimental3.common_math import F32Ptr, BF16Ptr, I8Ptr
 from minimax.kernels.qk_prep import prep_q_head, write_k_head, write_v_direct
 from minimax.kernels.dispatch_args import AttnGroupArgs
@@ -53,7 +52,7 @@ def partial_chunk_stride[head_dim: Int, heads_per_group: Int]() -> Int:
     return heads_per_group * partial_head_stride[head_dim]()
 
 
-def merge_and_quantize_kernel[head_dim: Int, heads_per_group: Int](
+def merge_and_quantize_kernel[head_dim: Int, heads_per_group: Int, max_attn_chunks: Int](
     partial_base: F32Ptr,
     num_chunks: Int,
     qi_out: I8Ptr,
@@ -71,9 +70,9 @@ def merge_and_quantize_kernel[head_dim: Int, heads_per_group: Int](
     var work_arr = InlineArray[Float32, head_dim](fill=Float32(0))
     var wp = UnsafePointer(to=work_arr).bitcast[Float32]()
 
-    var m_arr = InlineArray[Float32, MAX_CHUNKS](fill=Float32(-1e30))
-    var cs_arr = InlineArray[Float32, MAX_CHUNKS](uninitialized=True)
-    var rescale_arr = InlineArray[Float32, MAX_CHUNKS](uninitialized=True)
+    var m_arr = InlineArray[Float32, max_attn_chunks](fill=Float32(-1e30))
+    var cs_arr = InlineArray[Float32, max_attn_chunks](uninitialized=True)
+    var rescale_arr = InlineArray[Float32, max_attn_chunks](uninitialized=True)
 
     for qh in range(heads_per_group):
         # Gather per-chunk (max, sum) for this head; compute gmax.
@@ -88,7 +87,7 @@ def merge_and_quantize_kernel[head_dim: Int, heads_per_group: Int](
         # One batched SIMD exp covers all chunks; inactive lanes stay at -1e30.
         var gmax_vec = SIMD[DType.float32, width](gmax)
         var cg = 0
-        while cg < MAX_CHUNKS:
+        while cg < max_attn_chunks:
             var mv = UnsafePointer(to=m_arr[cg]).load[width=width]()
             UnsafePointer(to=rescale_arr[cg]).store(exp_f32[width](mv - gmax_vec))
             cg += width

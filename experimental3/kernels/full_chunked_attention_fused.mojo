@@ -151,12 +151,9 @@ def cp_attn_prep_kernel[
 # ============================================================================
 
 
-comptime MAX_CHUNKS = 32
-
-
 def cp_chunked_attn_kernel[
     head_dim: Int, local_max_seq: Int, num_kv_heads: Int, num_q_heads: Int,
-    heads_per_group: Int,
+    heads_per_group: Int, max_attn_chunks: Int,
 ](args: ChunkedAttnArgs):
     """Score one KV-cache chunk against all Q heads — CP variant.
 
@@ -257,7 +254,7 @@ def cp_chunked_attn_kernel[
 # ============================================================================
 
 
-def merge_local_chunks[head_dim: Int, heads_per_group: Int](
+def merge_local_chunks[head_dim: Int, heads_per_group: Int, max_attn_chunks: Int](
     partial_base: UnsafePointer[Float32, MutAnyOrigin],
     num_chunks: Int,
     out_m: UnsafePointer[Float32, MutAnyOrigin],
@@ -269,9 +266,9 @@ def merge_local_chunks[head_dim: Int, heads_per_group: Int](
     comptime CHUNK_STRIDE = partial_chunk_stride[head_dim, heads_per_group]()
     comptime width = simd_width_of[DType.float32]()
 
-    var m_arr = InlineArray[Float32, MAX_CHUNKS](fill=Float32(-1e30))
-    var cs_arr = InlineArray[Float32, MAX_CHUNKS](uninitialized=True)
-    var rescale_arr = InlineArray[Float32, MAX_CHUNKS](uninitialized=True)
+    var m_arr = InlineArray[Float32, max_attn_chunks](fill=Float32(-1e30))
+    var cs_arr = InlineArray[Float32, max_attn_chunks](uninitialized=True)
+    var rescale_arr = InlineArray[Float32, max_attn_chunks](uninitialized=True)
 
     for qh in range(heads_per_group):
         # Gather (max, sum) from each chunk; compute gmax.
@@ -286,7 +283,7 @@ def merge_local_chunks[head_dim: Int, heads_per_group: Int](
         # Batched SIMD exp across all chunks — unused slots are -1e30 → 0.
         var gmax_vec = SIMD[DType.float32, width](gmax)
         var cg = 0
-        while cg < MAX_CHUNKS:
+        while cg < max_attn_chunks:
             var mv = UnsafePointer(to=m_arr[cg]).load[width=width]()
             UnsafePointer(to=rescale_arr[cg]).store(exp_f32[width](mv - gmax_vec))
             cg += width
@@ -384,6 +381,7 @@ def cp_merge_and_quantize[
     num_kv: Int,
     num_heads: Int,
     tp: Int,
+    max_attn_chunks: Int,
 ](
     rank: Int,
     partial_base: UnsafePointer[Float32, MutAnyOrigin],
@@ -408,7 +406,7 @@ def cp_merge_and_quantize[
     comptime CHUNK_STRIDE = partial_chunk_stride[head_dim, heads_per_group]()
 
     for kv in range(num_kv):
-        merge_local_chunks[head_dim, heads_per_group](
+        merge_local_chunks[head_dim, heads_per_group, max_attn_chunks](
             partial_base + kv * num_chunks * CHUNK_STRIDE,
             num_chunks,
             local_m + kv * heads_per_group,
@@ -429,10 +427,10 @@ def cp_merge_and_quantize[
 # For the model's forward path, dispatchers in dispatch_kernels.mojo run the
 # same work on NUMA-local pool workers so all writes target local memory.
 
-def merge_local_chunks_kernel[head_dim: Int, heads_per_group: Int](
+def merge_local_chunks_kernel[head_dim: Int, heads_per_group: Int, max_attn_chunks: Int](
     args: MergeChunksArgs,
 ):
-    merge_local_chunks[head_dim, heads_per_group](
+    merge_local_chunks[head_dim, heads_per_group, max_attn_chunks](
         args.partial_base,
         args.num_chunks,
         args.out_m,
