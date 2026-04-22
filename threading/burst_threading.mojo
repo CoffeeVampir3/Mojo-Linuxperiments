@@ -164,7 +164,7 @@ struct WorkerStackHead[mask_size: Int]:
 # BurstPool
 # ============================================================================
 
-comptime SPIN_LIMIT = 1000
+comptime SPIN_LIMIT = 100_000
 
 struct BurstPool[mask_size: Int = 128](BurstThreadPool):
     """Spin-backoff pool with dual-mailbox NUMA-aware dispatch.
