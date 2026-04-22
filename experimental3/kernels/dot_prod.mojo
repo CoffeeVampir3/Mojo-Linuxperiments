@@ -42,20 +42,37 @@ def vpdpbusd[width: Int](
 
 
 @always_inline
+def bcast_4_vnni[width: Int](
+    b4: SIMD[DType.uint8, 4],
+) -> SIMD[DType.uint8, width * 4]:
+    """Broadcast a 4-byte sequence into `width` dword lanes (the VNNI
+    dword-broadcast shape). Lowers to a single vpbroadcastd, which
+    `vpdpbusd` can fold via its {1to16} broadcast modifier — verified in
+    inspectables/bcast_4_vnni.mojo.
+    """
+    var out = SIMD[DType.uint8, width * 4]()
+    comptime for lane in range(width):
+        out = out.insert[offset = lane * 4](b4)
+    return out
+
+
+@always_inline
+def bcast_4u8_vnni[width: Int](
+    p: UnsafePointer[UInt8, MutAnyOrigin],
+) -> SIMD[DType.uint8, width * 4]:
+    """Load 4 u8 bytes at `p` and broadcast to width*4 lanes."""
+    return bcast_4_vnni[width](p.load[width=4]())
+
+
+@always_inline
 def act_broadcast_vnni[width: Int](
     act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     k_pos: Int,
 ) -> SIMD[DType.uint8, width * 4]:
     """Load 4 i8 activation bytes at k_pos, XOR 0x80 to u8-bias, replicate."""
-    var b4 = (act_row + k_pos).bitcast[UInt8]().load[width=4]() ^ SIMD[DType.uint8, 4](0x80)
-    var b8 = b4.join(b4)
-    var b16 = b8.join(b8)
-    var b32 = b16.join(b16)
-    comptime if width <= 8:
-        return b32.slice[width * 4]()
-    else:
-        var b64 = b32.join(b32)
-        return b64.slice[width * 4]()
+    return bcast_4_vnni[width](
+        (act_row + k_pos).bitcast[UInt8]().load[width=4]()
+        ^ SIMD[DType.uint8, 4](0x80))
 
 
 # ============================================================================

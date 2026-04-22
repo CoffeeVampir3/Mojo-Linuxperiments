@@ -10,7 +10,7 @@ from experimental3.kernels.dispatch_args import Int8GemvBlockedArgs, ChunkedAttn
 from experimental3.kernels.gemm import int8_gemv_blocked_worker, int8_gemv_blocked_decode_worker
 from kernels.vnni import VNNI_N_STEP
 from experimental3.kv_cache import CACHE_WIDTH
-from experimental3.kernels.amx_attention import amx_chunked_attn_kernel
+from minimax.kernels.amx_attention import amx_chunked_attn_kernel
 
 from minimax.kernels.qk_prep import prep_q_head
 from minimax.kernels.dispatch_args import (
@@ -140,27 +140,48 @@ def q_prep_kernel[
         q_scales[qh] = result[1] * inv_sqrt_hd
 
 
-def chunked_score_dispatch[
+comptime ATTN_PG_PER_WORKER = 32
+
+
+@always_inline
+def attn_chunk_count(
+    context_len: Int, pool_capacity: Int, max_attn_chunks: Int,
+) -> Int:
+    """Floor of pgs-per-worker. The score dispatch and merge phase must
+    agree on num_chunks; this is the single source of truth."""
+    var num_pg = (context_len + CACHE_WIDTH - 1) // CACHE_WIDTH
+    var padded_pg = (num_pg + 3) & ~3
+    if padded_pg <= 0:
+        return 0
+    var raw_chunks = (padded_pg + ATTN_PG_PER_WORKER - 1) // ATTN_PG_PER_WORKER
+    var capped = min(raw_chunks, min(pool_capacity, max_attn_chunks))
+    if capped < 1:
+        return 1
+    return capped
+
+
+def chunked_score_dispatch_multi[
     head_dim: Int, heads_per_group: Int,
     max_seq: Int, num_kv_heads: Int, max_attn_chunks: Int,
     P: BurstThreadPool,
 ](
     q_i8_base: Int, qi_biases_base: Int, q_scales_base: Int,
-    cache_base: Int, kv_head: Int,
+    cache_base: Int, kv_start: Int, kv_count: Int,
     context_len: Int, pool_capacity: Int,
     partial_out_base: Int,
     mut pool: P,
 ) -> PoolFence[P]:
-    """Dispatch chunked scoring for one KV group across pool workers."""
-    comptime WIDTH = CACHE_WIDTH
-    var num_pg = (context_len + WIDTH - 1) // WIDTH
-    var num_chunks = min(pool_capacity, max_attn_chunks)
-    if num_chunks > num_pg:
-        num_chunks = num_pg
-    if num_chunks <= 0:
+    """Pack all (kv, chunk) work items into one pool dispatch + fence."""
+    var num_pg = (context_len + CACHE_WIDTH - 1) // CACHE_WIDTH
+    var padded_pg = (num_pg + 3) & ~3
+    var num_chunks = attn_chunk_count(
+        context_len, pool_capacity, max_attn_chunks)
+    if num_chunks <= 0 or kv_count <= 0:
         return PoolFence[P].completed()
-    var pgs_per_chunk = (num_pg + num_chunks - 1) // num_chunks
+    var pgs_per_chunk = ((padded_pg + num_chunks - 1) // num_chunks + 3) & ~3
     comptime CHUNK_F32_STRIDE = heads_per_group * (2 + head_dim)
+    comptime Q_STRIDE = heads_per_group * head_dim
+    comptime QSCALE_STRIDE = heads_per_group
 
     var q_i8 = I8Ptr(unsafe_from_address=q_i8_base)
     var qi_biases = F32Ptr(unsafe_from_address=qi_biases_base)
@@ -168,23 +189,32 @@ def chunked_score_dispatch[
     var cache = U8Ptr(unsafe_from_address=cache_base)
     var partial_out = F32Ptr(unsafe_from_address=partial_out_base)
 
-    var chunk_args = InlineArray[ChunkedAttnArgs, max_attn_chunks](fill=ChunkedAttnArgs())
-    for c in range(num_chunks):
-        var start = c * pgs_per_chunk
-        var end = min((c + 1) * pgs_per_chunk, num_pg)
-        chunk_args[c] = ChunkedAttnArgs(
-            q_i8_base=q_i8,
-            qi_biases_base=qi_biases,
-            q_scales_base=q_scales,
-            cache_base=cache,
-            kv_head=kv_head,
-            start_pg=start,
-            end_pg=end,
-            partial_out=partial_out + c * CHUNK_F32_STRIDE,
-            context_len=context_len)
+    var chunk_args = InlineArray[
+        ChunkedAttnArgs, max_attn_chunks * num_kv_heads](
+        fill=ChunkedAttnArgs())
+    var idx = 0
+    for kv_off in range(kv_count):
+        var kv = kv_start + kv_off
+        for c in range(num_chunks):
+            var start = c * pgs_per_chunk
+            var end = min((c + 1) * pgs_per_chunk, padded_pg)
+            chunk_args[idx] = ChunkedAttnArgs(
+                q_i8_base=q_i8 + kv_off * Q_STRIDE,
+                qi_biases_base=qi_biases + kv_off * QSCALE_STRIDE,
+                q_scales_base=q_scales + kv_off * QSCALE_STRIDE,
+                cache_base=cache,
+                kv_head=kv,
+                start_pg=start,
+                end_pg=end,
+                partial_out=partial_out + (
+                    kv_off * num_chunks + c) * CHUNK_F32_STRIDE,
+                context_len=context_len)
+            idx += 1
     pool.dispatch[ChunkedAttnArgs,
-        amx_chunked_attn_kernel[head_dim, max_seq, num_kv_heads, 0, heads_per_group, max_attn_chunks]](
-        UnsafePointer(to=chunk_args[0]), num_chunks)
+        amx_chunked_attn_kernel[
+            head_dim, max_seq, num_kv_heads, 0, heads_per_group,
+            max_attn_chunks]](
+        UnsafePointer(to=chunk_args[0]), idx)
     return pool_fence(pool)
 
 

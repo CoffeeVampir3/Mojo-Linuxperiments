@@ -64,6 +64,23 @@ def make_224_i8_config() -> TileConfig:
     return cfg^
 
 
+def make_224_decode_config[hpg: Int]() -> TileConfig:
+    """2-2-4 decode config: A/C tiles use hpg rows, B tiles use 16 (K dimension)."""
+    var cfg = TileConfig()
+    cfg.palette_id = 1
+    cfg.rows[0] = UInt8(hpg)
+    cfg.rows[1] = UInt8(hpg)
+    cfg.rows[2] = 16
+    cfg.rows[3] = 16
+    cfg.rows[4] = UInt8(hpg)
+    cfg.rows[5] = UInt8(hpg)
+    cfg.rows[6] = UInt8(hpg)
+    cfg.rows[7] = UInt8(hpg)
+    for i in range(8):
+        cfg.colsb[i] = 64
+    return cfg^
+
+
 def make_133_i8_config() -> TileConfig:
     """1-3-3 int8 config for decode: TMM0 A, TMM1-3 B, TMM4-6 C.
     All active tiles 16 rows x 64 col-bytes. TMM7 unused."""

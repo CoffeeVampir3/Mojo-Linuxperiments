@@ -59,7 +59,8 @@ from minimax.kernels.dispatch_kernels import (
     router_fused_dispatch,
     kv_write_dispatch,
     q_prep_kernel,
-    chunked_score_dispatch,
+    chunked_score_dispatch_multi,
+    attn_chunk_count,
     minimax_moe_phase1,
     minimax_moe_phase2,
 )
@@ -467,7 +468,9 @@ def calculate_peak_scratch[tp: Int]() -> Int:
     comptime i8   = 1
 
     comptime HPG = C.HPG
-    comptime PARTIAL_F32S = C.MAX_ATTN_CHUNKS * HPG * (2 + C.HEAD_DIM)
+    comptime KV_PER_RANK = S.NUM_KV_HEADS_LOCAL
+    comptime PARTIAL_F32S = (
+        KV_PER_RANK * C.MAX_ATTN_CHUNKS * HPG * (2 + C.HEAD_DIM))
     comptime act_scale_bytes = scratch_block_bytes[f32]()
     comptime qkv_bytes = scratch_block_bytes[S.QKV_LOCAL * bf16]()
     comptime attn_phase1_peak = (
@@ -481,9 +484,9 @@ def calculate_peak_scratch[tp: Int]() -> Int:
         + qkv_bytes
         + scratch_block_bytes[S.Q_LOCAL * i8]()
         + scratch_block_bytes[S.NUM_HEADS_LOCAL * f32]()
-        + scratch_block_bytes[HPG * C.HEAD_DIM * i8]()
-        + scratch_block_bytes[HPG * f32]()
-        + scratch_block_bytes[HPG * f32]()
+        + scratch_block_bytes[KV_PER_RANK * HPG * C.HEAD_DIM * i8]()
+        + scratch_block_bytes[KV_PER_RANK * HPG * f32]()
+        + scratch_block_bytes[KV_PER_RANK * HPG * f32]()
         + scratch_block_bytes[PARTIAL_F32S * f32]()
     )
     comptime attn_peak = (
@@ -814,7 +817,7 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
                     BF16Ptr(unsafe_from_address=base + topo.host.lm_output_head_sqrt_gamma_off))
 
         for rank in range(Self.tp):
-            worker_init_dispatch(self.main_pools[rank]).join()
+            worker_init_dispatch[C.HPG](self.main_pools[rank]).join()
         print("state initialized")
 
     @staticmethod
@@ -895,7 +898,8 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         comptime Q_GROUP_BF16 = HPG * C.HEAD_DIM * 2
         comptime K_HEAD_BF16 = C.HEAD_DIM * 2
         comptime V_HEAD_BF16 = C.HEAD_DIM * 2
-        comptime PARTIAL_F32S = C.MAX_ATTN_CHUNKS * HPG * (2 + C.HEAD_DIM)
+        comptime PARTIAL_F32S = (
+            KV_PER_RANK * C.MAX_ATTN_CHUNKS * HPG * (2 + C.HEAD_DIM))
 
         var t_forward0 = Int(perf_counter_ns())
         var sample = ForwardSample(pos)
@@ -1008,56 +1012,65 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
             # transient per-iteration leases on top so they release in reverse.
             var attn_qi_lease = self.scratch.borrow[Scalar[DType.int8], Q_LOCAL]()
             var attn_head_sc_lease = self.scratch.borrow[Float32, HEADS_PER_RANK]()
-            var q_i8_lease = self.scratch.borrow[Scalar[DType.int8], HPG * C.HEAD_DIM]()
-            var qi_biases_lease = self.scratch.borrow[Float32, HPG]()
-            var q_scales_lease = self.scratch.borrow[Float32, HPG]()
+            var q_i8_lease = self.scratch.borrow[
+                Scalar[DType.int8], KV_PER_RANK * HPG * C.HEAD_DIM]()
+            var qi_biases_lease = self.scratch.borrow[
+                Float32, KV_PER_RANK * HPG]()
+            var q_scales_lease = self.scratch.borrow[
+                Float32, KV_PER_RANK * HPG]()
             var partial_lease = self.scratch.borrow[Float32, PARTIAL_F32S]()
 
             var context_len = pos + 1
 
+            var t_qprep0 = Int(perf_counter_ns())
             for kv in range(KV_PER_RANK):
-                var t_qprep0 = Int(perf_counter_ns())
                 for r in range(Self.tp):
                     var lb = topos[r].layer_base(layer_idx)
                     var layer = topos[r].layers.proto
+                    var q_i8 = I8Ptr(unsafe_from_address=topos[r].scratch_addr(q_i8_lease)) + kv * HPG * C.HEAD_DIM
+                    var qi_biases = F32Ptr(unsafe_from_address=topos[r].scratch_addr(qi_biases_lease)) + kv * HPG
+                    var q_scales = F32Ptr(unsafe_from_address=topos[r].scratch_addr(q_scales_lease)) + kv * HPG
                     var qp_args = AttnGroupArgs()
                     qp_args.q_bf16_base = BF16Ptr(unsafe_from_address=topos[r].scratch_addr(qkv_lease) + Q_OFF + kv * Q_GROUP_BF16)
                     qp_args.q_norm_ptr = BF16Ptr(unsafe_from_address=layer.attn.q_norm.addr(lb) + kv * HPG * C.HEAD_DIM * 2)
                     qp_args.cos_ptr = F32Ptr(unsafe_from_address=topos[r].rope_cos_row(pos))
                     qp_args.sin_ptr = F32Ptr(unsafe_from_address=topos[r].rope_sin_row(pos))
                     qp_args.inv_rms_q = inv_rms_q
-                    qp_args.qi_out = I8Ptr(unsafe_from_address=topos[r].scratch_addr(q_i8_lease))
-                    qp_args.head_scale_ptr = F32Ptr(unsafe_from_address=topos[r].scratch_addr(qi_biases_lease))
-                    qp_args.context_len = topos[r].scratch_addr(q_scales_lease)
+                    qp_args.qi_out = q_i8
+                    qp_args.head_scale_ptr = qi_biases
+                    qp_args.context_len = Int(q_scales)
                     q_prep_kernel[C.HEAD_DIM, C.ROPE_DIM, C.ROPE_PAIR_STRIDE, HPG](qp_args)
-                sample.add(self.profile.phase("q_prep"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_qprep0))
+            sample.add(self.profile.phase("q_prep"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_qprep0))
 
-                @parameter
-                def do_chunk_score[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
-                    return chunked_score_dispatch[
-                        C.HEAD_DIM, HPG, C.MAX_SEQ_LEN, KV_PER_RANK, C.MAX_ATTN_CHUNKS](
-                        topo.scratch_addr(q_i8_lease),
-                        topo.scratch_addr(qi_biases_lease),
-                        topo.scratch_addr(q_scales_lease),
-                        topo.kv_cache_base(layer_idx), kv,
-                        context_len, Int(pool.capacity),
-                        topo.scratch_addr(partial_lease),
-                        pool)
-                sample.add(self.profile.phase("attention"), tp_parallel[Self.tp, do_chunk_score](topos, mp))
+            @parameter
+            def do_chunk_score_all[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+                return chunked_score_dispatch_multi[
+                    C.HEAD_DIM, HPG, C.MAX_SEQ_LEN, KV_PER_RANK,
+                    C.MAX_ATTN_CHUNKS](
+                    topo.scratch_addr(q_i8_lease),
+                    topo.scratch_addr(qi_biases_lease),
+                    topo.scratch_addr(q_scales_lease),
+                    topo.kv_cache_base(layer_idx),
+                    0, KV_PER_RANK,
+                    context_len, Int(pool.capacity),
+                    topo.scratch_addr(partial_lease),
+                    pool)
+            sample.add(self.profile.phase("attention"), tp_parallel[Self.tp, do_chunk_score_all](topos, mp))
 
-                var t_merge_q0 = Int(perf_counter_ns())
-                var num_pg = (context_len + CACHE_WIDTH - 1) // CACHE_WIDTH
+            var t_merge_q0 = Int(perf_counter_ns())
+            comptime CHUNK_F32_STRIDE = HPG * (2 + C.HEAD_DIM)
+            for kv in range(KV_PER_RANK):
                 for r in range(Self.tp):
-                    var nc = min(Int(self.main_pools[r].capacity), C.MAX_ATTN_CHUNKS)
-                    if nc > num_pg:
-                        nc = num_pg
+                    var nc = attn_chunk_count(
+                        context_len, Int(self.main_pools[r].capacity),
+                        C.MAX_ATTN_CHUNKS)
                     if nc > 0:
+                        var partial = F32Ptr(unsafe_from_address=topos[r].scratch_addr(partial_lease)) + kv * nc * CHUNK_F32_STRIDE
+                        var qi_out = I8Ptr(unsafe_from_address=topos[r].scratch_addr(attn_qi_lease)) + kv * HPG * C.HEAD_DIM
+                        var head_sc = F32Ptr(unsafe_from_address=topos[r].scratch_addr(attn_head_sc_lease)) + kv * HPG
                         merge_and_quantize_kernel[C.HEAD_DIM, HPG, C.MAX_ATTN_CHUNKS](
-                            F32Ptr(unsafe_from_address=topos[r].scratch_addr(partial_lease)),
-                            nc,
-                            I8Ptr(unsafe_from_address=topos[r].scratch_addr(attn_qi_lease) + kv * HPG * C.HEAD_DIM),
-                            F32Ptr(unsafe_from_address=topos[r].scratch_addr(attn_head_sc_lease) + kv * HPG * 4))
-                sample.add(self.profile.phase("merge_quant"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_merge_q0))
+                            partial, nc, qi_out, head_sc)
+            sample.add(self.profile.phase("merge_quant"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_merge_q0))
 
             partial_lease^.release()
             q_scales_lease^.release()

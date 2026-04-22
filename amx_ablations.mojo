@@ -7,7 +7,8 @@ from std.math import max, min
 
 from experimental3.amx import (
     TILE_M, TILE_K, TILE_N, K_STEP, VNNI_BLK, TILE_BYTES,
-    TileConfig, make_224_i8_config, init_intel_amx, ldtilecfg,
+    TileConfig, make_224_i8_config, make_224_decode_config,
+    init_intel_amx, ldtilecfg,
     tilezero, tileload, tilestore, tdpbssd, tdpbusd, tdpbsud, tile_dp,
 )
 from simd_math import exp_f32, roundeven, set_subnormal_zeroing
@@ -1456,3 +1457,109 @@ def main():
         for i in range(HPG * HEAD_DIM):
             va[i] = Float32(0)
         print("")
+
+    print("--- TILE ROW ABLATION: 16-row vs 6-row tiles ---")
+    comptime TR_WARMUP = 200
+    comptime TR_ITERS = 2000
+    for idx in range(5):
+        var npg = pg_sizes[idx]
+        print(String(npg) + " PGs:")
+
+        # 16-row tiles (standard)
+        var cfg16 = make_224_i8_config()
+        ldtilecfg(UnsafePointer(to=cfg16))
+        for i in range(HPG * HEAD_DIM):
+            va[i] = Float32(0)
+        for _ in range(TR_WARMUP):
+            fused_224_amx_v2(q, k_u8, v_vn, sc_i32, va, npg)
+        var t16 = Int(perf_counter_ns())
+        for _ in range(TR_ITERS):
+            fused_224_amx_v2(q, k_u8, v_vn, sc_i32, va, npg)
+        var e16 = Int(perf_counter_ns()) - t16
+        var ns16 = e16 // TR_ITERS
+        print("  16-row: " + String(ns16) + " ns  (" + String(ns16 // npg) + " ns/PG)")
+
+        # 6-row tiles (decode-optimized)
+        var cfg6 = make_224_decode_config[HPG]()
+        ldtilecfg(UnsafePointer(to=cfg6))
+        for i in range(HPG * HEAD_DIM):
+            va[i] = Float32(0)
+        for _ in range(TR_WARMUP):
+            fused_224_amx_v2(q, k_u8, v_vn, sc_i32, va, npg)
+        var t6 = Int(perf_counter_ns())
+        for _ in range(TR_ITERS):
+            fused_224_amx_v2(q, k_u8, v_vn, sc_i32, va, npg)
+        var e6 = Int(perf_counter_ns()) - t6
+        var ns6 = e6 // TR_ITERS
+        print("  6-row : " + String(ns6) + " ns  (" + String(ns6 // npg) + " ns/PG)")
+        for i in range(HPG * HEAD_DIM):
+            va[i] = Float32(0)
+        print("")
+
+    # Scoring-only with both configs
+    print("--- TILE ROW ABLATION: scoring only ---")
+    for idx in range(5):
+        var npg = pg_sizes[idx]
+        print(String(npg) + " PGs:")
+
+        var cfg16s = make_224_i8_config()
+        ldtilecfg(UnsafePointer(to=cfg16s))
+        for _ in range(TR_WARMUP):
+            score_2_2_4(q, k_u8, sc_i32, npg)
+        var ts16 = Int(perf_counter_ns())
+        for _ in range(TR_ITERS):
+            score_2_2_4(q, k_u8, sc_i32, npg)
+        var es16 = Int(perf_counter_ns()) - ts16
+        var nss16 = es16 // TR_ITERS
+        print("  16-row: " + String(nss16) + " ns  (" + String(nss16 // npg) + " ns/PG)")
+
+        var cfg6s = make_224_decode_config[HPG]()
+        ldtilecfg(UnsafePointer(to=cfg6s))
+        for _ in range(TR_WARMUP):
+            score_2_2_4(q, k_u8, sc_i32, npg)
+        var ts6 = Int(perf_counter_ns())
+        for _ in range(TR_ITERS):
+            score_2_2_4(q, k_u8, sc_i32, npg)
+        var es6 = Int(perf_counter_ns()) - ts6
+        var nss6 = es6 // TR_ITERS
+        print("  6-row : " + String(nss6) + " ns  (" + String(nss6 // npg) + " ns/PG)")
+        print("")
+
+    # V-agg only with both configs
+    print("--- TILE ROW ABLATION: V-agg only ---")
+    for idx in range(5):
+        var npg = pg_sizes[idx]
+        print(String(npg) + " PGs:")
+
+        var cfg16v = make_224_i8_config()
+        ldtilecfg(UnsafePointer(to=cfg16v))
+        for i in range(HPG * HEAD_DIM):
+            va[i] = Float32(0)
+        for _ in range(TR_WARMUP):
+            vagg_amx_vnni(wu_u8, v_vn, va, wd, npg)
+        var tv16 = Int(perf_counter_ns())
+        for _ in range(TR_ITERS):
+            vagg_amx_vnni(wu_u8, v_vn, va, wd, npg)
+        var ev16 = Int(perf_counter_ns()) - tv16
+        var nsv16 = ev16 // TR_ITERS
+        print("  16-row: " + String(nsv16) + " ns  (" + String(nsv16 // npg) + " ns/PG)")
+
+        var cfg6v = make_224_decode_config[HPG]()
+        ldtilecfg(UnsafePointer(to=cfg6v))
+        for i in range(HPG * HEAD_DIM):
+            va[i] = Float32(0)
+        for _ in range(TR_WARMUP):
+            vagg_amx_vnni(wu_u8, v_vn, va, wd, npg)
+        var tv6 = Int(perf_counter_ns())
+        for _ in range(TR_ITERS):
+            vagg_amx_vnni(wu_u8, v_vn, va, wd, npg)
+        var ev6 = Int(perf_counter_ns()) - tv6
+        var nsv6 = ev6 // TR_ITERS
+        print("  6-row : " + String(nsv6) + " ns  (" + String(nsv6 // npg) + " ns/PG)")
+        for i in range(HPG * HEAD_DIM):
+            va[i] = Float32(0)
+        print("")
+
+    # Restore standard config
+    var cfg_restore = make_224_i8_config()
+    ldtilecfg(UnsafePointer(to=cfg_restore))
