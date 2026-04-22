@@ -17,7 +17,7 @@ from numa import NumaArena, NumaInfo
 from notstdcollections import HeapMoveArray
 from threading import BurstPool
 
-from modeling.linear_borrow_pool import ScratchLease, ScratchPool
+from modeling.linear_borrow_pool import ScratchLease, ScratchPool, scratch_block_bytes
 
 from modeling.model_spec import (
     BF16, F32,
@@ -262,9 +262,12 @@ def calculate_peak_scratch[tp: Int]() -> Int:
     comptime S = SmolLM2Shapes[tp]
     comptime bf16 = BF16.ELEMENT_BYTES
 
-    comptime q_bytes = S.QAct.bytes_for[bf16]()
-    comptime kv_bytes = S.KVAct.bytes_for[bf16]()
-    comptime mlp_bytes = S.MLPAct.bytes_for[bf16]()
+    comptime q_raw_bytes = S.QAct.bytes_for[bf16]()
+    comptime kv_raw_bytes = S.KVAct.bytes_for[bf16]()
+    comptime mlp_raw_bytes = S.MLPAct.bytes_for[bf16]()
+    comptime q_bytes = scratch_block_bytes[q_raw_bytes]()
+    comptime kv_bytes = scratch_block_bytes[kv_raw_bytes]()
+    comptime mlp_bytes = scratch_block_bytes[mlp_raw_bytes]()
 
     comptime attn_qkv = q_bytes + kv_bytes + kv_bytes
     comptime attn_out = q_bytes + q_bytes

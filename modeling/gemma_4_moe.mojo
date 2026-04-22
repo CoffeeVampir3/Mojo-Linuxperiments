@@ -12,7 +12,7 @@ from simd_math import sqrt
 
 from numa import NumaArena, NumaInfo
 from threading import BurstPool
-from modeling.linear_borrow_pool import ScratchPool, ScratchLease
+from modeling.linear_borrow_pool import ScratchPool, ScratchLease, scratch_block_bytes
 
 from modeling.model_spec import (
     Encoding, BF16, F32,
@@ -326,22 +326,29 @@ def calculate_peak_scratch[tp: Int]() -> Int:
 
     # Match the actual live set in forward:
     # q+k+v are live together, then k/v are released before attn_out is borrowed.
-    comptime full_q = seq * S.FullQ.N * bf16
-    comptime full_kv = seq * S.FullK.N * bf16
+    comptime full_q = scratch_block_bytes[seq * S.FullQ.N * bf16]()
+    comptime full_kv = scratch_block_bytes[seq * S.FullK.N * bf16]()
     comptime full_attn = (
         full_q + full_kv + full_kv
         if full_q + full_kv + full_kv > full_q + full_q
         else full_q + full_q
     )
-    comptime sliding_q = seq * S.SlidingQ.N * bf16
-    comptime sliding_kv = seq * S.SlidingKV.N * bf16
+    comptime sliding_q = scratch_block_bytes[seq * S.SlidingQ.N * bf16]()
+    comptime sliding_kv = scratch_block_bytes[seq * S.SlidingKV.N * bf16]()
     comptime sliding_attn = (
         sliding_q + sliding_kv + sliding_kv
         if sliding_q + sliding_kv + sliding_kv > sliding_q + sliding_q
         else sliding_q + sliding_q
     )
-    comptime ffn_dense = seq * S.GateUp.N * bf16 * 2
-    comptime ffn_moe = seq * C.HIDDEN * bf16 * 2 + C.TOP_K * C.HIDDEN * bf16
+    comptime ffn_dense = (
+        scratch_block_bytes[seq * S.GateUp.N * bf16]()
+        + scratch_block_bytes[seq * S.GateUp.N * bf16]()
+    )
+    comptime ffn_moe = (
+        scratch_block_bytes[seq * C.HIDDEN * bf16]()
+        + scratch_block_bytes[seq * C.HIDDEN * bf16]()
+        + scratch_block_bytes[C.TOP_K * C.HIDDEN * bf16]()
+    )
     comptime ffn_peak = ffn_dense if ffn_dense > ffn_moe else ffn_moe
     comptime attn_peak = full_attn if full_attn > sliding_attn else sliding_attn
     return ffn_peak if ffn_peak > attn_peak else attn_peak

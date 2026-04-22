@@ -5,8 +5,9 @@ bases or pointers — it just hands out byte offsets and tracks usage.
 Each rank materializes a real pointer by adding its own scratch base.
 
 ScratchLease holds the offset and byte size. On release, the offset
-range is returned to the pool (LIFO). @explicit_destroy ensures every
-borrow is released.
+range is returned to the pool (LIFO). Leases are rounded up to 64-byte
+blocks so every lease offset is 64-byte aligned. @explicit_destroy ensures
+every borrow is released.
 
 Usage:
     var pool = ScratchPool(capacity)
@@ -17,6 +18,20 @@ Usage:
 
 from std.sys.info import size_of
 from std.os import abort
+
+
+comptime SCRATCH_LEASE_ALIGNMENT = 64
+
+
+@always_inline
+def scratch_block_bytes[nbytes: Int]() -> Int:
+    return ((nbytes + SCRATCH_LEASE_ALIGNMENT - 1) // SCRATCH_LEASE_ALIGNMENT) * SCRATCH_LEASE_ALIGNMENT
+
+
+@always_inline
+def scratch_lease_bytes[T: AnyType, count: Int]() -> Int:
+    comptime raw_byte_size = count * size_of[T]()
+    return scratch_block_bytes[raw_byte_size]()
 
 
 # =============================================================================
@@ -60,7 +75,7 @@ struct ScratchLease(Movable):
 struct ScratchPool(Movable):
     """Offset-only bump allocator. One per model, not per rank.
 
-    borrow[T, count]() returns a ScratchLease with the byte offset.
+    borrow[T, count]() returns a ScratchLease with a 64-byte-aligned offset.
     Each rank materializes a pointer: rv.scratch_base() + lease.offset.
     Cumulative overflow aborts. high_water canary prints on new peaks.
 
@@ -77,8 +92,8 @@ struct ScratchPool(Movable):
         self.high_water = 0
 
     def borrow[T: AnyType, count: Int](mut self) -> ScratchLease:
-        """Borrow `count` elements of type T. Returns an offset lease."""
-        comptime byte_size = count * size_of[T]()
+        """Borrow `count` elements of type T. Returns a 64B block lease."""
+        comptime byte_size = scratch_lease_bytes[T, count]()
         var lease_offset = self.offset
         self.offset += byte_size
         if self.offset > self.capacity:

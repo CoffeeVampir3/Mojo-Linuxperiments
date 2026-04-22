@@ -28,7 +28,8 @@ from modeling.modeling_common import (
 from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY, embed_lookup
 from kernels.reductions import small_allreduce, ring_broadcast
 from kernels.kv_rotors import init_rope_tables
-from modeling.linear_borrow_pool import ScratchPool, ScratchLease
+from simd_math import set_subnormal_zeroing
+from modeling.linear_borrow_pool import ScratchPool, ScratchLease, scratch_block_bytes
 from modeling.loader import discover_shards, load_weights_from_descs
 from simd_math import sqrt
 
@@ -63,7 +64,7 @@ from minimax.kernels.dispatch_kernels import (
     minimax_moe_phase2,
 )
 from minimax.kernels.rmsnorm import rmsnorm_dual_output_worker
-from experimental3.kernels.amx_attention import AmxConfigArgs, amx_config_kernel
+from kernels.worker_init import worker_init_dispatch
 from minimax.kernels.attention import merge_and_quantize_kernel
 
 
@@ -467,34 +468,47 @@ def calculate_peak_scratch[tp: Int]() -> Int:
 
     comptime HPG = C.HPG
     comptime PARTIAL_F32S = C.MAX_ATTN_CHUNKS * HPG * (2 + C.HEAD_DIM)
+    comptime act_scale_bytes = scratch_block_bytes[f32]()
+    comptime qkv_bytes = scratch_block_bytes[S.QKV_LOCAL * bf16]()
+    comptime attn_phase1_peak = (
+        act_scale_bytes
+        + qkv_bytes
+        + scratch_block_bytes[C.HIDDEN * i8]()
+        + scratch_block_bytes[C.HIDDEN * f32]()
+    )
+    comptime attn_phase2_peak = (
+        act_scale_bytes
+        + qkv_bytes
+        + scratch_block_bytes[S.Q_LOCAL * i8]()
+        + scratch_block_bytes[S.NUM_HEADS_LOCAL * f32]()
+        + scratch_block_bytes[HPG * C.HEAD_DIM * i8]()
+        + scratch_block_bytes[HPG * f32]()
+        + scratch_block_bytes[HPG * f32]()
+        + scratch_block_bytes[PARTIAL_F32S * f32]()
+    )
     comptime attn_peak = (
-        f32
-        + S.QKV_LOCAL * bf16
-        + HPG * C.HEAD_DIM * i8
-        + HPG * f32
-        + HPG * f32
-        + S.Q_LOCAL * i8
-        + S.NUM_HEADS_LOCAL * f32
-        + PARTIAL_F32S * f32
+        attn_phase1_peak if attn_phase1_peak > attn_phase2_peak else attn_phase2_peak
     )
 
     comptime router_candidate_bytes = 16   # RouterCandidate: i32 + f32 + f32 + pad
     comptime topk_result_bytes = C.TOP_K * (8 + f32)   # Int + Float32 per slot
     comptime moe_peak = (
-        C.HIDDEN * i8 + C.HIDDEN * f32 + f32
-        + MAX_POOL_CAPACITY * C.TOP_K * router_candidate_bytes
-        + topk_result_bytes
-        + C.TOP_K * 2 * f32
-        + C.TOP_K * C.MOE_INTERMEDIATE * i8
-        + C.TOP_K * MOE_DOWN_NUM_BLK * f32
-        + C.TOP_K * C.HIDDEN * bf16
+        scratch_block_bytes[C.HIDDEN * i8]()
+        + scratch_block_bytes[C.HIDDEN * f32]()
+        + scratch_block_bytes[f32]()
+        + scratch_block_bytes[MAX_POOL_CAPACITY * C.TOP_K * router_candidate_bytes]()
+        + scratch_block_bytes[topk_result_bytes]()
+        + scratch_block_bytes[C.TOP_K * 2 * f32]()
+        + scratch_block_bytes[C.TOP_K * C.MOE_INTERMEDIATE * i8]()
+        + scratch_block_bytes[C.TOP_K * MOE_DOWN_NUM_BLK * f32]()
+        + scratch_block_bytes[C.TOP_K * C.HIDDEN * bf16]()
     )
 
     comptime lm_output_head_peak = (
-        C.HIDDEN * i8
-        + (C.HIDDEN // LM_OUTPUT_HEAD_FWHT_BLK) * f32
-        + C.HIDDEN * f32
-        + C.VOCAB_SIZE * bf16
+        scratch_block_bytes[C.HIDDEN * i8]()
+        + scratch_block_bytes[(C.HIDDEN // LM_OUTPUT_HEAD_FWHT_BLK) * f32]()
+        + scratch_block_bytes[C.HIDDEN * f32]()
+        + scratch_block_bytes[C.VOCAB_SIZE * bf16]()
     )
 
     comptime layer_peak = attn_peak if attn_peak > moe_peak else moe_peak
@@ -729,6 +743,7 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         self.profile.clear()
 
     def init_state(mut self):
+        set_subnormal_zeroing()
         comptime MAX_PACK_BYTES = (C.Q_DIM + 2 * C.KV_DIM) * C.HIDDEN
         var numa = NumaInfo()
         var pack_arena = NumaArena[alignment=DEFAULT_ALIGNMENT](numa.plan_topology(1)[0], MAX_PACK_BYTES)
@@ -798,13 +813,8 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
                     fn_gamma,
                     BF16Ptr(unsafe_from_address=base + topo.host.lm_output_head_sqrt_gamma_off))
 
-        var amx_jobs = InlineArray[AmxConfigArgs, MAX_POOL_CAPACITY](
-            fill=AmxConfigArgs())
         for rank in range(Self.tp):
-            var cap = Int(self.main_pools[rank].capacity)
-            self.main_pools[rank].dispatch[AmxConfigArgs, amx_config_kernel](
-                UnsafePointer(to=amx_jobs[0]), cap)
-            self.main_pools[rank].join()
+            worker_init_dispatch(self.main_pools[rank]).join()
         print("state initialized")
 
     @staticmethod

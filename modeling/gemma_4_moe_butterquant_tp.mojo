@@ -35,7 +35,7 @@ from modeling.modeling_common import (
 )
 from kernels.kernel_ops import PoolFence, BF16Ptr
 from kernels.reductions import ring_allreduce, small_allreduce, ring_broadcast, ring_allgather
-from modeling.linear_borrow_pool import ScratchPool, ScratchLease
+from modeling.linear_borrow_pool import ScratchPool, ScratchLease, scratch_block_bytes
 
 from experimental3.kernels.dispatch_kernels import (
     rmsnorm_gamma_fwht_quantize,
@@ -466,36 +466,49 @@ def calculate_peak_scratch[tp: Int]() -> Int:
     comptime i8 = 1
     comptime f32 = 4
     comptime topk_bytes = size_of[Gemma4TopKResult[C.TOP_K]]()
+    comptime int32_bytes = size_of[Int32]()
     comptime S = Gemma4Shapes[tp]
+    comptime gateup_col_bytes = S.GateUp.col_bytes_for[i8]()
 
-    comptime persistent = f32 + S.DENSE_DOWN_NUM_BLK * f32
+    comptime persistent = (
+        scratch_block_bytes[f32]()
+        + scratch_block_bytes[S.DENSE_DOWN_NUM_BLK * f32]()
+    )
 
     comptime sliding_attn_peak = persistent + (
-        C.HIDDEN * i8 + C.HIDDEN * f32 + f32
-        + S.SlidingQ.N * bf16
-        + 2 * (C.KV_DIM_SLIDING // tp) * bf16
-        + S.SlidingQ.N * i8
-        + (S.SlidingQ.N // C.HEAD_DIM_SLIDING) * f32
+        scratch_block_bytes[C.HIDDEN * i8]()
+        + scratch_block_bytes[C.HIDDEN * f32]()
+        + scratch_block_bytes[f32]()
+        + scratch_block_bytes[S.SlidingQ.N * bf16]()
+        + scratch_block_bytes[2 * (C.KV_DIM_SLIDING // tp) * bf16]()
+        + scratch_block_bytes[S.SlidingQ.N * i8]()
+        + scratch_block_bytes[(S.SlidingQ.N // C.HEAD_DIM_SLIDING) * f32]()
     )
 
     comptime full_q_bf16 = S.FullQ.N * bf16
     comptime full_k_bf16 = C.KV_DIM_FULL * bf16
     comptime full_attn_phase1 = persistent + (
-        full_q_bf16 + full_k_bf16
-        + C.HIDDEN * i8 + C.HIDDEN * f32 + f32
+        scratch_block_bytes[full_q_bf16]()
+        + scratch_block_bytes[full_k_bf16]()
+        + scratch_block_bytes[C.HIDDEN * i8]()
+        + scratch_block_bytes[C.HIDDEN * f32]()
+        + scratch_block_bytes[f32]()
     )
     comptime full_attn_cp_extra = (
-        C.Q_DIM_FULL * bf16
-        + C.NUM_HEADS * f32 * 2
-        + C.NUM_HEADS * C.HEAD_DIM_FULL * f32
+        scratch_block_bytes[C.Q_DIM_FULL * bf16]()
+        + scratch_block_bytes[C.NUM_HEADS * f32]()
+        + scratch_block_bytes[C.NUM_HEADS * f32]()
+        + scratch_block_bytes[C.NUM_HEADS * C.HEAD_DIM_FULL * f32]()
     )
     comptime full_attn_phase2 = persistent + (
-        full_q_bf16 + full_k_bf16
-        + S.FullQ.N * i8
-        + (S.FullQ.N // C.HEAD_DIM_FULL) * f32
-        + S.FULL_HPG * C.HEAD_DIM_FULL * i8
-        + S.FULL_HPG * f32 * 2
-        + C.FULL_ATTN_MAX_CHUNKS * S.FULL_HPG * (2 + C.HEAD_DIM_FULL) * f32
+        scratch_block_bytes[full_q_bf16]()
+        + scratch_block_bytes[full_k_bf16]()
+        + scratch_block_bytes[S.FullQ.N * i8]()
+        + scratch_block_bytes[(S.FullQ.N // C.HEAD_DIM_FULL) * f32]()
+        + scratch_block_bytes[S.FULL_HPG * C.HEAD_DIM_FULL * i8]()
+        + scratch_block_bytes[S.FULL_HPG * f32]()
+        + scratch_block_bytes[S.FULL_HPG * f32]()
+        + scratch_block_bytes[C.FULL_ATTN_MAX_CHUNKS * S.FULL_HPG * (2 + C.HEAD_DIM_FULL) * f32]()
         + full_attn_cp_extra
     )
     comptime full_attn_peak = (
@@ -503,17 +516,20 @@ def calculate_peak_scratch[tp: Int]() -> Int:
     )
 
     comptime ffn_peak = persistent + (
-        C.HIDDEN * i8 + C.HIDDEN * f32 + C.HIDDEN * f32
-        + C.HIDDEN * i8 + f32
-        + C.NUM_EXPERTS * bf16
-        + topk_bytes
-        + C.TOP_K * C.MOE_INTERMEDIATE * i8
-        + C.TOP_K * MOE_NUM_BLOCKS * f32
-        + C.TOP_K * C.HIDDEN * bf16
-        + size_of[Int32]()
-        + S.GateUp.col_bytes_for[i8]()
-        + C.HIDDEN * bf16
-        + C.HIDDEN * bf16
+        scratch_block_bytes[C.HIDDEN * i8]()
+        + scratch_block_bytes[C.HIDDEN * f32]()
+        + scratch_block_bytes[C.HIDDEN * f32]()
+        + scratch_block_bytes[C.HIDDEN * i8]()
+        + scratch_block_bytes[f32]()
+        + scratch_block_bytes[C.NUM_EXPERTS * bf16]()
+        + scratch_block_bytes[topk_bytes]()
+        + scratch_block_bytes[C.TOP_K * C.MOE_INTERMEDIATE * i8]()
+        + scratch_block_bytes[C.TOP_K * MOE_NUM_BLOCKS * f32]()
+        + scratch_block_bytes[C.TOP_K * C.HIDDEN * bf16]()
+        + scratch_block_bytes[int32_bytes]()
+        + scratch_block_bytes[gateup_col_bytes]()
+        + scratch_block_bytes[C.HIDDEN * bf16]()
+        + scratch_block_bytes[C.HIDDEN * bf16]()
     )
 
     comptime layer_peak = (
@@ -523,8 +539,10 @@ def calculate_peak_scratch[tp: Int]() -> Int:
 
     comptime vocab_num_blocks = C.HIDDEN // LM_HEAD_FWHT_BLK
     comptime lm_head_peak = (
-        C.HIDDEN * i8 + vocab_num_blocks * f32
-        + C.HIDDEN * f32 + C.VOCAB_SIZE * bf16
+        scratch_block_bytes[C.HIDDEN * i8]()
+        + scratch_block_bytes[vocab_num_blocks * f32]()
+        + scratch_block_bytes[C.HIDDEN * f32]()
+        + scratch_block_bytes[C.VOCAB_SIZE * bf16]()
     )
     return lm_head_peak if lm_head_peak > decode_peak else decode_peak
 
