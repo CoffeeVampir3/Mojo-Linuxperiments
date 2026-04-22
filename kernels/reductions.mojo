@@ -1,20 +1,8 @@
-"""NUMA-aware collective operations for tensor parallelism.
-
-Broadcast: parallel pull — all destination ranks memcpy from source
-simultaneously via per-node BurstPool workers.
-
-Allreduce: fused multi-core reduce + flag-signaled parallel pull.
-Each node's full BurstPool reduces its chunk from all sources, the
-last worker signals completion via atomic flag, then all workers
-immediately pull completed chunks from other ranks. Single dispatch
-per node, no synchronization between reduce and gather phases.
-"""
-
 from std.memory import UnsafePointer, memcpy
 from std.collections import InlineArray
 from std.sys.info import simd_width_of
 from std.atomic import Atomic, Ordering
-from threading import BurstPool
+from threading.threading_traits import BurstThreadPool
 from threading.threading_shared import ptr as tptr
 import linux.sys as linux
 
@@ -45,15 +33,13 @@ def done_ptr(state_base: Int, rank: Int) -> UnsafePointer[Int32, MutAnyOrigin]:
     )
 
 
-# =============================================================================
-# Small-tensor allreduce: main-thread reduce + parallel broadcast
-# =============================================================================
-
-
-def small_allreduce[T: Encoding & Shaped, tp: Int, residual_add: Bool = False](
+def small_allreduce[
+    P: BurstThreadPool, //,
+    T: Encoding & Shaped, tp: Int, residual_add: Bool = False,
+](
     ptrs: InlineArray[Int, tp],
     seq_len: Int,
-    pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp],
+    pool_ptrs: InlineArray[UnsafePointer[P, MutAnyOrigin], tp],
     dst_ptrs: InlineArray[Int, tp] = InlineArray[Int, tp](fill=0),
 ):
     """Replicated allreduce for small tensors. Main thread reduces all
@@ -109,11 +95,6 @@ def small_allreduce[T: Encoding & Shaped, tp: Int, residual_add: Bool = False](
                 count=total_bytes)
 
 
-# =============================================================================
-# Dispatch args structs
-# =============================================================================
-
-
 @fieldwise_init
 struct MemcpyArgs(Copyable, ImplicitlyCopyable):
     var dst: Int
@@ -129,11 +110,6 @@ struct FusedReduceGatherArgs(Copyable, ImplicitlyCopyable):
     var my_rank: Int
     var worker_idx: Int
     var num_workers: Int
-
-
-# =============================================================================
-# Dispatch kernels
-# =============================================================================
 
 
 def memcpy_kernel(args: MemcpyArgs):
@@ -256,16 +232,14 @@ struct FusedConfig:
         self.tp = 0
 
 
-# =============================================================================
-# Broadcast: parallel pull
-# =============================================================================
-
-
-def ring_broadcast[T: Encoding & Shaped, tp: Int](
+def ring_broadcast[
+    P: BurstThreadPool, //,
+    T: Encoding & Shaped, tp: Int,
+](
     src_ptr: Int,
     dst_ptrs: InlineArray[Int, tp],
     seq_len: Int,
-    pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp],
+    pool_ptrs: InlineArray[UnsafePointer[P, MutAnyOrigin], tp],
 ):
     """Parallel pull broadcast. All destination ranks memcpy from source
     simultaneously via per-node workers. ~26 GB/s aggregate on 4 NUMA nodes.
@@ -274,7 +248,6 @@ def ring_broadcast[T: Encoding & Shaped, tp: Int](
     if total_bytes <= 0 or tp <= 1:
         return
 
-    # Ensure rank 0 has the data.
     if src_ptr != dst_ptrs[0]:
         memcpy(
             dest=UnsafePointer[Byte, MutAnyOrigin](unsafe_from_address=dst_ptrs[0]),
@@ -282,7 +255,6 @@ def ring_broadcast[T: Encoding & Shaped, tp: Int](
             count=total_bytes,
         )
 
-    # Dispatch: each destination rank pulls from rank 0.
     var mcpy_jobs = InlineArray[MemcpyArgs, tp](
         fill=MemcpyArgs(0, 0, 0)
     )
@@ -294,15 +266,13 @@ def ring_broadcast[T: Encoding & Shaped, tp: Int](
         pool_ptrs[r][].join()
 
 
-# =============================================================================
-# Allreduce: fused multi-core reduce + flag-signaled pull
-# =============================================================================
-
-
-def ring_allreduce[T: Encoding & Shaped, tp: Int, residual_add: Bool = False](
+def ring_allreduce[
+    P: BurstThreadPool, //,
+    T: Encoding & Shaped, tp: Int, residual_add: Bool = False,
+](
     ptrs: InlineArray[Int, tp],
     seq_len: Int,
-    pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp],
+    pool_ptrs: InlineArray[UnsafePointer[P, MutAnyOrigin], tp],
     dst_ptrs: InlineArray[Int, tp] = InlineArray[Int, tp](fill=0),
 ):
     """Fused allreduce. Each node's full BurstPool reduces its chunk from
@@ -340,7 +310,7 @@ def ring_allreduce[T: Encoding & Shaped, tp: Int, residual_add: Bool = False](
     var state_base = Int(UnsafePointer(to=state_mem))
 
     for r in range(tp):
-        var num_workers = pool_ptrs[r][].capacity
+        var num_workers = pool_ptrs[r][].get_capacity()
         AtomicInt32.store[ordering=Ordering.RELEASE](
             counter_ptr(state_base, r), Int32(num_workers)
         )
@@ -356,14 +326,13 @@ def ring_allreduce[T: Encoding & Shaped, tp: Int, residual_add: Bool = False](
 
     var config_addr = Int(UnsafePointer(to=cfg))
 
-    # Dispatch: each rank's full pool, workers partition the chunk.
     var jobs = InlineArray[FusedReduceGatherArgs, 128](
         fill=FusedReduceGatherArgs(0, 0, 0, 0, 0, 0)
     )
     for r in range(tp):
         var rank_start = r * chunk
         var rank_count = chunk + (rem if r == tp - 1 else 0)
-        var num_workers = pool_ptrs[r][].capacity
+        var num_workers = pool_ptrs[r][].get_capacity()
         var rows_per_worker = (rank_count + num_workers - 1) // num_workers
 
         for w in range(num_workers):
@@ -385,11 +354,6 @@ def ring_allreduce[T: Encoding & Shaped, tp: Int, residual_add: Bool = False](
 
     for r in range(tp):
         pool_ptrs[r][].join()
-
-
-# =============================================================================
-# Allgather: parallel pull — each rank assembles all shards locally
-# =============================================================================
 
 
 struct AllGatherConfig:
@@ -437,11 +401,14 @@ def allgather_kernel(args: AllGatherArgs):
             count=count)
 
 
-def ring_allgather[tp: Int](
+def ring_allgather[
+    P: BurstThreadPool, //,
+    tp: Int,
+](
     src_ptrs: InlineArray[Int, tp],
     dst_ptrs: InlineArray[Int, tp],
     shard_bytes: Int,
-    pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp],
+    pool_ptrs: InlineArray[UnsafePointer[P, MutAnyOrigin], tp],
 ):
     """Parallel pull allgather. Each rank's pool workers copy all shards
     into the local concatenated buffer. Shard s is placed at
@@ -470,7 +437,7 @@ def ring_allgather[tp: Int](
     var jobs = InlineArray[AllGatherArgs, 128](
         fill=AllGatherArgs(0, 0, 0, 0))
     for r in range(tp):
-        var num_workers = pool_ptrs[r][].capacity
+        var num_workers = pool_ptrs[r][].get_capacity()
         for w in range(num_workers):
             jobs[w] = AllGatherArgs(config_addr, r, w, num_workers)
         pool_ptrs[r][].dispatch[AllGatherArgs, allgather_kernel](

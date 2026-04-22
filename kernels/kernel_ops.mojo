@@ -1,12 +1,3 @@
-"""Operations as free functions on typed views.
-
-Pool-dispatched kernels return PoolFence — a linear type (@explicit_destroy)
-representing in-flight work. Must be consumed via .join() or parallel().
-
-TP=1: gemm(...).join()
-TP=N: parallel_for dispatches body[rank]() for each rank, then joins all
-"""
-
 from std.math import sqrt
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
@@ -20,10 +11,6 @@ from modeling.model_spec import (
 )
 from simd_math import exp_f32
 
-
-# ================================================================
-# DISPATCH ARG STRUCTS
-# ================================================================
 
 comptime MAX_POOL_CAPACITY = 128
 comptime BF16Ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
@@ -69,39 +56,32 @@ struct GQAArgs(Copyable, ImplicitlyCopyable):
     var pos: Int
     var seq_len: Int
 
-# ================================================================
-# POOL FENCE — linear synchronization token
-# ================================================================
-
-
 @explicit_destroy
 @fieldwise_init
 struct PoolFence[P: BurstThreadPool](Movable):
-    """Linear token for in-flight pool work. Unconsumed fences are a compile error.
-
-    Two consumption paths:
-        .join()  — wait immediately (TP=1)
-        .take()  — extract raw pool ptr for deferred batch join (parametric TP)
-    """
     var pool: UnsafePointer[Self.P, MutAnyOrigin]
 
     @staticmethod
     def completed() -> Self:
         return Self(UnsafePointer[Self.P, MutAnyOrigin]())
 
+    @staticmethod
+    def over(mut pool: Self.P) -> Self:
+        return Self(UnsafePointer[Self.P, MutAnyOrigin](
+            unsafe_from_address=Int(UnsafePointer(to=pool))))
+
     def join(deinit self):
-        """Consume fence, wait for work to complete."""
         if self.pool:
             self.pool[].join()
 
     def take(deinit self) -> UnsafePointer[Self.P, MutAnyOrigin]:
-        """Consume fence, return raw pool pointer for deferred join."""
         return self.pool
 
 
-def parallel_for[P: BurstThreadPool, tp: Int,
-    body: def[rank: Int] () capturing -> PoolFence[P]]():
-    """Parametric barrier: dispatch body[rank]() for each rank, then join all."""
+def parallel_for[
+    P: BurstThreadPool, //, tp: Int,
+    body: def[rank: Int]() capturing -> PoolFence[P],
+]():
     var ptrs = InlineArray[UnsafePointer[P, MutAnyOrigin], tp](
         fill=UnsafePointer[P, MutAnyOrigin]()
     )
@@ -119,9 +99,10 @@ struct ParallelTiming:
     var total_ns: Int
 
 
-def timed_parallel_for[P: BurstThreadPool, tp: Int,
-    body: def[rank: Int] () capturing -> PoolFence[P]]() -> ParallelTiming:
-    """Like parallel_for but returns dispatch/join/total timing."""
+def timed_parallel_for[
+    P: BurstThreadPool, //, tp: Int,
+    body: def[rank: Int]() capturing -> PoolFence[P],
+]() -> ParallelTiming:
     var ptrs = InlineArray[UnsafePointer[P, MutAnyOrigin], tp](
         fill=UnsafePointer[P, MutAnyOrigin]()
     )
@@ -134,11 +115,6 @@ def timed_parallel_for[P: BurstThreadPool, tp: Int,
             ptrs[i][].join()
     var t2 = Int(perf_counter_ns())
     return ParallelTiming(t1 - t0, t2 - t1, t2 - t0)
-
-
-# ================================================================
-# KERNEL FUNCTIONS (BurstPool dispatch targets)
-# ================================================================
 
 
 def gemm_kernel[K: Int, N: Int](args: GemmArgs):
@@ -321,11 +297,6 @@ def gqa_kernel[
                     (d_head + off).store(v.cast[DType.bfloat16]())
 
 
-# ================================================================
-# HIGH-LEVEL OPERATIONS
-# ================================================================
-
-
 def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped,
     P: BurstThreadPool](
     input: DynView[InT], weight: Bound[W], output: DynView[OutT],
@@ -344,17 +315,12 @@ def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped,
     if seq_len == 0:
         return PoolFence[P].completed()
 
-    var fence = PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
-
     var ip = input.as_ptr[DType.bfloat16]()
     var wp = weight.as_ptr[DType.bfloat16]()
     var op = output.as_ptr[DType.bfloat16]()
     var jobs = InlineArray[GemmArgs, MAX_POOL_CAPACITY](uninitialized=True)
 
     if seq_len < pool.get_capacity():
-        # Decode path: partition N (output columns) across workers
         comptime N = W.ROWS
         var num_jobs = pool.get_capacity()
         var cols_per_job = (N + num_jobs - 1) // num_jobs
@@ -367,7 +333,6 @@ def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped,
         pool.dispatch[GemmArgs, gemv_kernel[InT.COLS, N]](
             UnsafePointer(to=jobs[0]), num_jobs)
     else:
-        # Prefill path: partition M (input rows) across workers
         var num_jobs = min(seq_len, pool.get_capacity())
         var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
 
@@ -379,7 +344,7 @@ def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped,
         pool.dispatch[GemmArgs, gemm_kernel[InT.COLS, W.ROWS]](
             UnsafePointer(to=jobs[0]), num_jobs)
 
-    return fence^
+    return PoolFence[P].over(pool)
 
 
 def rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped,
@@ -413,9 +378,7 @@ def rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shape
 
     pool.dispatch[RMSNormArgs, rmsnorm_kernel[InT.COLS]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
+    return PoolFence[P].over(pool)
 
 
 def embed_lookup[W: Encoding & Shaped, OutT: Encoding & Shaped,
@@ -445,9 +408,7 @@ def embed_lookup[W: Encoding & Shaped, OutT: Encoding & Shaped,
 
     pool.dispatch[EmbedArgs, embed_lookup_kernel[W.COLS]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
+    return PoolFence[P].over(pool)
 
 
 def silu_mul[GT: Encoding & Shaped, UT: Encoding & Shaped, DstT: Encoding & Shaped](
@@ -571,6 +532,4 @@ def attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
 
     pool.dispatch[GQAArgs, gqa_kernel[num_heads, num_kv_heads, head_dim, KCT.COLS]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
+    return PoolFence[P].over(pool)

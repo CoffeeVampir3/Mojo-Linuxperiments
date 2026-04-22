@@ -1,17 +1,14 @@
-"""Autoregressive generation test for MiniMax M2.7 ButterQuant (int8).
-
-Loads model + tokenizer, processes prompt one token at a time, picks the next
-token by greedy argmax on the LM-head logits (no softcap), reports timing and
-generated text.
-
-Run remote only (too large for local):   fish remote_build.fish test_m27_butterquant.mojo
-"""
-
 from std.memory import UnsafePointer
 from std.pathlib import Path
 from std.time import perf_counter_ns
 
-from tokenizer import load_tokenizer
+from numa import NumaInfo, NumaTopology
+from notstdcollections import HeapMoveArray
+from threading.threading_traits import BurstThreadPool
+from threading.burst_threading import BurstPool
+from threading.isolated_burst_pool import IsolatedBurstPool
+
+from tokenizer import load_tokenizer, BPETokenizer, AutoPreTokenizer, AutoByteTransform
 from modeling.minimax_m27_moe_butterquant_tp import (
     MiniMaxM27Config, MiniMaxM27ButterQuant,
 )
@@ -24,30 +21,18 @@ comptime MAX_NEW_TOKENS = 32
 comptime TP = 4
 
 
-def main():
-    var tok_opt = load_tokenizer(Path(TOKENIZER_PATH))
-    if not tok_opt:
-        print("failed to load tokenizer from", TOKENIZER_PATH)
-        return
-    var tok = tok_opt.take()
-
-    var user_prompt = "The capital of France"
-    var prompt = (
-        "]~!b[]~b]system\n"
-        + "You are a helpful assistant. Your name is MiniMax-M2.7 and is built by MiniMax."
-        + "[e~[\n]~b]user\n"
-        + user_prompt
-        + "[e~[\n]~b]ai\n<think>\n"
-    )
-    var token_ids = tok.encode(prompt)
-    print("prompt:", repr(user_prompt))
-    print("tokens:", len(token_ids), "ids:", end="")
-    for i in range(len(token_ids)):
-        print("", token_ids[i], end="")
-    print()
-
+def load_and_run[
+    P: BurstThreadPool, //,
+    tp: Int,
+](
+    numa: NumaInfo,
+    numa_topo: NumaTopology,
+    var pools: HeapMoveArray[P],
+    read tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
+    read token_ids: List[Int],
+):
     var t0 = perf_counter_ns()
-    var model_opt = MiniMaxM27ButterQuant[TP].load(Path(MODEL_DIR))
+    var model_opt = MiniMaxM27ButterQuant[tp, P].load(Path(MODEL_DIR), numa, numa_topo, pools^)
     if not model_opt:
         return
     var model = model_opt.take()
@@ -55,17 +40,17 @@ def main():
     print("model loaded in", load_ms, "ms")
     print()
 
-    var tp = model.token_buffer()
+    var tp_ptr = model.token_buffer()
     var prompt_len = len(token_ids)
     model.reset_profile()
 
     var t1 = perf_counter_ns()
     for i in range(prompt_len - 1):
-        tp[0] = Scalar[DType.int32](token_ids[i])
-        _ = model.forward_decode(Int(tp), i)
+        tp_ptr[0] = Scalar[DType.int32](token_ids[i])
+        _ = model.forward_decode(Int(tp_ptr), i)
 
-    tp[0] = Scalar[DType.int32](token_ids[prompt_len - 1])
-    var next_id = Int(model.forward_decode(Int(tp), prompt_len - 1))
+    tp_ptr[0] = Scalar[DType.int32](token_ids[prompt_len - 1])
+    var next_id = Int(model.forward_decode(Int(tp_ptr), prompt_len - 1))
     var prefill_ms = (perf_counter_ns() - t1) / 1_000_000
 
     var generated = List[Int]()
@@ -84,8 +69,8 @@ def main():
 
     if next_id != MiniMaxM27Config.EOS_TOKEN_ID:
         for step in range(1, MAX_NEW_TOKENS):
-            tp[0] = Scalar[DType.int32](next_id)
-            next_id = Int(model.forward_decode(Int(tp), pos))
+            tp_ptr[0] = Scalar[DType.int32](next_id)
+            next_id = Int(model.forward_decode(Int(tp_ptr), pos))
             generated.append(next_id)
             pos += 1
 
@@ -122,3 +107,45 @@ def main():
     print()
     print("=== full text ===")
     print(full_text)
+
+
+def main():
+    var tok_opt = load_tokenizer(Path(TOKENIZER_PATH))
+    if not tok_opt:
+        print("failed to load tokenizer from", TOKENIZER_PATH)
+        return
+    var tok = tok_opt.take()
+
+    var user_prompt = "The capital of France"
+    var prompt = (
+        "]~!b[]~b]system\n"
+        + "You are a helpful assistant. Your name is MiniMax-M2.7 and is built by MiniMax."
+        + "[e~[\n]~b]user\n"
+        + user_prompt
+        + "[e~[\n]~b]ai\n<think>\n"
+    )
+    var token_ids = tok.encode(prompt)
+    print("prompt:", repr(user_prompt))
+    print("tokens:", len(token_ids), "ids:", end="")
+    for i in range(len(token_ids)):
+        print("", token_ids[i], end="")
+    print()
+
+    var numa = NumaInfo()
+    var numa_topo = numa.plan_topology(TP)
+
+    print(String(numa.num_nodes) + " NUMA nodes, "
+        + String(len(numa.isolated_cpus)) + " isolated cpus")
+
+    if numa.has_isolation():
+        print("mode: isolated (spin-only)")
+        var pools = HeapMoveArray[IsolatedBurstPool[]](TP)
+        for rank in range(TP):
+            pools.push(IsolatedBurstPool[].for_topology(numa, numa_topo[rank]))
+        load_and_run[TP](numa, numa_topo, pools^, tok, token_ids)
+    else:
+        print("mode: cold (spin-backoff)")
+        var pools = HeapMoveArray[BurstPool[]](TP)
+        for rank in range(TP):
+            pools.push(BurstPool[].for_topology(numa, numa_topo[rank]))
+        load_and_run[TP](numa, numa_topo, pools^, tok, token_ids)

@@ -1,21 +1,11 @@
-"""SmolLM2-135M TP rewrite using topology-bound modeling primitives.
-
-Target shape follows modeling/gemma_4_moe.mojo:
-  - explicit family-product refs via SlotOffset
-  - state/host layout via SectionBuilder + Repeated
-  - bound per-rank topology, no PlacedSlot / WeightIterable / RankView
-
-This file now covers topology/build-plan, desc-based loading, and the
-runtime forward path. Debug/parity helpers remain to be ported.
-"""
-
 from std.pathlib import Path
 from std.memory import UnsafePointer
 from std.collections import InlineArray
 
-from numa import NumaArena, NumaInfo
+from numa import NumaArena, NumaInfo, NumaTopology
 from notstdcollections import HeapMoveArray
 from threading import BurstPool
+from threading.threading_traits import BurstThreadPool
 
 from modeling.linear_borrow_pool import ScratchLease, ScratchPool, scratch_block_bytes
 
@@ -41,11 +31,6 @@ from kernels.reductions import ring_allreduce, ring_broadcast
 from kernels.profiler import Profiler
 
 
-# =============================================================================
-# Model config
-# =============================================================================
-
-
 struct SmolLM2Config:
     comptime HIDDEN = 576
     comptime NUM_LAYERS = 30
@@ -66,11 +51,6 @@ struct SmolLM2Config:
 comptime C = SmolLM2Config
 
 
-# =============================================================================
-# Storage shapes
-# =============================================================================
-
-
 struct SmolLM2Shapes[tp: Int]:
     comptime QProj = Shape[C.HIDDEN, C.HIDDEN, shard_n=True, tp=Self.tp]
     comptime KVProj = Shape[C.KV_HIDDEN, C.HIDDEN, shard_n=True, tp=Self.tp]
@@ -85,11 +65,6 @@ struct SmolLM2Shapes[tp: Int]:
     comptime LocalHeads = C.NUM_HEADS // Self.tp
     comptime LocalKVHeads = C.NUM_KV_HEADS // Self.tp
     comptime RopeHalf = C.HEAD_DIM // 2
-
-
-# =============================================================================
-# Family products — typed refs, no RankView / PlacedSlot chain
-# =============================================================================
 
 
 @fieldwise_init
@@ -117,11 +92,6 @@ struct LayerRefs[tp: Int](Copyable, ImplicitlyCopyable):
     var body: BodyRefs[Self.tp]
 
 
-# =============================================================================
-# State + host families
-# =============================================================================
-
-
 @fieldwise_init
 struct KVSlots[tp: Int](Copyable, ImplicitlyCopyable):
     comptime S = SmolLM2Shapes[Self.tp]
@@ -145,11 +115,6 @@ struct ActivationSlots(Copyable, ImplicitlyCopyable):
 struct HostSlots(Copyable, ImplicitlyCopyable):
     var final_norm: SlotOffset[BF16, Shape[C.HIDDEN, 1]]
     var embed: SlotOffset[BF16, Shape[C.VOCAB_SIZE, C.HIDDEN]]
-
-
-# =============================================================================
-# Topology
-# =============================================================================
 
 
 @fieldwise_init
@@ -216,11 +181,6 @@ struct SmolLM2Topology[tp: Int](Copyable, ImplicitlyCopyable):
             kb + self.kv.proto.v.offset)
 
 
-# =============================================================================
-# Emit
-# =============================================================================
-
-
 def emit_body[tp: Int](mut b: LayerBuilder, mut e: List[WeightDesc]) -> BodyRefs[tp]:
     comptime S = SmolLM2Shapes[tp]
     comptime REPL = LayerShard.REPL
@@ -253,11 +213,6 @@ def emit_layer[tp: Int](
     return (LayerRefs[tp](attn=attn, body=emit_body[tp](b, e)), b.cursor)
 
 
-# =============================================================================
-# Scratch budget
-# =============================================================================
-
-
 def calculate_peak_scratch[tp: Int]() -> Int:
     comptime S = SmolLM2Shapes[tp]
     comptime bf16 = BF16.ELEMENT_BYTES
@@ -274,11 +229,6 @@ def calculate_peak_scratch[tp: Int]() -> Int:
     comptime attn_peak = attn_qkv if attn_qkv > attn_out else attn_out
     comptime mlp_peak = mlp_bytes + mlp_bytes
     return attn_peak if attn_peak > mlp_peak else mlp_peak
-
-
-# =============================================================================
-# Build plan
-# =============================================================================
 
 
 @fieldwise_init
@@ -351,33 +301,30 @@ def build_smollm2_plan[tp: Int]() -> SmolLM2LoadPlan[tp]:
     return SmolLM2LoadPlan[tp](topo, descs^)
 
 
-# =============================================================================
-# TP model shell
-# =============================================================================
-
-
-def tp_parallel[tp: Int,
-    body: def[rank: Int](SmolLM2Topology[tp], mut BurstPool[]) capturing -> PoolFence[BurstPool[]],
+def tp_parallel[
+    Pool: BurstThreadPool, //,
+    tp: Int,
+    body: def[rank: Int](SmolLM2Topology[tp], mut Pool) capturing -> PoolFence[Pool],
 ](
     topos: InlineArray[SmolLM2Topology[tp], tp],
-    pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp],
+    pool_ptrs: InlineArray[UnsafePointer[Pool, MutAnyOrigin], tp],
 ):
     @parameter
-    def dispatch[rank: Int]() -> PoolFence[BurstPool[]]:
+    def dispatch[rank: Int]() -> PoolFence[Pool]:
         return body[rank](topos[rank], pool_ptrs[rank][])
-    parallel_for[BurstPool[], tp, dispatch]()
+    parallel_for[tp, dispatch]()
 
 
-struct SmolLM2TP[tp: Int](Movable):
+struct SmolLM2TP[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
     var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]]
-    var pools: HeapMoveArray[BurstPool[]]
+    var pools: HeapMoveArray[Self.Pool]
     var scratch: ScratchPool
     var topos: InlineArray[SmolLM2Topology[Self.tp], Self.tp]
 
     def __init__(
         out self,
         var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]],
-        var pools: HeapMoveArray[BurstPool[]],
+        var pools: HeapMoveArray[Self.Pool],
         var scratch: ScratchPool,
         topos: InlineArray[SmolLM2Topology[Self.tp], Self.tp],
     ):
@@ -415,11 +362,11 @@ struct SmolLM2TP[tp: Int](Movable):
         return UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
             unsafe_from_address=self.topos[0].scratch_base())
 
-    def pool_ptrs(self) -> InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]:
-        var ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp](
-            fill=UnsafePointer[BurstPool[], MutAnyOrigin]())
+    def pool_ptrs(self) -> InlineArray[UnsafePointer[Self.Pool, MutAnyOrigin], Self.tp]:
+        var ptrs = InlineArray[UnsafePointer[Self.Pool, MutAnyOrigin], Self.tp](
+            fill=UnsafePointer[Self.Pool, MutAnyOrigin]())
         for rank in range(Self.tp):
-            ptrs[rank] = UnsafePointer[BurstPool[], MutAnyOrigin](
+            ptrs[rank] = UnsafePointer[Self.Pool, MutAnyOrigin](
                 unsafe_from_address=Int(UnsafePointer(to=self.pools[rank])))
         return ptrs^
 
@@ -436,7 +383,12 @@ struct SmolLM2TP[tp: Int](Movable):
         return ptrs^
 
     @staticmethod
-    def load(dir_path: Path) -> Optional[Self]:
+    def load(
+        dir_path: Path,
+        numa: NumaInfo,
+        numa_topo: NumaTopology,
+        var pools: HeapMoveArray[Self.Pool],
+    ) -> Optional[Self]:
         var shards = discover_shards(dir_path)
         if len(shards) == 0:
             print("no safetensors shards found in", String(dir_path))
@@ -445,9 +397,6 @@ struct SmolLM2TP[tp: Int](Movable):
 
         var plan = build_smollm2_plan[Self.tp]()
         var topo = plan.topology
-
-        var numa = NumaInfo()
-        var numa_topo = numa.plan_topology(Self.tp)
 
         var arenas = HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]](Self.tp)
         for rank in range(Self.tp):
@@ -471,10 +420,6 @@ struct SmolLM2TP[tp: Int](Movable):
 
         for rank in range(Self.tp):
             _ = arenas[rank].prefault(topo.distributed_bytes, topo.state_bytes)
-
-        var pools = HeapMoveArray[BurstPool[]](Self.tp)
-        for rank in range(Self.tp):
-            pools.push(BurstPool[].for_numa_node(numa, numa_topo[rank]))
 
         var topos = InlineArray[SmolLM2Topology[Self.tp], Self.tp](fill=topo)
         for rank in range(Self.tp):
@@ -516,8 +461,8 @@ struct SmolLM2TP[tp: Int](Movable):
 
             @parameter
             def do_input_norm[rank: Int](
-                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
-            ) -> PoolFence[BurstPool[]]:
+                topo: SmolLM2Topology[Self.tp], mut pool: Self.Pool,
+            ) -> PoolFence[Self.Pool]:
                 var lb = topo.layer_base(layer_idx)
                 return rmsnorm(
                     topo.x_main(seq_len),
@@ -529,8 +474,8 @@ struct SmolLM2TP[tp: Int](Movable):
 
             @parameter
             def do_q[rank: Int](
-                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
-            ) -> PoolFence[BurstPool[]]:
+                topo: SmolLM2Topology[Self.tp], mut pool: Self.Pool,
+            ) -> PoolFence[Self.Pool]:
                 var lb = topo.layer_base(layer_idx)
                 return gemm(
                     topo.x_residual(seq_len),
@@ -542,8 +487,8 @@ struct SmolLM2TP[tp: Int](Movable):
 
             @parameter
             def do_k[rank: Int](
-                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
-            ) -> PoolFence[BurstPool[]]:
+                topo: SmolLM2Topology[Self.tp], mut pool: Self.Pool,
+            ) -> PoolFence[Self.Pool]:
                 var lb = topo.layer_base(layer_idx)
                 return gemm(
                     topo.x_residual(seq_len),
@@ -555,8 +500,8 @@ struct SmolLM2TP[tp: Int](Movable):
 
             @parameter
             def do_v[rank: Int](
-                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
-            ) -> PoolFence[BurstPool[]]:
+                topo: SmolLM2Topology[Self.tp], mut pool: Self.Pool,
+            ) -> PoolFence[Self.Pool]:
                 var lb = topo.layer_base(layer_idx)
                 return gemm(
                     topo.x_residual(seq_len),
@@ -599,8 +544,8 @@ struct SmolLM2TP[tp: Int](Movable):
 
             @parameter
             def do_attn[rank: Int](
-                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
-            ) -> PoolFence[BurstPool[]]:
+                topo: SmolLM2Topology[Self.tp], mut pool: Self.Pool,
+            ) -> PoolFence[Self.Pool]:
                 return attention[S.LocalHeads, S.LocalKVHeads, C.HEAD_DIM](
                     scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.QAct.M](
                         topo.scratch_base(), q_lease, seq_len),
@@ -614,8 +559,8 @@ struct SmolLM2TP[tp: Int](Movable):
 
             @parameter
             def do_o[rank: Int](
-                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
-            ) -> PoolFence[BurstPool[]]:
+                topo: SmolLM2Topology[Self.tp], mut pool: Self.Pool,
+            ) -> PoolFence[Self.Pool]:
                 var lb = topo.layer_base(layer_idx)
                 return gemm(
                     scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.QAct.M](
@@ -640,8 +585,8 @@ struct SmolLM2TP[tp: Int](Movable):
 
             @parameter
             def do_post_norm[rank: Int](
-                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
-            ) -> PoolFence[BurstPool[]]:
+                topo: SmolLM2Topology[Self.tp], mut pool: Self.Pool,
+            ) -> PoolFence[Self.Pool]:
                 var lb = topo.layer_base(layer_idx)
                 return rmsnorm(
                     topo.x_main(seq_len),
@@ -656,8 +601,8 @@ struct SmolLM2TP[tp: Int](Movable):
 
             @parameter
             def do_gate[rank: Int](
-                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
-            ) -> PoolFence[BurstPool[]]:
+                topo: SmolLM2Topology[Self.tp], mut pool: Self.Pool,
+            ) -> PoolFence[Self.Pool]:
                 var lb = topo.layer_base(layer_idx)
                 return gemm(
                     topo.x_residual(seq_len),
@@ -669,8 +614,8 @@ struct SmolLM2TP[tp: Int](Movable):
 
             @parameter
             def do_up[rank: Int](
-                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
-            ) -> PoolFence[BurstPool[]]:
+                topo: SmolLM2Topology[Self.tp], mut pool: Self.Pool,
+            ) -> PoolFence[Self.Pool]:
                 var lb = topo.layer_base(layer_idx)
                 return gemm(
                     topo.x_residual(seq_len),
@@ -694,8 +639,8 @@ struct SmolLM2TP[tp: Int](Movable):
 
             @parameter
             def do_down[rank: Int](
-                topo: SmolLM2Topology[Self.tp], mut pool: BurstPool[],
-            ) -> PoolFence[BurstPool[]]:
+                topo: SmolLM2Topology[Self.tp], mut pool: Self.Pool,
+            ) -> PoolFence[Self.Pool]:
                 var lb = topo.layer_base(layer_idx)
                 return gemm(
                     scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](
@@ -737,5 +682,3 @@ struct SmolLM2TP[tp: Int](Movable):
         return LogitsView[C.VOCAB_SIZE](
             scratch_ptr[Scalar[DType.bfloat16]](host.scratch_base(), logit_lease),
             logit_lease^)
-
-    # TODO: debug/parity helpers copied over only after forward lands.

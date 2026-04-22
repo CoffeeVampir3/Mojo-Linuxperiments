@@ -4,7 +4,7 @@ from std.sys.info import size_of, simd_width_of
 from std.time import perf_counter_ns
 from std.collections import InlineArray
 
-from numa import NumaArena, NumaInfo
+from numa import NumaArena, NumaInfo, NumaTopology
 from notstdcollections import HeapMoveArray
 from threading import BurstPool
 from threading.threading_traits import BurstThreadPool
@@ -618,14 +618,15 @@ def build_minimax_plan[tp: Int]() -> MiniMaxM27LoadPlan[tp]:
 # =============================================================================
 
 
-def tp_parallel[tp: Int,
-    body: def[rank: Int](MiniMaxM27Topology[tp], mut BurstPool[]) capturing -> PoolFence[BurstPool[]],
+def tp_parallel[
+    Pool: BurstThreadPool, //, tp: Int,
+    body: def[rank: Int](MiniMaxM27Topology[tp], mut Pool) capturing -> PoolFence[Pool],
 ](
     topos: InlineArray[MiniMaxM27Topology[tp], tp],
-    pool_ptrs: InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp],
+    pool_ptrs: InlineArray[UnsafePointer[Pool, MutAnyOrigin], tp],
 ) -> PhaseTiming:
-    var ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], tp](
-        fill=UnsafePointer[BurstPool[], MutAnyOrigin]())
+    var ptrs = InlineArray[UnsafePointer[Pool, MutAnyOrigin], tp](
+        fill=UnsafePointer[Pool, MutAnyOrigin]())
     var active = InlineArray[Bool, tp](fill=False)
     var t0 = Int(perf_counter_ns())
     comptime for rank in range(tp):
@@ -652,16 +653,16 @@ def tp_parallel[tp: Int,
 # =============================================================================
 
 
-struct MiniMaxM27ButterQuant[tp: Int](Movable):
+struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
     var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]]
-    var main_pools: HeapMoveArray[BurstPool[]]
+    var main_pools: HeapMoveArray[Self.Pool]
     var scratch: ScratchPool
     var topos: InlineArray[MiniMaxM27Topology[Self.tp], Self.tp]
     var profile: ForwardLogger
 
     def __init__(out self,
         var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]],
-        var mp: HeapMoveArray[BurstPool[]],
+        var mp: HeapMoveArray[Self.Pool],
         var sc: ScratchPool,
         topos: InlineArray[MiniMaxM27Topology[Self.tp], Self.tp],
     ):
@@ -671,11 +672,11 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         self.topos = topos
         self.profile = ForwardLogger()
 
-    def pool_ptrs(self) -> InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp]:
-        var ptrs = InlineArray[UnsafePointer[BurstPool[], MutAnyOrigin], Self.tp](
-            fill=UnsafePointer[BurstPool[], MutAnyOrigin]())
+    def pool_ptrs(self) -> InlineArray[UnsafePointer[Self.Pool, MutAnyOrigin], Self.tp]:
+        var ptrs = InlineArray[UnsafePointer[Self.Pool, MutAnyOrigin], Self.tp](
+            fill=UnsafePointer[Self.Pool, MutAnyOrigin]())
         for r in range(Self.tp):
-            ptrs[r] = UnsafePointer[BurstPool[], MutAnyOrigin](
+            ptrs[r] = UnsafePointer[Self.Pool, MutAnyOrigin](
                 unsafe_from_address=Int(UnsafePointer(to=self.main_pools[r])))
         return ptrs^
 
@@ -821,7 +822,12 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         print("state initialized")
 
     @staticmethod
-    def load(dir_path: Path) -> Optional[Self]:
+    def load(
+        dir_path: Path,
+        numa: NumaInfo,
+        numa_topo: NumaTopology,
+        var main_pools: HeapMoveArray[Self.Pool],
+    ) -> Optional[Self]:
         if C.NUM_KV_HEADS % Self.tp != 0:
             print(
                 "unsupported TP=", Self.tp,
@@ -836,9 +842,6 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         print("found", len(shards), "shard(s)")
 
         var plan = build_minimax_plan[Self.tp]()
-
-        var numa = NumaInfo()
-        var numa_topo = numa.plan_topology(Self.tp)
 
         var arenas = HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]](Self.tp)
         for rank in range(Self.tp):
@@ -865,11 +868,6 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
         for rank in range(Self.tp):
             _ = arenas[rank].prefault(plan.topology.distributed_bytes, plan.topology.state_bytes)
         print("DBG: prefault done")
-
-        var main_pools = HeapMoveArray[BurstPool[]](Self.tp)
-        for rank in range(Self.tp):
-            main_pools.push(BurstPool[].for_numa_node(numa, numa_topo[rank], headroom=2))
-        print("DBG: main_pools done")
 
         var topos = InlineArray[MiniMaxM27Topology[Self.tp], Self.tp](fill=plan.topology)
         for rank in range(Self.tp):
@@ -955,7 +953,7 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
             # Phase 2: fused QKV projection (contiguous output)
 
             @parameter
-            def do_qkv_gemv[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            def do_qkv_gemv[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
                 return int8_gemv[QKV_LOCAL, C.HIDDEN](
@@ -990,7 +988,7 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
 
             # Phase 4: K/V cache write (NKV_LOCAL parallel jobs per rank)
             @parameter
-            def do_kv_write[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            def do_kv_write[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
                 return kv_write_dispatch[
@@ -1043,7 +1041,7 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
             sample.add(self.profile.phase("q_prep"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_qprep0))
 
             @parameter
-            def do_chunk_score_all[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            def do_chunk_score_all[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
                 return chunked_score_dispatch_multi[
                     C.HEAD_DIM, HPG, C.MAX_SEQ_LEN, KV_PER_RANK,
                     C.MAX_ATTN_CHUNKS](
@@ -1052,7 +1050,7 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
                     topo.scratch_addr(q_scales_lease),
                     topo.kv_cache_base(layer_idx),
                     0, KV_PER_RANK,
-                    context_len, Int(pool.capacity),
+                    context_len, Int(pool.get_capacity()),
                     topo.scratch_addr(partial_lease),
                     pool)
             sample.add(self.profile.phase("attention"), tp_parallel[Self.tp, do_chunk_score_all](topos, mp))
@@ -1062,7 +1060,7 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
             for kv in range(KV_PER_RANK):
                 for r in range(Self.tp):
                     var nc = attn_chunk_count(
-                        context_len, Int(self.main_pools[r].capacity),
+                        context_len, Int(self.main_pools[r].get_capacity()),
                         C.MAX_ATTN_CHUNKS)
                     if nc > 0:
                         var partial = F32Ptr(unsafe_from_address=topos[r].scratch_addr(partial_lease)) + kv * nc * CHUNK_F32_STRIDE
@@ -1079,7 +1077,7 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
 
             # Phase 6: O projection
             @parameter
-            def do_o_proj[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            def do_o_proj[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
                 return int8_gemv_blocked[C.HIDDEN, Q_LOCAL, C.HEAD_DIM](
@@ -1144,7 +1142,7 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
                 RouterCandidate, MAX_POOL_CAPACITY * C.TOP_K]()
 
             @parameter
-            def do_router_fused[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            def do_router_fused[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
                 return router_fused_dispatch[C.NUM_EXPERTS, C.HIDDEN, C.TOP_K](
@@ -1157,7 +1155,7 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
 
             var t_merge0 = Int(perf_counter_ns())
             for r in range(Self.tp):
-                var num_workers = min(C.NUM_EXPERTS // C.TOP_K, Int(self.main_pools[r].capacity))
+                var num_workers = min(C.NUM_EXPERTS // C.TOP_K, Int(self.main_pools[r].get_capacity()))
                 var merge_args = RouterMergeArgs(
                     U8Ptr(unsafe_from_address=topos[r].scratch_addr(candidates_lease)),
                     U8Ptr(unsafe_from_address=topos[r].scratch_addr(routing_lease)),
@@ -1177,7 +1175,7 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
             var local_count_lease = self.scratch.borrow[Int32, 1]()
 
             @parameter
-            def do_expert_phase1[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            def do_expert_phase1[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
                 var routing = UnsafePointer[TopKResult[C.TOP_K], MutAnyOrigin](
@@ -1216,7 +1214,7 @@ struct MiniMaxM27ButterQuant[tp: Int](Movable):
 
             # Phase 10: expert down (w2)
             @parameter
-            def do_expert_phase2[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: BurstPool[]) -> PoolFence[BurstPool[]]:
+            def do_expert_phase2[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
                 var routing = UnsafePointer[TopKResult[C.TOP_K], MutAnyOrigin](

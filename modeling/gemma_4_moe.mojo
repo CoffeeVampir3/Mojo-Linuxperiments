@@ -10,8 +10,9 @@ from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 from simd_math import sqrt
 
-from numa import NumaArena, NumaInfo
+from numa import NumaArena, NumaInfo, NumaTopology
 from threading import BurstPool
+from threading.threading_traits import BurstThreadPool
 from modeling.linear_borrow_pool import ScratchPool, ScratchLease, scratch_block_bytes
 
 from modeling.model_spec import (
@@ -462,15 +463,15 @@ def build_gemma4_plan[tp: Int]() -> Gemma4LoadPlan[tp]:
 # =============================================================================
 
 
-struct Gemma4[tp: Int](Movable):
+struct Gemma4[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
     var arena: NumaArena[alignment=DEFAULT_ALIGNMENT]
-    var pool: BurstPool[]
+    var pool: Self.Pool
     var scratch: ScratchPool
     var topology: Gemma4Topology[Self.tp]
 
     def __init__(out self,
         var arena: NumaArena[alignment=DEFAULT_ALIGNMENT],
-        var pool: BurstPool[],
+        var pool: Self.Pool,
         topology: Gemma4Topology[Self.tp],
     ):
         self.arena = arena^
@@ -513,7 +514,12 @@ struct Gemma4[tp: Int](Movable):
         print("state initialized: rope tables + baked router constants")
 
     @staticmethod
-    def load(dir_path: Path) -> Optional[Self]:
+    def load(
+        dir_path: Path,
+        numa: NumaInfo,
+        numa_topo: NumaTopology,
+        var pool: Self.Pool,
+    ) -> Optional[Self]:
         var shards = discover_shards(dir_path)
         if len(shards) == 0:
             print("no safetensors shards found in", String(dir_path))
@@ -523,14 +529,11 @@ struct Gemma4[tp: Int](Movable):
         var plan = build_gemma4_plan[Self.tp]()
         var topo = plan.topology
 
-        var numa = NumaInfo()
-        var nodes = numa.plan_topology(1)
-
         var size = topo.host_arena_bytes()
         print("allocating", size // (1024 * 1024), "MB (" +
               String(topo.distributed_bytes // (1024 * 1024)) + " MB weights + " +
               String(topo.state_bytes // (1024 * 1024)) + " MB state)")
-        var arena = NumaArena[alignment=DEFAULT_ALIGNMENT](nodes[0], size)
+        var arena = NumaArena[alignment=DEFAULT_ALIGNMENT](numa_topo[0], size)
         if not arena:
             print("arena allocation failed")
             return None
@@ -538,7 +541,7 @@ struct Gemma4[tp: Int](Movable):
         var arena_bases = List[Int]()
         arena_bases.append(Int(arena.base))
 
-        var load_result = load_weights_from_descs(plan.descs, shards, arena_bases, nodes)
+        var load_result = load_weights_from_descs(plan.descs, shards, arena_bases, numa_topo)
         if not load_result:
             print("weight loading failed")
             return None
@@ -547,7 +550,6 @@ struct Gemma4[tp: Int](Movable):
 
         _ = arena.prefault(topo.distributed_bytes, topo.state_bytes)
 
-        var pool = BurstPool[].for_numa_node(numa, nodes[0])
         var model = Self(arena^, pool^, topo)
         model.init_state()
         return model^
@@ -834,7 +836,11 @@ struct Gemma4[tp: Int](Movable):
 
 
 def main():
-    var model_opt = Gemma4[1].load(Path("checkpoints/gemma-4-26B-A4B"))
+    var numa = NumaInfo()
+    var numa_topo = numa.plan_topology(1)
+    var pool = BurstPool[].for_topology(numa, numa_topo[0])
+    var model_opt = Gemma4[1].load(
+        Path("checkpoints/gemma-4-26B-A4B"), numa, numa_topo, pool^)
     if not model_opt:
         print("failed to load model")
         return
