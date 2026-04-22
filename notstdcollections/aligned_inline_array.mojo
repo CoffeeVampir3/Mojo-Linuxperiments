@@ -5,7 +5,7 @@ from std.collections import InlineArray
 struct AlignedInlineArray[ElementType: Copyable, count: Int, alignment: Int = 64]:
     comptime PAD = (Self.alignment - 1) // size_of[Self.ElementType]() + 1
     comptime TOTAL = Self.count + Self.PAD
-    var storage: InlineArray[Self.ElementType, TOTAL]
+    var storage: InlineArray[Self.ElementType, Self.TOTAL]
 
     @always_inline
     def __init__(out self, *, uninitialized: Bool):

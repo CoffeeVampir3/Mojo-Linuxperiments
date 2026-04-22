@@ -1005,6 +1005,167 @@ def fused_singularity(
             d += SIMD_W
 
 
+def fused_224_online(
+    q_ptr: I8Ptr, k_base: U8Ptr, v_vnni_base: I8Ptr,
+    score_buf: I32Ptr, v_acc: F32Ptr, num_pgs: Int,
+    k_scales: F32Ptr, v_scales: F32Ptr,
+    qi_biases: F32Ptr, q_factors: F32Ptr,
+):
+    debug_assert(num_pgs % 4 == 0, "num_pgs must be a multiple of 4")
+    comptime W_PAGE_BYTES = TILE_M * K_STEP
+    comptime SCORE_F32_PG = HPG * WIDTH
+    var w_arr = AlignedInlineArray[UInt8, 4 * W_PAGE_BYTES](fill=UInt8(0))
+    var w_base = w_arr.unsafe_ptr()
+    var wd_arr = InlineArray[Float32, 4 * HPG](fill=Float32(0))
+    var sf_arr = AlignedInlineArray[Float32, 4 * SCORE_F32_PG](uninitialized=True)
+    var sf_buf = sf_arr.unsafe_ptr()
+
+    var running_max = InlineArray[Float32, HPG](fill=Float32(-1e30))
+    var running_sum = InlineArray[Float32, HPG](fill=Float32(0))
+
+    var pg = 0
+    while pg < num_pgs:
+        # ── Phase 1: Score 4 PGs (2:2:4) ──
+        tilezero[4]()
+        tilezero[5]()
+        tilezero[6]()
+        tilezero[7]()
+        tileload[0, DType.int8](q_ptr, HEAD_DIM)
+        tileload[1, DType.int8](q_ptr + K_STEP, HEAD_DIM)
+
+        tileload[2, DType.uint8](k_base + pg * K_PG_BYTES, WIDTH * VNNI_BLK)
+        tileload[3, DType.uint8](k_base + (pg + 1) * K_PG_BYTES, WIDTH * VNNI_BLK)
+        tdpbsud[4, 0, 2]()
+        tdpbsud[5, 0, 3]()
+        tileload[2, DType.uint8](k_base + pg * K_PG_BYTES + TILE_BYTES, WIDTH * VNNI_BLK)
+        tileload[3, DType.uint8](k_base + (pg + 1) * K_PG_BYTES + TILE_BYTES, WIDTH * VNNI_BLK)
+        tdpbsud[4, 1, 2]()
+        tdpbsud[5, 1, 3]()
+
+        tileload[2, DType.uint8](k_base + (pg + 2) * K_PG_BYTES, WIDTH * VNNI_BLK)
+        tileload[3, DType.uint8](k_base + (pg + 3) * K_PG_BYTES, WIDTH * VNNI_BLK)
+        tdpbsud[6, 0, 2]()
+        tdpbsud[7, 0, 3]()
+        tileload[2, DType.uint8](k_base + (pg + 2) * K_PG_BYTES + TILE_BYTES, WIDTH * VNNI_BLK)
+        tileload[3, DType.uint8](k_base + (pg + 3) * K_PG_BYTES + TILE_BYTES, WIDTH * VNNI_BLK)
+        tdpbsud[6, 1, 2]()
+        tdpbsud[7, 1, 3]()
+
+        tilestore[4, DType.int32](score_buf, WIDTH * 4)
+        tilestore[5, DType.int32](score_buf + SCORE_STRIDE, WIDTH * 4)
+        tilestore[6, DType.int32](score_buf + 2 * SCORE_STRIDE, WIDTH * 4)
+        tilestore[7, DType.int32](score_buf + 3 * SCORE_STRIDE, WIDTH * 4)
+
+        # ── Phase 2a: Dequant all 4 PGs, find batch max ──
+        var batch_max = InlineArray[Float32, HPG](fill=Float32(-1e30))
+        for bp in range(4):
+            var s_base = score_buf + bp * SCORE_STRIDE
+            var k_sc = k_scales + (pg + bp) * WIDTH
+            var sf_pg = sf_buf + bp * SCORE_F32_PG
+            for qh in range(HPG):
+                var raw = (s_base + qh * WIDTH).load[width=WIDTH]().cast[
+                    DType.float32]()
+                var scores = (raw - qi_biases[qh]) * q_factors[qh] * k_sc.load[
+                    width=WIDTH]()
+                (sf_pg + qh * WIDTH).store(scores)
+                var pg_max = scores.reduce_max()
+                if pg_max > batch_max[qh]:
+                    batch_max[qh] = pg_max
+
+        # Single rescale for the entire 4-PG batch
+        var diff_vec = SIMD[DType.float32, SIMD_W](0)
+        var need_rescale = False
+        for qh in range(HPG):
+            var new_max = max(running_max[qh], batch_max[qh])
+            diff_vec[qh] = running_max[qh] - new_max
+            if new_max > running_max[qh]:
+                need_rescale = True
+            running_max[qh] = new_max
+
+        if need_rescale:
+            var rescales = exp_f32[SIMD_W](diff_vec)
+            for qh in range(HPG):
+                if running_sum[qh] > 0:
+                    var rs = rescales[qh]
+                    running_sum[qh] *= rs
+                    var acc = v_acc + qh * HEAD_DIM
+                    var d = 0
+                    while d + WIDTH <= HEAD_DIM:
+                        (acc + d).store((acc + d).load[width=WIDTH]() * rs)
+                        d += WIDTH
+
+        # ── Phase 2b: W quantization (all relative to final running_max) ──
+        for bp in range(4):
+            var sf_pg = sf_buf + bp * SCORE_F32_PG
+            var v_sc = v_scales + (pg + bp) * WIDTH
+            var w_pg = w_base + bp * W_PAGE_BYTES
+            for qh in range(HPG):
+                var scores = (sf_pg + qh * WIDTH).load[width=WIDTH]()
+                var exp_scores = exp_f32[WIDTH](scores - running_max[qh])
+                running_sum[qh] += exp_scores.reduce_add()
+                var w_eff = exp_scores * v_sc.load[width=WIDTH]()
+                var w_max = w_eff.reduce_max()
+                if w_max < Float32(1e-10):
+                    (w_pg + qh * K_STEP).store(SIMD[DType.uint8, WIDTH](0))
+                    wd_arr[bp * HPG + qh] = Float32(0)
+                    continue
+                var w_scale = 255.0 / w_max
+                (w_pg + qh * K_STEP).store(
+                    roundeven(w_eff * w_scale).clamp(0.0, 255.0).cast[
+                        DType.uint8]())
+                wd_arr[bp * HPG + qh] = w_max / 255.0
+
+        # ── Phase 3: V-agg in 2-PG pairs ──
+        for pair in range(2):
+            var bp0 = pair * 2
+            var bp1 = pair * 2 + 1
+            var v_pg0 = v_vnni_base + (pg + bp0) * V_PG_BYTES_VNNI
+            var v_pg1 = v_vnni_base + (pg + bp1) * V_PG_BYTES_VNNI
+
+            tileload[0, DType.uint8](w_base + bp0 * W_PAGE_BYTES, K_STEP)
+            tileload[1, DType.uint8](w_base + bp1 * W_PAGE_BYTES, K_STEP)
+
+            comptime for cg_pair in range(V_CHANNEL_GROUPS // 2):
+                comptime cg0 = cg_pair * 2
+                comptime cg1 = cg0 + 1
+                tilezero[4]()
+                tilezero[5]()
+                tilezero[6]()
+                tilezero[7]()
+
+                tileload[2, DType.int8](v_pg0 + cg0 * V_CG_BYTES, WIDTH * VNNI_BLK)
+                tdpbusd[4, 0, 2]()
+                tileload[2, DType.int8](v_pg1 + cg0 * V_CG_BYTES, WIDTH * VNNI_BLK)
+                tdpbusd[5, 1, 2]()
+                tileload[3, DType.int8](v_pg0 + cg1 * V_CG_BYTES, WIDTH * VNNI_BLK)
+                tdpbusd[6, 0, 3]()
+                tileload[3, DType.int8](v_pg1 + cg1 * V_CG_BYTES, WIDTH * VNNI_BLK)
+                tdpbusd[7, 1, 3]()
+
+                tilestore[4, DType.int32](score_buf, TILE_N * 4)
+                tilestore[5, DType.int32](score_buf + TILE_M * TILE_N, TILE_N * 4)
+                tilestore[6, DType.int32](score_buf + 2 * TILE_M * TILE_N, TILE_N * 4)
+                tilestore[7, DType.int32](score_buf + 3 * TILE_M * TILE_N, TILE_N * 4)
+
+                for qh in range(HPG):
+                    var wd0 = wd_arr[bp0 * HPG + qh]
+                    var wd1 = wd_arr[bp1 * HPG + qh]
+                    var acc_cg0 = v_acc + qh * HEAD_DIM + cg0 * WIDTH
+                    var acc_cg1 = v_acc + qh * HEAD_DIM + cg1 * WIDTH
+                    var r0_cg0 = (score_buf + qh * TILE_N).load[width=WIDTH]().cast[DType.float32]()
+                    var r1_cg0 = (score_buf + TILE_M * TILE_N + qh * TILE_N).load[width=WIDTH]().cast[DType.float32]()
+                    (acc_cg0).store((acc_cg0).load[width=WIDTH]() + r0_cg0 * wd0 + r1_cg0 * wd1)
+                    var r0_cg1 = (score_buf + 2 * TILE_M * TILE_N + qh * TILE_N).load[width=WIDTH]().cast[DType.float32]()
+                    var r1_cg1 = (score_buf + 3 * TILE_M * TILE_N + qh * TILE_N).load[width=WIDTH]().cast[DType.float32]()
+                    (acc_cg1).store((acc_cg1).load[width=WIDTH]() + r0_cg1 * wd0 + r1_cg1 * wd1)
+
+        pg += 4
+
+    _ = w_arr
+    _ = wd_arr
+    _ = sf_arr
+
+
 # =============================================================================
 # Harness
 # =============================================================================
@@ -1190,6 +1351,15 @@ def main():
     for i in range(HPG * HEAD_DIM):
         sum_pw += va[i].__abs__()
     print("  v2 positionwise v_acc abs sum: " + String(sum_pw))
+
+    for i in range(HPG * HEAD_DIM):
+        va[i] = Float32(0)
+    fused_224_online(q, k_u8, v_vn, sc_i32, va, 16,
+        k_scales, k_scales, q_biases, q_factors)
+    var sum_on = Float32(0)
+    for i in range(HPG * HEAD_DIM):
+        sum_on += va[i].__abs__()
+    print("  online v_acc abs sum: " + String(sum_on))
     print("")
 
     print("--- FUSED SCORE+SOFTMAX+VAGG ---")
@@ -1260,6 +1430,29 @@ def main():
         var elapsed_s = Int(perf_counter_ns()) - t0_s
         var ns_s = elapsed_s // S_ITERS
         print("  singularity: " + String(ns_s) + " ns  (" + String(ns_s // npg) + " ns/PG, " + String(ns_s // npos) + " ns/pos)")
+        for i in range(HPG * HEAD_DIM):
+            va[i] = Float32(0)
+        print("")
+
+    print("--- FUSED BATCHED ONLINE SOFTMAX (production-shaped) ---")
+    for idx in range(5):
+        var npg = pg_sizes[idx]
+        print(String(npg) + " PGs:")
+        for i in range(HPG * HEAD_DIM):
+            va[i] = Float32(0)
+
+        comptime ON_WARMUP = 100
+        comptime ON_ITERS = 1000
+        for _ in range(ON_WARMUP):
+            fused_224_online(q, k_u8, v_vn, sc_i32, va, npg,
+                k_scales, k_scales, q_biases, q_factors)
+        var t0_on = Int(perf_counter_ns())
+        for _ in range(ON_ITERS):
+            fused_224_online(q, k_u8, v_vn, sc_i32, va, npg,
+                k_scales, k_scales, q_biases, q_factors)
+        var elapsed_on = Int(perf_counter_ns()) - t0_on
+        var ns_on = elapsed_on // ON_ITERS
+        print("  224_online: " + String(ns_on) + " ns  (" + String(ns_on // npg) + " ns/PG)")
         for i in range(HPG * HEAD_DIM):
             va[i] = Float32(0)
         print("")
