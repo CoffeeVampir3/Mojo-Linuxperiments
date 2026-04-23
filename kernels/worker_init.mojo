@@ -24,13 +24,15 @@ def worker_init_kernel[heads_per_group: Int](args: WorkerInitArgs):
     ldtilecfg(UnsafePointer(to=cfg))
 
 
-def worker_init_dispatch[heads_per_group: Int, P: BurstThreadPool](
-    mut pool: P,
-) -> PoolFence[P]:
+def worker_init_dispatch[
+    P: BurstThreadPool, origin: MutOrigin, //,
+    heads_per_group: Int,
+](
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     var jobs = InlineArray[WorkerInitArgs, MAX_POOL_CAPACITY](
         fill=WorkerInitArgs())
     var cap = pool.get_capacity()
     pool.dispatch[WorkerInitArgs, worker_init_kernel[heads_per_group]](
         UnsafePointer(to=jobs[0]), cap)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))))
+    return PoolFence[P, origin].over(pool)

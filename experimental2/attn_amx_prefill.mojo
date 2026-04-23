@@ -278,11 +278,14 @@ def attn_prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int,
 # Public API
 # ============================================================================
 
-def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
+def prefill[
+    P: BurstThreadPool, origin: MutOrigin, //,
+    num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     num_q_heads: Int,
     QT: Encoding & Shaped,
     CosT: Encoding & Shaped, SinT: Encoding & Shaped,
-    P: BurstThreadPool, prefill_chunk: Int = 512](
+    prefill_chunk: Int = 512,
+](
     q: DynView[QT],
     q_stride: Int,
     cache: KVCache[max_seq, head_dim, num_kv_heads, num_q_heads],
@@ -291,8 +294,8 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     scratch: Int,
     pos: Int,
     v_layer_scale: Float32,
-    mut pool: P,
-) -> PoolFence[P]:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """Async AMX prefill — per-head dynamic Q/K scales, fixed V scale.
 
     Q/K scales are computed per-head at quantization time and stored in the
@@ -355,6 +358,4 @@ def prefill[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
 
     pool.dispatch[PrefillKernelArgs, attn_prefill[num_heads, num_kv_heads, head_dim, max_seq, prefill_chunk]](
         UnsafePointer(to=jobs[0]), total_jobs)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
+    return PoolFence[P, origin].over(pool)

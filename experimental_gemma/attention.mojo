@@ -123,14 +123,17 @@ def local_attention_kernel[
 # =============================================================================
 
 
-def local_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
+def local_attention[
+    P: BurstThreadPool, origin: MutOrigin, //,
+    num_heads: Int, num_kv_heads: Int, head_dim: Int,
     window_size: Int,
     QT: Encoding & Shaped, KCT: Encoding & Shaped, VCT: Encoding & Shaped,
-    OutT: Encoding & Shaped, P: BurstThreadPool](
+    OutT: Encoding & Shaped,
+](
     q: DynView[QT], k_cache: CacheView[KCT], v_cache: CacheView[VCT],
     output: DynView[OutT], pos: Int,
-    mut pool: P,
-) -> PoolFence[P] where KCT.DTYPE == DType.bfloat16:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin] where KCT.DTYPE == DType.bfloat16:
     """Sliding-window GQA attention with scale=1.0.
 
     Q[M, H*D] attends over KV cache within a window of window_size tokens.
@@ -149,7 +152,7 @@ def local_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
 
     var seq_len = q.seq_len
     if seq_len == 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
 
     var total_items = seq_len * num_heads
     var num_jobs = min(total_items, pool.get_capacity())
@@ -168,9 +171,7 @@ def local_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
     pool.dispatch[AttentionHeadArgs,
         local_attention_kernel[num_heads, num_kv_heads, head_dim, KCT.COLS, window_size]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
+    return PoolFence[P, origin].over(pool)
 
 
 # =============================================================================
@@ -252,13 +253,16 @@ def global_attention_kernel[
 # =============================================================================
 
 
-def global_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
+def global_attention[
+    P: BurstThreadPool, origin: MutOrigin, //,
+    num_heads: Int, num_kv_heads: Int, head_dim: Int,
     QT: Encoding & Shaped, KCT: Encoding & Shaped, VCT: Encoding & Shaped,
-    OutT: Encoding & Shaped, P: BurstThreadPool](
+    OutT: Encoding & Shaped,
+](
     q: DynView[QT], k_cache: CacheView[KCT], v_cache: CacheView[VCT],
     output: DynView[OutT], pos: Int,
-    mut pool: P,
-) -> PoolFence[P] where KCT.DTYPE == DType.bfloat16:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin] where KCT.DTYPE == DType.bfloat16:
     """Full-causal GQA attention with scale=1.0.
 
     Q[M, H*D] attends over full KV cache history [0..pos+M].
@@ -277,7 +281,7 @@ def global_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
 
     var seq_len = q.seq_len
     if seq_len == 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
 
     var total_items = seq_len * num_heads
     var num_jobs = min(total_items, pool.get_capacity())
@@ -296,6 +300,4 @@ def global_attention[num_heads: Int, num_kv_heads: Int, head_dim: Int,
     pool.dispatch[AttentionHeadArgs,
         global_attention_kernel[num_heads, num_kv_heads, head_dim, KCT.COLS]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
+    return PoolFence[P, origin].over(pool)

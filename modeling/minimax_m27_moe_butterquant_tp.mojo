@@ -35,7 +35,7 @@ from simd_math import sqrt
 
 from experimental3.profiler import (
     PhaseTiming, phase_timing_from_points, finish_single_pool_fence,
-    ForwardSample, ForwardLogger,
+    timed_tp_parallel, ForwardSample, ForwardLogger,
 )
 from experimental3.init_weights import colsum_at, block_colsum_at, block_colsum_row_major_at, pack_at
 from experimental3.gamma import compute_sqrt_gamma, compute_inv_sqrt_gamma
@@ -618,34 +618,6 @@ def build_minimax_plan[tp: Int]() -> MiniMaxM27LoadPlan[tp]:
 # =============================================================================
 
 
-def tp_parallel[
-    Pool: BurstThreadPool, //, tp: Int,
-    body: def[rank: Int](MiniMaxM27Topology[tp], mut Pool) capturing -> PoolFence[Pool],
-](
-    topos: InlineArray[MiniMaxM27Topology[tp], tp],
-    pool_ptrs: InlineArray[UnsafePointer[Pool, MutAnyOrigin], tp],
-) -> PhaseTiming:
-    var ptrs = InlineArray[UnsafePointer[Pool, MutAnyOrigin], tp](
-        fill=UnsafePointer[Pool, MutAnyOrigin]())
-    var active = InlineArray[Bool, tp](fill=False)
-    var t0 = Int(perf_counter_ns())
-    comptime for rank in range(tp):
-        ptrs[rank] = body[rank](topos[rank], pool_ptrs[rank][]).take()
-    var t1 = Int(perf_counter_ns())
-    for i in range(tp):
-        if ptrs[i]:
-            active[i] = True
-            ptrs[i][].join()
-    var t2 = Int(perf_counter_ns())
-    var max_done_ns = 0
-    var any_active = False
-    for i in range(tp):
-        if active[i]:
-            any_active = True
-            var ts = ptrs[i][].last_worker_timestamp()
-            if ts > max_done_ns:
-                max_done_ns = ts
-    return phase_timing_from_points(t0, t1, max_done_ns, t1, t2, any_active)
 
 
 # =============================================================================
@@ -672,13 +644,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         self.topos = topos
         self.profile = ForwardLogger()
 
-    def pool_ptrs(self) -> InlineArray[UnsafePointer[Self.Pool, MutAnyOrigin], Self.tp]:
-        var ptrs = InlineArray[UnsafePointer[Self.Pool, MutAnyOrigin], Self.tp](
-            fill=UnsafePointer[Self.Pool, MutAnyOrigin]())
-        for r in range(Self.tp):
-            ptrs[r] = UnsafePointer[Self.Pool, MutAnyOrigin](
-                unsafe_from_address=Int(UnsafePointer(to=self.main_pools[r])))
-        return ptrs^
 
     def x_main_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
         var ptrs = InlineArray[Int, Self.tp](fill=0)
@@ -903,7 +868,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         var sample = ForwardSample(pos)
         var topos = self.topos
         var host = topos[0]
-        var mp = self.pool_ptrs()
 
         # --- Embed (host rank) ---
         var t_embed0 = Int(perf_counter_ns())
@@ -916,7 +880,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
         var t_bcast0 = Int(perf_counter_ns())
         ring_broadcast[X_SLOT, Self.tp](
-            host.x_main(seq_len).ptr, self.x_main_ptrs(seq_len), seq_len, mp)
+            host.x_main(seq_len).ptr, self.x_main_ptrs(seq_len), seq_len, self.main_pools)
         sample.add(self.profile.phase("broadcast"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_bcast0))
 
         var act_scale_lease = self.scratch.borrow[Float32, 1]()
@@ -953,7 +917,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             # Phase 2: fused QKV projection (contiguous output)
 
             @parameter
-            def do_qkv_gemv[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_qkv_gemv[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
                 return int8_gemv[QKV_LOCAL, C.HIDDEN](
@@ -963,7 +927,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     layer.attn.qkv_proj_sc.addr(lb),
                     topo.scratch_addr(qkv_lease),
                     seq_len, topo.scratch_addr(act_scale_lease), pool)
-            sample.add(self.profile.phase("attn_proj"), tp_parallel[Self.tp, do_qkv_gemv](topos, mp))
+            sample.add(self.profile.phase("attn_proj"), timed_tp_parallel[Self.tp,do_qkv_gemv](topos, self.main_pools))
 
             attn_work_lease^.release()
             attn_i8_lease^.release()
@@ -988,7 +952,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
             # Phase 4: K/V cache write (NKV_LOCAL parallel jobs per rank)
             @parameter
-            def do_kv_write[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_kv_write[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
                 return kv_write_dispatch[
@@ -1003,7 +967,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     inv_rms_q, inv_rms_k,
                     topo.kv_cache_base(layer_idx), pos,
                     pool)
-            sample.add(self.profile.phase("kv_write"), tp_parallel[Self.tp, do_kv_write](topos, mp))
+            sample.add(self.profile.phase("kv_write"), timed_tp_parallel[Self.tp,do_kv_write](topos, self.main_pools))
 
             # Phase 5: per-KV-group Q prep + chunked scoring + merge/quantize.
             # LIFO order: persistent leases (live through o_proj) at the bottom,
@@ -1041,7 +1005,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             sample.add(self.profile.phase("q_prep"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_qprep0))
 
             @parameter
-            def do_chunk_score_all[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_chunk_score_all[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 return chunked_score_dispatch_multi[
                     C.HEAD_DIM, HPG, C.MAX_SEQ_LEN, KV_PER_RANK,
                     C.MAX_ATTN_CHUNKS](
@@ -1053,7 +1017,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     context_len, Int(pool.get_capacity()),
                     topo.scratch_addr(partial_lease),
                     pool)
-            sample.add(self.profile.phase("attention"), tp_parallel[Self.tp, do_chunk_score_all](topos, mp))
+            sample.add(self.profile.phase("attention"), timed_tp_parallel[Self.tp,do_chunk_score_all](topos, self.main_pools))
 
             var t_merge_q0 = Int(perf_counter_ns())
             comptime CHUNK_F32_STRIDE = HPG * (2 + C.HEAD_DIM)
@@ -1077,7 +1041,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
             # Phase 6: O projection
             @parameter
-            def do_o_proj[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_o_proj[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
                 return int8_gemv_blocked[C.HIDDEN, Q_LOCAL, C.HEAD_DIM](
@@ -1088,7 +1052,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     F32Ptr(unsafe_from_address=lb + layer.attn.o_colsum),
                     topo.x_residual(seq_len).as_ptr(),
                     seq_len, pool)
-            sample.add(self.profile.phase("o_proj"), tp_parallel[Self.tp, do_o_proj](topos, mp))
+            sample.add(self.profile.phase("o_proj"), timed_tp_parallel[Self.tp,do_o_proj](topos, self.main_pools))
 
             attn_head_sc_lease^.release()
             attn_qi_lease^.release()
@@ -1097,7 +1061,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             # Allreduce O-proj + fused residual add: x_main += sum(x_residual)
             var t_attn_reduce0 = Int(perf_counter_ns())
             small_allreduce[X_SLOT, Self.tp, residual_add=True](
-                self.x_residual_ptrs(seq_len), seq_len, mp,
+                self.x_residual_ptrs(seq_len), seq_len,
                 self.x_main_ptrs(seq_len))
             sample.add(self.profile.phase("attn_reduce"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_attn_reduce0))
 
@@ -1142,7 +1106,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                 RouterCandidate, MAX_POOL_CAPACITY * C.TOP_K]()
 
             @parameter
-            def do_router_fused[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_router_fused[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
                 return router_fused_dispatch[C.NUM_EXPERTS, C.HIDDEN, C.TOP_K](
@@ -1151,7 +1115,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     layer.body.router_bias.bound(lb).as_ptr(),
                     U8Ptr(unsafe_from_address=topo.scratch_addr(candidates_lease)),
                     pool)
-            sample.add(self.profile.phase("router_proj"), tp_parallel[Self.tp, do_router_fused](topos, mp))
+            sample.add(self.profile.phase("router_proj"), timed_tp_parallel[Self.tp,do_router_fused](topos, self.main_pools))
 
             var t_merge0 = Int(perf_counter_ns())
             for r in range(Self.tp):
@@ -1175,7 +1139,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             var local_count_lease = self.scratch.borrow[Int32, 1]()
 
             @parameter
-            def do_expert_phase1[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_expert_phase1[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
                 var routing = UnsafePointer[TopKResult[C.TOP_K], MutAnyOrigin](
@@ -1210,11 +1174,11 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     I8Ptr(unsafe_from_address=topo.scratch_addr(expert_qi_lease)),
                     F32Ptr(unsafe_from_address=topo.scratch_addr(expert_blk_scale_lease)),
                     rank, pool)
-            sample.add(self.profile.phase("expert_phase1"), tp_parallel[Self.tp, do_expert_phase1](topos, mp))
+            sample.add(self.profile.phase("expert_phase1"), timed_tp_parallel[Self.tp,do_expert_phase1](topos, self.main_pools))
 
             # Phase 10: expert down (w2)
             @parameter
-            def do_expert_phase2[rank: Int](topo: MiniMaxM27Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_expert_phase2[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
                 var routing = UnsafePointer[TopKResult[C.TOP_K], MutAnyOrigin](
@@ -1233,7 +1197,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     C.HIDDEN * MOE_DOWN_NUM_BLK * 4,
                     BF16Ptr(unsafe_from_address=topo.scratch_addr(expert_out_lease)),
                     rank, pool)
-            sample.add(self.profile.phase("expert_phase2"), tp_parallel[Self.tp, do_expert_phase2](topos, mp))
+            sample.add(self.profile.phase("expert_phase2"), timed_tp_parallel[Self.tp,do_expert_phase2](topos, self.main_pools))
 
             # Phase 11: expert reduce + fused allreduce + residual add
             var t_expert_sum0 = Int(perf_counter_ns())
@@ -1248,7 +1212,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
             var t_ffn_reduce0 = Int(perf_counter_ns())
             small_allreduce[X_SLOT, Self.tp, residual_add=True](
-                self.x_residual_ptrs(seq_len), seq_len, mp,
+                self.x_residual_ptrs(seq_len), seq_len,
                 self.x_main_ptrs(seq_len))
             sample.add(self.profile.phase("ffn_reduce"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_ffn_reduce0))
 

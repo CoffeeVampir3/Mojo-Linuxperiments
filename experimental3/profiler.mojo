@@ -1,8 +1,8 @@
-"""Forward-pass profiling — per-phase timing capture and reporting."""
-
 from std.time import perf_counter_ns
 from std.collections import InlineArray
+from std.memory import UnsafePointer
 from threading.threading_traits import BurstThreadPool
+from notstdcollections import HeapMoveArray
 
 from kernels.kernel_ops import PoolFence
 
@@ -70,22 +70,54 @@ def phase_timing_from_points(
     return PhaseTiming(dispatch_ns, kernel_ns, join_ns)
 
 
-def finish_single_pool_fence[P: BurstThreadPool](
+def finish_single_pool_fence[
+    P: BurstThreadPool, origin: MutOrigin, //,
+](
     dispatch_start_ns: Int,
     dispatch_end_ns: Int,
-    var fence: PoolFence[P],
+    var fence: PoolFence[P, origin],
 ) -> PhaseTiming:
-    var pool_ptr = fence^.take()
-    if not pool_ptr:
-        return phase_timing_from_points(
-            dispatch_start_ns, dispatch_end_ns,
-            dispatch_end_ns, dispatch_end_ns, dispatch_end_ns, False)
-    pool_ptr[].join()
+    var worker_done_ns = fence^.finish()
     var join_end_ns = Int(perf_counter_ns())
     return phase_timing_from_points(
         dispatch_start_ns, dispatch_end_ns,
-        pool_ptr[].last_worker_timestamp(),
+        worker_done_ns,
         dispatch_end_ns, join_end_ns, True)
+
+
+def timed_tp_dispatch_recursive[
+    Pool: BurstThreadPool,
+    Topo: Copyable & ImplicitlyCopyable, //,
+    rank: Int, tp: Int,
+    body: def[r: Int, origin: MutOrigin](Topo, ref [origin] Pool) capturing -> PoolFence[Pool, origin],
+](
+    topos: InlineArray[Topo, tp],
+    mut pools: HeapMoveArray[Pool],
+    mut max_done_ns: Int,
+):
+    comptime if rank < tp:
+        var fence = body[rank, origin_of(pools)](topos[rank], pools[rank])
+        timed_tp_dispatch_recursive[rank + 1, tp, body](topos, pools, max_done_ns)
+        var done_ns = fence^.finish()
+        if done_ns > max_done_ns:
+            max_done_ns = done_ns
+
+
+def timed_tp_parallel[
+    Pool: BurstThreadPool,
+    Topo: Copyable & ImplicitlyCopyable, //,
+    tp: Int,
+    body: def[r: Int, origin: MutOrigin](Topo, ref [origin] Pool) capturing -> PoolFence[Pool, origin],
+](
+    topos: InlineArray[Topo, tp],
+    mut pools: HeapMoveArray[Pool],
+) -> PhaseTiming:
+    var t0 = Int(perf_counter_ns())
+    var max_done_ns: Int = 0
+    timed_tp_dispatch_recursive[0, tp, body](topos, pools, max_done_ns)
+    var t_end = Int(perf_counter_ns())
+    return phase_timing_from_points(
+        t0, t0, max_done_ns, t0, t_end, max_done_ns > 0)
 
 
 struct ForwardSample(Copyable, ImplicitlyCopyable):

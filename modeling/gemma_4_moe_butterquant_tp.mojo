@@ -56,7 +56,7 @@ from experimental3.kernels.dispatch_kernels import (
 )
 from experimental3.profiler import (
     PhaseTiming, phase_timing_from_points, finish_single_pool_fence,
-    ForwardSample, ForwardLogger,
+    timed_tp_parallel, ForwardSample, ForwardLogger,
 )
 from experimental3.init_weights import (
     colsum_at, block_colsum_at, block_colsum_row_major_at, pack_at,
@@ -718,35 +718,6 @@ def init_layer_body_pack[tp: Int](arena_base: Int, layer_off: Int, body: BodyRef
 # =============================================================================
 
 
-def tp_parallel[
-    Pool: BurstThreadPool, //, tp: Int,
-    body: def[rank: Int](Gemma4Topology[tp], mut Pool) capturing -> PoolFence[Pool],
-](
-    topos: InlineArray[Gemma4Topology[tp], tp],
-    pool_ptrs: InlineArray[UnsafePointer[Pool, MutAnyOrigin], tp],
-) -> PhaseTiming:
-    var ptrs = InlineArray[UnsafePointer[Pool, MutAnyOrigin], tp](
-        fill=UnsafePointer[Pool, MutAnyOrigin]())
-    var active = InlineArray[Bool, tp](fill=False)
-    var t0 = Int(perf_counter_ns())
-    comptime for rank in range(tp):
-        ptrs[rank] = body[rank](topos[rank], pool_ptrs[rank][]).take()
-    var t1 = Int(perf_counter_ns())
-    for i in range(tp):
-        if ptrs[i]:
-            active[i] = True
-            ptrs[i][].join()
-    var t2 = Int(perf_counter_ns())
-
-    var max_done_ns = 0
-    var any_active = False
-    for i in range(tp):
-        if active[i]:
-            any_active = True
-            var ts = ptrs[i][].last_worker_timestamp()
-            if ts > max_done_ns:
-                max_done_ns = ts
-    return phase_timing_from_points(t0, t1, max_done_ns, t1, t2, any_active)
 
 
 # =============================================================================
@@ -773,13 +744,6 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         self.topos = topos
         self.profile = ForwardLogger()
 
-    def pool_ptrs(self) -> InlineArray[UnsafePointer[Self.Pool, MutAnyOrigin], Self.tp]:
-        var ptrs = InlineArray[UnsafePointer[Self.Pool, MutAnyOrigin], Self.tp](
-            fill=UnsafePointer[Self.Pool, MutAnyOrigin]())
-        for r in range(Self.tp):
-            ptrs[r] = UnsafePointer[Self.Pool, MutAnyOrigin](
-                unsafe_from_address=Int(UnsafePointer(to=self.main_pools[r])))
-        return ptrs^
 
     def x_main_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
         var ptrs = InlineArray[Int, Self.tp](fill=0)
@@ -1033,7 +997,6 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         var sample = ForwardSample(pos)
         var topos = self.topos
         var host = topos[0]
-        var mp = self.pool_ptrs()
         # --- Embed ---
         var t_embed0 = Int(perf_counter_ns())
         var embed_fence = embed_lookup_blocked[fwht_blk = LM_HEAD_FWHT_BLK](
@@ -1048,7 +1011,7 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
 
         var t_bcast0 = Int(perf_counter_ns())
         ring_broadcast[X_SLOT, Self.tp](
-            host.x_main(seq_len).ptr, self.x_main_ptrs(seq_len), seq_len, mp)
+            host.x_main(seq_len).ptr, self.x_main_ptrs(seq_len), seq_len, self.main_pools)
         sample.add(self.profile.phase("broadcast"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_bcast0))
 
         var act_scale_lease = self.scratch.borrow[Float32, 1]()
@@ -1069,7 +1032,7 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 var attn_scale_lease = self.scratch.borrow[Float32, 1]()
 
                 @parameter
-                def do_attn_quantize[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+                def do_attn_quantize[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     var lb = topo.sliding_base(sliding_idx)
                     var sl = topo.sliding.proto
                     return rmsnorm_gamma_fwht_quantize[C.HIDDEN, FWHT_BLK_HIDDEN](
@@ -1077,13 +1040,13 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                         topo.scratch_addr(attn_i8_lease),
                         topo.scratch_addr(attn_work_lease), topo.scratch_addr(attn_scale_lease),
                         EPS, seq_len, pool)
-                sample.add(self.profile.phase("local_attn_quantize"), tp_parallel[Self.tp, do_attn_quantize](topos, mp))
+                sample.add(self.profile.phase("local_attn_quantize"), timed_tp_parallel[Self.tp,do_attn_quantize](topos, self.main_pools))
 
                 var q_lease = self.scratch.borrow[Scalar[DType.bfloat16], Q_DIM_LOCAL_SLIDING]()
                 var kv_lease = self.scratch.borrow[Scalar[DType.bfloat16], 2 * KV_DIM_LOCAL_SLIDING]()
 
                 @parameter
-                def do_q_gemv[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+                def do_q_gemv[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     var lb = topo.sliding_base(sliding_idx)
                     var sl = topo.sliding.proto
                     return int8_gemv[Q_DIM_LOCAL_SLIDING, C.HIDDEN](
@@ -1093,10 +1056,10 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                         sl.attn.q_proj_sc.addr(lb),
                         topo.scratch_addr(q_lease),
                         seq_len, topo.scratch_addr(attn_scale_lease), pool)
-                sample.add(self.profile.phase("local_attn_proj"), tp_parallel[Self.tp, do_q_gemv](topos, mp))
+                sample.add(self.profile.phase("local_attn_proj"), timed_tp_parallel[Self.tp,do_q_gemv](topos, self.main_pools))
 
                 @parameter
-                def do_kv_gemv[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+                def do_kv_gemv[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     var lb = topo.sliding_base(sliding_idx)
                     var sl = topo.sliding.proto
                     return int8_gemv[2 * KV_DIM_LOCAL_SLIDING, C.HIDDEN](
@@ -1106,13 +1069,13 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                         sl.attn.k_proj_sc.addr(lb),
                         topo.scratch_addr(kv_lease),
                         seq_len, topo.scratch_addr(attn_scale_lease), pool)
-                sample.add(self.profile.phase("local_attn_proj"), tp_parallel[Self.tp, do_kv_gemv](topos, mp))
+                sample.add(self.profile.phase("local_attn_proj"), timed_tp_parallel[Self.tp,do_kv_gemv](topos, self.main_pools))
 
                 var attn_qi_lease = self.scratch.borrow[Scalar[DType.int8], Q_DIM_LOCAL_SLIDING]()
                 var attn_head_sc_lease = self.scratch.borrow[Float32, Q_DIM_LOCAL_SLIDING // C.HEAD_DIM_SLIDING]()
 
                 @parameter
-                def do_sliding_attn[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+                def do_sliding_attn[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     comptime HPG = C.NUM_HEADS // C.NUM_KV_HEADS_SLIDING
                     comptime NKV = C.NUM_KV_HEADS_SLIDING // Self.tp
                     var lb = topo.sliding_base(sliding_idx)
@@ -1128,10 +1091,10 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                         pos % C.SLIDING_WINDOW, min(pos + 1, C.SLIDING_WINDOW),
                         topo.scratch_addr(attn_qi_lease), topo.scratch_addr(attn_head_sc_lease),
                         EPS, pool)
-                sample.add(self.profile.phase("local_attention"), tp_parallel[Self.tp, do_sliding_attn](topos, mp))
+                sample.add(self.profile.phase("local_attention"), timed_tp_parallel[Self.tp,do_sliding_attn](topos, self.main_pools))
 
                 @parameter
-                def do_o_proj[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+                def do_o_proj[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     var lb = topo.sliding_base(sliding_idx)
                     var sl = topo.sliding.proto
                     return int8_gemv_blocked[C.HIDDEN, Q_DIM_LOCAL_SLIDING, C.HEAD_DIM_SLIDING](
@@ -1142,7 +1105,7 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                         F32Ptr(unsafe_from_address=lb + sl.attn.o_colsum),
                         topo.x_residual(seq_len).as_ptr(),
                         seq_len, pool)
-                sample.add(self.profile.phase("local_o_proj"), tp_parallel[Self.tp, do_o_proj](topos, mp))
+                sample.add(self.profile.phase("local_o_proj"), timed_tp_parallel[Self.tp,do_o_proj](topos, self.main_pools))
                 attn_head_sc_lease^.release()
                 attn_qi_lease^.release()
                 kv_lease^.release()
@@ -1169,7 +1132,7 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 var full_attn_scale_lease = self.scratch.borrow[Float32, 1]()
 
                 @parameter
-                def do_full_attn_quantize[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+                def do_full_attn_quantize[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     var lb = topo.full_base(full_idx)
                     var fl = topo.full.proto
                     return rmsnorm_gamma_fwht_quantize[C.HIDDEN, FWHT_BLK_HIDDEN](
@@ -1177,10 +1140,10 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                         topo.scratch_addr(full_attn_i8_lease),
                         topo.scratch_addr(full_attn_work_lease), topo.scratch_addr(full_attn_scale_lease),
                         EPS, seq_len, pool)
-                sample.add(self.profile.phase("global_attn_quantize"), tp_parallel[Self.tp, do_full_attn_quantize](topos, mp))
+                sample.add(self.profile.phase("global_attn_quantize"), timed_tp_parallel[Self.tp,do_full_attn_quantize](topos, self.main_pools))
 
                 @parameter
-                def do_full_q_gemv[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+                def do_full_q_gemv[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     var lb = topo.full_base(full_idx)
                     var fl = topo.full.proto
                     return int8_gemv[Q_DIM_LOCAL_FULL, C.HIDDEN](
@@ -1190,10 +1153,10 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                         fl.attn.q_proj_sc.addr(lb),
                         topo.scratch_addr(full_q_lease),
                         seq_len, topo.scratch_addr(full_attn_scale_lease), pool)
-                sample.add(self.profile.phase("global_attn_proj"), tp_parallel[Self.tp, do_full_q_gemv](topos, mp))
+                sample.add(self.profile.phase("global_attn_proj"), timed_tp_parallel[Self.tp,do_full_q_gemv](topos, self.main_pools))
 
                 @parameter
-                def do_full_k_gemv[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+                def do_full_k_gemv[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     var lb = topo.full_base(full_idx)
                     var fl = topo.full.proto
                     return int8_gemv[C.KV_DIM_FULL, C.HIDDEN](
@@ -1203,7 +1166,7 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                         fl.attn.k_proj_sc.addr(lb),
                         topo.scratch_addr(full_k_lease),
                         seq_len, topo.scratch_addr(full_attn_scale_lease), pool)
-                sample.add(self.profile.phase("global_attn_proj"), tp_parallel[Self.tp, do_full_k_gemv](topos, mp))
+                sample.add(self.profile.phase("global_attn_proj"), timed_tp_parallel[Self.tp,do_full_k_gemv](topos, self.main_pools))
                 full_attn_scale_lease^.release()
                 full_attn_work_lease^.release()
                 full_attn_i8_lease^.release()
@@ -1216,7 +1179,7 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                     q_shard_ptrs[r] = topos[r].scratch_addr(full_q_lease)
                     q_dst_ptrs[r] = topos[r].scratch_addr(full_q_all_lease)
                 ring_allgather[Self.tp](
-                    q_shard_ptrs, q_dst_ptrs, Q_DIM_LOCAL_FULL * 2, mp)
+                    q_shard_ptrs, q_dst_ptrs, Q_DIM_LOCAL_FULL * 2, self.main_pools)
 
                 var attn_qi_lease = self.scratch.borrow[Scalar[DType.int8], Q_DIM_LOCAL_FULL]()
                 var attn_head_sc_lease = self.scratch.borrow[Float32, HEADS_PER_RANK]()
@@ -1231,7 +1194,7 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
 
                 for kv in range(C.NUM_KV_HEADS_FULL):
                     @parameter
-                    def do_cp_attn_prep[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+                    def do_cp_attn_prep[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                         var lb = topo.full_base(full_idx)
                         var fl = topo.full.proto
                         var lp = cp_local_pos(pos, Self.tp)
@@ -1250,10 +1213,10 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                             topo.scratch_addr(qi_biases_lease),
                             topo.scratch_addr(q_scales_lease),
                             pool)
-                    sample.add(self.profile.phase("global_attention"), tp_parallel[Self.tp, do_cp_attn_prep](topos, mp))
+                    sample.add(self.profile.phase("global_attention"), timed_tp_parallel[Self.tp,do_cp_attn_prep](topos, self.main_pools))
 
                     @parameter
-                    def do_cp_chunk_attn[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+                    def do_cp_chunk_attn[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                         var local_ctx = cp_local_context_len(pos + 1, rank, Self.tp)
                         return cp_chunked_attn_dispatch[
                             C.HEAD_DIM_FULL, LOCAL_MAX_SEQ_FULL,
@@ -1266,10 +1229,10 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                             local_ctx, Int(pool.get_capacity()),
                             topo.scratch_addr(partial_lease),
                             pool)
-                    sample.add(self.profile.phase("global_attention"), tp_parallel[Self.tp, do_cp_chunk_attn](topos, mp))
+                    sample.add(self.profile.phase("global_attention"), timed_tp_parallel[Self.tp,do_cp_chunk_attn](topos, self.main_pools))
 
                     @parameter
-                    def do_merge_chunks[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+                    def do_merge_chunks[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                         var local_ctx = cp_local_context_len(pos + 1, rank, Self.tp)
                         var num_pg = (local_ctx + CACHE_WIDTH - 1) // CACHE_WIDTH
                         var nc = min(Int(pool.get_capacity()), C.FULL_ATTN_MAX_CHUNKS)
@@ -1282,7 +1245,7 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                             topo.scratch_addr(cp_l_lease) + kv * FULL_HPG * 4,
                             topo.scratch_addr(cp_v_lease) + kv * FULL_HPG * C.HEAD_DIM_FULL * 4,
                             pool)
-                    sample.add(self.profile.phase("global_attention"), tp_parallel[Self.tp, do_merge_chunks](topos, mp))
+                    sample.add(self.profile.phase("global_attention"), timed_tp_parallel[Self.tp,do_merge_chunks](topos, self.main_pools))
 
                 # Cross-rank gather + quantize: each rank's pool merges V
                 # from all ranks (remote reads) and writes qi/scales locally
@@ -1295,13 +1258,13 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                     all_v_addrs[r] = topos[r].scratch_addr(cp_v_lease)
 
                 @parameter
-                def do_cp_gather[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+                def do_cp_gather[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     return cp_gather_dispatch[C.HEAD_DIM_FULL, C.NUM_HEADS, Self.tp](
                         rank, all_m_addrs, all_l_addrs, all_v_addrs,
                         topo.scratch_addr(attn_qi_lease),
                         topo.scratch_addr(attn_head_sc_lease),
                         rank * HEADS_PER_RANK, HEADS_PER_RANK, pool)
-                sample.add(self.profile.phase("global_attention"), tp_parallel[Self.tp, do_cp_gather](topos, mp))
+                sample.add(self.profile.phase("global_attention"), timed_tp_parallel[Self.tp,do_cp_gather](topos, self.main_pools))
 
                 cp_v_lease^.release()
                 cp_l_lease^.release()
@@ -1312,7 +1275,7 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 q_i8_prep_lease^.release()
 
                 @parameter
-                def do_full_o_proj[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+                def do_full_o_proj[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     var lb = topo.full_base(full_idx)
                     var fl = topo.full.proto
                     return int8_gemv_blocked[C.HIDDEN, Q_DIM_LOCAL_FULL, C.HEAD_DIM_FULL](
@@ -1323,7 +1286,7 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                         F32Ptr(unsafe_from_address=lb + fl.attn.o_colsum),
                         topo.x_residual(seq_len).as_ptr(),
                         seq_len, pool)
-                sample.add(self.profile.phase("global_o_proj"), tp_parallel[Self.tp, do_full_o_proj](topos, mp))
+                sample.add(self.profile.phase("global_o_proj"), timed_tp_parallel[Self.tp,do_full_o_proj](topos, self.main_pools))
 
                 attn_head_sc_lease^.release()
                 attn_qi_lease^.release()
@@ -1334,21 +1297,21 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             # Allreduce + post-attn norm
             var t_attn_reduce0 = Int(perf_counter_ns())
             small_allreduce[X_SLOT, Self.tp](
-                self.x_residual_ptrs(seq_len), seq_len, mp)
+                self.x_residual_ptrs(seq_len), seq_len)
             if is_full:
                 sample.add(self.profile.phase("global_attn_reduce"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_attn_reduce0))
             else:
                 sample.add(self.profile.phase("local_attn_reduce"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_attn_reduce0))
 
             @parameter
-            def do_post_attn_norm[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_post_attn_norm[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
                 return post_attn_norm_dispatch[C.HIDDEN](
                     topo.x_residual(seq_len).ptr,
                     body.post_attn_norm.addr(lb),
                     topo.x_main(seq_len).ptr, EPS, pool)
-            sample.add(self.profile.phase("post_attn_norm"), tp_parallel[Self.tp, do_post_attn_norm](topos, mp))
+            sample.add(self.profile.phase("post_attn_norm"), timed_tp_parallel[Self.tp,do_post_attn_norm](topos, self.main_pools))
 
             # =============================================================
             # FFN BLOCK
@@ -1361,7 +1324,7 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             var expert_act_scale_lease = self.scratch.borrow[Float32, 1]()
 
             @parameter
-            def do_router_quantize[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_router_quantize[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
                 return rmsnorm_gamma_fwht_quantize[C.HIDDEN, FWHT_BLK_HIDDEN](
@@ -1369,13 +1332,13 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                     topo.scratch_addr(act_i8_lease),
                     topo.scratch_addr(act_work_lease), topo.scratch_addr(act_scale_lease),
                     EPS, seq_len, pool)
-            sample.add(self.profile.phase("router_quantize"), tp_parallel[Self.tp, do_router_quantize](topos, mp))
+            sample.add(self.profile.phase("router_quantize"), timed_tp_parallel[Self.tp,do_router_quantize](topos, self.main_pools))
 
             var router_logits_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.NUM_EXPERTS]()
             var routing_lease = self.scratch.borrow[Gemma4TopKResult[C.TOP_K], 1]()
 
             @parameter
-            def do_router_gemv[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_router_gemv[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
                 return int8_gemv[C.NUM_EXPERTS, C.HIDDEN](
@@ -1385,17 +1348,17 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                     body.router_proj_sc.addr(lb),
                     topo.scratch_addr(router_logits_lease),
                     seq_len, topo.scratch_addr(act_scale_lease), pool)
-            sample.add(self.profile.phase("router_proj"), tp_parallel[Self.tp, do_router_gemv](topos, mp))
+            sample.add(self.profile.phase("router_proj"), timed_tp_parallel[Self.tp,do_router_gemv](topos, self.main_pools))
 
             @parameter
-            def do_router_topk[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_router_topk[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
                 return router_topk_dispatch[C.NUM_EXPERTS, C.TOP_K](
                     BF16Ptr(unsafe_from_address=topo.scratch_addr(router_logits_lease)),
                     body.router_pes.bound(lb).as_ptr(),
                     topo.scratch_addr(routing_lease), pool)
-            sample.add(self.profile.phase("router_topk"), tp_parallel[Self.tp, do_router_topk](topos, mp))
+            sample.add(self.profile.phase("router_topk"), timed_tp_parallel[Self.tp,do_router_topk](topos, self.main_pools))
 
             var expert_qi_lease = self.scratch.borrow[Scalar[DType.int8], C.TOP_K * C.MOE_INTERMEDIATE]()
             var expert_blk_scale_lease = self.scratch.borrow[Float32, C.TOP_K * MOE_NUM_BLOCKS]()
@@ -1403,7 +1366,7 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             var local_count_lease = self.scratch.borrow[Int32, 1]()
 
             @parameter
-            def do_ffn_quantize[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_ffn_quantize[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
                 return rmsnorm_dual_gamma_fwht_quantize[C.HIDDEN, FWHT_BLK_HIDDEN](
@@ -1417,10 +1380,10 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                     topo.scratch_addr(act_scale_lease),
                     topo.scratch_addr(expert_act_scale_lease),
                     EPS, seq_len, pool)
-            sample.add(self.profile.phase("ffn_quantize"), tp_parallel[Self.tp, do_ffn_quantize](topos, mp))
+            sample.add(self.profile.phase("ffn_quantize"), timed_tp_parallel[Self.tp,do_ffn_quantize](topos, self.main_pools))
 
             @parameter
-            def do_expert_phase1[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_expert_phase1[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
                 var routing = UnsafePointer[Gemma4TopKResult[C.TOP_K], MutAnyOrigin](
@@ -1449,12 +1412,12 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                     I8Ptr(unsafe_from_address=topo.scratch_addr(expert_qi_lease)),
                     F32Ptr(unsafe_from_address=topo.scratch_addr(expert_blk_scale_lease)),
                     rank, pool)
-            sample.add(self.profile.phase("expert_phase1"), tp_parallel[Self.tp, do_expert_phase1](topos, mp))
+            sample.add(self.profile.phase("expert_phase1"), timed_tp_parallel[Self.tp,do_expert_phase1](topos, self.main_pools))
 
             var dense_post_i8_lease = self.scratch.borrow[Scalar[DType.int8], DENSE_INT_LOCAL]()
 
             @parameter
-            def do_dense_phase1[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_dense_phase1[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
                 return fused_gu_gelu_tanh_wa[DENSE_INT_LOCAL, C.HIDDEN, FWHT_BLK_DENSE_DOWN](
@@ -1466,10 +1429,10 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                     I8Ptr(unsafe_from_address=topo.scratch_addr(dense_post_i8_lease)),
                     F32Ptr(unsafe_from_address=topo.scratch_addr(post_blk_scale_lease)),
                     seq_len, pool)
-            sample.add(self.profile.phase("dense_phase1"), tp_parallel[Self.tp, do_dense_phase1](topos, mp))
+            sample.add(self.profile.phase("dense_phase1"), timed_tp_parallel[Self.tp,do_dense_phase1](topos, self.main_pools))
 
             @parameter
-            def do_expert_phase2[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_expert_phase2[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
                 var routing = UnsafePointer[Gemma4TopKResult[C.TOP_K], MutAnyOrigin](
@@ -1488,12 +1451,12 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                     C.HIDDEN * MOE_NUM_BLOCKS * 4,
                     BF16Ptr(unsafe_from_address=topo.scratch_addr(expert_out_lease)),
                     rank, pool)
-            sample.add(self.profile.phase("expert_phase2"), tp_parallel[Self.tp, do_expert_phase2](topos, mp))
+            sample.add(self.profile.phase("expert_phase2"), timed_tp_parallel[Self.tp,do_expert_phase2](topos, self.main_pools))
 
             var dense_out_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.HIDDEN]()
 
             @parameter
-            def do_dense_phase2[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_dense_phase2[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
                 return int8_gemv_blocked_wa[C.HIDDEN, DENSE_INT_LOCAL, FWHT_BLK_DENSE_DOWN](
@@ -1504,43 +1467,43 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                     F32Ptr(unsafe_from_address=lb + body.down_colsum),
                     BF16Ptr(unsafe_from_address=topo.scratch_addr(dense_out_lease)),
                     seq_len, pool)
-            sample.add(self.profile.phase("dense_phase2"), tp_parallel[Self.tp, do_dense_phase2](topos, mp))
+            sample.add(self.profile.phase("dense_phase2"), timed_tp_parallel[Self.tp,do_dense_phase2](topos, self.main_pools))
 
             var dense_normed_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.HIDDEN]()
 
             @parameter
-            def do_expert_sum[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_expert_sum[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lc = Int(UnsafePointer[Int32, MutAnyOrigin](
                     unsafe_from_address=topo.scratch_addr(local_count_lease))[] )
                 return expert_sum_dispatch[C.HIDDEN, C.TOP_K](
                     topo.scratch_addr(expert_out_lease), lc,
                     topo.x_residual(seq_len).ptr, pool)
-            sample.add(self.profile.phase("pre_reduce"), tp_parallel[Self.tp, do_expert_sum](topos, mp))
+            sample.add(self.profile.phase("pre_reduce"), timed_tp_parallel[Self.tp,do_expert_sum](topos, self.main_pools))
 
             var t_dense_reduce0 = Int(perf_counter_ns())
             var dense_out_ptrs = InlineArray[Int, Self.tp](fill=0)
             for r in range(Self.tp):
                 dense_out_ptrs[r] = topos[r].scratch_addr(dense_out_lease)
-            small_allreduce[X_SLOT, Self.tp](dense_out_ptrs, 1, mp)
+            small_allreduce[X_SLOT, Self.tp](dense_out_ptrs, 1)
             sample.add(self.profile.phase("mlp_reduce"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_dense_reduce0))
 
             @parameter
-            def do_dense_norm[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_dense_norm[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
                 return dense_norm_dispatch[C.HIDDEN](
                     topo.scratch_addr(dense_out_lease),
                     body.post_ffn_norm_1.addr(lb),
                     topo.scratch_addr(dense_normed_lease), EPS, pool)
-            sample.add(self.profile.phase("pre_reduce"), tp_parallel[Self.tp, do_dense_norm](topos, mp))
+            sample.add(self.profile.phase("pre_reduce"), timed_tp_parallel[Self.tp,do_dense_norm](topos, self.main_pools))
 
             var t_mlp_reduce0 = Int(perf_counter_ns())
             small_allreduce[X_SLOT, Self.tp](
-                self.x_residual_ptrs(seq_len), seq_len, mp)
+                self.x_residual_ptrs(seq_len), seq_len)
             sample.add(self.profile.phase("mlp_reduce"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_mlp_reduce0))
 
             @parameter
-            def do_post_reduce[rank: Int](topo: Gemma4Topology[Self.tp], mut pool: Self.Pool) -> PoolFence[Self.Pool]:
+            def do_post_reduce[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
                 var ls = body.layer_scalar.bound(lb).as_ptr()
@@ -1550,7 +1513,7 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                     topo.scratch_addr(dense_normed_lease),
                     body.post_ffn_norm.addr(lb),
                     topo.x_main(seq_len).ptr, Float32(ls[]), EPS, pool)
-            sample.add(self.profile.phase("post_reduce"), tp_parallel[Self.tp, do_post_reduce](topos, mp))
+            sample.add(self.profile.phase("post_reduce"), timed_tp_parallel[Self.tp,do_post_reduce](topos, self.main_pools))
 
             dense_normed_lease^.release()
             dense_out_lease^.release()

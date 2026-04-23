@@ -79,11 +79,6 @@ from experimental3.kernels.rmsnorm import (
 # ============================================================================
 
 
-@always_inline
-def pool_fence[P: BurstThreadPool](mut pool: P) -> PoolFence[P]:
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
 
 
 # ============================================================================
@@ -91,13 +86,13 @@ def pool_fence[P: BurstThreadPool](mut pool: P) -> PoolFence[P]:
 # ============================================================================
 
 
-def int8_gemv[N: Int, K: Int, P: BurstThreadPool](
+def int8_gemv[P: BurstThreadPool, origin: MutOrigin, //, N: Int, K: Int](
     act_ptr: Int, wpacked_ptr: Int,
     colsum_ptr: Int, weight_scale_ptr: Int, dst_ptr: Int,
     seq_len: Int,
     act_scale_ptr: Int,
-    mut pool: P,
-) -> PoolFence[P]:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """Dispatch int8 GEMV: [seq_len, K] x [N, K]^T -> [seq_len, N] bf16.
 
     Decode (seq_len=1): N-split across workers. Each worker computes a
@@ -106,7 +101,7 @@ def int8_gemv[N: Int, K: Int, P: BurstThreadPool](
     full N outputs for a subset of rows.
     """
     if seq_len == 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
 
     var act = I8Ptr(unsafe_from_address=act_ptr)
     var wpacked = U8Ptr(unsafe_from_address=wpacked_ptr)
@@ -132,7 +127,7 @@ def int8_gemv[N: Int, K: Int, P: BurstThreadPool](
             actual += 1
         pool.dispatch[WorkerConfig, int8_gemv_decode_worker[N, K]](
             UnsafePointer(to=jobs[0]), actual)
-        return pool_fence(pool)
+        return PoolFence[P, origin].over(pool)
 
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
@@ -146,7 +141,7 @@ def int8_gemv[N: Int, K: Int, P: BurstThreadPool](
             act_scale, start, end - start)
     pool.dispatch[WorkerConfig, int8_gemv_worker[N, K]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
 # ============================================================================
@@ -154,7 +149,7 @@ def int8_gemv[N: Int, K: Int, P: BurstThreadPool](
 # ============================================================================
 
 
-def int8_gemv_blocked[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
+def int8_gemv_blocked[P: BurstThreadPool, origin: MutOrigin, //, N: Int, K: Int, fwht_blk: Int](
     act: I8Ptr,
     wpacked: U8Ptr,
     blk_scale: F32Ptr,
@@ -162,16 +157,16 @@ def int8_gemv_blocked[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
     blk_colsum: F32Ptr,
     dst: BF16Ptr,
     seq_len: Int,
-    mut pool: P,
+    ref [origin] pool: P,
     output_scale: Float32 = Float32(1.0),
-) -> PoolFence[P]:
+) -> PoolFence[P, origin]:
     """Dispatch int8 GEMV with per-block activation scales.
 
     Decode (seq_len=1): N-split across workers.
     Prefill (seq_len>1): M-split across workers.
     """
     if seq_len == 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
 
     comptime num_blocks = K // fwht_blk
 
@@ -194,7 +189,7 @@ def int8_gemv_blocked[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
         pool.dispatch[Int8GemvBlockedArgs,
             int8_gemv_blocked_decode_worker[N, K, fwht_blk]](
             UnsafePointer(to=jobs[0]), actual)
-        return pool_fence(pool)
+        return PoolFence[P, origin].over(pool)
 
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
@@ -208,17 +203,17 @@ def int8_gemv_blocked[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
             dst + start * N, output_scale, N, N)
     pool.dispatch[Int8GemvBlockedArgs, int8_gemv_blocked_worker[N, K, fwht_blk]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
-def int8_gemv_blocked_wa[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
+def int8_gemv_blocked_wa[P: BurstThreadPool, origin: MutOrigin, //, N: Int, K: Int, fwht_blk: Int](
     act: I8Ptr, wpacked: U8Ptr, blk_scale: F32Ptr,
     wscale: F32Ptr, blk_colsum: F32Ptr, dst: BF16Ptr,
-    seq_len: Int, mut pool: P,
-) -> PoolFence[P]:
+    seq_len: Int, ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """Dispatch workaround blocked GEMV for sub-VNNI_K_STEP block sizes."""
     if seq_len == 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
 
     var num_jobs = min(seq_len, pool.get_capacity())
     comptime num_blocks = K // fwht_blk
@@ -235,7 +230,7 @@ def int8_gemv_blocked_wa[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
 
     pool.dispatch[Int8GemvBlockedArgs, int8_gemv_blocked_wa_worker[N, K, fwht_blk]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
 # ============================================================================
@@ -243,8 +238,10 @@ def int8_gemv_blocked_wa[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
 # ============================================================================
 
 
-def fused_gu_gelu_tanh[intermediate: Int, K: Int, fwht_blk: Int,
-                       P: BurstThreadPool, fwht: Bool = True](
+def fused_gu_gelu_tanh[
+    P: BurstThreadPool, origin: MutOrigin, //,
+    intermediate: Int, K: Int, fwht_blk: Int, fwht: Bool = True,
+](
     act_i8: I8Ptr,
     act_scale: F32Ptr,
     wpacked: U8Ptr,
@@ -253,15 +250,15 @@ def fused_gu_gelu_tanh[intermediate: Int, K: Int, fwht_blk: Int,
     qi_out: I8Ptr,
     blk_scale: F32Ptr,
     seq_len: Int,
-    mut pool: P,
-) -> PoolFence[P]:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """Dispatch gate_up GEMV + GELU-tanh + [FWHT] + per-block quantize.
 
     For seq_len=1 (decode): parallelizes across the output dimension N.
     For seq_len>1 (prompt): parallelizes across sequence rows.
     """
     if seq_len == 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
 
     comptime n_tiles = intermediate // fwht_blk
     comptime num_blk_per_row = intermediate // fwht_blk
@@ -301,19 +298,21 @@ def fused_gu_gelu_tanh[intermediate: Int, K: Int, fwht_blk: Int,
         pool.dispatch[FusedGuGeluTanhArgs, fused_gu_gelu_tanh_worker[intermediate, K, fwht_blk, fwht]](
             UnsafePointer(to=jobs[0]), num_workers)
 
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
-def fused_gu_gelu_tanh_wa[intermediate: Int, K: Int, fwht_blk: Int,
-                          P: BurstThreadPool](
+def fused_gu_gelu_tanh_wa[
+    P: BurstThreadPool, origin: MutOrigin, //,
+    intermediate: Int, K: Int, fwht_blk: Int,
+](
     act_i8: I8Ptr, act_scale: F32Ptr,
     wpacked: U8Ptr, wscale: F32Ptr, wcolsum: F32Ptr,
     qi_out: I8Ptr, blk_scale: F32Ptr,
-    seq_len: Int, mut pool: P,
-) -> PoolFence[P]:
+    seq_len: Int, ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """Dispatch workaround fused gate_up + GELU-tanh + FWHT(sub-block) + quantize."""
     if seq_len == 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
 
     comptime n_tiles = intermediate // GEMV_TILE
     comptime num_blk_per_row = intermediate // fwht_blk
@@ -353,7 +352,7 @@ def fused_gu_gelu_tanh_wa[intermediate: Int, K: Int, fwht_blk: Int,
             fused_gu_gelu_tanh_worker_wa[intermediate, K, fwht_blk]](
             UnsafePointer(to=jobs[0]), num_workers)
 
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
 # ============================================================================
@@ -361,15 +360,15 @@ def fused_gu_gelu_tanh_wa[intermediate: Int, K: Int, fwht_blk: Int,
 # ============================================================================
 
 
-def lm_head_gemv[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
+def lm_head_gemv[P: BurstThreadPool, origin: MutOrigin, //, N: Int, K: Int, fwht_blk: Int](
     act: Int,
     weight: Int,
     act_blk_scales: Int,
     w_blk_scales: Int,
     w_blk_colsums: Int,
     dst: Int,
-    mut pool: P,
-) -> PoolFence[P]:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """LM head GEMV: i8 [N, K] x i8 [K] -> bf16 [N] with per-block dequant.
 
     Decode only (seq_len=1). Work is N-split across pool workers.
@@ -399,7 +398,7 @@ def lm_head_gemv[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
 
     pool.dispatch[LmHeadArgs, lm_head_worker[K, fwht_blk]](
         UnsafePointer(to=jobs[0]), actual_jobs)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
 # ============================================================================
@@ -408,8 +407,9 @@ def lm_head_gemv[N: Int, K: Int, fwht_blk: Int, P: BurstThreadPool](
 
 
 def gemma4_moe_phase1[
+    P: BurstThreadPool, origin: MutOrigin, //,
     intermediate: Int, hidden: Int, fwht_blk: Int,
-    top_k: Int, num_experts: Int, tp: Int, P: BurstThreadPool,
+    top_k: Int, num_experts: Int, tp: Int,
 ](
     act_i8: I8Ptr,
     act_scale: F32Ptr,
@@ -423,8 +423,8 @@ def gemma4_moe_phase1[
     expert_qi: I8Ptr,
     expert_blk_scale: F32Ptr,
     rank: Int,
-    mut pool: P,
-) -> PoolFence[P]:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """Multi-expert phase 1: gate_up + gelu_tanh + FWHT + per-block i8 quantize.
 
     Filters routing.indices to experts owned by this rank (block sharding:
@@ -447,7 +447,7 @@ def gemma4_moe_phase1[
             local_count += 1
 
     if local_count == 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
 
     var workers_per_expert = pool_capacity // local_count
     if workers_per_expert < 1:
@@ -490,12 +490,13 @@ def gemma4_moe_phase1[
 
     pool.dispatch[FusedGuGeluTanhArgs, fused_gu_gelu_tanh_worker[intermediate, hidden, fwht_blk]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
 def gemma4_moe_phase2[
+    P: BurstThreadPool, origin: MutOrigin, //,
     hidden: Int, intermediate: Int, fwht_blk: Int,
-    top_k: Int, num_experts: Int, tp: Int, P: BurstThreadPool,
+    top_k: Int, num_experts: Int, tp: Int,
 ](
     expert_qi: I8Ptr,
     expert_blk_scale: F32Ptr,
@@ -508,8 +509,8 @@ def gemma4_moe_phase2[
     down_bcs_stride: Int,
     expert_out_buf: BF16Ptr,
     rank: Int,
-    mut pool: P,
-) -> PoolFence[P]:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """Multi-expert phase 2: per-local-expert down GEMV with routing weight.
 
     One job per local expert: int8_gemv_blocked_worker reading the expert's
@@ -542,21 +543,21 @@ def gemma4_moe_phase2[
         local_count += 1
 
     if local_count == 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
 
     pool.dispatch[Int8GemvBlockedArgs, int8_gemv_blocked_worker[hidden, intermediate, fwht_blk]](
         UnsafePointer(to=jobs[0]), local_count)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
-def router_topk_dispatch[num_experts: Int, k: Int, P: BurstThreadPool](
-    logits: BF16Ptr, per_expert_scale: BF16Ptr, result_ptr: Int, mut pool: P,
-) -> PoolFence[P]:
+def router_topk_dispatch[P: BurstThreadPool, origin: MutOrigin, //, num_experts: Int, k: Int](
+    logits: BF16Ptr, per_expert_scale: BF16Ptr, result_ptr: Int, ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     var args = RouterTopkArgs(
         logits, per_expert_scale, U8Ptr(unsafe_from_address=result_ptr))
     pool.dispatch[RouterTopkArgs, router_topk_kernel[num_experts, k]](
         UnsafePointer(to=args), 1)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
 # ============================================================================
@@ -565,16 +566,17 @@ def router_topk_dispatch[num_experts: Int, k: Int, P: BurstThreadPool](
 
 
 def sliding_attn_dispatch[
+    P: BurstThreadPool, origin: MutOrigin, //,
     head_dim: Int, heads_per_group: Int, window_size: Int,
-    num_kv_heads: Int, num_q_heads: Int, P: BurstThreadPool,
+    num_kv_heads: Int, num_q_heads: Int,
 ](
     q_base: Int, k_base: Int, v_base: Int,
     q_norm_ptr: Int, k_norm_ptr: Int,
     cos_ptr: Int, sin_ptr: Int,
     cache_base: Int, cache_pos: Int, context_len: Int,
     qi_out_ptr: Int, head_scale_ptr: Int,
-    eps: Float32, mut pool: P,
-) -> PoolFence[P]:
+    eps: Float32, ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     comptime NKV = num_kv_heads
     var jobs = InlineArray[AttnGroupArgs, 8](fill=AttnGroupArgs())
     var q = BF16Ptr(unsafe_from_address=q_base)
@@ -603,7 +605,7 @@ def sliding_attn_dispatch[
         sliding_attn_group_kernel[head_dim, heads_per_group,
             window_size, num_kv_heads, num_q_heads]](
         UnsafePointer(to=jobs[0]), NKV)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
 # ============================================================================
@@ -612,9 +614,9 @@ def sliding_attn_dispatch[
 
 
 def cp_attn_prep_dispatch[
+    P: BurstThreadPool, origin: MutOrigin, //,
     head_dim: Int, rope_dims: Int, heads_per_group: Int,
     local_max_seq: Int, num_kv_heads: Int, num_q_heads: Int,
-    P: BurstThreadPool,
 ](
     q_bf16_base: Int, k_bf16_ptr: Int,
     q_norm_ptr: Int, k_norm_ptr: Int,
@@ -622,8 +624,8 @@ def cp_attn_prep_dispatch[
     cache_base: Int, local_pos: Int, kv_head: Int,
     eps: Float32, write_kv: Bool,
     q_i8_out: Int, qi_biases_out: Int, q_scales_out: Int,
-    mut pool: P,
-) -> PoolFence[P]:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     var args = CpAttnPrepArgs(
         q_bf16_base=BF16Ptr(unsafe_from_address=q_bf16_base),
         k_bf16_ptr=BF16Ptr(unsafe_from_address=k_bf16_ptr),
@@ -642,28 +644,28 @@ def cp_attn_prep_dispatch[
         cp_attn_prep_kernel[head_dim, rope_dims, heads_per_group,
             local_max_seq, num_kv_heads, num_q_heads]](
         UnsafePointer(to=args), 1)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
 def cp_chunked_attn_dispatch[
+    P: BurstThreadPool, origin: MutOrigin, //,
     head_dim: Int, local_max_seq: Int,
     num_kv_heads: Int, num_q_heads: Int, heads_per_group: Int,
     max_attn_chunks: Int,
-    P: BurstThreadPool,
 ](
     q_i8_base: Int, qi_biases_base: Int, q_scales_base: Int,
     cache_base: Int, kv_head: Int,
     local_context_len: Int, pool_capacity: Int,
     partial_out_base: Int,
-    mut pool: P,
-) -> PoolFence[P]:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """Dispatch chunked attention with CP cache parameters."""
     var num_pg = (local_context_len + CACHE_WIDTH - 1) // CACHE_WIDTH
     var num_chunks = min(pool_capacity, max_attn_chunks)
     if num_chunks > num_pg:
         num_chunks = num_pg
     if num_chunks <= 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
     var pgs_per_chunk = (num_pg + num_chunks - 1) // num_chunks
     comptime CHUNK_F32_STRIDE = heads_per_group * (2 + head_dim)
     var q_i8 = I8Ptr(unsafe_from_address=q_i8_base)
@@ -688,19 +690,19 @@ def cp_chunked_attn_dispatch[
     pool.dispatch[ChunkedAttnArgs,
         cp_chunked_attn_kernel[head_dim, local_max_seq, num_kv_heads, num_q_heads, heads_per_group, max_attn_chunks]](
         UnsafePointer(to=chunk_args[0]), num_chunks)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
 def merge_local_chunks_dispatch[
+    P: BurstThreadPool, origin: MutOrigin, //,
     head_dim: Int, heads_per_group: Int, max_attn_chunks: Int,
-    P: BurstThreadPool,
 ](
     partial_base: Int, num_chunks: Int,
     out_m: Int, out_l: Int, out_v: Int,
-    mut pool: P,
-) -> PoolFence[P]:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     if num_chunks <= 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
     var args = MergeChunksArgs(
         partial_base=F32Ptr(unsafe_from_address=partial_base),
         num_chunks=num_chunks,
@@ -710,11 +712,12 @@ def merge_local_chunks_dispatch[
     pool.dispatch[MergeChunksArgs,
         merge_local_chunks_kernel[head_dim, heads_per_group, max_attn_chunks]](
         UnsafePointer(to=args), 1)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
 def cp_gather_dispatch[
-    head_dim: Int, num_heads: Int, tp: Int, P: BurstThreadPool,
+    P: BurstThreadPool, origin: MutOrigin, //,
+    head_dim: Int, num_heads: Int, tp: Int,
 ](
     rank: Int,
     all_m: InlineArray[Int, MAX_CP_RANKS],
@@ -722,8 +725,8 @@ def cp_gather_dispatch[
     all_v: InlineArray[Int, MAX_CP_RANKS],
     qi_out: Int, head_scales: Int,
     head_start: Int, head_count: Int,
-    mut pool: P,
-) -> PoolFence[P]:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     var all_m_ptrs = InlineArray[F32Ptr, MAX_CP_RANKS](fill=F32Ptr())
     var all_l_ptrs = InlineArray[F32Ptr, MAX_CP_RANKS](fill=F32Ptr())
     var all_v_ptrs = InlineArray[F32Ptr, MAX_CP_RANKS](fill=F32Ptr())
@@ -742,7 +745,7 @@ def cp_gather_dispatch[
     pool.dispatch[CpGatherArgs,
         cp_gather_kernel[head_dim, num_heads, tp]](
         UnsafePointer(to=args), 1)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
 # ============================================================================
@@ -750,14 +753,17 @@ def cp_gather_dispatch[
 # ============================================================================
 
 
-def rmsnorm_fwht_quant[cols: Int, block: Int,
-    has_gamma: Bool, per_block: Bool, P: BurstThreadPool](
+def rmsnorm_fwht_quant[
+    P: BurstThreadPool, origin: MutOrigin, //,
+    cols: Int, block: Int,
+    has_gamma: Bool, per_block: Bool,
+](
     in_ptr: Int, gamma_ptr: Int, qi_ptr: Int, work_ptr: Int,
-    scale_ptr: Int, eps: Float32, seq_len: Int, mut pool: P,
-) -> PoolFence[P]:
+    scale_ptr: Int, eps: Float32, seq_len: Int, ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """Unified FWHT+quantize dispatcher. Use convenience wrappers below."""
     if seq_len == 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
 
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
@@ -782,47 +788,47 @@ def rmsnorm_fwht_quant[cols: Int, block: Int,
     pool.dispatch[RmsNormFwhtQuantArgs,
         rmsnorm_fwht_quant_worker[cols, block, has_gamma, per_block]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
-def rmsnorm_gamma_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
+def rmsnorm_gamma_fwht_quantize[P: BurstThreadPool, origin: MutOrigin, //, cols: Int, block: Int](
     in_ptr: Int, gamma_ptr: Int, qi_ptr: Int, work_ptr: Int,
-    scale_ptr: Int, eps: Float32, seq_len: Int, mut pool: P,
-) -> PoolFence[P]:
+    scale_ptr: Int, eps: Float32, seq_len: Int, ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """RMSNorm * gamma + FWHT + per-row i8."""
-    return rmsnorm_fwht_quant[cols, block, True, False, P](
+    return rmsnorm_fwht_quant[cols, block, True, False](
         in_ptr, gamma_ptr, qi_ptr, work_ptr, scale_ptr, eps, seq_len, pool)
 
 
-def rmsnorm_gamma_fwht_per_block_quantize[cols: Int, block: Int, P: BurstThreadPool](
+def rmsnorm_gamma_fwht_per_block_quantize[P: BurstThreadPool, origin: MutOrigin, //, cols: Int, block: Int](
     in_ptr: Int, gamma_ptr: Int, qi_ptr: Int, work_ptr: Int,
-    blk_scale_ptr: Int, eps: Float32, seq_len: Int, mut pool: P,
-) -> PoolFence[P]:
+    blk_scale_ptr: Int, eps: Float32, seq_len: Int, ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """RMSNorm * gamma + FWHT + per-block i8."""
-    return rmsnorm_fwht_quant[cols, block, True, True, P](
+    return rmsnorm_fwht_quant[cols, block, True, True](
         in_ptr, gamma_ptr, qi_ptr, work_ptr, blk_scale_ptr, eps, seq_len, pool)
 
 
-def rmsnorm_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
+def rmsnorm_fwht_quantize[P: BurstThreadPool, origin: MutOrigin, //, cols: Int, block: Int](
     in_ptr: Int, qi_ptr: Int, work_ptr: Int,
-    scale_ptr: Int, eps: Float32, seq_len: Int, mut pool: P,
-) -> PoolFence[P]:
+    scale_ptr: Int, eps: Float32, seq_len: Int, ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """RMSNorm + FWHT + per-row i8. No gamma."""
-    return rmsnorm_fwht_quant[cols, block, False, False, P](
+    return rmsnorm_fwht_quant[cols, block, False, False](
         in_ptr, 0, qi_ptr, work_ptr, scale_ptr, eps, seq_len, pool)
 
 
-def rmsnorm_dual_gamma_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
+def rmsnorm_dual_gamma_fwht_quantize[P: BurstThreadPool, origin: MutOrigin, //, cols: Int, block: Int](
     in_ptr: Int,
     gamma_a_ptr: Int, gamma_b_ptr: Int,
     qi_a_ptr: Int, qi_b_ptr: Int,
     work_a_ptr: Int, work_b_ptr: Int,
     scale_a_ptr: Int, scale_b_ptr: Int,
-    eps: Float32, seq_len: Int, mut pool: P,
-) -> PoolFence[P]:
+    eps: Float32, seq_len: Int, ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """Dual-gamma RMSNorm + FWHT + per-row i8. One pass, two outputs."""
     if seq_len == 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
 
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
@@ -852,15 +858,17 @@ def rmsnorm_dual_gamma_fwht_quantize[cols: Int, block: Int, P: BurstThreadPool](
     pool.dispatch[RmsNormDualGammaFwhtArgs,
         rmsnorm_dual_gamma_fwht_quant_worker[cols, block]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
-def rmsnorm_no_scale[InT: Encoding & Shaped, OutT: Encoding & Shaped,
-    P: BurstThreadPool](
+def rmsnorm_no_scale[
+    P: BurstThreadPool, origin: MutOrigin, //,
+    InT: Encoding & Shaped, OutT: Encoding & Shaped,
+](
     input: DynView[InT], output: DynView[OutT],
-    mut pool: P,
+    ref [origin] pool: P,
     eps: Float32 = 1e-6,
-) -> PoolFence[P]:
+) -> PoolFence[P, origin]:
     """RMSNorm without learnable scale via BurstPool."""
     comptime assert InT.DTYPE == DType.bfloat16, "rmsnorm_no_scale: input must be bf16"
     comptime assert OutT.DTYPE == DType.bfloat16, "rmsnorm_no_scale: output must be bf16"
@@ -869,7 +877,7 @@ def rmsnorm_no_scale[InT: Encoding & Shaped, OutT: Encoding & Shaped,
 
     var seq_len = input.seq_len
     if seq_len == 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
 
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
@@ -885,16 +893,18 @@ def rmsnorm_no_scale[InT: Encoding & Shaped, OutT: Encoding & Shaped,
 
     pool.dispatch[RMSNormNoScaleArgs, rmsnorm_no_scale_kernel[InT.COLS]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
-def rmsnorm_per_head[head_dim: Int, num_heads: Int,
+def rmsnorm_per_head[
+    P: BurstThreadPool, origin: MutOrigin, //,
+    head_dim: Int, num_heads: Int,
     W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped,
-    P: BurstThreadPool](
+](
     input: DynView[InT], weight: Bound[W], output: DynView[OutT],
-    mut pool: P,
+    ref [origin] pool: P,
     eps: Float32 = 1e-6,
-) -> PoolFence[P] where W.DTYPE == DType.bfloat16:
+) -> PoolFence[P, origin] where W.DTYPE == DType.bfloat16:
     """Per-head RMSNorm with learnable scale via BurstPool."""
     comptime assert InT.DTYPE == DType.bfloat16, "rmsnorm_per_head: input must be bf16"
     comptime assert OutT.DTYPE == DType.bfloat16, "rmsnorm_per_head: output must be bf16"
@@ -905,7 +915,7 @@ def rmsnorm_per_head[head_dim: Int, num_heads: Int,
 
     var seq_len = input.seq_len
     if seq_len == 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
 
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
@@ -922,12 +932,12 @@ def rmsnorm_per_head[head_dim: Int, num_heads: Int,
 
     pool.dispatch[RMSNormPerHeadArgs, rmsnorm_per_head_kernel[head_dim, num_heads]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
-def post_attn_norm_dispatch[hidden: Int, P: BurstThreadPool](
-    src_ptr: Int, norm_w_ptr: Int, x_main_ptr: Int, eps: Float32, mut pool: P,
-) -> PoolFence[P]:
+def post_attn_norm_dispatch[P: BurstThreadPool, origin: MutOrigin, //, hidden: Int](
+    src_ptr: Int, norm_w_ptr: Int, x_main_ptr: Int, eps: Float32, ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     var args = PostAttnNormArgs(
         BF16Ptr(unsafe_from_address=src_ptr),
         BF16Ptr(unsafe_from_address=norm_w_ptr),
@@ -935,24 +945,24 @@ def post_attn_norm_dispatch[hidden: Int, P: BurstThreadPool](
         eps)
     pool.dispatch[PostAttnNormArgs, post_attn_norm_kernel[hidden]](
         UnsafePointer(to=args), 1)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
-def expert_sum_dispatch[hidden: Int, max_local: Int, P: BurstThreadPool](
-    expert_out_ptr: Int, local_count: Int, dst_ptr: Int, mut pool: P,
-) -> PoolFence[P]:
+def expert_sum_dispatch[P: BurstThreadPool, origin: MutOrigin, //, hidden: Int, max_local: Int](
+    expert_out_ptr: Int, local_count: Int, dst_ptr: Int, ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     var args = ExpertSumArgs(
         BF16Ptr(unsafe_from_address=expert_out_ptr),
         local_count,
         BF16Ptr(unsafe_from_address=dst_ptr))
     pool.dispatch[ExpertSumArgs, expert_sum_kernel[hidden, max_local]](
         UnsafePointer(to=args), 1)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
-def dense_norm_dispatch[hidden: Int, P: BurstThreadPool](
-    src_ptr: Int, norm_w_ptr: Int, dst_ptr: Int, eps: Float32, mut pool: P,
-) -> PoolFence[P]:
+def dense_norm_dispatch[P: BurstThreadPool, origin: MutOrigin, //, hidden: Int](
+    src_ptr: Int, norm_w_ptr: Int, dst_ptr: Int, eps: Float32, ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     var args = DenseNormArgs(
         BF16Ptr(unsafe_from_address=src_ptr),
         BF16Ptr(unsafe_from_address=norm_w_ptr),
@@ -960,14 +970,14 @@ def dense_norm_dispatch[hidden: Int, P: BurstThreadPool](
         eps)
     pool.dispatch[DenseNormArgs, dense_norm_kernel[hidden]](
         UnsafePointer(to=args), 1)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
-def post_reduce_dispatch[hidden: Int, P: BurstThreadPool](
+def post_reduce_dispatch[P: BurstThreadPool, origin: MutOrigin, //, hidden: Int](
     moe_out_ptr: Int, moe_norm_w_ptr: Int, dense_normed_ptr: Int,
     combine_norm_w_ptr: Int, x_main_ptr: Int,
-    layer_scalar: Float32, eps: Float32, mut pool: P,
-) -> PoolFence[P]:
+    layer_scalar: Float32, eps: Float32, ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     var args = PostReduceArgs(
         BF16Ptr(unsafe_from_address=moe_out_ptr),
         BF16Ptr(unsafe_from_address=moe_norm_w_ptr),
@@ -977,4 +987,4 @@ def post_reduce_dispatch[hidden: Int, P: BurstThreadPool](
         layer_scalar, eps)
     pool.dispatch[PostReduceArgs, post_reduce_kernel[hidden]](
         UnsafePointer(to=args), 1)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)

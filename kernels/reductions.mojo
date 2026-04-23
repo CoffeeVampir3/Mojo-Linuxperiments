@@ -4,6 +4,7 @@ from std.sys.info import simd_width_of
 from std.atomic import Atomic, Ordering
 from threading.threading_traits import BurstThreadPool
 from threading.threading_shared import ptr as tptr
+from notstdcollections import HeapMoveArray
 import linux.sys as linux
 
 from modeling.model_spec import Encoding, Shaped
@@ -34,12 +35,10 @@ def done_ptr(state_base: Int, rank: Int) -> UnsafePointer[Int32, MutAnyOrigin]:
 
 
 def small_allreduce[
-    P: BurstThreadPool, //,
     T: Encoding & Shaped, tp: Int, residual_add: Bool = False,
 ](
     ptrs: InlineArray[Int, tp],
     seq_len: Int,
-    pool_ptrs: InlineArray[UnsafePointer[P, MutAnyOrigin], tp],
     dst_ptrs: InlineArray[Int, tp] = InlineArray[Int, tp](fill=0),
 ):
     """Replicated allreduce for small tensors. Main thread reduces all
@@ -239,7 +238,7 @@ def ring_broadcast[
     src_ptr: Int,
     dst_ptrs: InlineArray[Int, tp],
     seq_len: Int,
-    pool_ptrs: InlineArray[UnsafePointer[P, MutAnyOrigin], tp],
+    mut pools: HeapMoveArray[P],
 ):
     """Parallel pull broadcast. All destination ranks memcpy from source
     simultaneously via per-node workers. ~26 GB/s aggregate on 4 NUMA nodes.
@@ -260,10 +259,10 @@ def ring_broadcast[
     )
     for r in range(1, tp):
         mcpy_jobs[r] = MemcpyArgs(dst_ptrs[r], dst_ptrs[0], total_bytes)
-        pool_ptrs[r][].dispatch[MemcpyArgs, memcpy_kernel](
+        pools[r].dispatch[MemcpyArgs, memcpy_kernel](
             UnsafePointer(to=mcpy_jobs[r]), 1)
     for r in range(1, tp):
-        pool_ptrs[r][].join()
+        pools[r].join()
 
 
 def ring_allreduce[
@@ -272,7 +271,7 @@ def ring_allreduce[
 ](
     ptrs: InlineArray[Int, tp],
     seq_len: Int,
-    pool_ptrs: InlineArray[UnsafePointer[P, MutAnyOrigin], tp],
+    mut pools: HeapMoveArray[P],
     dst_ptrs: InlineArray[Int, tp] = InlineArray[Int, tp](fill=0),
 ):
     """Fused allreduce. Each node's full BurstPool reduces its chunk from
@@ -310,7 +309,7 @@ def ring_allreduce[
     var state_base = Int(UnsafePointer(to=state_mem))
 
     for r in range(tp):
-        var num_workers = pool_ptrs[r][].get_capacity()
+        var num_workers = pools[r].get_capacity()
         AtomicInt32.store[ordering=Ordering.RELEASE](
             counter_ptr(state_base, r), Int32(num_workers)
         )
@@ -332,7 +331,7 @@ def ring_allreduce[
     for r in range(tp):
         var rank_start = r * chunk
         var rank_count = chunk + (rem if r == tp - 1 else 0)
-        var num_workers = pool_ptrs[r][].get_capacity()
+        var num_workers = pools[r].get_capacity()
         var rows_per_worker = (rank_count + num_workers - 1) // num_workers
 
         for w in range(num_workers):
@@ -346,14 +345,14 @@ def ring_allreduce[
             )
 
         comptime if residual_add:
-            pool_ptrs[r][].dispatch[FusedReduceGatherArgs, fused_reduce_gather_add_kernel](
+            pools[r].dispatch[FusedReduceGatherArgs, fused_reduce_gather_add_kernel](
                 UnsafePointer(to=jobs[0]), num_workers)
         else:
-            pool_ptrs[r][].dispatch[FusedReduceGatherArgs, fused_reduce_gather_kernel](
+            pools[r].dispatch[FusedReduceGatherArgs, fused_reduce_gather_kernel](
                 UnsafePointer(to=jobs[0]), num_workers)
 
     for r in range(tp):
-        pool_ptrs[r][].join()
+        pools[r].join()
 
 
 struct AllGatherConfig:
@@ -408,7 +407,7 @@ def ring_allgather[
     src_ptrs: InlineArray[Int, tp],
     dst_ptrs: InlineArray[Int, tp],
     shard_bytes: Int,
-    pool_ptrs: InlineArray[UnsafePointer[P, MutAnyOrigin], tp],
+    mut pools: HeapMoveArray[P],
 ):
     """Parallel pull allgather. Each rank's pool workers copy all shards
     into the local concatenated buffer. Shard s is placed at
@@ -437,11 +436,11 @@ def ring_allgather[
     var jobs = InlineArray[AllGatherArgs, 128](
         fill=AllGatherArgs(0, 0, 0, 0))
     for r in range(tp):
-        var num_workers = pool_ptrs[r][].get_capacity()
+        var num_workers = pools[r].get_capacity()
         for w in range(num_workers):
             jobs[w] = AllGatherArgs(config_addr, r, w, num_workers)
-        pool_ptrs[r][].dispatch[AllGatherArgs, allgather_kernel](
+        pools[r].dispatch[AllGatherArgs, allgather_kernel](
             UnsafePointer(to=jobs[0]), num_workers)
 
     for r in range(tp):
-        pool_ptrs[r][].join()
+        pools[r].join()

@@ -394,11 +394,13 @@ def collect_profiles[num_heads: Int, num_kv_heads: Int, head_dim: Int](
 # Public API
 # ============================================================================
 
-def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
+def decode[
+    P: BurstThreadPool, origin: MutOrigin, //,
+    num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     num_q_heads: Int,
     QT: Encoding & Shaped,
     CosT: Encoding & Shaped, SinT: Encoding & Shaped,
-    P: BurstThreadPool](
+](
     q: DynView[QT],
     q_stride: Int,
     cache: KVCache[max_seq, head_dim, num_kv_heads, num_q_heads],
@@ -408,8 +410,8 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
     pos: Int,
     v_layer_scale: Float32,
     workers_per_group: Int,
-    mut pool: P,
-) -> PoolFence[P]:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """Async AMX decode — per-head dynamic Q/K scales, fixed V scale."""
     comptime gqa_factor = num_heads // num_kv_heads
     comptime q_cols = QT.COLS
@@ -489,6 +491,4 @@ def decode[num_heads: Int, num_kv_heads: Int, head_dim: Int, max_seq: Int,
 
     pool.dispatch[DecodeKernelArgs, attn_decode[num_heads, num_kv_heads, head_dim, max_seq]](
         UnsafePointer(to=jobs[0]), total_jobs)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
+    return PoolFence[P, origin].over(pool)

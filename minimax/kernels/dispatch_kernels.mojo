@@ -25,10 +25,6 @@ from minimax.kernels.router import TopKResult, router_fused_worker
 
 
 @always_inline
-def pool_fence[P: BurstThreadPool](mut pool: P) -> PoolFence[P]:
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
 
 
 # ============================================================================
@@ -46,13 +42,13 @@ def router_num_workers[num_experts: Int, k: Int](pool_capacity: Int) -> Int:
     return min(max_workers, pool_capacity)
 
 
-def router_fused_dispatch[num_experts: Int, hidden: Int, k: Int, P: BurstThreadPool](
+def router_fused_dispatch[P: BurstThreadPool, origin: MutOrigin, //, num_experts: Int, hidden: Int, k: Int](
     act_bf16: BF16Ptr,
     weight_f32: F32Ptr,
     bias_f32: F32Ptr,
     candidates: U8Ptr,
-    mut pool: P,
-) -> PoolFence[P]:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     var num_workers = router_num_workers[num_experts, k](pool.get_capacity())
     var rows_per_worker = (num_experts + num_workers - 1) // num_workers
 
@@ -71,7 +67,7 @@ def router_fused_dispatch[num_experts: Int, hidden: Int, k: Int, P: BurstThreadP
 
     pool.dispatch[RouterFusedArgs, router_fused_worker[hidden, k]](
         UnsafePointer(to=jobs[0]), actual)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
 # ============================================================================
@@ -80,16 +76,17 @@ def router_fused_dispatch[num_experts: Int, hidden: Int, k: Int, P: BurstThreadP
 
 
 def kv_write_dispatch[
+    P: BurstThreadPool, origin: MutOrigin, //,
     head_dim: Int, rope_dim: Int, pair_stride: Int,
-    max_seq: Int, num_kv_heads: Int, P: BurstThreadPool,
+    max_seq: Int, num_kv_heads: Int,
 ](
     q_bf16_base: Int, k_bf16_base: Int, v_bf16_base: Int,
     q_norm_ptr: Int, k_norm_ptr: Int,
     cos_ptr: Int, sin_ptr: Int,
     inv_rms_q: Float32, inv_rms_k: Float32,
     cache_base: Int, cache_pos: Int,
-    mut pool: P,
-) -> PoolFence[P]:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     comptime HPG = 1
     var jobs = InlineArray[AttnGroupArgs, 8](fill=AttnGroupArgs())
     comptime K_HEAD_BF16 = head_dim * 2
@@ -114,7 +111,7 @@ def kv_write_dispatch[
     pool.dispatch[AttnGroupArgs,
         kv_write_kernel[head_dim, rope_dim, pair_stride, max_seq, num_kv_heads]](
         UnsafePointer(to=jobs[0]), num_kv_heads)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
 # ============================================================================
@@ -161,23 +158,23 @@ def attn_chunk_count(
 
 
 def chunked_score_dispatch_multi[
+    P: BurstThreadPool, origin: MutOrigin, //,
     head_dim: Int, heads_per_group: Int,
     max_seq: Int, num_kv_heads: Int, max_attn_chunks: Int,
-    P: BurstThreadPool,
 ](
     q_i8_base: Int, qi_biases_base: Int, q_scales_base: Int,
     cache_base: Int, kv_start: Int, kv_count: Int,
     context_len: Int, pool_capacity: Int,
     partial_out_base: Int,
-    mut pool: P,
-) -> PoolFence[P]:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """Pack all (kv, chunk) work items into one pool dispatch + fence."""
     var num_pg = (context_len + CACHE_WIDTH - 1) // CACHE_WIDTH
     var padded_pg = (num_pg + 3) & ~3
     var num_chunks = attn_chunk_count(
         context_len, pool_capacity, max_attn_chunks)
     if num_chunks <= 0 or kv_count <= 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
     var pgs_per_chunk = ((padded_pg + num_chunks - 1) // num_chunks + 3) & ~3
     comptime CHUNK_F32_STRIDE = heads_per_group * (2 + head_dim)
     comptime Q_STRIDE = heads_per_group * head_dim
@@ -215,7 +212,7 @@ def chunked_score_dispatch_multi[
             head_dim, max_seq, num_kv_heads, 0, heads_per_group,
             max_attn_chunks]](
         UnsafePointer(to=chunk_args[0]), idx)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
 # ============================================================================
@@ -229,8 +226,9 @@ def chunked_score_dispatch_multi[
 
 
 def minimax_moe_phase1[
+    P: BurstThreadPool, origin: MutOrigin, //,
     intermediate: Int, hidden: Int, fwht_blk: Int,
-    top_k: Int, num_experts: Int, tp: Int, P: BurstThreadPool,
+    top_k: Int, num_experts: Int, tp: Int,
 ](
     act_i8: I8Ptr,
     act_scale: F32Ptr,
@@ -244,8 +242,8 @@ def minimax_moe_phase1[
     expert_qi: I8Ptr,
     expert_blk_scale: F32Ptr,
     rank: Int,
-    mut pool: P,
-) -> PoolFence[P]:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """Multi-expert phase 1: gate(w1) + up(w3) + SiLU + FWHT + per-block i8.
 
     Filters routing.indices to experts owned by this rank, then builds
@@ -266,7 +264,7 @@ def minimax_moe_phase1[
             local_count += 1
 
     if local_count == 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
 
     var workers_per_expert = pool_capacity // local_count
     if workers_per_expert < 1:
@@ -311,7 +309,7 @@ def minimax_moe_phase1[
 
     pool.dispatch[FusedW1W3SiluArgs, fused_w1_w3_silu_worker[intermediate, hidden, fwht_blk]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 
 # ============================================================================
@@ -320,8 +318,9 @@ def minimax_moe_phase1[
 
 
 def minimax_moe_phase2[
+    P: BurstThreadPool, origin: MutOrigin, //,
     hidden: Int, intermediate: Int, fwht_blk: Int,
-    top_k: Int, num_experts: Int, tp: Int, P: BurstThreadPool,
+    top_k: Int, num_experts: Int, tp: Int,
 ](
     expert_qi: I8Ptr,
     expert_blk_scale: F32Ptr,
@@ -331,8 +330,8 @@ def minimax_moe_phase2[
     down_bcs_base: Int, down_bcs_stride: Int,
     expert_out_buf: BF16Ptr,
     rank: Int,
-    mut pool: P,
-) -> PoolFence[P]:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
     """Per-local-expert down GEMV with routing weight folded into output scale.
 
     N-tile sharded: each expert's hidden-dimension output is split across
@@ -352,7 +351,7 @@ def minimax_moe_phase2[
             local_count += 1
 
     if local_count == 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
 
     var workers_per_expert = pool_capacity // local_count
     if workers_per_expert < 1:
@@ -394,6 +393,6 @@ def minimax_moe_phase2[
     pool.dispatch[Int8GemvBlockedArgs,
         int8_gemv_blocked_decode_worker[hidden, intermediate, fwht_blk]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return pool_fence(pool)
+    return PoolFence[P, origin].over(pool)
 
 

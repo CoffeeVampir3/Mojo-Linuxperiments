@@ -121,18 +121,18 @@ def embed_lookup_blocked_kernel[cols: Int, fwht_blk: Int](args: BlockedEmbedArgs
 
 
 def embed_lookup_scaled[W: Encoding & Shaped, OutT: Encoding & Shaped,
-    P: BurstThreadPool](
+    P: BurstThreadPool, origin: MutOrigin, //](
     table: Bound[W], tokens: Int, output: DynView[OutT],
     scale: Float32,
-    mut pool: P,
-) -> PoolFence[P] where W.DTYPE == DType.bfloat16:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin] where W.DTYPE == DType.bfloat16:
     """Gather + scale: for each token ID, output[row] = table[id] * scale."""
     comptime assert OutT.DTYPE == DType.bfloat16, "embed_scaled: output must be bf16"
     comptime assert W.COLS == OutT.COLS, "embed_scaled: table hidden != output hidden"
 
     var seq_len = output.seq_len
     if seq_len == 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
 
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
@@ -148,21 +148,22 @@ def embed_lookup_scaled[W: Encoding & Shaped, OutT: Encoding & Shaped,
 
     pool.dispatch[ScaledEmbedArgs, embed_lookup_scaled_kernel[W.COLS]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
+    return PoolFence[P, origin].over(pool)
 
 
-def embed_lookup_blocked[W: Encoding & Shaped, ScT: Encoding & Shaped,
-    OutT: Encoding & Shaped, P: BurstThreadPool, fwht_blk: Int](
+def embed_lookup_blocked[
+    P: BurstThreadPool, origin: MutOrigin, //,
+    W: Encoding & Shaped, ScT: Encoding & Shaped, OutT: Encoding & Shaped,
+    fwht_blk: Int,
+](
     table: Bound[W],
     blk_scales: Bound[ScT],
     inv_smooth: Int,
     tokens: Int,
     output: DynView[OutT],
     scale: Float32,
-    mut pool: P,
-) -> PoolFence[P] where W.DTYPE == DType.int8:
+    ref [origin] pool: P,
+) -> PoolFence[P, origin] where W.DTYPE == DType.int8:
     """Gather + dequant + iFWHT + smooth correction + scale.
 
     table:      i8 [VOCAB, HIDDEN] row-major (FWHT'd + smooth-split at quantize time)
@@ -178,7 +179,7 @@ def embed_lookup_blocked[W: Encoding & Shaped, ScT: Encoding & Shaped,
 
     var seq_len = output.seq_len
     if seq_len == 0:
-        return PoolFence[P].completed()
+        return PoolFence[P, origin].over(pool)
 
     var num_jobs = min(seq_len, pool.get_capacity())
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
@@ -192,9 +193,7 @@ def embed_lookup_blocked[W: Encoding & Shaped, ScT: Encoding & Shaped,
 
     pool.dispatch[BlockedEmbedArgs, embed_lookup_blocked_kernel[W.COLS, fwht_blk]](
         UnsafePointer(to=jobs[0]), num_jobs)
-    return PoolFence[P](UnsafePointer[P, MutAnyOrigin](
-        unsafe_from_address=Int(UnsafePointer(to=pool))
-    ))
+    return PoolFence[P, origin].over(pool)
 
 
 def elem_scale[T: Encoding & Shaped](dst: DynView[T], scale: Float32) where T.DTYPE == DType.bfloat16:
