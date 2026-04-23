@@ -49,8 +49,8 @@ from experimental3.profiler import (
     timed_tp_parallel, ForwardSample, ForwardLogger,
 )
 from experimental3.init_weights import (
-    colsum_at, block_colsum_at, block_colsum_row_major_at, pack_at,
-    zero_pad_tail,
+    PackColsumTask, make_pack_colsum_task, dispatch_pack_colsum_tasks,
+    colsum_at, zero_pad_tail,
 )
 from experimental3.gamma import compute_sqrt_gamma, compute_inv_sqrt_gamma
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
@@ -573,41 +573,38 @@ def init_layer_body_padding[tp: Int](arena_base: Int, layer_off: Int, body: Body
     zero_pad_tail(arena_base + layer_off, body.up_proj)
 
 
-def init_layer_body_colsums[tp: Int](arena_base: Int, layer_off: Int, body: BodyRefs[tp]):
+def append_layer_body_tasks[tp: Int](
+    arena_base: Int, layer_off: Int, body: BodyRefs[tp],
+    mut tasks: List[PackColsumTask],
+):
     comptime experts_local = C.NUM_EXPERTS // tp
     comptime S = Gemma4Shapes[tp]
+    var lb = arena_base + layer_off
+
     var gu_slab = TensorRef[I8, Shape[S.DENSE_INT_LOCAL * 2, C.HIDDEN]](
         offset=body.gate_proj.offset)
-    colsum_at(arena_base + layer_off, gu_slab, body.gu_colsum)
-    block_colsum_at(arena_base + layer_off, body.down_proj, body.down_colsum, FWHT_BLK_DENSE_DOWN)
-    colsum_at(arena_base + layer_off, body.router_proj, body.router_colsum)
-    var experts_gu_slab = TensorRef[I8, Shape[experts_local * C.MOE_GATE_UP_FUSED, C.HIDDEN]](
-        offset=body.experts_gate_up.offset)
-    colsum_at(arena_base + layer_off, experts_gu_slab, body.experts_gu_colsum)
-    for e in range(experts_local):
-        var expert_down_slab = TensorRef[I8, Shape[C.HIDDEN, C.MOE_INTERMEDIATE]](
-            offset=body.experts_down.offset + e * C.HIDDEN * C.MOE_INTERMEDIATE)
-        var expert_down_colsum_slab = TensorRef[F32, Shape[C.HIDDEN * MOE_NUM_BLOCKS, 1]](
-            offset=body.experts_down_colsum.offset + e * C.HIDDEN * MOE_NUM_BLOCKS * 4)
-        block_colsum_at(arena_base + layer_off, expert_down_slab, expert_down_colsum_slab, FWHT_BLK)
+    tasks.append(make_pack_colsum_task(lb, gu_slab, body.gu_colsum))
 
+    tasks.append(make_pack_colsum_task(
+        lb, body.down_proj, body.down_colsum,
+        block_cols=FWHT_BLK_DENSE_DOWN, colsum_row_major=False))
 
-def init_layer_body_pack[tp: Int](arena_base: Int, layer_off: Int, body: BodyRefs[tp],
-    scratch: UnsafePointer[UInt8, MutAnyOrigin]):
-    comptime experts_local = C.NUM_EXPERTS // tp
-    comptime S = Gemma4Shapes[tp]
-    var gu_slab = TensorRef[I8, Shape[S.DENSE_INT_LOCAL * 2, C.HIDDEN]](
-        offset=body.gate_proj.offset)
-    pack_at(arena_base + layer_off, gu_slab, scratch)
-    pack_at(arena_base + layer_off, body.down_proj, scratch)
-    pack_at(arena_base + layer_off, body.router_proj, scratch)
+    tasks.append(make_pack_colsum_task(lb, body.router_proj, body.router_colsum))
+
     for e in range(experts_local):
-        var expert_gu_slab = TensorRef[I8, Shape[C.MOE_GATE_UP_FUSED, C.HIDDEN]](
+        var expert_gu = TensorRef[I8, Shape[C.MOE_GATE_UP_FUSED, C.HIDDEN]](
             offset=body.experts_gate_up.offset + e * C.MOE_GATE_UP_FUSED * C.HIDDEN)
-        pack_at(arena_base + layer_off, expert_gu_slab, scratch)
-        var expert_down_slab = TensorRef[I8, Shape[C.HIDDEN, C.MOE_INTERMEDIATE]](
+        var expert_gu_colsum = TensorRef[F32, Shape[C.MOE_GATE_UP_FUSED, 1]](
+            offset=body.experts_gu_colsum.offset + e * C.MOE_GATE_UP_FUSED * 4)
+        tasks.append(make_pack_colsum_task(lb, expert_gu, expert_gu_colsum))
+
+        var expert_down = TensorRef[I8, Shape[C.HIDDEN, C.MOE_INTERMEDIATE]](
             offset=body.experts_down.offset + e * C.HIDDEN * C.MOE_INTERMEDIATE)
-        pack_at(arena_base + layer_off, expert_down_slab, scratch)
+        var expert_down_colsum = TensorRef[F32, Shape[C.HIDDEN * MOE_NUM_BLOCKS, 1]](
+            offset=body.experts_down_colsum.offset + e * C.HIDDEN * MOE_NUM_BLOCKS * 4)
+        tasks.append(make_pack_colsum_task(
+            lb, expert_down, expert_down_colsum,
+            block_cols=FWHT_BLK, colsum_row_major=False))
 
 
 # =============================================================================
@@ -714,12 +711,6 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         self.profile.clear()
 
     def init_state(mut self):
-        comptime MAX_PACK_BYTES = C.Q_DIM_FULL * C.HIDDEN
-        var numa = NumaInfo()
-        var pack_arena = NumaArena[alignment=DEFAULT_ALIGNMENT](numa.plan_topology(1)[0], MAX_PACK_BYTES)
-        var pack_scratch = UnsafePointer[UInt8, MutAnyOrigin](
-            unsafe_from_address=Int(pack_arena.base))
-
         comptime Q_LOCAL_FULL = C.Q_DIM_FULL // Self.tp
         comptime Q_LOCAL_SLIDING = C.Q_DIM_SLIDING // Self.tp
         comptime KV_N_SLIDING = 2 * (C.KV_DIM_SLIDING // Self.tp)
@@ -727,6 +718,8 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         for rank in range(Self.tp):
             var topo = self.topos[rank]
             var base = topo.arena.base
+            var numa_node = self.arenas[rank].node
+
             init_sliding_rope_tables(
                 topo.sliding_rope.cos.bound(base),
                 topo.sliding_rope.sin.bound(base))
@@ -739,46 +732,56 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             for i in range(C.NUM_LAYERS):
                 if is_full_layer(i):
                     var lb = topo.full.base(base, full_idx)
+                    init_layer_body_padding[Self.tp](base, lb - base, topo.full.proto.body)
+                    full_idx += 1
+                else:
+                    var lb = topo.sliding.base(base, sliding_idx)
+                    init_layer_body_padding[Self.tp](base, lb - base, topo.sliding.proto.body)
+                    sliding_idx += 1
+
+            var tasks = List[PackColsumTask]()
+            sliding_idx = 0
+            full_idx = 0
+            for i in range(C.NUM_LAYERS):
+                if is_full_layer(i):
+                    var lb = topo.full.base(base, full_idx)
                     var fl = topo.full.proto
                     var q_slot = TensorRef[I8, Shape[Q_LOCAL_FULL, C.HIDDEN]](
                         offset=fl.attn.q_proj.offset)
-                    colsum_at(lb, q_slot, fl.attn.q_colsum)
-                    pack_at(lb, q_slot, pack_scratch)
+                    tasks.append(make_pack_colsum_task(lb, q_slot, fl.attn.q_colsum))
                     var k_slot = TensorRef[I8, Shape[C.KV_DIM_FULL, C.HIDDEN]](
                         offset=fl.attn.k_proj.offset)
-                    colsum_at(lb, k_slot, fl.attn.k_colsum)
-                    pack_at(lb, k_slot, pack_scratch)
+                    tasks.append(make_pack_colsum_task(lb, k_slot, fl.attn.k_colsum))
                     var o_slot = TensorRef[I8, Shape[C.HIDDEN, Q_LOCAL_FULL]](
                         offset=fl.attn.o_proj.offset)
-                    block_colsum_at(lb, o_slot, fl.attn.o_colsum, C.HEAD_DIM_FULL)
-                    pack_at(lb, o_slot, pack_scratch)
-                    init_layer_body_padding[Self.tp](base, lb - base, fl.body)
-                    init_layer_body_colsums[Self.tp](base, lb - base, fl.body)
-                    init_layer_body_pack[Self.tp](base, lb - base, fl.body, pack_scratch)
+                    tasks.append(make_pack_colsum_task(
+                        lb, o_slot, fl.attn.o_colsum,
+                        block_cols=C.HEAD_DIM_FULL, colsum_row_major=False))
+                    append_layer_body_tasks[Self.tp](base, lb - base, fl.body, tasks)
                     full_idx += 1
                 else:
                     var lb = topo.sliding.base(base, sliding_idx)
                     var sl = topo.sliding.proto
                     var q_slot = TensorRef[I8, Shape[Q_LOCAL_SLIDING, C.HIDDEN]](
                         offset=sl.attn.q_proj.offset)
-                    colsum_at(lb, q_slot, sl.attn.q_colsum)
-                    pack_at(lb, q_slot, pack_scratch)
+                    tasks.append(make_pack_colsum_task(lb, q_slot, sl.attn.q_colsum))
                     var kv_slab = TensorRef[I8, Shape[KV_N_SLIDING, C.HIDDEN]](
                         offset=sl.attn.k_proj.offset)
-                    colsum_at(lb, kv_slab, sl.attn.kv_colsum)
-                    pack_at(lb, kv_slab, pack_scratch)
+                    tasks.append(make_pack_colsum_task(lb, kv_slab, sl.attn.kv_colsum))
                     var o_slot = TensorRef[I8, Shape[C.HIDDEN, Q_LOCAL_SLIDING]](
                         offset=sl.attn.o_proj.offset)
-                    block_colsum_at(lb, o_slot, sl.attn.o_colsum, C.HEAD_DIM_SLIDING)
-                    pack_at(lb, o_slot, pack_scratch)
-                    init_layer_body_padding[Self.tp](base, lb - base, sl.body)
-                    init_layer_body_colsums[Self.tp](base, lb - base, sl.body)
-                    init_layer_body_pack[Self.tp](base, lb - base, sl.body, pack_scratch)
+                    tasks.append(make_pack_colsum_task(
+                        lb, o_slot, sl.attn.o_colsum,
+                        block_cols=C.HEAD_DIM_SLIDING, colsum_row_major=False))
+                    append_layer_body_tasks[Self.tp](base, lb - base, sl.body, tasks)
                     sliding_idx += 1
 
+            dispatch_pack_colsum_tasks(self.main_pools[rank], numa_node, tasks)
+
             if rank == HOST_RANK:
-                block_colsum_row_major_at(base,
-                    topo.host.embed, topo.host.embed_colsum, LM_HEAD_FWHT_BLK)
+                colsum_at(base,
+                    topo.host.embed, topo.host.embed_colsum,
+                    block_cols=LM_HEAD_FWHT_BLK, colsum_row_major=True)
                 var fn_gamma = topo.host.final_norm.bound(base).as_ptr()
                 compute_sqrt_gamma[C.HIDDEN](
                     fn_gamma,
@@ -787,7 +790,6 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                     fn_gamma,
                     topo.host.inv_sqrt_gamma.bound(base).as_ptr())
 
-            # Fold 1/sqrt(hidden) into router weight scales
             comptime inv_sqrt_h = Float32(1.0 / sqrt(Float64(C.HIDDEN)))
             sliding_idx = 0
             full_idx = 0

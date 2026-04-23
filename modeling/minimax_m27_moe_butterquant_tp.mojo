@@ -34,7 +34,9 @@ from experimental3.profiler import (
     PhaseTiming, phase_timing_from_points, finish_single_pool_fence,
     timed_tp_parallel, ForwardSample, ForwardLogger,
 )
-from experimental3.init_weights import colsum_at, block_colsum_at, block_colsum_row_major_at, pack_at
+from experimental3.init_weights import (
+    PackColsumTask, make_pack_colsum_task, dispatch_pack_colsum_tasks, colsum_at,
+)
 from experimental3.gamma import compute_sqrt_gamma, compute_inv_sqrt_gamma
 from experimental3.common_math import rms_reduce_bf16, inv_rms_from_sum_sq
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
@@ -648,73 +650,74 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
     def init_state(mut self):
         set_subnormal_zeroing()
-        comptime MAX_PACK_BYTES = (C.Q_DIM + 2 * C.KV_DIM) * C.HIDDEN
-        var numa = NumaInfo()
-        var pack_arena = NumaArena[alignment=DEFAULT_ALIGNMENT](numa.plan_topology(1)[0], MAX_PACK_BYTES)
-        var pack_scratch = UnsafePointer[UInt8, MutAnyOrigin](
-            unsafe_from_address=Int(pack_arena.base))
-
-        comptime bf16 = size_of[Scalar[DType.bfloat16]]()
         comptime experts_local = MiniMaxShapes[Self.tp].EXPERTS_LOCAL
         comptime q_local = C.Q_DIM // Self.tp
         comptime kv_local = C.KV_DIM // Self.tp
-        comptime o_num_blk = C.NUM_HEADS // Self.tp
+        comptime qkv_local = q_local + 2 * kv_local
 
         for rank in range(Self.tp):
             var topo = self.topos[rank]
             var base = topo.arena.base
+            var numa_node = self.arenas[rank].node
+
             init_rope_tables(
                 topo.rope.cos.bound(base),
                 topo.rope.sin.bound(base),
                 theta=Float64(C.ROPE_THETA))
 
+            var tasks = List[PackColsumTask]()
             for i in range(C.NUM_LAYERS):
                 var lb = topo.layers.base(base, i)
                 var layer = topo.layers.proto
 
-                comptime qkv_local = q_local + 2 * kv_local
                 var qkv_slot = TensorRef[I8, Shape[qkv_local, C.HIDDEN]](
                     offset=layer.attn.qkv_proj.offset)
-                colsum_at(lb, qkv_slot, layer.attn.qkv_colsum)
-                pack_at(lb, qkv_slot, pack_scratch)
+                tasks.append(make_pack_colsum_task(
+                    lb, qkv_slot, layer.attn.qkv_colsum))
 
                 var o_slot = TensorRef[I8, Shape[C.HIDDEN, q_local]](
                     offset=layer.attn.o_proj.offset)
-                block_colsum_at(lb, o_slot, layer.attn.o_colsum, C.HEAD_DIM)
-                pack_at(lb, o_slot, pack_scratch)
+                tasks.append(make_pack_colsum_task(
+                    lb, o_slot, layer.attn.o_colsum,
+                    block_cols=C.HEAD_DIM, colsum_row_major=False))
 
-                var experts_w1_slab = TensorRef[I8, Shape[experts_local * C.MOE_INTERMEDIATE, C.HIDDEN]](
-                    offset=layer.body.experts_w1.offset)
-                colsum_at(lb, experts_w1_slab, layer.body.experts_w1_colsum)
-                var experts_w3_slab = TensorRef[I8, Shape[experts_local * C.MOE_INTERMEDIATE, C.HIDDEN]](
-                    offset=layer.body.experts_w3.offset)
-                colsum_at(lb, experts_w3_slab, layer.body.experts_w3_colsum)
                 for e in range(experts_local):
                     var expert_w1 = TensorRef[I8, Shape[C.MOE_INTERMEDIATE, C.HIDDEN]](
                         offset=layer.body.experts_w1.offset + e * C.MOE_INTERMEDIATE * C.HIDDEN)
-                    pack_at(lb, expert_w1, pack_scratch)
+                    var expert_w1_colsum = TensorRef[F32, Shape[C.MOE_INTERMEDIATE, 1]](
+                        offset=layer.body.experts_w1_colsum.offset + e * C.MOE_INTERMEDIATE * 4)
+                    tasks.append(make_pack_colsum_task(lb, expert_w1, expert_w1_colsum))
+
                     var expert_w3 = TensorRef[I8, Shape[C.MOE_INTERMEDIATE, C.HIDDEN]](
                         offset=layer.body.experts_w3.offset + e * C.MOE_INTERMEDIATE * C.HIDDEN)
-                    pack_at(lb, expert_w3, pack_scratch)
+                    var expert_w3_colsum = TensorRef[F32, Shape[C.MOE_INTERMEDIATE, 1]](
+                        offset=layer.body.experts_w3_colsum.offset + e * C.MOE_INTERMEDIATE * 4)
+                    tasks.append(make_pack_colsum_task(lb, expert_w3, expert_w3_colsum))
+
                     var expert_w2 = TensorRef[I8, Shape[C.HIDDEN, C.MOE_INTERMEDIATE]](
                         offset=layer.body.experts_w2.offset + e * C.HIDDEN * C.MOE_INTERMEDIATE)
                     var expert_w2_colsum = TensorRef[F32, Shape[C.HIDDEN * MOE_DOWN_NUM_BLK, 1]](
                         offset=layer.body.experts_w2_colsum.offset + e * C.HIDDEN * MOE_DOWN_NUM_BLK * 4)
-                    block_colsum_at(lb, expert_w2, expert_w2_colsum, FWHT_BLK_MOE_DOWN)
-                    pack_at(lb, expert_w2, pack_scratch)
+                    tasks.append(make_pack_colsum_task(
+                        lb, expert_w2, expert_w2_colsum,
+                        block_cols=FWHT_BLK_MOE_DOWN, colsum_row_major=False))
 
+            dispatch_pack_colsum_tasks(self.main_pools[rank], numa_node, tasks)
+
+            for i in range(C.NUM_LAYERS):
+                var lb = topo.layers.base(base, i)
+                var layer = topo.layers.proto
                 compute_sqrt_gamma[C.HIDDEN](
                     layer.body.input_norm.bound(lb).as_ptr(),
                     layer.body.input_norm_sqrt.bound(lb).as_ptr())
-
                 compute_sqrt_gamma[C.HIDDEN](
                     layer.body.post_attn_norm.bound(lb).as_ptr(),
                     layer.body.post_attn_norm_sqrt.bound(lb).as_ptr())
 
             if rank == HOST_RANK:
-                block_colsum_row_major_at(base,
+                colsum_at(base,
                     topo.host.lm_output_head, topo.host.lm_output_head_colsum,
-                    LM_OUTPUT_HEAD_FWHT_BLK)
+                    block_cols=LM_OUTPUT_HEAD_FWHT_BLK, colsum_row_major=True)
                 compute_sqrt_gamma[C.HIDDEN](
                     topo.host.final_norm.bound(base).as_ptr(),
                     topo.host.lm_output_head_sqrt_gamma.bound(base).as_ptr())
