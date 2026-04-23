@@ -1128,6 +1128,9 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                 candidate_ptrs, candidate_counts,
                 routing_lease.as_ptr[TopKResult[C.TOP_K]](host_sb))
             var routing = routing_lease.as_ptr[TopKResult[C.TOP_K]](host_sb)[]
+            self.profile.record_moe_route[C.TOP_K](
+                layer_idx, C.NUM_LAYERS, C.NUM_EXPERTS, Self.tp,
+                routing.indices, routing.weights)
             for r in range(Self.tp):
                 var sb_r = topos[r].arena.scratch_base()
                 routing_lease.as_ptr[TopKResult[C.TOP_K]](sb_r)[] = routing

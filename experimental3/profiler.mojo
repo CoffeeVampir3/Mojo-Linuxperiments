@@ -176,6 +176,84 @@ struct PhaseReportRow(Copyable, ImplicitlyCopyable):
     var stats: PhaseStats
 
 
+struct MoeHotExpertRow(Copyable, ImplicitlyCopyable):
+    var layer: Int
+    var expert: Int
+    var rank: Int
+    var count: Int
+    var events: Int
+
+    def __init__(out self):
+        self.layer = -1
+        self.expert = -1
+        self.rank = -1
+        self.count = 0
+        self.events = 1
+
+    def __init__(out self, layer: Int, expert: Int, rank: Int, count: Int, events: Int):
+        self.layer = layer
+        self.expert = expert
+        self.rank = rank
+        self.count = count
+        self.events = events if events > 0 else 1
+
+
+struct MoeLayerRankRow(Copyable, ImplicitlyCopyable):
+    var layer: Int
+    var rank: Int
+    var count: Int
+    var events: Int
+
+    def __init__(out self):
+        self.layer = -1
+        self.rank = -1
+        self.count = 0
+        self.events = 1
+
+    def __init__(out self, layer: Int, rank: Int, count: Int, events: Int):
+        self.layer = layer
+        self.rank = rank
+        self.count = count
+        self.events = events if events > 0 else 1
+
+
+struct MoeLayerHotnessRow(Copyable, ImplicitlyCopyable):
+    var layer: Int
+    var expert: Int
+    var top1_count: Int
+    var top8_count: Int
+    var events: Int
+    var avg_max_load_milli: Int
+    var avg_same_rank_pairs_milli: Int
+
+    def __init__(out self):
+        self.layer = -1
+        self.expert = -1
+        self.top1_count = 0
+        self.top8_count = 0
+        self.events = 1
+        self.avg_max_load_milli = 0
+        self.avg_same_rank_pairs_milli = 0
+
+    def __init__(
+        out self,
+        layer: Int,
+        expert: Int,
+        top1_count: Int,
+        top8_count: Int,
+        events: Int,
+        avg_max_load_milli: Int,
+        avg_same_rank_pairs_milli: Int,
+    ):
+        self.layer = layer
+        self.expert = expert
+        self.top1_count = top1_count
+        self.top8_count = top8_count
+        self.events = events if events > 0 else 1
+        self.avg_max_load_milli = avg_max_load_milli
+        self.avg_same_rank_pairs_milli = avg_same_rank_pairs_milli
+
+
 @always_inline
 def percentile_index(count: Int, pct: Int) -> Int:
     if count <= 1:
@@ -289,11 +367,79 @@ def format_ms3(ns: Int) -> String:
     return sign + String(whole) + "." + frac_s
 
 
+def format_milli3(value: Int) -> String:
+    var x = value
+    var sign = ""
+    if x < 0:
+        sign = "-"
+        x = -x
+    var whole = x // 1000
+    var frac = x % 1000
+    var frac_s = String(frac)
+    if frac < 10:
+        frac_s = "00" + frac_s
+    elif frac < 100:
+        frac_s = "0" + frac_s
+    return sign + String(whole) + "." + frac_s
+
+
 def format_pct1(part: Int, total: Int) -> String:
     if total <= 0:
         return "0.0%"
     var tenths = (part * 1000 + total // 2) // total
     return String(tenths // 10) + "." + String(tenths % 10) + "%"
+
+
+def moe_ratio_better(count: Int, events: Int, other_count: Int, other_events: Int) -> Bool:
+    if other_count <= 0:
+        return count > 0
+    var e = events if events > 0 else 1
+    var oe = other_events if other_events > 0 else 1
+    return count * oe > other_count * e
+
+
+def random_max_rank_load_mean_milli(num_experts: Int, tp: Int, top_k: Int) -> Int:
+    # Exact equal-shard hypergeometric baseline for MiniMax/Gemma top-8 over
+    # four ranks. Other configurations still get ideal and same-rank baselines.
+    if num_experts == 256 and tp == 4 and top_k == 8:
+        return 3512
+    return 0
+
+
+def random_max_rank_load_p90(num_experts: Int, tp: Int, top_k: Int) -> Int:
+    if num_experts == 256 and tp == 4 and top_k == 8:
+        return 5
+    return 0
+
+
+def random_max_rank_load_p99(num_experts: Int, tp: Int, top_k: Int) -> Int:
+    if num_experts == 256 and tp == 4 and top_k == 8:
+        return 6
+    return 0
+
+
+def random_same_rank_pairs_milli(num_experts: Int, tp: Int, top_k: Int) -> Int:
+    if num_experts <= 1 or tp <= 0 or top_k <= 1:
+        return 0
+    if num_experts % tp != 0:
+        return 0
+    var experts_per_rank = num_experts // tp
+    var pairs = (top_k * (top_k - 1)) // 2
+    return (pairs * (experts_per_rank - 1) * 1000 + (num_experts - 1) // 2) // (num_experts - 1)
+
+
+def ideal_same_rank_pairs_milli(tp: Int, top_k: Int) -> Int:
+    if tp <= 0 or top_k <= 1:
+        return 0
+    var base = top_k // tp
+    var rem = top_k - base * tp
+    var pairs = 0
+    for r in range(tp):
+        var load = base
+        if r < rem:
+            load += 1
+        pairs += (load * (load - 1)) // 2
+    return pairs * 1000
 
 
 def sort_phase_rows(mut rows: List[PhaseReportRow]):
@@ -309,13 +455,72 @@ def sort_phase_rows(mut rows: List[PhaseReportRow]):
 struct ForwardLogger(Movable):
     var samples: List[ForwardSample]
     var names: List[String]
+    var moe_layers: Int
+    var moe_experts: Int
+    var moe_tp: Int
+    var moe_top_k: Int
+    var moe_layer_events: List[Int]
+    var moe_rank_counts: List[Int]
+    var moe_expert_counts: List[Int]
+    var moe_max_rank_load_milli: List[Int]
+    var moe_active_rank_count_milli: List[Int]
+    var moe_same_rank_pairs_milli: List[Int]
+    var moe_layer_max_rank_load: List[Int]
+    var moe_layer_same_rank_pairs: List[Int]
 
     def __init__(out self):
         self.samples = List[ForwardSample]()
         self.names = List[String]()
+        self.moe_layers = 0
+        self.moe_experts = 0
+        self.moe_tp = 0
+        self.moe_top_k = 0
+        self.moe_layer_events = List[Int]()
+        self.moe_rank_counts = List[Int]()
+        self.moe_expert_counts = List[Int]()
+        self.moe_max_rank_load_milli = List[Int]()
+        self.moe_active_rank_count_milli = List[Int]()
+        self.moe_same_rank_pairs_milli = List[Int]()
+        self.moe_layer_max_rank_load = List[Int]()
+        self.moe_layer_same_rank_pairs = List[Int]()
 
     def clear(mut self):
         self.samples = List[ForwardSample]()
+        self.clear_moe()
+
+    def clear_moe(mut self):
+        self.moe_layer_events = List[Int](capacity=self.moe_layers)
+        self.moe_rank_counts = List[Int](capacity=self.moe_layers * self.moe_tp)
+        self.moe_expert_counts = List[Int](capacity=self.moe_layers * self.moe_experts)
+        self.moe_max_rank_load_milli = List[Int]()
+        self.moe_active_rank_count_milli = List[Int]()
+        self.moe_same_rank_pairs_milli = List[Int]()
+        self.moe_layer_max_rank_load = List[Int](capacity=self.moe_layers)
+        self.moe_layer_same_rank_pairs = List[Int](capacity=self.moe_layers)
+
+        for _ in range(self.moe_layers):
+            self.moe_layer_events.append(0)
+            self.moe_layer_max_rank_load.append(0)
+            self.moe_layer_same_rank_pairs.append(0)
+        for _ in range(self.moe_layers * self.moe_tp):
+            self.moe_rank_counts.append(0)
+        for _ in range(self.moe_layers * self.moe_experts):
+            self.moe_expert_counts.append(0)
+
+    def configure_moe(mut self, layers: Int, experts: Int, tp: Int, top_k: Int):
+        if layers <= 0 or experts <= 0 or tp <= 0 or top_k <= 0:
+            return
+        if (
+            self.moe_layers == layers and self.moe_experts == experts
+            and self.moe_tp == tp and self.moe_top_k == top_k
+            and len(self.moe_layer_events) == layers
+        ):
+            return
+        self.moe_layers = layers
+        self.moe_experts = experts
+        self.moe_tp = tp
+        self.moe_top_k = top_k
+        self.clear_moe()
 
     def phase(mut self, name: String) -> Int:
         for i in range(len(self.names)):
@@ -327,6 +532,237 @@ struct ForwardLogger(Movable):
 
     def record(mut self, sample: ForwardSample):
         self.samples.append(sample)
+
+    def record_moe_route[top_k: Int](
+        mut self,
+        layer_idx: Int,
+        num_layers: Int,
+        num_experts: Int,
+        tp: Int,
+        indices: InlineArray[Int, top_k],
+        weights: InlineArray[Float32, top_k],
+    ):
+        if layer_idx < 0 or layer_idx >= num_layers:
+            return
+        if num_experts <= 0 or tp <= 0 or top_k <= 0:
+            return
+        if num_experts % tp != 0:
+            return
+
+        self.configure_moe(num_layers, num_experts, tp, top_k)
+        if len(self.moe_layer_events) != num_layers:
+            return
+
+        var experts_per_rank = num_experts // tp
+        var layer_rank_base = layer_idx * tp
+        var layer_expert_base = layer_idx * num_experts
+
+        var max_count = 0
+        var min_count = top_k
+        var active_count = 0
+        var same_rank_pairs = 0
+        for r in range(tp):
+            var rank_start = r * experts_per_rank
+            var rank_end = rank_start + experts_per_rank
+            var count = 0
+            for s in range(top_k):
+                var eid = indices[s]
+                if eid >= rank_start and eid < rank_end:
+                    count += 1
+            self.moe_rank_counts[layer_rank_base + r] = self.moe_rank_counts[layer_rank_base + r] + count
+            if count > max_count:
+                max_count = count
+            if count < min_count:
+                min_count = count
+            if count > 0:
+                active_count += 1
+            same_rank_pairs += (count * (count - 1)) // 2
+
+        for s in range(top_k):
+            var eid = indices[s]
+            if eid >= 0 and eid < num_experts:
+                var idx = layer_expert_base + eid
+                self.moe_expert_counts[idx] = self.moe_expert_counts[idx] + 1
+            _ = weights[s]
+
+        self.moe_layer_events[layer_idx] = self.moe_layer_events[layer_idx] + 1
+        self.moe_layer_max_rank_load[layer_idx] = self.moe_layer_max_rank_load[layer_idx] + max_count
+        self.moe_layer_same_rank_pairs[layer_idx] = self.moe_layer_same_rank_pairs[layer_idx] + same_rank_pairs
+        self.moe_max_rank_load_milli.append(max_count * 1000)
+        self.moe_active_rank_count_milli.append(active_count * 1000)
+        self.moe_same_rank_pairs_milli.append(same_rank_pairs * 1000)
+
+    def report_moe(self):
+        var events = len(self.moe_max_rank_load_milli)
+        if events == 0 or self.moe_layers <= 0 or self.moe_experts <= 0 or self.moe_tp <= 0:
+            return
+
+        var total_slots = events * self.moe_top_k
+        var max_load = ns_stats(self.moe_max_rank_load_milli)
+        var active_ranks = ns_stats(self.moe_active_rank_count_milli)
+        var same_rank_pairs = ns_stats(self.moe_same_rank_pairs_milli)
+        var ideal_rank_load = (self.moe_top_k * 1000 + self.moe_tp // 2) // self.moe_tp
+        var ideal_pairs = ideal_same_rank_pairs_milli(self.moe_tp, self.moe_top_k)
+        var random_pairs = random_same_rank_pairs_milli(self.moe_experts, self.moe_tp, self.moe_top_k)
+        var random_max_mean = random_max_rank_load_mean_milli(self.moe_experts, self.moe_tp, self.moe_top_k)
+        var random_max_p90 = random_max_rank_load_p90(self.moe_experts, self.moe_tp, self.moe_top_k)
+        var random_max_p99 = random_max_rank_load_p99(self.moe_experts, self.moe_tp, self.moe_top_k)
+
+        print("  moe routing")
+        print("    layer-events: " + String(events)
+            + "  slots: " + String(total_slots)
+            + "  experts/layer: " + String(self.moe_experts)
+            + "  top-k: " + String(self.moe_top_k)
+            + "  tp: " + String(self.moe_tp))
+        print("    max rank load/event: ideal " + format_milli3(ideal_rank_load)
+            + "  avg " + format_milli3(max_load.mean_ns)
+            + "  p90 " + format_milli3(max_load.p90_ns)
+            + "  p99 " + format_milli3(max_load.p99_ns)
+            + "  max " + format_milli3(max_load.max_ns)
+            + "  active-ranks avg " + format_milli3(active_ranks.mean_ns))
+        if random_max_mean > 0:
+            print("    random occupancy baseline: max-load avg "
+                + format_milli3(random_max_mean)
+                + "  p90 " + String(random_max_p90)
+                + "  p99 " + String(random_max_p99))
+        print("    same-rank expert pairs/event: ideal " + format_milli3(ideal_pairs)
+            + "  random " + format_milli3(random_pairs)
+            + "  avg " + format_milli3(same_rank_pairs.mean_ns)
+            + "  p90 " + format_milli3(same_rank_pairs.p90_ns)
+            + "  p99 " + format_milli3(same_rank_pairs.p99_ns)
+            + "  max " + format_milli3(same_rank_pairs.max_ns))
+
+        var rank_line = "    rank slot share:"
+        for r in range(self.moe_tp):
+            var rank_total = 0
+            for layer in range(self.moe_layers):
+                rank_total += self.moe_rank_counts[layer * self.moe_tp + r]
+            rank_line += " r" + String(r) + " " + format_pct1(rank_total, total_slots)
+        print(rank_line)
+
+        var layer_rows = InlineArray[MoeLayerRankRow, 5](fill=MoeLayerRankRow())
+        for layer in range(self.moe_layers):
+            var layer_events = self.moe_layer_events[layer]
+            if layer_events <= 0:
+                continue
+            var best_rank = 0
+            var best_count = 0
+            for r in range(self.moe_tp):
+                var c = self.moe_rank_counts[layer * self.moe_tp + r]
+                if c > best_count:
+                    best_count = c
+                    best_rank = r
+            var insert = -1
+            for slot in range(5):
+                if moe_ratio_better(best_count, layer_events, layer_rows[slot].count, layer_rows[slot].events):
+                    insert = slot
+                    break
+            if insert >= 0:
+                for slot in range(4, insert, -1):
+                    layer_rows[slot] = layer_rows[slot - 1]
+                layer_rows[insert] = MoeLayerRankRow(layer, best_rank, best_count, layer_events)
+
+        print("    most imbalanced layers")
+        for slot in range(5):
+            var row = layer_rows[slot]
+            if row.layer < 0:
+                continue
+            var avg_milli = (row.count * 1000 + row.events // 2) // row.events
+            print("      L" + pad_left(String(row.layer), 2)
+                + " rank " + String(row.rank)
+                + " avg-load " + format_milli3(avg_milli)
+                + " share " + format_pct1(row.count, row.events * self.moe_top_k))
+
+        var hot_layer_rows = InlineArray[MoeLayerHotnessRow, 5](
+            fill=MoeLayerHotnessRow())
+        for layer in range(self.moe_layers):
+            var layer_events = self.moe_layer_events[layer]
+            if layer_events <= 0:
+                continue
+            var top_counts = InlineArray[Int, 8](fill=0)
+            var top_ids = InlineArray[Int, 8](fill=-1)
+            var base = layer * self.moe_experts
+            for expert in range(self.moe_experts):
+                var count = self.moe_expert_counts[base + expert]
+                if count > top_counts[7]:
+                    var insert = 7
+                    while insert > 0 and count > top_counts[insert - 1]:
+                        top_counts[insert] = top_counts[insert - 1]
+                        top_ids[insert] = top_ids[insert - 1]
+                        insert -= 1
+                    top_counts[insert] = count
+                    top_ids[insert] = expert
+            var top8_count = 0
+            for i in range(8):
+                top8_count += top_counts[i]
+            var avg_max_load_milli = (
+                self.moe_layer_max_rank_load[layer] * 1000 + layer_events // 2
+            ) // layer_events
+            var avg_same_pairs_milli = (
+                self.moe_layer_same_rank_pairs[layer] * 1000 + layer_events // 2
+            ) // layer_events
+
+            var insert = -1
+            for slot in range(5):
+                if moe_ratio_better(
+                    top_counts[0], layer_events,
+                    hot_layer_rows[slot].top1_count,
+                    hot_layer_rows[slot].events,
+                ):
+                    insert = slot
+                    break
+            if insert >= 0:
+                for slot in range(4, insert, -1):
+                    hot_layer_rows[slot] = hot_layer_rows[slot - 1]
+                hot_layer_rows[insert] = MoeLayerHotnessRow(
+                    layer, top_ids[0], top_counts[0], top8_count,
+                    layer_events, avg_max_load_milli,
+                    avg_same_pairs_milli)
+
+        print("    most concentrated layers")
+        for slot in range(5):
+            var row = hot_layer_rows[slot]
+            if row.layer < 0:
+                continue
+            print("      L" + pad_left(String(row.layer), 2)
+                + " top E" + pad_left(String(row.expert), 3)
+                + " hit " + format_pct1(row.top1_count, row.events)
+                + "  top8-cover " + format_pct1(row.top8_count, row.events * self.moe_top_k)
+                + "  max-load " + format_milli3(row.avg_max_load_milli)
+                + "  same-rank-pairs " + format_milli3(row.avg_same_rank_pairs_milli))
+
+        var hot_rows = InlineArray[MoeHotExpertRow, 8](fill=MoeHotExpertRow())
+        var experts_per_rank = self.moe_experts // self.moe_tp
+        for layer in range(self.moe_layers):
+            var layer_events = self.moe_layer_events[layer]
+            if layer_events <= 0:
+                continue
+            var base = layer * self.moe_experts
+            for expert in range(self.moe_experts):
+                var count = self.moe_expert_counts[base + expert]
+                if count <= 0:
+                    continue
+                var rank = expert // experts_per_rank
+                var insert = -1
+                for slot in range(8):
+                    if moe_ratio_better(count, layer_events, hot_rows[slot].count, hot_rows[slot].events):
+                        insert = slot
+                        break
+                if insert >= 0:
+                    for slot in range(7, insert, -1):
+                        hot_rows[slot] = hot_rows[slot - 1]
+                    hot_rows[insert] = MoeHotExpertRow(layer, expert, rank, count, layer_events)
+
+        print("    hottest experts")
+        for slot in range(8):
+            var row = hot_rows[slot]
+            if row.layer < 0:
+                continue
+            print("      L" + pad_left(String(row.layer), 2)
+                + ":E" + pad_left(String(row.expert), 3)
+                + " rank " + String(row.rank)
+                + " hits " + String(row.count) + "/" + String(row.events)
+                + " (" + format_pct1(row.count, row.events) + " of layer routes)")
 
     def report(self, label: String):
         var n = len(self.samples)
@@ -427,3 +863,4 @@ struct ForwardLogger(Movable):
                 + "/" + pad_left(format_ms3(ps.join.p99_ns), 8))
         if omitted.byte_length() > 0:
             print("    omitted tiny phases: " + omitted)
+        self.report_moe()
