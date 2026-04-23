@@ -50,12 +50,15 @@ def router_fused_dispatch[
     bias_f32: BT,
     candidates: UnsafePointer[RouterCandidate, MutAnyOrigin],
     ref [origin] pool: P,
+    expert_base: Int = 0,
 ) -> PoolFence[P, origin]:
     comptime assert ActT.DTYPE == DType.bfloat16, "router_fused: act must be bf16"
     comptime assert WT.DTYPE == DType.float32, "router_fused: weight must be f32"
     comptime assert BT.DTYPE == DType.float32, "router_fused: bias must be f32"
 
     var num_workers = router_num_workers[num_experts, k](pool.get_capacity())
+    if num_workers <= 0:
+        return PoolFence[P, origin].over(pool)
     var rows_per_worker = (num_experts + num_workers - 1) // num_workers
 
     var act_p = act_bf16.as_ptr[DType.bfloat16]()
@@ -72,7 +75,7 @@ def router_fused_dispatch[
         var count = min(rows_per_worker, num_experts - start)
         var slot = candidates + i * k
         jobs[actual] = RouterFusedArgs(
-            act_p, weight_p, bias_p, slot, start, count)
+            act_p, weight_p, bias_p, slot, expert_base, start, count)
         actual += 1
 
     pool.dispatch[RouterFusedArgs, router_fused_worker[hidden, k]](

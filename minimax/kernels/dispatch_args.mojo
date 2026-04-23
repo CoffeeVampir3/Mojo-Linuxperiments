@@ -149,6 +149,7 @@ struct RouterFusedArgs(Copyable, ImplicitlyCopyable):
     var weight_f32: F32Ptr
     var bias_f32: F32Ptr
     var candidates: UnsafePointer[RouterCandidate, MutAnyOrigin]
+    var eid_base: Int
     var n_start: Int
     var n_count: Int
 
@@ -157,24 +158,7 @@ struct RouterFusedArgs(Copyable, ImplicitlyCopyable):
         self.weight_f32 = F32Ptr()
         self.bias_f32 = F32Ptr()
         self.candidates = UnsafePointer[RouterCandidate, MutAnyOrigin]()
+        self.eid_base = 0
         self.n_start = 0
         self.n_count = 0
-
-
-@fieldwise_init
-struct RouterMergeArgs[k: Int](Copyable, ImplicitlyCopyable):
-    """Args for router candidate-merge + renorm.
-
-    candidates: num_candidates × RouterCandidate scratch from phase 1.
-    result_ptr: TopKResult[k] destination.
-    """
-    var candidates: UnsafePointer[RouterCandidate, MutAnyOrigin]
-    var result_ptr: UnsafePointer[TopKResult[Self.k], MutAnyOrigin]
-    var num_candidates: Int
-
-    def __init__(out self):
-        self.candidates = UnsafePointer[RouterCandidate, MutAnyOrigin]()
-        self.result_ptr = UnsafePointer[TopKResult[Self.k], MutAnyOrigin]()
-        self.num_candidates = 0
-
 
