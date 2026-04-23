@@ -16,7 +16,7 @@ from threading.threading_shared import ptr as tptr
 
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named,
-    Bound, DynView,
+    StaticView, DynamicView,
 )
 from kernels.kernel_ops import PoolFence
 from simd_math import sqrt, roundeven
@@ -401,11 +401,11 @@ def decode[
     QT: Encoding & Shaped,
     CosT: Encoding & Shaped, SinT: Encoding & Shaped,
 ](
-    q: DynView[QT],
+    q: DynamicView[QT],
     q_stride: Int,
     cache: KVCache[max_seq, head_dim, num_kv_heads, num_q_heads],
-    cos_table: Bound[CosT],
-    sin_table: Bound[SinT],
+    cos_table: StaticView[CosT],
+    sin_table: StaticView[SinT],
     scratch: Int,
     pos: Int,
     v_layer_scale: Float32,

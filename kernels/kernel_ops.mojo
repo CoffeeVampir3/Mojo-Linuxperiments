@@ -8,7 +8,9 @@ from notstdcollections import HeapMoveArray
 import linux.sys as linux
 
 from modeling.model_spec import (
-    Encoding, Shaped, Bound, DynView, CacheView,
+    Encoding, Shaped, Aligned, HasPtr, Dynamic,
+    StaticTensor, DynamicTensor,
+    StaticView, DynamicView, CacheView,
 )
 from simd_math import exp_f32
 
@@ -281,9 +283,11 @@ def gqa_kernel[
                     (d_head + off).store(v.cast[DType.bfloat16]())
 
 
-def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped,
-    P: BurstThreadPool, origin: MutOrigin, //](
-    input: DynView[InT], weight: Bound[W], output: DynView[OutT],
+def gemm[
+    W: StaticTensor, InT: DynamicTensor, OutT: DynamicTensor,
+    P: BurstThreadPool, origin: MutOrigin, //,
+](
+    input: InT, weight: W, output: OutT,
     ref [origin] pool: P,
 ) -> PoolFence[P, origin] where W.DTYPE == DType.bfloat16:
     """dst[M,N] = input[M,K] × weight[N,K]^T. M is runtime, via BurstPool.
@@ -295,7 +299,7 @@ def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped,
     comptime assert OutT.COLS == W.ROWS, "gemm: output N != weight N"
     comptime assert InT.COLS % simd_width_of[DType.float32]() == 0, "gemm: K must be f32-simd-aligned"
 
-    var seq_len = input.seq_len
+    var seq_len = input.seq_len()
     if seq_len == 0:
         return PoolFence[P, origin].over(pool)
 
@@ -331,9 +335,11 @@ def gemm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped,
     return PoolFence[P, origin].over(pool)
 
 
-def rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shaped,
-    P: BurstThreadPool, origin: MutOrigin, //](
-    input: DynView[InT], weight: Bound[W], output: DynView[OutT],
+def rmsnorm[
+    W: StaticTensor, InT: DynamicTensor, OutT: DynamicTensor,
+    P: BurstThreadPool, origin: MutOrigin, //,
+](
+    input: InT, weight: W, output: OutT,
     ref [origin] pool: P,
     eps: Float32 = 1e-5,
 ) -> PoolFence[P, origin] where W.DTYPE == DType.bfloat16:
@@ -344,7 +350,7 @@ def rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shape
     comptime assert InT.COLS == OutT.COLS, "rmsnorm: input/output cols mismatch"
     comptime assert InT.COLS % simd_width_of[DType.float32]() == 0, "rmsnorm: hidden must be f32-simd-aligned"
 
-    var seq_len = input.seq_len
+    var seq_len = input.seq_len()
     if seq_len == 0:
         return PoolFence[P, origin].over(pool)
 
@@ -365,16 +371,19 @@ def rmsnorm[W: Encoding & Shaped, InT: Encoding & Shaped, OutT: Encoding & Shape
     return PoolFence[P, origin].over(pool)
 
 
-def embed_lookup[W: Encoding & Shaped, OutT: Encoding & Shaped,
-    P: BurstThreadPool, origin: MutOrigin, //](
-    table: Bound[W], tokens: Int, output: DynView[OutT],
+def embed_lookup[
+    W: StaticTensor,
+    OutT: DynamicTensor,
+    P: BurstThreadPool, origin: MutOrigin, //,
+](
+    table: W, tokens: Int, output: OutT,
     ref [origin] pool: P,
 ) -> PoolFence[P, origin] where W.DTYPE == DType.bfloat16:
     """Gather: for each token ID, copy table[id] → output row."""
     comptime assert OutT.DTYPE == DType.bfloat16, "embed: output must be bf16"
     comptime assert W.COLS == OutT.COLS, "embed: table hidden != output hidden"
 
-    var seq_len = output.seq_len
+    var seq_len = output.seq_len()
     if seq_len == 0:
         return PoolFence[P, origin].over(pool)
 
@@ -395,8 +404,12 @@ def embed_lookup[W: Encoding & Shaped, OutT: Encoding & Shaped,
     return PoolFence[P, origin].over(pool)
 
 
-def silu_mul[GT: Encoding & Shaped, UT: Encoding & Shaped, DstT: Encoding & Shaped](
-    gate: DynView[GT], up: DynView[UT], dst: DynView[DstT],
+def silu_mul[
+    GT: DynamicTensor,
+    UT: DynamicTensor,
+    DstT: DynamicTensor,
+](
+    gate: GT, up: UT, dst: DstT,
 ):
     """SwiGLU: dst = silu(gate) * up. F32 compute, bf16 I/O."""
     comptime assert GT.DTYPE == DType.bfloat16, "silu_mul: gate must be bf16"
@@ -406,7 +419,7 @@ def silu_mul[GT: Encoding & Shaped, UT: Encoding & Shaped, DstT: Encoding & Shap
     comptime assert GT.COLS == DstT.COLS, "silu_mul: gate/dst cols mismatch"
     comptime assert GT.COLS % simd_width_of[DType.float32]() == 0, "silu_mul: cols must be f32-simd-aligned"
 
-    var seq_len = gate.seq_len
+    var seq_len = gate.seq_len()
     if seq_len == 0:
         return
 
@@ -423,8 +436,12 @@ def silu_mul[GT: Encoding & Shaped, UT: Encoding & Shaped, DstT: Encoding & Shap
         (dp + i).store((g * sig * u).cast[DType.bfloat16]())
 
 
-def elem_add[AT: Encoding & Shaped, BT: Encoding & Shaped, DstT: Encoding & Shaped](
-    a: DynView[AT], b: DynView[BT], dst: DynView[DstT],
+def elem_add[
+    AT: DynamicTensor,
+    BT: DynamicTensor,
+    DstT: DynamicTensor,
+](
+    a: AT, b: BT, dst: DstT,
 ):
     """Elementwise: dst = a + b. F32 compute, bf16 I/O."""
     comptime assert AT.DTYPE == DType.bfloat16, "elem_add: a must be bf16"
@@ -434,7 +451,7 @@ def elem_add[AT: Encoding & Shaped, BT: Encoding & Shaped, DstT: Encoding & Shap
     comptime assert AT.COLS == DstT.COLS, "elem_add: a/dst cols mismatch"
     comptime assert AT.COLS % simd_width_of[DType.float32]() == 0, "elem_add: cols must be f32-simd-aligned"
 
-    var seq_len = a.seq_len
+    var seq_len = a.seq_len()
     if seq_len == 0:
         return
 
@@ -449,8 +466,11 @@ def elem_add[AT: Encoding & Shaped, BT: Encoding & Shaped, DstT: Encoding & Shap
         (dp + i).store((av + bv).cast[DType.bfloat16]())
 
 
-def kv_cache_write[SrcT: Encoding & Shaped, CT: Encoding & Shaped](
-    src: DynView[SrcT], cache: CacheView[CT], pos: Int,
+def kv_cache_write[
+    SrcT: DynamicTensor,
+    CT: StaticTensor,
+](
+    src: SrcT, cache: CT, pos: Int,
 ):
     """Copy src[seq_len, kv_dim] into cache at row pos."""
     comptime assert SrcT.DTYPE == DType.bfloat16, "kv_write: src must be bf16"
@@ -458,7 +478,7 @@ def kv_cache_write[SrcT: Encoding & Shaped, CT: Encoding & Shaped](
     comptime assert SrcT.COLS == CT.COLS, "kv_write: src cols != cache cols"
     comptime assert SrcT.COLS % simd_width_of[DType.bfloat16]() == 0, "kv_write: cols must be bf16-simd-aligned"
 
-    var seq_len = src.seq_len
+    var seq_len = src.seq_len()
     if seq_len == 0:
         return
     debug_assert(pos >= 0 and pos + seq_len <= CT.ROWS,
@@ -479,11 +499,13 @@ def kv_cache_write[SrcT: Encoding & Shaped, CT: Encoding & Shaped](
 def attention[
     P: BurstThreadPool, origin: MutOrigin, //,
     num_heads: Int, num_kv_heads: Int, head_dim: Int,
-    QT: Encoding & Shaped, KCT: Encoding & Shaped, VCT: Encoding & Shaped,
-    OutT: Encoding & Shaped,
+    QT: DynamicTensor,
+    KCT: StaticTensor,
+    VCT: StaticTensor,
+    OutT: DynamicTensor,
 ](
-    q: DynView[QT], k_cache: CacheView[KCT], v_cache: CacheView[VCT],
-    output: DynView[OutT], pos: Int,
+    q: QT, k_cache: KCT, v_cache: VCT,
+    output: OutT, pos: Int,
     ref [origin] pool: P,
 ) -> PoolFence[P, origin] where KCT.DTYPE == DType.bfloat16:
     """GQA attention: Q[M, H*D] attends over KV cache[0..pos+M, Hkv*D].
@@ -500,7 +522,7 @@ def attention[
     comptime assert head_dim % simd_width_of[DType.float32]() == 0, "attention: head_dim must be f32-simd-aligned"
     comptime assert num_heads % num_kv_heads == 0, "attention: heads must divide evenly for GQA"
 
-    var seq_len = q.seq_len
+    var seq_len = q.seq_len()
     if seq_len == 0:
         return PoolFence[P, origin].over(pool)
 

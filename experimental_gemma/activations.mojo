@@ -8,7 +8,7 @@ The fused gelu_tanh_mul computes: dst = gelu_tanh(gate) * up
 
 from std.sys.info import simd_width_of
 
-from modeling.model_spec import Encoding, Shaped, DynView
+from modeling.model_spec import Encoding, Shaped, DynamicView
 from simd_math import exp_f32
 
 
@@ -29,7 +29,7 @@ def gelu_tanh_f32[width: Int](x: SIMD[DType.float32, width]) -> SIMD[DType.float
 
 
 def gelu_tanh_mul[GT: Encoding & Shaped, UT: Encoding & Shaped, DstT: Encoding & Shaped](
-    gate: DynView[GT], up: DynView[UT], dst: DynView[DstT],
+    gate: DynamicView[GT], up: DynamicView[UT], dst: DynamicView[DstT],
 ):
     """dst = gelu_tanh(gate) * up. F32 compute, bf16 I/O."""
     comptime assert GT.DTYPE == DType.bfloat16, "gelu_tanh_mul: gate must be bf16"
@@ -39,7 +39,7 @@ def gelu_tanh_mul[GT: Encoding & Shaped, UT: Encoding & Shaped, DstT: Encoding &
     comptime assert GT.COLS == DstT.COLS, "gelu_tanh_mul: gate/dst cols mismatch"
     comptime assert GT.COLS % simd_width_of[DType.float32]() == 0, "gelu_tanh_mul: cols must be f32-simd-aligned"
 
-    var seq_len = gate.seq_len
+    var seq_len = gate.seq_len()
     if seq_len == 0:
         return
 

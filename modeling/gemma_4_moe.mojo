@@ -17,7 +17,7 @@ from modeling.linear_borrow_pool import ScratchPool, ScratchLease, scratch_block
 
 from modeling.model_spec import (
     Encoding, BF16, F32,
-    Shape, ShapeLike, Mat, DynView, CacheView, WeightDesc,
+    Shape, ShapeLike, Mat, DynamicView, CacheView, WeightDesc,
     DEFAULT_ALIGNMENT, LogitsView,
 )
 from modeling.gemma4_common import (
@@ -27,14 +27,13 @@ from modeling.modeling_common import (
     SlotOffset, Repeated, SectionBuilder, align_up,
     StaticTensorView, DynamicTensorView,
     static_tensor_view, dynamic_tensor_view,
-    borrow_scratch_tensor, scratch_tensor_view, scratch_ptr,
+    borrow_scratch_tensor, scratch_ptr,
     LayerShard, LayerBuilder,
 )
 from modeling.loader import discover_shards, load_weights_from_descs
 from kernels.kernel_ops import (
     gemm, rmsnorm, elem_add, kv_cache_write,
     gemv_kernel, GemmArgs,
-    BF16Ptr,
 )
 from kernels.kv_rotors import rope
 
@@ -231,25 +230,29 @@ struct Gemma4Topology[tp: Int](Copyable, ImplicitlyCopyable):
     def sliding_k_cache(self, sliding_idx: Int) -> CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]]:
         var kb = self.sliding_kv.base(self.state_base(), sliding_idx)
         return CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]](
-            kb + self.sliding_kv.proto.k.offset)
+            UnsafePointer[Scalar[BF16.DTYPE], MutAnyOrigin](
+                unsafe_from_address=kb + self.sliding_kv.proto.k.offset))
 
     @always_inline
     def sliding_v_cache(self, sliding_idx: Int) -> CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]]:
         var kb = self.sliding_kv.base(self.state_base(), sliding_idx)
         return CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_SLIDING]](
-            kb + self.sliding_kv.proto.v.offset)
+            UnsafePointer[Scalar[BF16.DTYPE], MutAnyOrigin](
+                unsafe_from_address=kb + self.sliding_kv.proto.v.offset))
 
     @always_inline
     def full_k_cache(self, full_idx: Int) -> CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_FULL]]:
         var kb = self.full_kv.base(self.state_base(), full_idx)
         return CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_FULL]](
-            kb + self.full_kv.proto.k.offset)
+            UnsafePointer[Scalar[BF16.DTYPE], MutAnyOrigin](
+                unsafe_from_address=kb + self.full_kv.proto.k.offset))
 
     @always_inline
     def full_v_cache(self, full_idx: Int) -> CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_FULL]]:
         var kb = self.full_kv.base(self.state_base(), full_idx)
         return CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_DIM_FULL]](
-            kb + self.full_kv.proto.v.offset)
+            UnsafePointer[Scalar[BF16.DTYPE], MutAnyOrigin](
+                unsafe_from_address=kb + self.full_kv.proto.v.offset))
 
 
 # =============================================================================
@@ -497,16 +500,15 @@ struct Gemma4[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         var si = 0
         var fi = 0
         for i in range(C.NUM_LAYERS):
-            var scale_addr: Int
+            var p: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
             if is_full_layer(i):
                 var lb = topo.full_base(fi)
-                scale_addr = topo.full.proto.body.router_scale.addr(lb)
+                p = topo.full.proto.body.router_scale.bound(lb).as_ptr()
                 fi += 1
             else:
                 var lb = topo.sliding_base(si)
-                scale_addr = topo.sliding.proto.body.router_scale.addr(lb)
+                p = topo.sliding.proto.body.router_scale.bound(lb).as_ptr()
                 si += 1
-            var p = BF16Ptr(unsafe_from_address=scale_addr)
             for j in range(0, C.HIDDEN, width):
                 var v = (p + j).load[width=width]().cast[DType.float32]()
                 (p + j).store((v * inv_sqrt_hidden).cast[DType.bfloat16]())
@@ -633,8 +635,8 @@ struct Gemma4[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
 
             var router_logits_buf = InlineArray[Scalar[DType.bfloat16], C.NUM_EXPERTS](
                 fill=Scalar[DType.bfloat16](0))
-            var router_logits_ptr = BF16Ptr(
-                unsafe_from_address=Int(UnsafePointer(to=router_logits_buf[0])))
+            var router_logits_ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+                UnsafePointer(to=router_logits_buf[0]))
             var router_input_ptr = router.view().as_ptr[DType.bfloat16]()
 
             gemv_kernel[C.HIDDEN, C.NUM_EXPERTS](GemmArgs(
@@ -688,10 +690,11 @@ struct Gemma4[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
 
         rmsnorm(x_main, final_norm, x_main, self.pool, Float32(C.RMS_NORM_EPS)).join()
 
-        var last_row_off = (seq_len - 1) * C.HIDDEN * BF16.ELEMENT_BYTES
-        var last_hidden = DynView[Mat[BF16, C.MAX_SEQ_LEN, C.HIDDEN]](x_main.ptr + last_row_off, 1)
+        var last_row_off = (seq_len - 1) * C.HIDDEN
+        var last_hidden = DynamicView[Mat[BF16, C.MAX_SEQ_LEN, C.HIDDEN]](
+            x_main.as_ptr[DType.bfloat16]() + last_row_off, 1)
         var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
-        var logit_view = scratch_tensor_view[BF16, 1, C.VOCAB_SIZE](scb, logit_lease, 1)
+        var logit_view = logit_lease.view[BF16, 1, C.VOCAB_SIZE](scb, 1)
         gemm(last_hidden, embed, logit_view, self.pool).join()
         logit_softcap(logit_view)
 

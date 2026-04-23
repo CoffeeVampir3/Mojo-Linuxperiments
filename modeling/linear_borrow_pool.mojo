@@ -12,12 +12,14 @@ every borrow is released.
 Usage:
     var pool = ScratchPool(capacity)
     var lease = pool.borrow[Float32, 1536]()  # lease.offset = 0
-    # In closure: DynView[T](rv.scratch_base() + lease.offset, seq_len)
+    # In closure: DynamicView[T](rv.scratch_base() + lease.offset, seq_len)
     lease^.release()                           # offset returned
 """
 
 from std.sys.info import size_of
 from std.os import abort
+
+from modeling.model_spec import Encoding, Shaped, Mat, ScratchView
 
 
 comptime SCRATCH_LEASE_ALIGNMENT = 64
@@ -65,6 +67,28 @@ struct ScratchLease(Movable):
                   " actual_top=", top)
             abort("ScratchPool: non-LIFO release")
         self.pool_offset_ptr[] -= self.byte_size
+
+    @always_inline
+    def view[
+        o: MutOrigin, //,
+        E: Encoding, rows: Int, cols: Int,
+    ](
+        ref [o] self, scratch_base: Int, seq_len: Int,
+        element_offset: Int = 0,
+    ) -> ScratchView[Mat[E, rows, cols], o]:
+        """Bridge from scratch lease to typed view.
+
+        Origin comes from the lease reference: release-then-use on any
+        derived view fails at compile time.
+
+        element_offset: element-unit offset into the lease (e.g., to split
+        a [K; V] buffer into separate K and V views from one lease).
+        """
+        return ScratchView[Mat[E, rows, cols], o](
+            UnsafePointer[Scalar[E.DTYPE], o](
+                unsafe_from_address=(scratch_base + self.offset
+                    + element_offset * E.ELEMENT_BYTES)),
+            seq_len)
 
 
 # =============================================================================

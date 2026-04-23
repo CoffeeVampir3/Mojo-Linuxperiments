@@ -13,8 +13,8 @@ from minimax.kernels.dispatch_args import FusedW1W3SiluArgs
 
 def fused_w1w3_gemv_row[N: Int, K: Int](
     act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
-    w1_packed: UnsafePointer[UInt8, MutAnyOrigin],
-    w3_packed: UnsafePointer[UInt8, MutAnyOrigin],
+    w1_packed: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
+    w3_packed: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     act_sc: Float32,
     w1_sc: UnsafePointer[Float32, MutAnyOrigin],
     w1_cs: UnsafePointer[Float32, MutAnyOrigin],

@@ -31,7 +31,7 @@ from experimental3.common_math import I8Ptr, F32Ptr
 
 def gemv_row[N: Int, K: Int, OutDType: DType](
     act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
-    wpacked: UnsafePointer[UInt8, MutAnyOrigin],
+    wpacked: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     act_sc: Float32,
     wsc: UnsafePointer[Float32, MutAnyOrigin],
     wcs: UnsafePointer[Float32, MutAnyOrigin],
@@ -99,7 +99,7 @@ def gemv_row[N: Int, K: Int, OutDType: DType](
 
 def gemv_row_blocked[N: Int, K: Int, fwht_block_size: Int](
     act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
-    wpacked: UnsafePointer[UInt8, MutAnyOrigin],
+    wpacked: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     block_scales: UnsafePointer[Float32, MutAnyOrigin],
     wsc: UnsafePointer[Float32, MutAnyOrigin],
     block_colsums: UnsafePointer[Float32, MutAnyOrigin],
@@ -172,7 +172,7 @@ def gemv_row_blocked[N: Int, K: Int, fwht_block_size: Int](
 
 def gemv_row_blocked_wa[N: Int, K: Int, fwht_blk: Int](
     act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
-    wpacked: UnsafePointer[UInt8, MutAnyOrigin],
+    wpacked: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     block_scales: UnsafePointer[Float32, MutAnyOrigin],
     wsc: UnsafePointer[Float32, MutAnyOrigin],
     block_colsums: UnsafePointer[Float32, MutAnyOrigin],

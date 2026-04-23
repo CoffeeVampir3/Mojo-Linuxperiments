@@ -17,7 +17,7 @@ from modeling.model_spec import (
 from modeling.modeling_common import (
     SlotOffset, Repeated, SectionBuilder, align_up,
     DynamicTensorView, dynamic_tensor_view,
-    static_tensor_view, scratch_tensor_view, scratch_ptr,
+    static_tensor_view,
     LayerShard, LayerBuilder,
 )
 from modeling.loader import discover_shards, load_weights_from_descs
@@ -172,13 +172,15 @@ struct SmolLM2Topology[tp: Int](Copyable, ImplicitlyCopyable):
     def k_cache(self, layer_idx: Int) -> CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_HIDDEN // Self.tp]]:
         var kb = self.kv.base(self.state_base(), layer_idx)
         return CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_HIDDEN // Self.tp]](
-            kb + self.kv.proto.k.offset)
+            UnsafePointer[Scalar[BF16.DTYPE], MutAnyOrigin](
+                unsafe_from_address=kb + self.kv.proto.k.offset))
 
     @always_inline
     def v_cache(self, layer_idx: Int) -> CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_HIDDEN // Self.tp]]:
         var kb = self.kv.base(self.state_base(), layer_idx)
         return CacheView[Mat[BF16, C.MAX_SEQ_LEN, C.KV_HIDDEN // Self.tp]](
-            kb + self.kv.proto.v.offset)
+            UnsafePointer[Scalar[BF16.DTYPE], MutAnyOrigin](
+                unsafe_from_address=kb + self.kv.proto.v.offset))
 
 
 def emit_body[tp: Int](mut b: LayerBuilder, mut e: List[WeightDesc]) -> BodyRefs[tp]:
@@ -351,13 +353,13 @@ struct SmolLM2TP[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
     def x_main_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
         var ptrs = InlineArray[Int, Self.tp](fill=0)
         for rank in range(Self.tp):
-            ptrs[rank] = self.topos[rank].x_main(seq_len).ptr
+            ptrs[rank] = self.topos[rank].x_main(seq_len).addr()
         return ptrs^
 
     def x_residual_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
         var ptrs = InlineArray[Int, Self.tp](fill=0)
         for rank in range(Self.tp):
-            ptrs[rank] = self.topos[rank].x_residual(seq_len).ptr
+            ptrs[rank] = self.topos[rank].x_residual(seq_len).addr()
         return ptrs^
 
     @staticmethod
@@ -427,7 +429,7 @@ struct SmolLM2TP[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
 
         embed_lookup(embed, tokens_ptr, x_main, self.pools[0]).join()
         ring_broadcast[XSlot, Self.tp](
-            x_main.ptr, self.x_main_ptrs(seq_len), seq_len, self.pools)
+            x_main.addr(), self.x_main_ptrs(seq_len), seq_len, self.pools)
 
         for layer_idx in range(C.NUM_LAYERS):
             var layer = host.layers.proto
@@ -457,8 +459,7 @@ struct SmolLM2TP[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 return gemm(
                     topo.x_residual(seq_len),
                     static_tensor_view(lb, layer.attn.q_proj),
-                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.QAct.M](
-                        topo.scratch_base(), q_lease, seq_len),
+                    q_lease.view[BF16, C.MAX_SEQ_LEN, S.QAct.M](topo.scratch_base(), seq_len),
                     pool)
             tp_parallel[Self.tp, do_q](topos, self.pools)
 
@@ -470,8 +471,7 @@ struct SmolLM2TP[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 return gemm(
                     topo.x_residual(seq_len),
                     static_tensor_view(lb, layer.attn.k_proj),
-                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.KVAct.M](
-                        topo.scratch_base(), k_lease, seq_len),
+                    k_lease.view[BF16, C.MAX_SEQ_LEN, S.KVAct.M](topo.scratch_base(), seq_len),
                     pool)
             tp_parallel[Self.tp, do_k](topos, self.pools)
 
@@ -483,8 +483,7 @@ struct SmolLM2TP[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 return gemm(
                     topo.x_residual(seq_len),
                     static_tensor_view(lb, layer.attn.v_proj),
-                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.KVAct.M](
-                        topo.scratch_base(), v_lease, seq_len),
+                    v_lease.view[BF16, C.MAX_SEQ_LEN, S.KVAct.M](topo.scratch_base(), seq_len),
                     pool)
             tp_parallel[Self.tp, do_v](topos, self.pools)
 
@@ -492,25 +491,21 @@ struct SmolLM2TP[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 var topo = topos[rank]
                 var sb = topo.state_base()
                 rope[C.HEAD_DIM, S.LocalHeads](
-                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.QAct.M](
-                        topo.scratch_base(), q_lease, seq_len),
+                    q_lease.view[BF16, C.MAX_SEQ_LEN, S.QAct.M](topo.scratch_base(), seq_len),
                     static_tensor_view(sb, topo.rope.cos),
                     static_tensor_view(sb, topo.rope.sin),
                     pos)
                 rope[C.HEAD_DIM, S.LocalKVHeads](
-                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.KVAct.M](
-                        topo.scratch_base(), k_lease, seq_len),
+                    k_lease.view[BF16, C.MAX_SEQ_LEN, S.KVAct.M](topo.scratch_base(), seq_len),
                     static_tensor_view(sb, topo.rope.cos),
                     static_tensor_view(sb, topo.rope.sin),
                     pos)
                 kv_cache_write(
-                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.KVAct.M](
-                        topo.scratch_base(), k_lease, seq_len),
+                    k_lease.view[BF16, C.MAX_SEQ_LEN, S.KVAct.M](topo.scratch_base(), seq_len),
                     topo.k_cache(layer_idx),
                     pos)
                 kv_cache_write(
-                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.KVAct.M](
-                        topo.scratch_base(), v_lease, seq_len),
+                    v_lease.view[BF16, C.MAX_SEQ_LEN, S.KVAct.M](topo.scratch_base(), seq_len),
                     topo.v_cache(layer_idx),
                     pos)
 
@@ -524,12 +519,10 @@ struct SmolLM2TP[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 topo: SmolLM2Topology[Self.tp], ref [origin] pool: Self.Pool,
             ) -> PoolFence[Self.Pool, origin]:
                 return attention[S.LocalHeads, S.LocalKVHeads, C.HEAD_DIM](
-                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.QAct.M](
-                        topo.scratch_base(), q_lease, seq_len),
+                    q_lease.view[BF16, C.MAX_SEQ_LEN, S.QAct.M](topo.scratch_base(), seq_len),
                     topo.k_cache(layer_idx),
                     topo.v_cache(layer_idx),
-                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.QAct.M](
-                        topo.scratch_base(), attn_out_lease, seq_len),
+                    attn_out_lease.view[BF16, C.MAX_SEQ_LEN, S.QAct.M](topo.scratch_base(), seq_len),
                     pos,
                     pool)
             tp_parallel[Self.tp, do_attn](topos, self.pools)
@@ -540,8 +533,7 @@ struct SmolLM2TP[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             ) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.layer_base(layer_idx)
                 return gemm(
-                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.QAct.M](
-                        topo.scratch_base(), attn_out_lease, seq_len),
+                    attn_out_lease.view[BF16, C.MAX_SEQ_LEN, S.QAct.M](topo.scratch_base(), seq_len),
                     static_tensor_view(lb, layer.attn.o_proj),
                     topo.x_residual(seq_len),
                     pool)
@@ -584,8 +576,7 @@ struct SmolLM2TP[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 return gemm(
                     topo.x_residual(seq_len),
                     static_tensor_view(lb, layer.body.gate_proj),
-                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](
-                        topo.scratch_base(), gate_lease, seq_len),
+                    gate_lease.view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](topo.scratch_base(), seq_len),
                     pool)
             tp_parallel[Self.tp, do_gate](topos, self.pools)
 
@@ -597,20 +588,16 @@ struct SmolLM2TP[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 return gemm(
                     topo.x_residual(seq_len),
                     static_tensor_view(lb, layer.body.up_proj),
-                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](
-                        topo.scratch_base(), up_lease, seq_len),
+                    up_lease.view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](topo.scratch_base(), seq_len),
                     pool)
             tp_parallel[Self.tp, do_up](topos, self.pools)
 
             for rank in range(Self.tp):
                 var topo = topos[rank]
                 silu_mul(
-                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](
-                        topo.scratch_base(), gate_lease, seq_len),
-                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](
-                        topo.scratch_base(), up_lease, seq_len),
-                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](
-                        topo.scratch_base(), gate_lease, seq_len))
+                    gate_lease.view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](topo.scratch_base(), seq_len).any(),
+                    up_lease.view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](topo.scratch_base(), seq_len).any(),
+                    gate_lease.view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](topo.scratch_base(), seq_len).any())
 
             up_lease^.release()
 
@@ -620,8 +607,7 @@ struct SmolLM2TP[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             ) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.layer_base(layer_idx)
                 return gemm(
-                    scratch_tensor_view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](
-                        topo.scratch_base(), gate_lease, seq_len),
+                    gate_lease.view[BF16, C.MAX_SEQ_LEN, S.MLPAct.M](topo.scratch_base(), seq_len),
                     static_tensor_view(lb, layer.body.down_proj),
                     topo.x_residual(seq_len),
                     pool)
@@ -646,16 +632,16 @@ struct SmolLM2TP[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             self.pools[0],
             Float32(C.RMS_NORM_EPS)).join()
 
-        var last_row_off = (seq_len - 1) * C.HIDDEN * BF16.ELEMENT_BYTES
+        var last_row_off = (seq_len - 1) * C.HIDDEN
         var last_hidden = DynamicTensorView[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](
-            x_main.ptr + last_row_off, 1)
+            x_main.as_ptr[DType.bfloat16]() + last_row_off, 1)
         var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
-        var logit_view = scratch_tensor_view[BF16, 1, C.VOCAB_SIZE](
-            host.scratch_base(), logit_lease, 1)
+        var logit_view = logit_lease.view[BF16, 1, C.VOCAB_SIZE](host.scratch_base(), 1)
         gemm(last_hidden, embed, logit_view, self.pools[0]).join()
         prof.finish()
         prof.report()
 
         return LogitsView[C.VOCAB_SIZE](
-            scratch_ptr[Scalar[DType.bfloat16]](host.scratch_base(), logit_lease),
+            UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+                unsafe_from_address=host.scratch_base() + logit_lease.offset),
             logit_lease^)

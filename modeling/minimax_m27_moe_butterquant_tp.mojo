@@ -11,7 +11,7 @@ from threading.threading_traits import BurstThreadPool
 
 from modeling.model_spec import (
     Encoding, Shaped, BF16, F32, I8,
-    Shape, ShapeLike, Mat, DynView, Bound,
+    Shape, ShapeLike, Mat, DynamicView, StaticView,
     WeightDesc, DEFAULT_ALIGNMENT, LogitsView,
     TaskVisitor, QuantizeSpec,
     PerRow, PerRowAbsorbed, PerBlockAbsorbed, TwoSidedAbsorbed,
@@ -21,8 +21,8 @@ from quant.source_format import Bf16Converter, Fp8E4M3Block128Converter
 from modeling.modeling_common import (
     SlotOffset, Repeated, SectionBuilder, align_up,
     StaticTensorView, DynamicTensorView,
-    static_tensor_view, dynamic_tensor_view,
-    scratch_tensor_view, scratch_ptr,
+    dynamic_tensor_view,
+    scratch_ptr,
     LayerShard, LayerBuilder,
 )
 from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY, embed_lookup
@@ -152,18 +152,18 @@ struct AttnRefs[tp: Int](Copyable, ImplicitlyCopyable):
     var q_norm:      SlotOffset[BF16, Shape[C.Q_DIM,  1]]
     var k_norm:      SlotOffset[BF16, Shape[C.KV_DIM, 1]]
 
-    var qkv_colsum:  Int
-    var o_colsum:    Int
+    var qkv_colsum:  SlotOffset[F32, Shape[(C.Q_DIM // Self.tp) + 2 * (C.KV_DIM // Self.tp), 1]]
+    var o_colsum:    SlotOffset[F32, Shape[C.HIDDEN * (C.NUM_HEADS // Self.tp), 1]]
 
 
 @fieldwise_init
 struct BodyRefs[tp: Int](Copyable, ImplicitlyCopyable):
     comptime S = MiniMaxShapes[Self.tp]
 
-    var input_norm:     SlotOffset[BF16, Shape[C.HIDDEN, 1]]
-    var post_attn_norm: SlotOffset[BF16, Shape[C.HIDDEN, 1]]
-    var input_norm_sqrt_off: Int
-    var post_attn_norm_sqrt_off: Int
+    var input_norm:      SlotOffset[BF16, Shape[C.HIDDEN, 1]]
+    var post_attn_norm:  SlotOffset[BF16, Shape[C.HIDDEN, 1]]
+    var input_norm_sqrt: SlotOffset[BF16, Shape[C.HIDDEN, 1]]
+    var post_attn_norm_sqrt: SlotOffset[BF16, Shape[C.HIDDEN, 1]]
 
     # F32 router — sigmoid + correction-bias + top-k is magnitude-sensitive.
     var router_proj: SlotOffset[F32, Shape[C.NUM_EXPERTS, C.HIDDEN]]
@@ -180,9 +180,9 @@ struct BodyRefs[tp: Int](Copyable, ImplicitlyCopyable):
     var experts_w2:       SlotOffset[I8,  Shape[C.NUM_EXPERTS * C.HIDDEN, C.MOE_INTERMEDIATE]]
     var experts_w2_sc:    SlotOffset[F32, Shape[Self.S.EXPERTS_LOCAL * C.HIDDEN, 1]]
 
-    var experts_w1_colsum: Int
-    var experts_w3_colsum: Int
-    var experts_w2_colsum: Int
+    var experts_w1_colsum: SlotOffset[F32, Shape[Self.S.EXPERTS_LOCAL * C.MOE_INTERMEDIATE, 1]]
+    var experts_w3_colsum: SlotOffset[F32, Shape[Self.S.EXPERTS_LOCAL * C.MOE_INTERMEDIATE, 1]]
+    var experts_w2_colsum: SlotOffset[F32, Shape[Self.S.EXPERTS_LOCAL * C.HIDDEN * MOE_DOWN_NUM_BLK, 1]]
 
 
 @fieldwise_init
@@ -219,10 +219,10 @@ struct HostSlots(Copyable, ImplicitlyCopyable):
     # - lm_output_head is the ButterQuant output projection derived from
     #   source lm_head.weight, keeping the fast per-block GEMV path.
     var embed:      SlotOffset[BF16, Shape[C.VOCAB_SIZE, C.HIDDEN]]
-    var lm_output_head:    SlotOffset[I8,  Shape[C.VOCAB_SIZE, C.HIDDEN]]
-    var lm_output_head_sc: SlotOffset[F32, Shape[C.VOCAB_SIZE, C.HIDDEN // LM_OUTPUT_HEAD_FWHT_BLK]]
-    var lm_output_head_colsum_off: Int
-    var lm_output_head_sqrt_gamma_off: Int
+    var lm_output_head:         SlotOffset[I8,  Shape[C.VOCAB_SIZE, C.HIDDEN]]
+    var lm_output_head_sc:      SlotOffset[F32, Shape[C.VOCAB_SIZE, C.HIDDEN // LM_OUTPUT_HEAD_FWHT_BLK]]
+    var lm_output_head_colsum:  SlotOffset[F32, Shape[C.VOCAB_SIZE, C.HIDDEN // LM_OUTPUT_HEAD_FWHT_BLK]]
+    var lm_output_head_sqrt_gamma: SlotOffset[BF16, Shape[C.HIDDEN, 1]]
 
 
 # =============================================================================
@@ -288,12 +288,16 @@ struct MiniMaxM27Topology[tp: Int](Copyable, ImplicitlyCopyable):
         return self.state_base() + self.kv_cache_off + idx * self.kv_cache_stride
 
     @always_inline
-    def rope_cos_row(self, pos: Int) -> Int:
-        return self.state_base() + self.rope.cos.offset + pos * (C.ROPE_DIM // 2) * size_of[Float32]()
+    def rope_cos_row(self, pos: Int) -> StaticView[Mat[F32, 1, C.ROPE_DIM // 2]]:
+        var off = self.state_base() + self.rope.cos.offset + pos * (C.ROPE_DIM // 2) * size_of[Float32]()
+        return StaticView[Mat[F32, 1, C.ROPE_DIM // 2]](
+            UnsafePointer[Scalar[F32.DTYPE], MutAnyOrigin](unsafe_from_address=off))
 
     @always_inline
-    def rope_sin_row(self, pos: Int) -> Int:
-        return self.state_base() + self.rope.sin.offset + pos * (C.ROPE_DIM // 2) * size_of[Float32]()
+    def rope_sin_row(self, pos: Int) -> StaticView[Mat[F32, 1, C.ROPE_DIM // 2]]:
+        var off = self.state_base() + self.rope.sin.offset + pos * (C.ROPE_DIM // 2) * size_of[Float32]()
+        return StaticView[Mat[F32, 1, C.ROPE_DIM // 2]](
+            UnsafePointer[Scalar[F32.DTYPE], MutAnyOrigin](unsafe_from_address=off))
 
 
 def emit_expert_block(
@@ -391,8 +395,8 @@ def emit_layer[tp: Int](
     var k_norm = SlotOffset[BF16, Shape[C.KV_DIM, 1]](
         b.bf(e, "self_attn.k_norm.weight", C.KV_DIM, 1, ROW))
 
-    var qkv_colsum = b.colsum(qkv_n_loc * 4)
-    var o_colsum = b.colsum(H * o_num_blk * 4)
+    var qkv_colsum = b.colsum_slot[F32, Shape[qkv_n_loc, 1]]()
+    var o_colsum = b.colsum_slot[F32, Shape[H * o_num_blk, 1]]()
 
     var attn = AttnRefs[tp](
         qkv_proj=qkv_proj, qkv_proj_sc=qkv_proj_sc,
@@ -406,8 +410,8 @@ def emit_layer[tp: Int](
         b.bf(e, "input_layernorm.weight", H, 1, REPL))
     var post_attn_norm = SlotOffset[BF16, Shape[H, 1]](
         b.bf(e, "post_attention_layernorm.weight", H, 1, REPL))
-    var input_norm_sqrt_off = b.colsum(H * bf16)
-    var post_attn_norm_sqrt_off = b.colsum(H * bf16)
+    var input_norm_sqrt = b.colsum_slot[BF16, Shape[H, 1]]()
+    var post_attn_norm_sqrt = b.colsum_slot[BF16, Shape[H, 1]]()
 
     # --- Router (F32, not butterquantized) ---
     var router_proj = SlotOffset[F32, Shape[NE, H]](
@@ -436,14 +440,14 @@ def emit_layer[tp: Int](
     var experts_w2 = SlotOffset[I8, Shape[NE * H, MI]](experts_w2_off[0])
     var experts_w2_sc = SlotOffset[F32, Shape[experts_local * H, 1]](experts_w2_off[1])
 
-    var experts_w1_colsum = b.colsum(experts_local * MI * 4)
-    var experts_w3_colsum = b.colsum(experts_local * MI * 4)
-    var experts_w2_colsum = b.colsum(experts_local * H * MOE_DOWN_NUM_BLK * 4)
+    var experts_w1_colsum = b.colsum_slot[F32, Shape[experts_local * MI, 1]]()
+    var experts_w3_colsum = b.colsum_slot[F32, Shape[experts_local * MI, 1]]()
+    var experts_w2_colsum = b.colsum_slot[F32, Shape[experts_local * H * MOE_DOWN_NUM_BLK, 1]]()
 
     var body = BodyRefs[tp](
         input_norm=input_norm, post_attn_norm=post_attn_norm,
-        input_norm_sqrt_off=input_norm_sqrt_off,
-        post_attn_norm_sqrt_off=post_attn_norm_sqrt_off,
+        input_norm_sqrt=input_norm_sqrt,
+        post_attn_norm_sqrt=post_attn_norm_sqrt,
         router_proj=router_proj, router_bias=router_bias,
         experts_w1=experts_w1, experts_w1_sc=experts_w1_sc,
         experts_w3=experts_w3, experts_w3_sc=experts_w3_sc,
@@ -582,10 +586,8 @@ def build_minimax_plan[tp: Int]() -> MiniMaxM27LoadPlan[tp]:
                                  C.VOCAB_SIZE, C.HIDDEN, HOST)
     var lm_output_head_sc_off = hb.f(descs, "lm_head.weight_scale",
                                     C.VOCAB_SIZE, vocab_num_blocks, HOST)
-    var lm_output_head_colsum_bytes = C.VOCAB_SIZE * vocab_num_blocks * f32
-    var lm_output_head_colsum_off = hb.colsum(lm_output_head_colsum_bytes)
-    var lm_output_head_sqrt_gamma_off = hb.cursor
-    hb.cursor += C.HIDDEN * bf16
+    var lm_output_head_colsum = hb.colsum_slot[F32, Shape[C.VOCAB_SIZE, vocab_num_blocks]]()
+    var lm_output_head_sqrt_gamma = hb.colsum_slot[BF16, Shape[C.HIDDEN, 1]]()
     var host_bytes = hb.cursor
 
     var host = HostSlots(
@@ -595,8 +597,8 @@ def build_minimax_plan[tp: Int]() -> MiniMaxM27LoadPlan[tp]:
             lm_output_head_off),
         lm_output_head_sc=SlotOffset[F32, Shape[C.VOCAB_SIZE, vocab_num_blocks]](
             lm_output_head_sc_off),
-        lm_output_head_colsum_off=lm_output_head_colsum_off,
-        lm_output_head_sqrt_gamma_off=lm_output_head_sqrt_gamma_off,
+        lm_output_head_colsum=lm_output_head_colsum,
+        lm_output_head_sqrt_gamma=lm_output_head_sqrt_gamma,
     )
 
     var topo = MiniMaxM27Topology[tp](
@@ -648,13 +650,13 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
     def x_main_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
         var ptrs = InlineArray[Int, Self.tp](fill=0)
         for r in range(Self.tp):
-            ptrs[r] = self.topos[r].x_main(seq_len).ptr
+            ptrs[r] = self.topos[r].x_main(seq_len).addr()
         return ptrs^
 
     def x_residual_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
         var ptrs = InlineArray[Int, Self.tp](fill=0)
         for r in range(Self.tp):
-            ptrs[r] = self.topos[r].x_residual(seq_len).ptr
+            ptrs[r] = self.topos[r].x_residual(seq_len).addr()
         return ptrs^
 
     def token_buffer(mut self) -> UnsafePointer[Scalar[DType.int32], MutAnyOrigin]:
@@ -739,17 +741,17 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                 var layer = topo.layers.proto
 
                 comptime qkv_local = q_local + 2 * kv_local
-                colsum_at(base, lb - base + layer.attn.qkv_proj.offset, lb - base + layer.attn.qkv_colsum,
+                colsum_at(base, lb - base + layer.attn.qkv_proj.offset, lb - base + layer.attn.qkv_colsum.offset,
                     qkv_local, C.HIDDEN)
                 pack_at(base, lb - base + layer.attn.qkv_proj.offset, qkv_local, C.HIDDEN, pack_scratch)
 
-                block_colsum_at(base, lb - base + layer.attn.o_proj.offset, lb - base + layer.attn.o_colsum,
+                block_colsum_at(base, lb - base + layer.attn.o_proj.offset, lb - base + layer.attn.o_colsum.offset,
                     C.HIDDEN, q_local, C.HEAD_DIM)
                 pack_at(base, lb - base + layer.attn.o_proj.offset, C.HIDDEN, q_local, pack_scratch)
 
-                colsum_at(base, lb - base + layer.body.experts_w1.offset, lb - base + layer.body.experts_w1_colsum,
+                colsum_at(base, lb - base + layer.body.experts_w1.offset, lb - base + layer.body.experts_w1_colsum.offset,
                     experts_local * C.MOE_INTERMEDIATE, C.HIDDEN)
-                colsum_at(base, lb - base + layer.body.experts_w3.offset, lb - base + layer.body.experts_w3_colsum,
+                colsum_at(base, lb - base + layer.body.experts_w3.offset, lb - base + layer.body.experts_w3_colsum.offset,
                     experts_local * C.MOE_INTERMEDIATE, C.HIDDEN)
                 for e in range(experts_local):
                     pack_at(base, lb - base + layer.body.experts_w1.offset + e * C.MOE_INTERMEDIATE * C.HIDDEN,
@@ -758,29 +760,26 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                         C.MOE_INTERMEDIATE, C.HIDDEN, pack_scratch)
                     block_colsum_at(base,
                         lb - base + layer.body.experts_w2.offset + e * C.HIDDEN * C.MOE_INTERMEDIATE,
-                        lb - base + layer.body.experts_w2_colsum + e * C.HIDDEN * MOE_DOWN_NUM_BLK * 4,
+                        lb - base + layer.body.experts_w2_colsum.offset + e * C.HIDDEN * MOE_DOWN_NUM_BLK * 4,
                         C.HIDDEN, C.MOE_INTERMEDIATE, FWHT_BLK_MOE_DOWN)
                     pack_at(base, lb - base + layer.body.experts_w2.offset + e * C.HIDDEN * C.MOE_INTERMEDIATE,
                         C.HIDDEN, C.MOE_INTERMEDIATE, pack_scratch)
 
-                var in_gamma = BF16Ptr(unsafe_from_address=layer.body.input_norm.addr(lb))
                 compute_sqrt_gamma[C.HIDDEN](
-                    in_gamma,
-                    BF16Ptr(unsafe_from_address=lb + layer.body.input_norm_sqrt_off))
+                    layer.body.input_norm.bound(lb).as_ptr(),
+                    layer.body.input_norm_sqrt.bound(lb).as_ptr())
 
-                var pa_gamma = BF16Ptr(unsafe_from_address=layer.body.post_attn_norm.addr(lb))
                 compute_sqrt_gamma[C.HIDDEN](
-                    pa_gamma,
-                    BF16Ptr(unsafe_from_address=lb + layer.body.post_attn_norm_sqrt_off))
+                    layer.body.post_attn_norm.bound(lb).as_ptr(),
+                    layer.body.post_attn_norm_sqrt.bound(lb).as_ptr())
 
             if rank == HOST_RANK:
                 block_colsum_row_major_at(base,
-                    topo.host.lm_output_head.offset, topo.host.lm_output_head_colsum_off,
+                    topo.host.lm_output_head.offset, topo.host.lm_output_head_colsum.offset,
                     C.VOCAB_SIZE, C.HIDDEN, LM_OUTPUT_HEAD_FWHT_BLK)
-                var fn_gamma = BF16Ptr(unsafe_from_address=base + topo.host.final_norm.offset)
                 compute_sqrt_gamma[C.HIDDEN](
-                    fn_gamma,
-                    BF16Ptr(unsafe_from_address=base + topo.host.lm_output_head_sqrt_gamma_off))
+                    topo.host.final_norm.bound(base).as_ptr(),
+                    topo.host.lm_output_head_sqrt_gamma.bound(base).as_ptr())
 
         for rank in range(Self.tp):
             worker_init_dispatch[C.HPG](self.main_pools[rank]).join()
@@ -880,7 +879,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
         var t_bcast0 = Int(perf_counter_ns())
         ring_broadcast[X_SLOT, Self.tp](
-            host.x_main(seq_len).ptr, self.x_main_ptrs(seq_len), seq_len, self.main_pools)
+            host.x_main(seq_len).addr(), self.x_main_ptrs(seq_len), seq_len, self.main_pools)
         sample.add(self.profile.phase("broadcast"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_bcast0))
 
         var act_scale_lease = self.scratch.borrow[Float32, 1]()
@@ -904,12 +903,13 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             for r in range(Self.tp):
                 var lb = topos[r].layer_base(layer_idx)
                 var layer = topos[r].layers.proto
+                var sb = topos[r].scratch_base()
                 var args = RmsNormFwhtQuantArgs(
-                    BF16Ptr(unsafe_from_address=topos[r].x_main(seq_len).ptr),
-                    BF16Ptr(unsafe_from_address=lb + layer.body.input_norm_sqrt_off),
-                    I8Ptr(unsafe_from_address=topos[r].scratch_addr(attn_i8_lease)),
-                    F32Ptr(unsafe_from_address=topos[r].scratch_addr(attn_work_lease)),
-                    F32Ptr(unsafe_from_address=topos[r].scratch_addr(act_scale_lease)),
+                    topos[r].x_main(seq_len).as_ptr[DType.bfloat16](),
+                    layer.body.input_norm_sqrt.bound(lb).as_ptr[DType.bfloat16](),
+                    attn_i8_lease.view[I8, 1, C.HIDDEN](sb, 1).as_ptr[DType.int8](),
+                    attn_work_lease.view[F32, 1, C.HIDDEN](sb, 1).as_ptr[DType.float32](),
+                    act_scale_lease.view[F32, 1, 1](sb, 1).as_ptr[DType.float32](),
                     EPS, 0, seq_len)
                 rmsnorm_fwht_quant_worker[C.HIDDEN, FWHT_BLK_HIDDEN, True, False](args)
             sample.add(self.profile.phase("attn_quantize"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_attn_quant0))
@@ -920,13 +920,15 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             def do_qkv_gemv[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
+                var sb = topo.scratch_base()
                 return int8_gemv[QKV_LOCAL, C.HIDDEN](
-                    topo.scratch_addr(attn_i8_lease),
-                    layer.attn.qkv_proj.addr(lb),
-                    lb + layer.attn.qkv_colsum,
-                    layer.attn.qkv_proj_sc.addr(lb),
-                    topo.scratch_addr(qkv_lease),
-                    seq_len, topo.scratch_addr(act_scale_lease), pool)
+                    attn_i8_lease.view[I8, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                    layer.attn.qkv_proj.bound(lb),
+                    layer.attn.qkv_colsum.bound(lb),
+                    layer.attn.qkv_proj_sc.bound(lb),
+                    qkv_lease.view[BF16, C.MAX_SEQ_LEN, QKV_LOCAL](sb, seq_len),
+                    act_scale_lease.view[F32, C.MAX_SEQ_LEN, 1](sb, seq_len),
+                    pool)
             sample.add(self.profile.phase("attn_proj"), timed_tp_parallel[Self.tp,do_qkv_gemv](topos, self.main_pools))
 
             attn_work_lease^.release()
@@ -942,10 +944,11 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             var global_q_ss = Float32(0)
             var global_k_ss = Float32(0)
             for r in range(Self.tp):
-                var q_ptr = BF16Ptr(unsafe_from_address=topos[r].scratch_addr(qkv_lease) + Q_OFF)
-                var k_ptr = BF16Ptr(unsafe_from_address=topos[r].scratch_addr(qkv_lease) + K_OFF)
-                global_q_ss += rms_reduce_bf16[Q_LOCAL](q_ptr)
-                global_k_ss += rms_reduce_bf16[KV_LOCAL](k_ptr)
+                var sb = topos[r].scratch_base()
+                var q_view = qkv_lease.view[BF16, 1, Q_LOCAL](sb, 1)
+                var k_view = qkv_lease.view[BF16, 1, KV_LOCAL](sb, 1, element_offset=Q_LOCAL)
+                global_q_ss += rms_reduce_bf16[Q_LOCAL](q_view.as_ptr[DType.bfloat16]())
+                global_k_ss += rms_reduce_bf16[KV_LOCAL](k_view.as_ptr[DType.bfloat16]())
             sample.add(self.profile.phase("norm_prep"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_norm_prep0))
             var inv_rms_q = inv_rms_from_sum_sq(global_q_ss, C.Q_DIM, EPS)
             var inv_rms_k = inv_rms_from_sum_sq(global_k_ss, C.KV_DIM, EPS)
@@ -955,14 +958,15 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             def do_kv_write[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
+                var sb = topo.scratch_base()
                 return kv_write_dispatch[
                     C.HEAD_DIM, C.ROPE_DIM, C.ROPE_PAIR_STRIDE,
                     C.MAX_SEQ_LEN, KV_PER_RANK](
-                    topo.scratch_addr(qkv_lease) + Q_OFF,
-                    topo.scratch_addr(qkv_lease) + K_OFF,
-                    topo.scratch_addr(qkv_lease) + V_OFF,
-                    layer.attn.q_norm.addr(lb),
-                    layer.attn.k_norm.addr(lb),
+                    qkv_lease.view[BF16, 1, Q_LOCAL](sb, 1).any(),
+                    qkv_lease.view[BF16, 1, KV_LOCAL](sb, 1, element_offset=Q_LOCAL).any(),
+                    qkv_lease.view[BF16, 1, KV_LOCAL](sb, 1, element_offset=Q_LOCAL + KV_LOCAL).any(),
+                    layer.attn.q_norm.bound(lb),
+                    layer.attn.k_norm.bound(lb),
                     topo.rope_cos_row(pos), topo.rope_sin_row(pos),
                     inv_rms_q, inv_rms_k,
                     topo.kv_cache_base(layer_idx), pos,
@@ -989,18 +993,26 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                 for r in range(Self.tp):
                     var lb = topos[r].layer_base(layer_idx)
                     var layer = topos[r].layers.proto
-                    var q_i8 = I8Ptr(unsafe_from_address=topos[r].scratch_addr(q_i8_lease)) + kv * HPG * C.HEAD_DIM
-                    var qi_biases = F32Ptr(unsafe_from_address=topos[r].scratch_addr(qi_biases_lease)) + kv * HPG
-                    var q_scales = F32Ptr(unsafe_from_address=topos[r].scratch_addr(q_scales_lease)) + kv * HPG
+                    var sb = topos[r].scratch_base()
+                    var q_view = qkv_lease.view[BF16, 1, HPG * C.HEAD_DIM](
+                        sb, 1, element_offset=kv * HPG * C.HEAD_DIM)
+                    var q_norm_off_elems = kv * HPG * C.HEAD_DIM
+                    var q_norm_ptr = layer.attn.q_norm.bound(lb).as_ptr[DType.bfloat16]() + q_norm_off_elems
+                    var qi_out_view = q_i8_lease.view[I8, 1, HPG * C.HEAD_DIM](
+                        sb, 1, element_offset=kv * HPG * C.HEAD_DIM)
+                    var qi_biases_view = qi_biases_lease.view[F32, 1, HPG](
+                        sb, 1, element_offset=kv * HPG)
+                    var q_scales_view = q_scales_lease.view[F32, 1, HPG](
+                        sb, 1, element_offset=kv * HPG)
                     var qp_args = AttnGroupArgs()
-                    qp_args.q_bf16_base = BF16Ptr(unsafe_from_address=topos[r].scratch_addr(qkv_lease) + Q_OFF + kv * Q_GROUP_BF16)
-                    qp_args.q_norm_ptr = BF16Ptr(unsafe_from_address=layer.attn.q_norm.addr(lb) + kv * HPG * C.HEAD_DIM * 2)
-                    qp_args.cos_ptr = F32Ptr(unsafe_from_address=topos[r].rope_cos_row(pos))
-                    qp_args.sin_ptr = F32Ptr(unsafe_from_address=topos[r].rope_sin_row(pos))
+                    qp_args.q_bf16_base = q_view.as_ptr[DType.bfloat16]()
+                    qp_args.q_norm_ptr = q_norm_ptr
+                    qp_args.cos_ptr = topos[r].rope_cos_row(pos).as_ptr[DType.float32]()
+                    qp_args.sin_ptr = topos[r].rope_sin_row(pos).as_ptr[DType.float32]()
                     qp_args.inv_rms_q = inv_rms_q
-                    qp_args.qi_out = q_i8
-                    qp_args.head_scale_ptr = qi_biases
-                    qp_args.context_len = Int(q_scales)
+                    qp_args.qi_out = qi_out_view.as_ptr[DType.int8]()
+                    qp_args.head_scale_ptr = qi_biases_view.as_ptr[DType.float32]()
+                    qp_args.context_len = Int(q_scales_view.as_ptr[DType.float32]())
                     q_prep_kernel[C.HEAD_DIM, C.ROPE_DIM, C.ROPE_PAIR_STRIDE, HPG](qp_args)
             sample.add(self.profile.phase("q_prep"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_qprep0))
 
@@ -1027,9 +1039,16 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                         context_len, Int(self.main_pools[r].get_capacity()),
                         C.MAX_ATTN_CHUNKS)
                     if nc > 0:
-                        var partial = F32Ptr(unsafe_from_address=topos[r].scratch_addr(partial_lease)) + kv * nc * CHUNK_F32_STRIDE
-                        var qi_out = I8Ptr(unsafe_from_address=topos[r].scratch_addr(attn_qi_lease)) + kv * HPG * C.HEAD_DIM
-                        var head_sc = F32Ptr(unsafe_from_address=topos[r].scratch_addr(attn_head_sc_lease)) + kv * HPG
+                        var sb = topos[r].scratch_base()
+                        var partial = partial_lease.view[F32, 1, CHUNK_F32_STRIDE](
+                            sb, 1, element_offset=kv * nc * CHUNK_F32_STRIDE
+                        ).as_ptr[DType.float32]()
+                        var qi_out = attn_qi_lease.view[I8, 1, HPG * C.HEAD_DIM](
+                            sb, 1, element_offset=kv * HPG * C.HEAD_DIM
+                        ).as_ptr[DType.int8]()
+                        var head_sc = attn_head_sc_lease.view[F32, 1, HPG](
+                            sb, 1, element_offset=kv * HPG
+                        ).as_ptr[DType.float32]()
                         merge_and_quantize_kernel[C.HEAD_DIM, HPG, C.MAX_ATTN_CHUNKS](
                             partial, nc, qi_out, head_sc)
             sample.add(self.profile.phase("merge_quant"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_merge_q0))
@@ -1044,14 +1063,15 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             def do_o_proj[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
+                var sb = topo.scratch_base()
                 return int8_gemv_blocked[C.HIDDEN, Q_LOCAL, C.HEAD_DIM](
-                    I8Ptr(unsafe_from_address=topo.scratch_addr(attn_qi_lease)),
-                    U8Ptr(unsafe_from_address=layer.attn.o_proj.addr(lb)),
-                    F32Ptr(unsafe_from_address=topo.scratch_addr(attn_head_sc_lease)),
-                    layer.attn.o_proj_sc.bound(lb).as_ptr(),
-                    F32Ptr(unsafe_from_address=lb + layer.attn.o_colsum),
-                    topo.x_residual(seq_len).as_ptr(),
-                    seq_len, pool)
+                    attn_qi_lease.view[I8, C.MAX_SEQ_LEN, Q_LOCAL](sb, seq_len),
+                    layer.attn.o_proj.bound(lb),
+                    attn_head_sc_lease.view[F32, C.MAX_SEQ_LEN, Q_LOCAL // C.HEAD_DIM](sb, seq_len),
+                    layer.attn.o_proj_sc.bound(lb),
+                    layer.attn.o_colsum.bound(lb),
+                    topo.x_residual(seq_len),
+                    pool)
             sample.add(self.profile.phase("o_proj"), timed_tp_parallel[Self.tp,do_o_proj](topos, self.main_pools))
 
             attn_head_sc_lease^.release()
@@ -1083,14 +1103,15 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             for r in range(Self.tp):
                 var lb = topos[r].layer_base(layer_idx)
                 var layer = topos[r].layers.proto
+                var sb = topos[r].scratch_base()
                 var args = RmsNormDualOutputArgs(
-                    BF16Ptr(unsafe_from_address=topos[r].x_main(seq_len).ptr),
-                    BF16Ptr(unsafe_from_address=lb + layer.body.post_attn_norm_sqrt_off),
-                    BF16Ptr(unsafe_from_address=layer.body.post_attn_norm.addr(lb)),
-                    I8Ptr(unsafe_from_address=topos[r].scratch_addr(moe_i8_lease)),
-                    F32Ptr(unsafe_from_address=topos[r].scratch_addr(moe_work_lease)),
-                    F32Ptr(unsafe_from_address=topos[r].scratch_addr(moe_scale_lease)),
-                    BF16Ptr(unsafe_from_address=topos[r].scratch_addr(normed_bf16_lease)),
+                    topos[r].x_main(seq_len).as_ptr[DType.bfloat16](),
+                    layer.body.post_attn_norm_sqrt.bound(lb).as_ptr[DType.bfloat16](),
+                    layer.body.post_attn_norm.bound(lb).as_ptr[DType.bfloat16](),
+                    moe_i8_lease.view[I8, 1, C.HIDDEN](sb, 1).as_ptr[DType.int8](),
+                    moe_work_lease.view[F32, 1, C.HIDDEN](sb, 1).as_ptr[DType.float32](),
+                    moe_scale_lease.view[F32, 1, 1](sb, 1).as_ptr[DType.float32](),
+                    normed_bf16_lease.view[BF16, 1, C.HIDDEN](sb, 1).as_ptr[DType.bfloat16](),
                     EPS, 0, seq_len)
                 rmsnorm_dual_output_worker[C.HIDDEN, FWHT_BLK_HIDDEN](args)
             sample.add(self.profile.phase("dual_norm"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_dual_norm0))
@@ -1109,10 +1130,11 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             def do_router_fused[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
+                var sb = topo.scratch_base()
                 return router_fused_dispatch[C.NUM_EXPERTS, C.HIDDEN, C.TOP_K](
-                    BF16Ptr(unsafe_from_address=topo.scratch_addr(normed_bf16_lease)),
-                    layer.body.router_proj.bound(lb).as_ptr(),
-                    layer.body.router_bias.bound(lb).as_ptr(),
+                    normed_bf16_lease.view[BF16, 1, C.HIDDEN](sb, 1),
+                    layer.body.router_proj.bound(lb),
+                    layer.body.router_bias.bound(lb),
                     U8Ptr(unsafe_from_address=topo.scratch_addr(candidates_lease)),
                     pool)
             sample.add(self.profile.phase("router_proj"), timed_tp_parallel[Self.tp,do_router_fused](topos, self.main_pools))
@@ -1126,6 +1148,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     num_workers * C.TOP_K)
                 router_merge_and_renorm[C.TOP_K](merge_args)
             sample.add(self.profile.phase("router_topk"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_merge0))
+
 
             candidates_lease^.release()
             # normed_bf16 and routing remain live: routing is read by Phase 9/10;
@@ -1142,6 +1165,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             def do_expert_phase1[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
+                var sb = topo.scratch_base()
                 var routing = UnsafePointer[TopKResult[C.TOP_K], MutAnyOrigin](
                     unsafe_from_address=topo.scratch_addr(routing_lease))[]
                 comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
@@ -1156,23 +1180,23 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                 return minimax_moe_phase1[
                     C.MOE_INTERMEDIATE, C.HIDDEN, FWHT_BLK,
                     C.TOP_K, C.NUM_EXPERTS, Self.tp](
-                    I8Ptr(unsafe_from_address=topo.scratch_addr(moe_i8_lease)),
-                    F32Ptr(unsafe_from_address=topo.scratch_addr(moe_scale_lease)),
+                    moe_i8_lease.view[I8, 1, C.HIDDEN](sb, 1),
+                    moe_scale_lease.view[F32, 1, 1](sb, 1),
                     routing,
-                    layer.body.experts_w1.addr(lb),
+                    layer.body.experts_w1.bound(lb),
                     C.MOE_INTERMEDIATE * C.HIDDEN,
-                    layer.body.experts_w1_sc.addr(lb),
+                    layer.body.experts_w1_sc.bound(lb),
                     C.MOE_INTERMEDIATE * 4,
-                    lb + layer.body.experts_w1_colsum,
+                    layer.body.experts_w1_colsum.bound(lb),
                     C.MOE_INTERMEDIATE * 4,
-                    layer.body.experts_w3.addr(lb),
+                    layer.body.experts_w3.bound(lb),
                     C.MOE_INTERMEDIATE * C.HIDDEN,
-                    layer.body.experts_w3_sc.addr(lb),
+                    layer.body.experts_w3_sc.bound(lb),
                     C.MOE_INTERMEDIATE * 4,
-                    lb + layer.body.experts_w3_colsum,
+                    layer.body.experts_w3_colsum.bound(lb),
                     C.MOE_INTERMEDIATE * 4,
-                    I8Ptr(unsafe_from_address=topo.scratch_addr(expert_qi_lease)),
-                    F32Ptr(unsafe_from_address=topo.scratch_addr(expert_blk_scale_lease)),
+                    expert_qi_lease.view[I8, C.TOP_K, C.MOE_INTERMEDIATE](sb, C.TOP_K),
+                    expert_blk_scale_lease.view[F32, C.TOP_K, MOE_DOWN_NUM_BLK](sb, C.TOP_K),
                     rank, pool)
             sample.add(self.profile.phase("expert_phase1"), timed_tp_parallel[Self.tp,do_expert_phase1](topos, self.main_pools))
 
@@ -1181,33 +1205,35 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             def do_expert_phase2[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.layer_base(layer_idx)
                 var layer = topo.layers.proto
+                var sb = topo.scratch_base()
                 var routing = UnsafePointer[TopKResult[C.TOP_K], MutAnyOrigin](
                     unsafe_from_address=topo.scratch_addr(routing_lease))[]
                 return minimax_moe_phase2[
                     C.HIDDEN, C.MOE_INTERMEDIATE, FWHT_BLK_MOE_DOWN,
                     C.TOP_K, C.NUM_EXPERTS, Self.tp](
-                    I8Ptr(unsafe_from_address=topo.scratch_addr(expert_qi_lease)),
-                    F32Ptr(unsafe_from_address=topo.scratch_addr(expert_blk_scale_lease)),
+                    expert_qi_lease.view[I8, C.TOP_K, C.MOE_INTERMEDIATE](sb, C.TOP_K),
+                    expert_blk_scale_lease.view[F32, C.TOP_K, MOE_DOWN_NUM_BLK](sb, C.TOP_K),
                     routing,
-                    layer.body.experts_w2.addr(lb),
+                    layer.body.experts_w2.bound(lb),
                     C.HIDDEN * C.MOE_INTERMEDIATE,
-                    layer.body.experts_w2_sc.addr(lb),
+                    layer.body.experts_w2_sc.bound(lb),
                     C.HIDDEN * 4,
-                    lb + layer.body.experts_w2_colsum,
+                    layer.body.experts_w2_colsum.bound(lb),
                     C.HIDDEN * MOE_DOWN_NUM_BLK * 4,
-                    BF16Ptr(unsafe_from_address=topo.scratch_addr(expert_out_lease)),
+                    expert_out_lease.view[BF16, C.TOP_K, C.HIDDEN](sb, C.TOP_K),
                     rank, pool)
             sample.add(self.profile.phase("expert_phase2"), timed_tp_parallel[Self.tp,do_expert_phase2](topos, self.main_pools))
 
             # Phase 11: expert reduce + fused allreduce + residual add
             var t_expert_sum0 = Int(perf_counter_ns())
             for r in range(Self.tp):
+                var sb = topos[r].scratch_base()
                 var lc = Int(UnsafePointer[Int32, MutAnyOrigin](
                     unsafe_from_address=topos[r].scratch_addr(local_count_lease))[])
                 accumulate_expert_outputs[C.HIDDEN, C.TOP_K](
-                    BF16Ptr(unsafe_from_address=topos[r].scratch_addr(expert_out_lease)),
+                    expert_out_lease.view[BF16, C.TOP_K, C.HIDDEN](sb, C.TOP_K).as_ptr[DType.bfloat16](),
                     lc,
-                    BF16Ptr(unsafe_from_address=topos[r].x_residual(seq_len).ptr))
+                    topos[r].x_residual(seq_len).as_ptr[DType.bfloat16]())
             sample.add(self.profile.phase("expert_sum"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_expert_sum0))
 
             var t_ffn_reduce0 = Int(perf_counter_ns())
@@ -1234,12 +1260,12 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         var t_final0 = Int(perf_counter_ns())
         var final_fence = rmsnorm_gamma_fwht_per_block_quantize[
             C.HIDDEN, LM_OUTPUT_HEAD_FWHT_BLK](
-            host.x_main(seq_len).ptr,
-            host.arena_base + host.host.lm_output_head_sqrt_gamma_off,
-            host.scratch_addr(lm_act_i8_lease),
-            host.scratch_addr(lm_work_lease),
-            host.scratch_addr(lm_act_blk_scale_lease),
-            EPS, 1, self.main_pools[0])
+            host.x_main(seq_len),
+            host.host.lm_output_head_sqrt_gamma.bound(host.arena_base),
+            lm_act_i8_lease.view[I8, 1, C.HIDDEN](host.scratch_base(), 1),
+            lm_work_lease.view[F32, 1, C.HIDDEN](host.scratch_base(), 1),
+            lm_act_blk_scale_lease.view[F32, 1, VOCAB_NUM_BLOCKS](host.scratch_base(), 1),
+            EPS, self.main_pools[0])
         var t_final1 = Int(perf_counter_ns())
         sample.add(self.profile.phase("final_norm"), finish_single_pool_fence(t_final0, t_final1, final_fence^))
 
@@ -1248,16 +1274,16 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         lm_work_lease^.release()
 
         var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
-        var logit_view = scratch_tensor_view[BF16, 1, C.VOCAB_SIZE](host.scratch_base(), logit_lease, 1)
+        var logit_view = logit_lease.view[BF16, 1, C.VOCAB_SIZE](host.scratch_base(), 1)
         var t_lm0 = Int(perf_counter_ns())
         var lm_fence = lm_head_gemv[
             C.VOCAB_SIZE, C.HIDDEN, LM_OUTPUT_HEAD_FWHT_BLK](
-            host.scratch_addr(lm_act_i8_lease),
-            host.host.lm_output_head.addr(host.arena_base),
-            host.scratch_addr(lm_act_blk_scale_lease),
-            host.host.lm_output_head_sc.addr(host.arena_base),
-            host.arena_base + host.host.lm_output_head_colsum_off,
-            logit_view.ptr,
+            lm_act_i8_lease.view[I8, 1, C.HIDDEN](host.scratch_base(), 1),
+            host.host.lm_output_head.bound(host.arena_base),
+            lm_act_blk_scale_lease.view[F32, 1, C.HIDDEN // LM_OUTPUT_HEAD_FWHT_BLK](host.scratch_base(), 1),
+            host.host.lm_output_head_sc.bound(host.arena_base),
+            host.host.lm_output_head_colsum.bound(host.arena_base),
+            logit_view,
             self.main_pools[0])
         var t_lm1 = Int(perf_counter_ns())
         sample.add(self.profile.phase("lm_head"), finish_single_pool_fence(t_lm0, t_lm1, lm_fence^))

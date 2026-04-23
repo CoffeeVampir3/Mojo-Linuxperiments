@@ -12,7 +12,11 @@ from std.collections import InlineArray
 from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY, BF16Ptr
 from threading.threading_traits import BurstThreadPool
 from threading.threading_shared import ptr as tptr
-from modeling.model_spec import Encoding, Shaped, Bound, DynView
+from modeling.model_spec import (
+    Encoding, Shaped, Aligned, HasPtr, Dynamic,
+    StaticTensor, DynamicTensor,
+    StaticView, DynamicView,
+)
 from experimental_gemma.activations import tanh_f32
 from experimental3.kernels.fwht import fwht_block
 
@@ -120,9 +124,12 @@ def embed_lookup_blocked_kernel[cols: Int, fwht_blk: Int](args: BlockedEmbedArgs
 # =============================================================================
 
 
-def embed_lookup_scaled[W: Encoding & Shaped, OutT: Encoding & Shaped,
-    P: BurstThreadPool, origin: MutOrigin, //](
-    table: Bound[W], tokens: Int, output: DynView[OutT],
+def embed_lookup_scaled[
+    W: StaticTensor,
+    OutT: DynamicTensor,
+    P: BurstThreadPool, origin: MutOrigin, //,
+](
+    table: W, tokens: Int, output: OutT,
     scale: Float32,
     ref [origin] pool: P,
 ) -> PoolFence[P, origin] where W.DTYPE == DType.bfloat16:
@@ -130,7 +137,7 @@ def embed_lookup_scaled[W: Encoding & Shaped, OutT: Encoding & Shaped,
     comptime assert OutT.DTYPE == DType.bfloat16, "embed_scaled: output must be bf16"
     comptime assert W.COLS == OutT.COLS, "embed_scaled: table hidden != output hidden"
 
-    var seq_len = output.seq_len
+    var seq_len = output.seq_len()
     if seq_len == 0:
         return PoolFence[P, origin].over(pool)
 
@@ -153,14 +160,16 @@ def embed_lookup_scaled[W: Encoding & Shaped, OutT: Encoding & Shaped,
 
 def embed_lookup_blocked[
     P: BurstThreadPool, origin: MutOrigin, //,
-    W: Encoding & Shaped, ScT: Encoding & Shaped, OutT: Encoding & Shaped,
+    W: StaticTensor,
+    ScT: StaticTensor,
+    OutT: DynamicTensor,
     fwht_blk: Int,
 ](
-    table: Bound[W],
-    blk_scales: Bound[ScT],
+    table: W,
+    blk_scales: ScT,
     inv_smooth: Int,
     tokens: Int,
-    output: DynView[OutT],
+    output: OutT,
     scale: Float32,
     ref [origin] pool: P,
 ) -> PoolFence[P, origin] where W.DTYPE == DType.int8:
@@ -177,7 +186,7 @@ def embed_lookup_blocked[
     comptime assert W.COLS == OutT.COLS, "embed_lookup_blocked: hidden mismatch"
     comptime assert W.COLS % fwht_blk == 0, "embed_lookup_blocked: hidden must be a multiple of fwht_blk"
 
-    var seq_len = output.seq_len
+    var seq_len = output.seq_len()
     if seq_len == 0:
         return PoolFence[P, origin].over(pool)
 
@@ -189,31 +198,31 @@ def embed_lookup_blocked[
         var start = i * rows_per_job
         var end = min(start + rows_per_job, seq_len)
         jobs[i] = BlockedEmbedArgs(
-            table.ptr, blk_scales.ptr, inv_smooth, tokens, output.ptr, scale, start, end)
+            table.addr(), blk_scales.addr(), inv_smooth, tokens, output.addr(), scale, start, end)
 
     pool.dispatch[BlockedEmbedArgs, embed_lookup_blocked_kernel[W.COLS, fwht_blk]](
         UnsafePointer(to=jobs[0]), num_jobs)
     return PoolFence[P, origin].over(pool)
 
 
-def elem_scale[T: Encoding & Shaped](dst: DynView[T], scale: Float32) where T.DTYPE == DType.bfloat16:
+def elem_scale[T: DynamicTensor](dst: T, scale: Float32) where T.DTYPE == DType.bfloat16:
     """In-place scalar multiply: dst *= scale. F32 compute, bf16 I/O."""
     comptime width = simd_width_of[DType.float32]()
     var sv = SIMD[DType.float32, width](scale)
     var dp = dst.as_ptr[DType.bfloat16]()
-    for i in range(0, dst.seq_len * T.COLS, width):
+    for i in range(0, dst.seq_len() * T.COLS, width):
         var v = (dp + i).load[width=width]().cast[DType.float32]()
         (dp + i).store((v * sv).cast[DType.bfloat16]())
 
 
-def logit_softcap[T: Encoding & Shaped](dst: DynView[T]) where T.DTYPE == DType.bfloat16:
+def logit_softcap[T: DynamicTensor](dst: T) where T.DTYPE == DType.bfloat16:
     """In-place logit softcapping: dst = tanh(dst / 30) * 30."""
     comptime width = simd_width_of[DType.float32]()
     comptime cap = Float32(30.0)
     comptime inv_cap = Float32(1.0) / cap
 
     var dp = dst.as_ptr[DType.bfloat16]()
-    for i in range(0, dst.seq_len * T.COLS, width):
+    for i in range(0, dst.seq_len() * T.COLS, width):
         var v = (dp + i).load[width=width]().cast[DType.float32]()
         var capped = tanh_f32(v * inv_cap) * cap
         (dp + i).store(capped.cast[DType.bfloat16]())

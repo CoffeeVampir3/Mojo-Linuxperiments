@@ -5,6 +5,7 @@ from threading.threading_traits import BurstThreadPool
 
 from simd_math import sqrt
 from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY
+from modeling.model_spec import StaticTensor, DynamicTensor
 from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr, BF16Ptr
 from experimental3.kernels.dispatch_args import Int8GemvBlockedArgs, ChunkedAttnArgs
 from experimental3.kernels.gemm import int8_gemv_blocked_worker, int8_gemv_blocked_decode_worker
@@ -24,12 +25,8 @@ from minimax.kernels.attention import kv_write_kernel
 from minimax.kernels.router import TopKResult, router_fused_worker
 
 
-@always_inline
-
-
 # ============================================================================
 # Fused router — f32 GEMV + sigmoid + bias + local top-K (phase 1)
-# and cross-worker merge + renorm (phase 2).
 # ============================================================================
 
 
@@ -42,15 +39,27 @@ def router_num_workers[num_experts: Int, k: Int](pool_capacity: Int) -> Int:
     return min(max_workers, pool_capacity)
 
 
-def router_fused_dispatch[P: BurstThreadPool, origin: MutOrigin, //, num_experts: Int, hidden: Int, k: Int](
-    act_bf16: BF16Ptr,
-    weight_f32: F32Ptr,
-    bias_f32: F32Ptr,
+def router_fused_dispatch[
+    ActT: DynamicTensor, WT: StaticTensor, BT: StaticTensor,
+    P: BurstThreadPool, origin: MutOrigin, //,
+    num_experts: Int, hidden: Int, k: Int,
+](
+    act_bf16: ActT,
+    weight_f32: WT,
+    bias_f32: BT,
     candidates: U8Ptr,
     ref [origin] pool: P,
 ) -> PoolFence[P, origin]:
+    comptime assert ActT.DTYPE == DType.bfloat16, "router_fused: act must be bf16"
+    comptime assert WT.DTYPE == DType.float32, "router_fused: weight must be f32"
+    comptime assert BT.DTYPE == DType.float32, "router_fused: bias must be f32"
+
     var num_workers = router_num_workers[num_experts, k](pool.get_capacity())
     var rows_per_worker = (num_experts + num_workers - 1) // num_workers
+
+    var act_p = act_bf16.as_ptr[DType.bfloat16]()
+    var weight_p = weight_f32.as_ptr[DType.float32]()
+    var bias_p = bias_f32.as_ptr[DType.float32]()
 
     var jobs = InlineArray[RouterFusedArgs, MAX_POOL_CAPACITY](
         fill=RouterFusedArgs())
@@ -62,7 +71,7 @@ def router_fused_dispatch[P: BurstThreadPool, origin: MutOrigin, //, num_experts
         var count = min(rows_per_worker, num_experts - start)
         var slot = candidates + i * k * size_of[RouterCandidate]()
         jobs[actual] = RouterFusedArgs(
-            act_bf16, weight_f32, bias_f32, slot, start, count)
+            act_p, weight_p, bias_p, slot, start, count)
         actual += 1
 
     pool.dispatch[RouterFusedArgs, router_fused_worker[hidden, k]](
@@ -76,33 +85,54 @@ def router_fused_dispatch[P: BurstThreadPool, origin: MutOrigin, //, num_experts
 
 
 def kv_write_dispatch[
+    QT: DynamicTensor, KT: DynamicTensor, VT: DynamicTensor,
+    QnT: StaticTensor, KnT: StaticTensor,
+    CosT: StaticTensor, SinT: StaticTensor,
     P: BurstThreadPool, origin: MutOrigin, //,
     head_dim: Int, rope_dim: Int, pair_stride: Int,
     max_seq: Int, num_kv_heads: Int,
 ](
-    q_bf16_base: Int, k_bf16_base: Int, v_bf16_base: Int,
-    q_norm_ptr: Int, k_norm_ptr: Int,
-    cos_ptr: Int, sin_ptr: Int,
+    q_bf16: QT, k_bf16: KT, v_bf16: VT,
+    q_norm: QnT, k_norm: KnT,
+    cos_table: CosT, sin_table: SinT,
     inv_rms_q: Float32, inv_rms_k: Float32,
     cache_base: Int, cache_pos: Int,
     ref [origin] pool: P,
 ) -> PoolFence[P, origin]:
+    comptime assert QT.DTYPE == DType.bfloat16, "kv_write: q must be bf16"
+    comptime assert KT.DTYPE == DType.bfloat16, "kv_write: k must be bf16"
+    comptime assert VT.DTYPE == DType.bfloat16, "kv_write: v must be bf16"
+    comptime assert QnT.DTYPE == DType.bfloat16, "kv_write: q_norm must be bf16"
+    comptime assert KnT.DTYPE == DType.bfloat16, "kv_write: k_norm must be bf16"
+    comptime assert CosT.DTYPE == DType.float32, "kv_write: cos must be f32"
+    comptime assert SinT.DTYPE == DType.float32, "kv_write: sin must be f32"
+
     comptime HPG = 1
     var jobs = InlineArray[AttnGroupArgs, 8](fill=AttnGroupArgs())
     comptime K_HEAD_BF16 = head_dim * 2
     comptime V_HEAD_BF16 = head_dim * 2
+
+    var q_p = q_bf16.as_ptr[DType.bfloat16]()
+    var k_p = k_bf16.as_ptr[DType.bfloat16]()
+    var v_p = v_bf16.as_ptr[DType.bfloat16]()
+    var q_norm_p = q_norm.as_ptr[DType.bfloat16]()
+    var k_norm_p = k_norm.as_ptr[DType.bfloat16]()
+    var cos_p = cos_table.as_ptr[DType.float32]()
+    var sin_p = sin_table.as_ptr[DType.float32]()
+    var cache = U8Ptr(unsafe_from_address=cache_base)
+
     for g in range(num_kv_heads):
         jobs[g] = AttnGroupArgs(
-            q_bf16_base=BF16Ptr(unsafe_from_address=q_bf16_base),
-            k_bf16_ptr=BF16Ptr(unsafe_from_address=k_bf16_base + g * K_HEAD_BF16),
-            v_bf16_ptr=BF16Ptr(unsafe_from_address=v_bf16_base + g * V_HEAD_BF16),
-            q_norm_ptr=BF16Ptr(unsafe_from_address=q_norm_ptr),
-            k_norm_ptr=BF16Ptr(unsafe_from_address=k_norm_ptr + g * K_HEAD_BF16),
-            cos_ptr=F32Ptr(unsafe_from_address=cos_ptr),
-            sin_ptr=F32Ptr(unsafe_from_address=sin_ptr),
+            q_bf16_base=q_p,
+            k_bf16_ptr=k_p + g * head_dim,
+            v_bf16_ptr=v_p + g * head_dim,
+            q_norm_ptr=q_norm_p,
+            k_norm_ptr=k_norm_p + g * head_dim,
+            cos_ptr=cos_p,
+            sin_ptr=sin_p,
             inv_rms_q=inv_rms_q,
             inv_rms_k=inv_rms_k,
-            cache_base=U8Ptr(unsafe_from_address=cache_base),
+            cache_base=cache,
             cache_pos=cache_pos,
             kv_head=g,
             context_len=0,
@@ -115,7 +145,7 @@ def kv_write_dispatch[
 
 
 # ============================================================================
-# Attention phase B: Q prep + chunked scoring — reuses cp_chunked_attn_kernel
+# Q prep kernel — called on the main thread, reuses AttnGroupArgs plumbing
 # ============================================================================
 
 
@@ -216,31 +246,30 @@ def chunked_score_dispatch_multi[
 
 
 # ============================================================================
-# Attention phase C: local merge + quantize — no cross-rank gather
-# ============================================================================
-
-
-# ============================================================================
 # MoE phase 1 — expert gate(w1) + up(w3) + SiLU + FWHT + quantize
 # ============================================================================
 
 
 def minimax_moe_phase1[
+    AT: DynamicTensor, AsT: DynamicTensor,
+    W1T: StaticTensor, W1ScT: StaticTensor, W1CsT: StaticTensor,
+    W3T: StaticTensor, W3ScT: StaticTensor, W3CsT: StaticTensor,
+    QiT: DynamicTensor, BScT: DynamicTensor,
     P: BurstThreadPool, origin: MutOrigin, //,
     intermediate: Int, hidden: Int, fwht_blk: Int,
     top_k: Int, num_experts: Int, tp: Int,
 ](
-    act_i8: I8Ptr,
-    act_scale: F32Ptr,
+    act_i8: AT,
+    act_scale: AsT,
     routing: TopKResult[top_k],
-    w1_base: Int, w1_stride: Int,
-    w1_sc_base: Int, w1_sc_stride: Int,
-    w1_cs_base: Int, w1_cs_stride: Int,
-    w3_base: Int, w3_stride: Int,
-    w3_sc_base: Int, w3_sc_stride: Int,
-    w3_cs_base: Int, w3_cs_stride: Int,
-    expert_qi: I8Ptr,
-    expert_blk_scale: F32Ptr,
+    w1: W1T, w1_stride: Int,
+    w1_sc: W1ScT, w1_sc_stride: Int,
+    w1_cs: W1CsT, w1_cs_stride: Int,
+    w3: W3T, w3_stride: Int,
+    w3_sc: W3ScT, w3_sc_stride: Int,
+    w3_cs: W3CsT, w3_cs_stride: Int,
+    expert_qi: QiT,
+    expert_blk_scale: BScT,
     rank: Int,
     ref [origin] pool: P,
 ) -> PoolFence[P, origin]:
@@ -249,6 +278,17 @@ def minimax_moe_phase1[
     Filters routing.indices to experts owned by this rank, then builds
     N-tile-sharded FusedW1W3SiluArgs jobs across all local experts.
     """
+    comptime assert AT.DTYPE == DType.int8, "moe_phase1: act must be i8"
+    comptime assert AsT.DTYPE == DType.float32, "moe_phase1: act_scale must be f32"
+    comptime assert W1T.DTYPE == DType.int8, "moe_phase1: w1 must be i8"
+    comptime assert W1ScT.DTYPE == DType.float32, "moe_phase1: w1_sc must be f32"
+    comptime assert W1CsT.DTYPE == DType.float32, "moe_phase1: w1_cs must be f32"
+    comptime assert W3T.DTYPE == DType.int8, "moe_phase1: w3 must be i8"
+    comptime assert W3ScT.DTYPE == DType.float32, "moe_phase1: w3_sc must be f32"
+    comptime assert W3CsT.DTYPE == DType.float32, "moe_phase1: w3_cs must be f32"
+    comptime assert QiT.DTYPE == DType.int8, "moe_phase1: expert_qi must be i8"
+    comptime assert BScT.DTYPE == DType.float32, "moe_phase1: expert_blk_scale must be f32"
+
     comptime n_tiles = intermediate // fwht_blk
     comptime experts_per_rank = num_experts // tp
 
@@ -273,6 +313,17 @@ def minimax_moe_phase1[
         workers_per_expert = n_tiles
     var tiles_per_worker = (n_tiles + workers_per_expert - 1) // workers_per_expert
 
+    var act_p = act_i8.as_ptr[DType.int8]()
+    var act_scale_p = act_scale.as_ptr[DType.float32]()
+    var w1_base = w1.addr()
+    var w1_sc_base = w1_sc.addr()
+    var w1_cs_base = w1_cs.addr()
+    var w3_base = w3.addr()
+    var w3_sc_base = w3_sc.addr()
+    var w3_cs_base = w3_cs.addr()
+    var expert_qi_p = expert_qi.as_ptr[DType.int8]()
+    var expert_blk_scale_p = expert_blk_scale.as_ptr[DType.float32]()
+
     var jobs = InlineArray[FusedW1W3SiluArgs, MAX_POOL_CAPACITY](
         fill=FusedW1W3SiluArgs())
 
@@ -282,14 +333,14 @@ def minimax_moe_phase1[
         var eid = routing.indices[s]
         var local_idx = eid - expert_base
 
-        var w1p = U8Ptr(unsafe_from_address=w1_base + local_idx * w1_stride)
+        var w1p = I8Ptr(unsafe_from_address=w1_base + local_idx * w1_stride)
         var w1s = F32Ptr(unsafe_from_address=w1_sc_base + local_idx * w1_sc_stride)
         var w1c = F32Ptr(unsafe_from_address=w1_cs_base + local_idx * w1_cs_stride)
-        var w3p = U8Ptr(unsafe_from_address=w3_base + local_idx * w3_stride)
+        var w3p = I8Ptr(unsafe_from_address=w3_base + local_idx * w3_stride)
         var w3s = F32Ptr(unsafe_from_address=w3_sc_base + local_idx * w3_sc_stride)
         var w3c = F32Ptr(unsafe_from_address=w3_cs_base + local_idx * w3_cs_stride)
-        var qi_out = expert_qi + li * intermediate
-        var blk_out = expert_blk_scale + li * n_tiles
+        var qi_out = expert_qi_p + li * intermediate
+        var blk_out = expert_blk_scale_p + li * n_tiles
 
         for w in range(workers_per_expert):
             var tile_start = w * tiles_per_worker
@@ -299,7 +350,7 @@ def minimax_moe_phase1[
             var n_start = tile_start * fwht_blk
             var n_count = (tile_end - tile_start) * fwht_blk
             jobs[num_jobs] = FusedW1W3SiluArgs(
-                act_i8, act_scale,
+                act_p, act_scale_p,
                 w1p, w1s, w1c,
                 w3p, w3s, w3c,
                 qi_out + n_start,
@@ -318,17 +369,20 @@ def minimax_moe_phase1[
 
 
 def minimax_moe_phase2[
+    QiT: DynamicTensor, BScT: DynamicTensor,
+    DnT: StaticTensor, DnScT: StaticTensor, DnCsT: StaticTensor,
+    OutT: DynamicTensor,
     P: BurstThreadPool, origin: MutOrigin, //,
     hidden: Int, intermediate: Int, fwht_blk: Int,
     top_k: Int, num_experts: Int, tp: Int,
 ](
-    expert_qi: I8Ptr,
-    expert_blk_scale: F32Ptr,
+    expert_qi: QiT,
+    expert_blk_scale: BScT,
     routing: TopKResult[top_k],
-    down_base: Int, down_stride: Int,
-    down_sc_base: Int, down_sc_stride: Int,
-    down_bcs_base: Int, down_bcs_stride: Int,
-    expert_out_buf: BF16Ptr,
+    down: DnT, down_stride: Int,
+    down_sc: DnScT, down_sc_stride: Int,
+    down_bcs: DnCsT, down_bcs_stride: Int,
+    expert_out_buf: OutT,
     rank: Int,
     ref [origin] pool: P,
 ) -> PoolFence[P, origin]:
@@ -337,6 +391,13 @@ def minimax_moe_phase2[
     N-tile sharded: each expert's hidden-dimension output is split across
     workers, matching the phase1 pattern.
     """
+    comptime assert QiT.DTYPE == DType.int8, "moe_phase2: expert_qi must be i8"
+    comptime assert BScT.DTYPE == DType.float32, "moe_phase2: expert_blk_scale must be f32"
+    comptime assert DnT.DTYPE == DType.int8, "moe_phase2: down must be i8"
+    comptime assert DnScT.DTYPE == DType.float32, "moe_phase2: down_sc must be f32"
+    comptime assert DnCsT.DTYPE == DType.float32, "moe_phase2: down_bcs must be f32"
+    comptime assert OutT.DTYPE == DType.bfloat16, "moe_phase2: expert_out_buf must be bf16"
+
     comptime num_blocks = intermediate // fwht_blk
     comptime experts_per_rank = num_experts // tp
     var pool_capacity = pool.get_capacity()
@@ -361,6 +422,13 @@ def minimax_moe_phase2[
         workers_per_expert = max_n_workers
     var n_per_worker = ((max_n_workers + workers_per_expert - 1) // workers_per_expert) * VNNI_N_STEP
 
+    var expert_qi_p = expert_qi.as_ptr[DType.int8]()
+    var expert_blk_scale_p = expert_blk_scale.as_ptr[DType.float32]()
+    var down_base = down.addr()
+    var down_sc_base = down_sc.addr()
+    var down_bcs_base = down_bcs.addr()
+    var expert_out_p = expert_out_buf.as_ptr[DType.bfloat16]()
+
     var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](
         fill=Int8GemvBlockedArgs())
 
@@ -370,12 +438,12 @@ def minimax_moe_phase2[
         var eid = routing.indices[s]
         var local_idx = eid - expert_base
 
-        var act = expert_qi + li * intermediate
-        var wpacked = U8Ptr(unsafe_from_address=down_base + local_idx * down_stride)
-        var blk_scale = expert_blk_scale + li * num_blocks
+        var act = expert_qi_p + li * intermediate
+        var wpacked = I8Ptr(unsafe_from_address=down_base + local_idx * down_stride)
+        var blk_scale = expert_blk_scale_p + li * num_blocks
         var wscale = F32Ptr(unsafe_from_address=down_sc_base + local_idx * down_sc_stride)
         var blk_colsum = F32Ptr(unsafe_from_address=down_bcs_base + local_idx * down_bcs_stride)
-        var dst = expert_out_buf + li * hidden
+        var dst = expert_out_p + li * hidden
         var weight = routing.weights[s]
 
         for w in range(workers_per_expert):
@@ -394,5 +462,3 @@ def minimax_moe_phase2[
         int8_gemv_blocked_decode_worker[hidden, intermediate, fwht_blk]](
         UnsafePointer(to=jobs[0]), num_jobs)
     return PoolFence[P, origin].over(pool)
-
-

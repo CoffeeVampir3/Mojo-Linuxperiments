@@ -7,7 +7,11 @@ from std.math import log, sqrt
 from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 
-from modeling.model_spec import Encoding, Shaped, Bound, DynView
+from modeling.model_spec import (
+    Encoding, Shaped, Aligned, HasPtr, Dynamic,
+    StaticTensor, DynamicTensor,
+    StaticView, DynamicView,
+)
 from simd_math import sincos
 
 
@@ -66,7 +70,7 @@ def yarn_linear_ramp(low: Int, high: Int, i: Int) -> Float64:
 
 
 def init_rope_tables[CosT: Encoding & Shaped, SinT: Encoding & Shaped](
-    cos_buf: Bound[CosT], sin_buf: Bound[SinT],
+    cos_buf: StaticView[CosT], sin_buf: StaticView[SinT],
     theta: Float64 = 10000.0,
     factor: Float64 = 1.0,
     original_max_pos: Int = 4096,
@@ -151,12 +155,13 @@ def rope_apply[
     num_blocks: Int,
     block_stride: Int,
     block_offset: Int,
-    CosT: Encoding & Shaped, SinT: Encoding & Shaped,
+    CosT: StaticTensor,
+    SinT: StaticTensor,
 ](
     ptr: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     row_stride: Int,
     seq_len: Int,
-    cos_table: Bound[CosT], sin_table: Bound[SinT],
+    cos_table: CosT, sin_table: SinT,
     pos: Int,
 ) where CosT.DTYPE == DType.float32:
     """Apply half-split RoPE rotation in-place.
@@ -201,12 +206,13 @@ def rope_apply_partial[
     num_blocks: Int,
     block_stride: Int,
     block_offset: Int,
-    CosT: Encoding & Shaped, SinT: Encoding & Shaped,
+    CosT: StaticTensor,
+    SinT: StaticTensor,
 ](
     ptr: UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin],
     row_stride: Int,
     seq_len: Int,
-    cos_table: Bound[CosT], sin_table: Bound[SinT],
+    cos_table: CosT, sin_table: SinT,
     pos: Int,
 ) where CosT.DTYPE == DType.float32:
     """Apply RoPE in-place to only the leading rotary_dim channels of each head.
@@ -247,13 +253,15 @@ def rope_apply_partial[
 
 
 # =============================================================================
-# Typed wrappers — constrain shapes at compile time via DynView
+# Typed wrappers — constrain shapes at compile time via DynamicView
 # =============================================================================
 
 
 def rope[head_dim: Int, num_heads: Int,
-    XT: Encoding & Shaped, CosT: Encoding & Shaped, SinT: Encoding & Shaped](
-    x: DynView[XT], cos_table: Bound[CosT], sin_table: Bound[SinT], pos: Int,
+    XT: DynamicTensor,
+    CosT: StaticTensor,
+    SinT: StaticTensor](
+    x: XT, cos_table: CosT, sin_table: SinT, pos: Int,
 ) where CosT.DTYPE == DType.float32:
     """Standard RoPE: rotate full head_dim per head."""
     comptime assert XT.DTYPE == DType.bfloat16, "rope: must be bf16"
@@ -261,13 +269,15 @@ def rope[head_dim: Int, num_heads: Int,
 
     var xp = x.as_ptr[DType.bfloat16]()
     rope_apply[head_dim, num_heads, head_dim, 0](
-        xp, XT.COLS, x.seq_len, cos_table, sin_table, pos,
+        xp, XT.COLS, x.seq_len(), cos_table, sin_table, pos,
     )
 
 
 def rope_partial[head_dim: Int, rotary_dim: Int, pair_stride: Int, num_heads: Int,
-    XT: Encoding & Shaped, CosT: Encoding & Shaped, SinT: Encoding & Shaped](
-    x: DynView[XT], cos_table: Bound[CosT], sin_table: Bound[SinT], pos: Int,
+    XT: DynamicTensor,
+    CosT: StaticTensor,
+    SinT: StaticTensor](
+    x: XT, cos_table: CosT, sin_table: SinT, pos: Int,
 ) where CosT.DTYPE == DType.float32:
     """RoPE wrapper for heads where only a prefix of channels is rotary."""
     comptime assert XT.DTYPE == DType.bfloat16, "rope partial: must be bf16"
@@ -275,15 +285,17 @@ def rope_partial[head_dim: Int, rotary_dim: Int, pair_stride: Int, num_heads: In
 
     var xp = x.as_ptr[DType.bfloat16]()
     rope_apply_partial[head_dim, rotary_dim, pair_stride, num_heads, head_dim, 0](
-        xp, XT.COLS, x.seq_len, cos_table, sin_table, pos,
+        xp, XT.COLS, x.seq_len(), cos_table, sin_table, pos,
     )
 
 
 def mla_rope_q[
     rope_dim: Int, nope_dim: Int, num_heads: Int,
-    XT: Encoding & Shaped, CosT: Encoding & Shaped, SinT: Encoding & Shaped,
+    XT: DynamicTensor,
+    CosT: StaticTensor,
+    SinT: StaticTensor,
 ](
-    x: DynView[XT], cos_table: Bound[CosT], sin_table: Bound[SinT], pos: Int,
+    x: XT, cos_table: CosT, sin_table: SinT, pos: Int,
 ) where CosT.DTYPE == DType.float32:
     """MLA query RoPE: rotate only the q_pe portion of each head."""
     comptime head_dim = nope_dim + rope_dim
@@ -292,15 +304,17 @@ def mla_rope_q[
 
     var xp = x.as_ptr[DType.bfloat16]()
     rope_apply[rope_dim, num_heads, head_dim, nope_dim](
-        xp, XT.COLS, x.seq_len, cos_table, sin_table, pos,
+        xp, XT.COLS, x.seq_len(), cos_table, sin_table, pos,
     )
 
 
 def mla_rope_kr[
     rope_dim: Int,
-    XT: Encoding & Shaped, CosT: Encoding & Shaped, SinT: Encoding & Shaped,
+    XT: DynamicTensor,
+    CosT: StaticTensor,
+    SinT: StaticTensor,
 ](
-    x: DynView[XT], cos_table: Bound[CosT], sin_table: Bound[SinT], pos: Int,
+    x: XT, cos_table: CosT, sin_table: SinT, pos: Int,
 ) where CosT.DTYPE == DType.float32:
     """MLA key RoPE: rotate the k_R tail of the kv_a output."""
     comptime kv_lora_rank = XT.COLS - rope_dim
@@ -308,5 +322,5 @@ def mla_rope_kr[
 
     var xp = x.as_ptr[DType.bfloat16]()
     rope_apply[rope_dim, 1, XT.COLS, kv_lora_rank](
-        xp, XT.COLS, x.seq_len, cos_table, sin_table, pos,
+        xp, XT.COLS, x.seq_len(), cos_table, sin_table, pos,
     )

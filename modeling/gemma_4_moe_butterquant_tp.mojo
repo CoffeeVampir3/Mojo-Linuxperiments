@@ -18,7 +18,7 @@ from threading.threading_traits import BurstThreadPool
 
 from modeling.model_spec import (
     Encoding, Shaped, BF16, F32, I8,
-    Shape, ShapeLike, Mat, DynView, Bound,
+    Shape, ShapeLike, Mat, DynamicView, StaticView,
     WeightDesc, DEFAULT_ALIGNMENT, LogitsView,
     TaskVisitor, PerRow, PerBlockAbsorbed,
 )
@@ -29,8 +29,8 @@ from modeling.gemma4_common import (
 from modeling.modeling_common import (
     SlotOffset, Repeated, SectionBuilder, align_up,
     StaticTensorView, DynamicTensorView,
-    static_tensor_view, dynamic_tensor_view,
-    scratch_tensor_view, scratch_ptr,
+    dynamic_tensor_view,
+    scratch_ptr,
     LayerShard, LayerBuilder,
 )
 from kernels.kernel_ops import PoolFence, BF16Ptr
@@ -130,9 +130,9 @@ struct SlidingAttnRefs[tp: Int](Copyable, ImplicitlyCopyable):
     var o_proj_sc: SlotOffset[F32, Shape[C.HIDDEN, 1]]
     var q_norm:    SlotOffset[BF16, Shape[C.HEAD_DIM_SLIDING, 1]]
     var k_norm:    SlotOffset[BF16, Shape[C.HEAD_DIM_SLIDING, 1]]
-    var q_colsum: Int
-    var kv_colsum: Int
-    var o_colsum: Int
+    var q_colsum:  SlotOffset[F32, Shape[C.Q_DIM_SLIDING // Self.tp, 1]]
+    var kv_colsum: SlotOffset[F32, Shape[2 * (C.KV_DIM_SLIDING // Self.tp), 1]]
+    var o_colsum:  SlotOffset[F32, Shape[C.HIDDEN * (C.NUM_HEADS // Self.tp), 1]]
 
 
 @fieldwise_init
@@ -145,9 +145,9 @@ struct FullAttnRefs[tp: Int](Copyable, ImplicitlyCopyable):
     var o_proj_sc: SlotOffset[F32, Shape[C.HIDDEN, 1]]
     var q_norm:    SlotOffset[BF16, Shape[C.HEAD_DIM_FULL, 1]]
     var k_norm:    SlotOffset[BF16, Shape[C.HEAD_DIM_FULL, 1]]
-    var q_colsum: Int
-    var k_colsum: Int
-    var o_colsum: Int
+    var q_colsum:  SlotOffset[F32, Shape[C.Q_DIM_FULL // Self.tp, 1]]
+    var k_colsum:  SlotOffset[F32, Shape[C.KV_DIM_FULL, 1]]
+    var o_colsum:  SlotOffset[F32, Shape[C.HIDDEN * (C.NUM_HEADS // Self.tp), 1]]
 
 
 @fieldwise_init
@@ -175,11 +175,11 @@ struct BodyRefs[tp: Int](Copyable, ImplicitlyCopyable):
     var experts_gate_up_sc: SlotOffset[F32, Shape[C.NUM_EXPERTS * C.MOE_GATE_UP_FUSED, 1]]
     var experts_down:       SlotOffset[I8, Shape[C.NUM_EXPERTS * C.HIDDEN, C.MOE_INTERMEDIATE]]
     var experts_down_sc:    SlotOffset[F32, Shape[C.NUM_EXPERTS * C.HIDDEN, 1]]
-    var gu_colsum: Int
-    var down_colsum: Int
-    var router_colsum: Int
-    var experts_gu_colsum: Int
-    var experts_down_colsum: Int
+    var gu_colsum:           SlotOffset[F32, Shape[Self.S.DENSE_INT_LOCAL * 2, 1]]
+    var down_colsum:         SlotOffset[F32, Shape[C.HIDDEN * Self.S.DENSE_DOWN_NUM_BLK, 1]]
+    var router_colsum:       SlotOffset[F32, Shape[C.NUM_EXPERTS, 1]]
+    var experts_gu_colsum:   SlotOffset[F32, Shape[(C.NUM_EXPERTS // Self.tp) * C.MOE_GATE_UP_FUSED, 1]]
+    var experts_down_colsum: SlotOffset[F32, Shape[(C.NUM_EXPERTS // Self.tp) * C.HIDDEN * MOE_NUM_BLOCKS, 1]]
 
 
 @fieldwise_init
@@ -216,9 +216,9 @@ struct HostSlots(Copyable, ImplicitlyCopyable):
     var final_norm: SlotOffset[BF16, Shape[C.HIDDEN, 1]]
     var embed:      SlotOffset[I8, Shape[C.VOCAB_SIZE, C.HIDDEN]]
     var embed_sc:   SlotOffset[F32, Shape[C.VOCAB_SIZE, C.HIDDEN // LM_HEAD_FWHT_BLK]]
-    var embed_colsum_off: Int
-    var sqrt_gamma_off: Int
-    var inv_sqrt_gamma_off: Int
+    var embed_colsum:    SlotOffset[F32, Shape[C.VOCAB_SIZE, C.HIDDEN // LM_HEAD_FWHT_BLK]]
+    var sqrt_gamma:      SlotOffset[BF16, Shape[C.HIDDEN, 1]]
+    var inv_sqrt_gamma:  SlotOffset[F32, Shape[C.HIDDEN, 1]]
 
 
 # =============================================================================
@@ -296,12 +296,28 @@ struct Gemma4Topology[tp: Int](Copyable, ImplicitlyCopyable):
         return self.state_base() + self.full_cache_off + idx * self.full_cache_stride
 
     @always_inline
-    def sliding_cos_row(self, pos: Int) -> Int:
-        return self.state_base() + self.sliding_rope.cos.offset + pos * (C.HEAD_DIM_SLIDING // 2) * size_of[Float32]()
+    def sliding_cos_row(self, pos: Int) -> StaticView[Mat[F32, 1, C.HEAD_DIM_SLIDING // 2]]:
+        var off = self.state_base() + self.sliding_rope.cos.offset + pos * (C.HEAD_DIM_SLIDING // 2) * size_of[Float32]()
+        return StaticView[Mat[F32, 1, C.HEAD_DIM_SLIDING // 2]](
+            UnsafePointer[Scalar[F32.DTYPE], MutAnyOrigin](unsafe_from_address=off))
 
     @always_inline
-    def sliding_sin_row(self, pos: Int) -> Int:
-        return self.state_base() + self.sliding_rope.sin.offset + pos * (C.HEAD_DIM_SLIDING // 2) * size_of[Float32]()
+    def sliding_sin_row(self, pos: Int) -> StaticView[Mat[F32, 1, C.HEAD_DIM_SLIDING // 2]]:
+        var off = self.state_base() + self.sliding_rope.sin.offset + pos * (C.HEAD_DIM_SLIDING // 2) * size_of[Float32]()
+        return StaticView[Mat[F32, 1, C.HEAD_DIM_SLIDING // 2]](
+            UnsafePointer[Scalar[F32.DTYPE], MutAnyOrigin](unsafe_from_address=off))
+
+    @always_inline
+    def full_cos_row(self, pos: Int) -> StaticView[Mat[F32, 1, 64]]:
+        var off = self.state_base() + self.full_rope.cos.offset + pos * 64 * size_of[Float32]()
+        return StaticView[Mat[F32, 1, 64]](
+            UnsafePointer[Scalar[F32.DTYPE], MutAnyOrigin](unsafe_from_address=off))
+
+    @always_inline
+    def full_sin_row(self, pos: Int) -> StaticView[Mat[F32, 1, 64]]:
+        var off = self.state_base() + self.full_rope.sin.offset + pos * 64 * size_of[Float32]()
+        return StaticView[Mat[F32, 1, 64]](
+            UnsafePointer[Scalar[F32.DTYPE], MutAnyOrigin](unsafe_from_address=off))
 
 
 # =============================================================================
@@ -366,11 +382,11 @@ def emit_body[tp: Int](mut b: LayerBuilder, mut e: List[WeightDesc]) -> BodyRefs
         b.q(e, "experts.down_proj", NE * H, MI, ROW))
     var experts_down_sc = SlotOffset[F32, Shape[NE * H, 1]](
         b.f(e, "experts.down_proj_scale", NE * H, 1, ROW))
-    var gu_colsum = b.colsum(S.DENSE_INT_LOCAL * 2 * 4)
-    var down_colsum = b.colsum(H * S.DENSE_DOWN_NUM_BLK * 4)
-    var router_colsum = b.colsum(NE * 4)
-    var experts_gu_colsum = b.colsum(experts_local * GU * 4)
-    var experts_down_colsum = b.colsum(experts_local * H * MOE_NUM_BLOCKS * 4)
+    var gu_colsum = b.colsum_slot[F32, Shape[S.DENSE_INT_LOCAL * 2, 1]]()
+    var down_colsum = b.colsum_slot[F32, Shape[H * S.DENSE_DOWN_NUM_BLK, 1]]()
+    var router_colsum = b.colsum_slot[F32, Shape[NE, 1]]()
+    var experts_gu_colsum = b.colsum_slot[F32, Shape[experts_local * GU, 1]]()
+    var experts_down_colsum = b.colsum_slot[F32, Shape[experts_local * H * MOE_NUM_BLOCKS, 1]]()
 
     return BodyRefs[tp](
         input_norm=input_norm,
@@ -424,9 +440,9 @@ def emit_sliding[tp: Int](
         o_proj_sc = SlotOffset[F32, Shape[H, 1]](b.f(e, "self_attn.o_proj.weight_scale", H, 1, REPL)),
         q_norm    = SlotOffset[BF16, Shape[HDS, 1]](b.bf(e, "self_attn.q_norm.weight", HDS, 1, REPL)),
         k_norm    = SlotOffset[BF16, Shape[HDS, 1]](b.bf(e, "self_attn.k_norm.weight", HDS, 1, REPL)),
-        q_colsum  = b.colsum(q_n_loc * 4),
-        kv_colsum = b.colsum(kv_n * 4),
-        o_colsum  = b.colsum(H * o_num_blk * 4),
+        q_colsum  = b.colsum_slot[F32, Shape[C.Q_DIM_SLIDING // tp, 1]](),
+        kv_colsum = b.colsum_slot[F32, Shape[2 * (C.KV_DIM_SLIDING // tp), 1]](),
+        o_colsum  = b.colsum_slot[F32, Shape[H * (C.NUM_HEADS // tp), 1]](),
     )
     return (SlidingLayerRefs[tp](attn=attn, body=emit_body[tp](b, e)), b.cursor)
 
@@ -449,9 +465,9 @@ def emit_full[tp: Int](
         o_proj_sc = SlotOffset[F32, Shape[H, 1]](b.f(e, "self_attn.o_proj.weight_scale", H, 1, REPL)),
         q_norm    = SlotOffset[BF16, Shape[HDF, 1]](b.bf(e, "self_attn.q_norm.weight", HDF, 1, REPL)),
         k_norm    = SlotOffset[BF16, Shape[HDF, 1]](b.bf(e, "self_attn.k_norm.weight", HDF, 1, REPL)),
-        q_colsum  = b.colsum(q_n_loc * 4),
-        k_colsum  = b.colsum(C.KV_DIM_FULL * 4),
-        o_colsum  = b.colsum(H * o_num_blk * 4),
+        q_colsum  = b.colsum_slot[F32, Shape[C.Q_DIM_FULL // tp, 1]](),
+        k_colsum  = b.colsum_slot[F32, Shape[C.KV_DIM_FULL, 1]](),
+        o_colsum  = b.colsum_slot[F32, Shape[H * (C.NUM_HEADS // tp), 1]](),
     )
     return (FullLayerRefs[tp](attn=attn, body=emit_body[tp](b, e)), b.cursor)
 
@@ -620,19 +636,18 @@ def build_gemma4_plan[tp: Int]() -> Gemma4LoadPlan[tp]:
     var final_norm_off = hb.bf(descs, "model.language_model.norm.weight", C.HIDDEN, 1, HOST)
     var embed_off = hb.q(descs, "model.language_model.embed_tokens.weight", C.VOCAB_SIZE, C.HIDDEN, HOST)
     var embed_sc_off = hb.f(descs, "model.language_model.embed_tokens.weight_scale", C.VOCAB_SIZE, vocab_num_blocks, HOST)
-    var embed_colsum_bytes = C.VOCAB_SIZE * vocab_num_blocks * f32
-    var embed_colsum_off = hb.colsum(embed_colsum_bytes)
-    var sqrt_gamma_off = embed_colsum_off + embed_colsum_bytes
-    var inv_sqrt_gamma_off = sqrt_gamma_off + C.HIDDEN * bf16
-    var host_bytes = inv_sqrt_gamma_off + C.HIDDEN * f32
+    var embed_colsum = hb.colsum_slot[F32, Shape[C.VOCAB_SIZE, vocab_num_blocks]]()
+    var sqrt_gamma = hb.colsum_slot[BF16, Shape[C.HIDDEN, 1]]()
+    var inv_sqrt_gamma = hb.colsum_slot[F32, Shape[C.HIDDEN, 1]]()
+    var host_bytes = hb.cursor
 
     var host = HostSlots(
         final_norm=SlotOffset[BF16, Shape[C.HIDDEN, 1]](final_norm_off),
         embed=SlotOffset[I8, Shape[C.VOCAB_SIZE, C.HIDDEN]](embed_off),
         embed_sc=SlotOffset[F32, Shape[C.VOCAB_SIZE, vocab_num_blocks]](embed_sc_off),
-        embed_colsum_off=embed_colsum_off,
-        sqrt_gamma_off=sqrt_gamma_off,
-        inv_sqrt_gamma_off=inv_sqrt_gamma_off)
+        embed_colsum=embed_colsum,
+        sqrt_gamma=sqrt_gamma,
+        inv_sqrt_gamma=inv_sqrt_gamma)
 
     var topo = Gemma4Topology[tp](
         arena_base=0,
@@ -684,18 +699,18 @@ def init_layer_body_padding[tp: Int](arena_base: Int, layer_off: Int, body: Body
 def init_layer_body_colsums[tp: Int](arena_base: Int, layer_off: Int, body: BodyRefs[tp]):
     comptime experts_local = C.NUM_EXPERTS // tp
     comptime S = Gemma4Shapes[tp]
-    colsum_at(arena_base, layer_off + body.gate_proj.offset, layer_off + body.gu_colsum,
+    colsum_at(arena_base, layer_off + body.gate_proj.offset, layer_off + body.gu_colsum.offset,
         S.DENSE_INT_LOCAL * 2, C.HIDDEN)
-    block_colsum_at(arena_base, layer_off + body.down_proj.offset, layer_off + body.down_colsum,
+    block_colsum_at(arena_base, layer_off + body.down_proj.offset, layer_off + body.down_colsum.offset,
         C.HIDDEN, S.DENSE_INT_LOCAL, FWHT_BLK_DENSE_DOWN)
-    colsum_at(arena_base, layer_off + body.router_proj.offset, layer_off + body.router_colsum,
+    colsum_at(arena_base, layer_off + body.router_proj.offset, layer_off + body.router_colsum.offset,
         C.NUM_EXPERTS, C.HIDDEN)
-    colsum_at(arena_base, layer_off + body.experts_gate_up.offset, layer_off + body.experts_gu_colsum,
+    colsum_at(arena_base, layer_off + body.experts_gate_up.offset, layer_off + body.experts_gu_colsum.offset,
         experts_local * C.MOE_GATE_UP_FUSED, C.HIDDEN)
     for e in range(experts_local):
         block_colsum_at(arena_base,
             layer_off + body.experts_down.offset + e * C.HIDDEN * C.MOE_INTERMEDIATE,
-            layer_off + body.experts_down_colsum + e * C.HIDDEN * MOE_NUM_BLOCKS * 4,
+            layer_off + body.experts_down_colsum.offset + e * C.HIDDEN * MOE_NUM_BLOCKS * 4,
             C.HIDDEN, C.MOE_INTERMEDIATE, FWHT_BLK)
 
 
@@ -748,13 +763,13 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
     def x_main_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
         var ptrs = InlineArray[Int, Self.tp](fill=0)
         for r in range(Self.tp):
-            ptrs[r] = self.topos[r].x_main(seq_len).ptr
+            ptrs[r] = self.topos[r].x_main(seq_len).addr()
         return ptrs^
 
     def x_residual_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
         var ptrs = InlineArray[Int, Self.tp](fill=0)
         for r in range(Self.tp):
-            ptrs[r] = self.topos[r].x_residual(seq_len).ptr
+            ptrs[r] = self.topos[r].x_residual(seq_len).addr()
         return ptrs^
 
     def token_buffer(mut self) -> UnsafePointer[Scalar[DType.int32], MutAnyOrigin]:
@@ -840,15 +855,15 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                     var fl = topo.full.proto
                     comptime q_local = C.Q_DIM_FULL // Self.tp
                     # Q projection colsum + pack (sharded)
-                    colsum_at(base, lb - base + fl.attn.q_proj.offset, lb - base + fl.attn.q_colsum,
+                    colsum_at(base, lb - base + fl.attn.q_proj.offset, lb - base + fl.attn.q_colsum.offset,
                         q_local, C.HIDDEN)
                     pack_at(base, lb - base + fl.attn.q_proj.offset, q_local, C.HIDDEN, pack_scratch)
                     # K projection colsum + pack (replicated)
-                    colsum_at(base, lb - base + fl.attn.k_proj.offset, lb - base + fl.attn.k_colsum,
+                    colsum_at(base, lb - base + fl.attn.k_proj.offset, lb - base + fl.attn.k_colsum.offset,
                         C.KV_DIM_FULL, C.HIDDEN)
                     pack_at(base, lb - base + fl.attn.k_proj.offset, C.KV_DIM_FULL, C.HIDDEN, pack_scratch)
                     # O projection colsum + pack
-                    block_colsum_at(base, lb - base + fl.attn.o_proj.offset, lb - base + fl.attn.o_colsum,
+                    block_colsum_at(base, lb - base + fl.attn.o_proj.offset, lb - base + fl.attn.o_colsum.offset,
                         C.HIDDEN, q_local, C.HEAD_DIM_FULL)
                     pack_at(base, lb - base + fl.attn.o_proj.offset, C.HIDDEN, q_local, pack_scratch)
                     init_layer_body_padding[Self.tp](base, lb - base, fl.body)
@@ -861,15 +876,15 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                     comptime q_local = C.Q_DIM_SLIDING // Self.tp
                     comptime kv_n = 2 * (C.KV_DIM_SLIDING // Self.tp)
                     # Q projection colsum + pack (sharded)
-                    colsum_at(base, lb - base + sl.attn.q_proj.offset, lb - base + sl.attn.q_colsum,
+                    colsum_at(base, lb - base + sl.attn.q_proj.offset, lb - base + sl.attn.q_colsum.offset,
                         q_local, C.HIDDEN)
                     pack_at(base, lb - base + sl.attn.q_proj.offset, q_local, C.HIDDEN, pack_scratch)
                     # KV projection colsum + pack (sharded, k+v contiguous)
-                    colsum_at(base, lb - base + sl.attn.k_proj.offset, lb - base + sl.attn.kv_colsum,
+                    colsum_at(base, lb - base + sl.attn.k_proj.offset, lb - base + sl.attn.kv_colsum.offset,
                         kv_n, C.HIDDEN)
                     pack_at(base, lb - base + sl.attn.k_proj.offset, kv_n, C.HIDDEN, pack_scratch)
                     # O projection colsum + pack
-                    block_colsum_at(base, lb - base + sl.attn.o_proj.offset, lb - base + sl.attn.o_colsum,
+                    block_colsum_at(base, lb - base + sl.attn.o_proj.offset, lb - base + sl.attn.o_colsum.offset,
                         C.HIDDEN, q_local, C.HEAD_DIM_SLIDING)
                     pack_at(base, lb - base + sl.attn.o_proj.offset, C.HIDDEN, q_local, pack_scratch)
                     init_layer_body_padding[Self.tp](base, lb - base, sl.body)
@@ -879,15 +894,15 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
 
             if rank == HOST_RANK:
                 block_colsum_row_major_at(base,
-                    topo.host.embed.offset, topo.host.embed_colsum_off,
+                    topo.host.embed.offset, topo.host.embed_colsum.offset,
                     C.VOCAB_SIZE, C.HIDDEN, LM_HEAD_FWHT_BLK)
-                var fn_gamma = BF16Ptr(unsafe_from_address=base + topo.host.final_norm.offset)
+                var fn_gamma = topo.host.final_norm.bound(base).as_ptr()
                 compute_sqrt_gamma[C.HIDDEN](
                     fn_gamma,
-                    BF16Ptr(unsafe_from_address=base + topo.host.sqrt_gamma_off))
+                    topo.host.sqrt_gamma.bound(base).as_ptr())
                 compute_inv_sqrt_gamma[C.HIDDEN](
                     fn_gamma,
-                    F32Ptr(unsafe_from_address=base + topo.host.inv_sqrt_gamma_off))
+                    topo.host.inv_sqrt_gamma.bound(base).as_ptr())
 
             # Fold 1/sqrt(hidden) into router weight scales
             comptime inv_sqrt_h = Float32(1.0 / sqrt(Float64(C.HIDDEN)))
@@ -897,13 +912,11 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 var sc_ptr: UnsafePointer[Float32, MutAnyOrigin]
                 if is_full_layer(i):
                     var lb = topo.full_base(full_idx)
-                    sc_ptr = UnsafePointer[Float32, MutAnyOrigin](
-                        unsafe_from_address=topo.full.proto.body.router_proj_sc.addr(lb))
+                    sc_ptr = topo.full.proto.body.router_proj_sc.bound(lb).as_ptr()
                     full_idx += 1
                 else:
                     var lb = topo.sliding_base(sliding_idx)
-                    sc_ptr = UnsafePointer[Float32, MutAnyOrigin](
-                        unsafe_from_address=topo.sliding.proto.body.router_proj_sc.addr(lb))
+                    sc_ptr = topo.sliding.proto.body.router_proj_sc.bound(lb).as_ptr()
                     sliding_idx += 1
                 for n in range(C.NUM_EXPERTS):
                     sc_ptr[n] *= inv_sqrt_h
@@ -1002,7 +1015,7 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         var embed_fence = embed_lookup_blocked[fwht_blk = LM_HEAD_FWHT_BLK](
             host.host.embed.bound(host.arena_base),
             host.host.embed_sc.bound(host.arena_base),
-            host.arena_base + host.host.inv_sqrt_gamma_off,
+            host.arena_base + host.host.inv_sqrt_gamma.offset,
             tokens_ptr,
             host.x_main(seq_len), Float32(EMBED_SCALE),
             self.main_pools[0])
@@ -1011,7 +1024,7 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
 
         var t_bcast0 = Int(perf_counter_ns())
         ring_broadcast[X_SLOT, Self.tp](
-            host.x_main(seq_len).ptr, self.x_main_ptrs(seq_len), seq_len, self.main_pools)
+            host.x_main(seq_len).addr(), self.x_main_ptrs(seq_len), seq_len, self.main_pools)
         sample.add(self.profile.phase("broadcast"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_bcast0))
 
         var act_scale_lease = self.scratch.borrow[Float32, 1]()
@@ -1035,11 +1048,13 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 def do_attn_quantize[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     var lb = topo.sliding_base(sliding_idx)
                     var sl = topo.sliding.proto
+                    var sb = topo.scratch_base()
                     return rmsnorm_gamma_fwht_quantize[C.HIDDEN, FWHT_BLK_HIDDEN](
-                        topo.x_main(seq_len).ptr, sl.body.input_norm.addr(lb),
-                        topo.scratch_addr(attn_i8_lease),
-                        topo.scratch_addr(attn_work_lease), topo.scratch_addr(attn_scale_lease),
-                        EPS, seq_len, pool)
+                        topo.x_main(seq_len), sl.body.input_norm.bound(lb),
+                        attn_i8_lease.view[I8, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                        attn_work_lease.view[F32, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                        attn_scale_lease.view[F32, C.MAX_SEQ_LEN, 1](sb, seq_len),
+                        EPS, pool)
                 sample.add(self.profile.phase("local_attn_quantize"), timed_tp_parallel[Self.tp,do_attn_quantize](topos, self.main_pools))
 
                 var q_lease = self.scratch.borrow[Scalar[DType.bfloat16], Q_DIM_LOCAL_SLIDING]()
@@ -1049,26 +1064,30 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 def do_q_gemv[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     var lb = topo.sliding_base(sliding_idx)
                     var sl = topo.sliding.proto
+                    var sb = topo.scratch_base()
                     return int8_gemv[Q_DIM_LOCAL_SLIDING, C.HIDDEN](
-                        topo.scratch_addr(attn_i8_lease),
-                        sl.attn.q_proj.addr(lb),
-                        lb + sl.attn.q_colsum,
-                        sl.attn.q_proj_sc.addr(lb),
-                        topo.scratch_addr(q_lease),
-                        seq_len, topo.scratch_addr(attn_scale_lease), pool)
+                        attn_i8_lease.view[I8, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                        sl.attn.q_proj.bound(lb),
+                        sl.attn.q_colsum.bound(lb),
+                        sl.attn.q_proj_sc.bound(lb),
+                        q_lease.view[BF16, C.MAX_SEQ_LEN, Q_DIM_LOCAL_SLIDING](sb, seq_len),
+                        attn_scale_lease.view[F32, C.MAX_SEQ_LEN, 1](sb, seq_len),
+                        pool)
                 sample.add(self.profile.phase("local_attn_proj"), timed_tp_parallel[Self.tp,do_q_gemv](topos, self.main_pools))
 
                 @parameter
                 def do_kv_gemv[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     var lb = topo.sliding_base(sliding_idx)
                     var sl = topo.sliding.proto
+                    var sb = topo.scratch_base()
                     return int8_gemv[2 * KV_DIM_LOCAL_SLIDING, C.HIDDEN](
-                        topo.scratch_addr(attn_i8_lease),
-                        sl.attn.k_proj.addr(lb),
-                        lb + sl.attn.kv_colsum,
-                        sl.attn.k_proj_sc.addr(lb),
-                        topo.scratch_addr(kv_lease),
-                        seq_len, topo.scratch_addr(attn_scale_lease), pool)
+                        attn_i8_lease.view[I8, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                        sl.attn.k_proj.bound(lb),
+                        sl.attn.kv_colsum.bound(lb),
+                        sl.attn.k_proj_sc.bound(lb),
+                        kv_lease.view[BF16, C.MAX_SEQ_LEN, 2 * KV_DIM_LOCAL_SLIDING](sb, seq_len),
+                        attn_scale_lease.view[F32, C.MAX_SEQ_LEN, 1](sb, seq_len),
+                        pool)
                 sample.add(self.profile.phase("local_attn_proj"), timed_tp_parallel[Self.tp,do_kv_gemv](topos, self.main_pools))
 
                 var attn_qi_lease = self.scratch.borrow[Scalar[DType.int8], Q_DIM_LOCAL_SLIDING]()
@@ -1080,16 +1099,18 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                     comptime NKV = C.NUM_KV_HEADS_SLIDING // Self.tp
                     var lb = topo.sliding_base(sliding_idx)
                     var sl = topo.sliding.proto
+                    var sb = topo.scratch_base()
                     return sliding_attn_dispatch[
                         C.HEAD_DIM_SLIDING, HPG, C.SLIDING_WINDOW, NKV, C.NUM_HEADS // Self.tp](
-                        topo.scratch_addr(q_lease),
-                        topo.scratch_addr(kv_lease),
-                        topo.scratch_addr(kv_lease) + KV_DIM_LOCAL_SLIDING * 2,
-                        sl.attn.q_norm.addr(lb), sl.attn.k_norm.addr(lb),
+                        q_lease.view[BF16, 1, Q_DIM_LOCAL_SLIDING](sb, 1),
+                        kv_lease.view[BF16, 1, KV_DIM_LOCAL_SLIDING](sb, 1).any(),
+                        kv_lease.view[BF16, 1, KV_DIM_LOCAL_SLIDING](sb, 1, element_offset=KV_DIM_LOCAL_SLIDING).any(),
+                        sl.attn.q_norm.bound(lb), sl.attn.k_norm.bound(lb),
                         topo.sliding_cos_row(pos), topo.sliding_sin_row(pos),
                         topo.sliding_cache_base(sliding_idx),
                         pos % C.SLIDING_WINDOW, min(pos + 1, C.SLIDING_WINDOW),
-                        topo.scratch_addr(attn_qi_lease), topo.scratch_addr(attn_head_sc_lease),
+                        attn_qi_lease.view[I8, 1, Q_DIM_LOCAL_SLIDING](sb, 1),
+                        attn_head_sc_lease.view[F32, 1, Q_DIM_LOCAL_SLIDING // C.HEAD_DIM_SLIDING](sb, 1),
                         EPS, pool)
                 sample.add(self.profile.phase("local_attention"), timed_tp_parallel[Self.tp,do_sliding_attn](topos, self.main_pools))
 
@@ -1097,14 +1118,15 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 def do_o_proj[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     var lb = topo.sliding_base(sliding_idx)
                     var sl = topo.sliding.proto
+                    var sb = topo.scratch_base()
                     return int8_gemv_blocked[C.HIDDEN, Q_DIM_LOCAL_SLIDING, C.HEAD_DIM_SLIDING](
-                        I8Ptr(unsafe_from_address=topo.scratch_addr(attn_qi_lease)),
-                        U8Ptr(unsafe_from_address=sl.attn.o_proj.addr(lb)),
-                        F32Ptr(unsafe_from_address=topo.scratch_addr(attn_head_sc_lease)),
-                        sl.attn.o_proj_sc.bound(lb).as_ptr(),
-                        F32Ptr(unsafe_from_address=lb + sl.attn.o_colsum),
-                        topo.x_residual(seq_len).as_ptr(),
-                        seq_len, pool)
+                        attn_qi_lease.view[I8, C.MAX_SEQ_LEN, Q_DIM_LOCAL_SLIDING](sb, seq_len),
+                        sl.attn.o_proj.bound(lb),
+                        attn_head_sc_lease.view[F32, C.MAX_SEQ_LEN, Q_DIM_LOCAL_SLIDING // C.HEAD_DIM_SLIDING](sb, seq_len),
+                        sl.attn.o_proj_sc.bound(lb),
+                        sl.attn.o_colsum.bound(lb),
+                        topo.x_residual(seq_len),
+                        pool)
                 sample.add(self.profile.phase("local_o_proj"), timed_tp_parallel[Self.tp,do_o_proj](topos, self.main_pools))
                 attn_head_sc_lease^.release()
                 attn_qi_lease^.release()
@@ -1135,37 +1157,43 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 def do_full_attn_quantize[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     var lb = topo.full_base(full_idx)
                     var fl = topo.full.proto
+                    var sb = topo.scratch_base()
                     return rmsnorm_gamma_fwht_quantize[C.HIDDEN, FWHT_BLK_HIDDEN](
-                        topo.x_main(seq_len).ptr, fl.body.input_norm.addr(lb),
-                        topo.scratch_addr(full_attn_i8_lease),
-                        topo.scratch_addr(full_attn_work_lease), topo.scratch_addr(full_attn_scale_lease),
-                        EPS, seq_len, pool)
+                        topo.x_main(seq_len), fl.body.input_norm.bound(lb),
+                        full_attn_i8_lease.view[I8, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                        full_attn_work_lease.view[F32, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                        full_attn_scale_lease.view[F32, C.MAX_SEQ_LEN, 1](sb, seq_len),
+                        EPS, pool)
                 sample.add(self.profile.phase("global_attn_quantize"), timed_tp_parallel[Self.tp,do_full_attn_quantize](topos, self.main_pools))
 
                 @parameter
                 def do_full_q_gemv[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     var lb = topo.full_base(full_idx)
                     var fl = topo.full.proto
+                    var sb = topo.scratch_base()
                     return int8_gemv[Q_DIM_LOCAL_FULL, C.HIDDEN](
-                        topo.scratch_addr(full_attn_i8_lease),
-                        fl.attn.q_proj.addr(lb),
-                        lb + fl.attn.q_colsum,
-                        fl.attn.q_proj_sc.addr(lb),
-                        topo.scratch_addr(full_q_lease),
-                        seq_len, topo.scratch_addr(full_attn_scale_lease), pool)
+                        full_attn_i8_lease.view[I8, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                        fl.attn.q_proj.bound(lb),
+                        fl.attn.q_colsum.bound(lb),
+                        fl.attn.q_proj_sc.bound(lb),
+                        full_q_lease.view[BF16, C.MAX_SEQ_LEN, Q_DIM_LOCAL_FULL](sb, seq_len),
+                        full_attn_scale_lease.view[F32, C.MAX_SEQ_LEN, 1](sb, seq_len),
+                        pool)
                 sample.add(self.profile.phase("global_attn_proj"), timed_tp_parallel[Self.tp,do_full_q_gemv](topos, self.main_pools))
 
                 @parameter
                 def do_full_k_gemv[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     var lb = topo.full_base(full_idx)
                     var fl = topo.full.proto
+                    var sb = topo.scratch_base()
                     return int8_gemv[C.KV_DIM_FULL, C.HIDDEN](
-                        topo.scratch_addr(full_attn_i8_lease),
-                        fl.attn.k_proj.addr(lb),
-                        lb + fl.attn.k_colsum,
-                        fl.attn.k_proj_sc.addr(lb),
-                        topo.scratch_addr(full_k_lease),
-                        seq_len, topo.scratch_addr(full_attn_scale_lease), pool)
+                        full_attn_i8_lease.view[I8, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                        fl.attn.k_proj.bound(lb),
+                        fl.attn.k_colsum.bound(lb),
+                        fl.attn.k_proj_sc.bound(lb),
+                        full_k_lease.view[BF16, C.MAX_SEQ_LEN, C.KV_DIM_FULL](sb, seq_len),
+                        full_attn_scale_lease.view[F32, C.MAX_SEQ_LEN, 1](sb, seq_len),
+                        pool)
                 sample.add(self.profile.phase("global_attn_proj"), timed_tp_parallel[Self.tp,do_full_k_gemv](topos, self.main_pools))
                 full_attn_scale_lease^.release()
                 full_attn_work_lease^.release()
@@ -1197,21 +1225,25 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                     def do_cp_attn_prep[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                         var lb = topo.full_base(full_idx)
                         var fl = topo.full.proto
+                        var sb = topo.scratch_base()
                         var lp = cp_local_pos(pos, Self.tp)
                         var is_owner = cp_owning_rank(pos, Self.tp) == rank
+                        comptime Q_GROUP_ELEMS = FULL_HPG * C.HEAD_DIM_FULL
+                        comptime K_HEAD_ELEMS = C.HEAD_DIM_FULL
                         return cp_attn_prep_dispatch[
                             C.HEAD_DIM_FULL, ROPE_DIMS_FULL, FULL_HPG,
                             LOCAL_MAX_SEQ_FULL, C.NUM_KV_HEADS_FULL, C.NUM_HEADS](
-                            topo.scratch_addr(full_q_all_lease) + kv * Q_GROUP_BF16,
-                            topo.scratch_addr(full_k_lease) + kv * K_HEAD_BF16,
-                            fl.attn.q_norm.addr(lb), fl.attn.k_norm.addr(lb),
-                            topo.state_base() + topo.full_rope.cos.offset + pos * 64 * size_of[Float32](),
-                            topo.state_base() + topo.full_rope.sin.offset + pos * 64 * size_of[Float32](),
+                            full_q_all_lease.view[BF16, 1, Q_GROUP_ELEMS](
+                                sb, 1, element_offset=kv * Q_GROUP_ELEMS),
+                            full_k_lease.view[BF16, 1, K_HEAD_ELEMS](
+                                sb, 1, element_offset=kv * K_HEAD_ELEMS),
+                            fl.attn.q_norm.bound(lb), fl.attn.k_norm.bound(lb),
+                            topo.full_cos_row(pos), topo.full_sin_row(pos),
                             topo.full_cache_base(full_idx), lp, kv,
                             EPS, is_owner,
-                            topo.scratch_addr(q_i8_prep_lease),
-                            topo.scratch_addr(qi_biases_lease),
-                            topo.scratch_addr(q_scales_lease),
+                            q_i8_prep_lease.view[I8, 1, Q_GROUP_ELEMS](sb, 1),
+                            qi_biases_lease.view[F32, 1, FULL_HPG](sb, 1),
+                            q_scales_lease.view[F32, 1, FULL_HPG](sb, 1),
                             pool)
                     sample.add(self.profile.phase("global_attention"), timed_tp_parallel[Self.tp,do_cp_attn_prep](topos, self.main_pools))
 
@@ -1278,14 +1310,15 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 def do_full_o_proj[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                     var lb = topo.full_base(full_idx)
                     var fl = topo.full.proto
+                    var sb = topo.scratch_base()
                     return int8_gemv_blocked[C.HIDDEN, Q_DIM_LOCAL_FULL, C.HEAD_DIM_FULL](
-                        I8Ptr(unsafe_from_address=topo.scratch_addr(attn_qi_lease)),
-                        U8Ptr(unsafe_from_address=fl.attn.o_proj.addr(lb)),
-                        F32Ptr(unsafe_from_address=topo.scratch_addr(attn_head_sc_lease)),
-                        fl.attn.o_proj_sc.bound(lb).as_ptr(),
-                        F32Ptr(unsafe_from_address=lb + fl.attn.o_colsum),
-                        topo.x_residual(seq_len).as_ptr(),
-                        seq_len, pool)
+                        attn_qi_lease.view[I8, C.MAX_SEQ_LEN, Q_DIM_LOCAL_FULL](sb, seq_len),
+                        fl.attn.o_proj.bound(lb),
+                        attn_head_sc_lease.view[F32, C.MAX_SEQ_LEN, Q_DIM_LOCAL_FULL // C.HEAD_DIM_FULL](sb, seq_len),
+                        fl.attn.o_proj_sc.bound(lb),
+                        fl.attn.o_colsum.bound(lb),
+                        topo.x_residual(seq_len),
+                        pool)
                 sample.add(self.profile.phase("global_o_proj"), timed_tp_parallel[Self.tp,do_full_o_proj](topos, self.main_pools))
 
                 attn_head_sc_lease^.release()
@@ -1308,9 +1341,9 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
                 return post_attn_norm_dispatch[C.HIDDEN](
-                    topo.x_residual(seq_len).ptr,
-                    body.post_attn_norm.addr(lb),
-                    topo.x_main(seq_len).ptr, EPS, pool)
+                    topo.x_residual(seq_len),
+                    body.post_attn_norm.bound(lb),
+                    topo.x_main(seq_len), EPS, pool)
             sample.add(self.profile.phase("post_attn_norm"), timed_tp_parallel[Self.tp,do_post_attn_norm](topos, self.main_pools))
 
             # =============================================================
@@ -1327,11 +1360,13 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             def do_router_quantize[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
+                var sb = topo.scratch_base()
                 return rmsnorm_gamma_fwht_quantize[C.HIDDEN, FWHT_BLK_HIDDEN](
-                    topo.x_main(seq_len).ptr, body.router_scale.addr(lb),
-                    topo.scratch_addr(act_i8_lease),
-                    topo.scratch_addr(act_work_lease), topo.scratch_addr(act_scale_lease),
-                    EPS, seq_len, pool)
+                    topo.x_main(seq_len), body.router_scale.bound(lb),
+                    act_i8_lease.view[I8, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                    act_work_lease.view[F32, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                    act_scale_lease.view[F32, C.MAX_SEQ_LEN, 1](sb, seq_len),
+                    EPS, pool)
             sample.add(self.profile.phase("router_quantize"), timed_tp_parallel[Self.tp,do_router_quantize](topos, self.main_pools))
 
             var router_logits_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.NUM_EXPERTS]()
@@ -1341,22 +1376,25 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             def do_router_gemv[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
+                var sb = topo.scratch_base()
                 return int8_gemv[C.NUM_EXPERTS, C.HIDDEN](
-                    topo.scratch_addr(act_i8_lease),
-                    body.router_proj.addr(lb),
-                    lb + body.router_colsum,
-                    body.router_proj_sc.addr(lb),
-                    topo.scratch_addr(router_logits_lease),
-                    seq_len, topo.scratch_addr(act_scale_lease), pool)
+                    act_i8_lease.view[I8, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                    body.router_proj.bound(lb),
+                    body.router_colsum.bound(lb),
+                    body.router_proj_sc.bound(lb),
+                    router_logits_lease.view[BF16, C.MAX_SEQ_LEN, C.NUM_EXPERTS](sb, seq_len),
+                    act_scale_lease.view[F32, C.MAX_SEQ_LEN, 1](sb, seq_len),
+                    pool)
             sample.add(self.profile.phase("router_proj"), timed_tp_parallel[Self.tp,do_router_gemv](topos, self.main_pools))
 
             @parameter
             def do_router_topk[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
+                var sb = topo.scratch_base()
                 return router_topk_dispatch[C.NUM_EXPERTS, C.TOP_K](
-                    BF16Ptr(unsafe_from_address=topo.scratch_addr(router_logits_lease)),
-                    body.router_pes.bound(lb).as_ptr(),
+                    router_logits_lease.view[BF16, 1, C.NUM_EXPERTS](sb, 1),
+                    body.router_pes.bound(lb),
                     topo.scratch_addr(routing_lease), pool)
             sample.add(self.profile.phase("router_topk"), timed_tp_parallel[Self.tp,do_router_topk](topos, self.main_pools))
 
@@ -1369,17 +1407,18 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             def do_ffn_quantize[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
+                var sb = topo.scratch_base()
                 return rmsnorm_dual_gamma_fwht_quantize[C.HIDDEN, FWHT_BLK_HIDDEN](
-                    topo.x_main(seq_len).ptr,
-                    body.pre_ffn_norm.addr(lb),
-                    body.pre_ffn_norm_2.addr(lb),
-                    topo.scratch_addr(act_i8_lease),
-                    topo.scratch_addr(expert_act_i8_lease),
-                    topo.scratch_addr(act_work_lease),
-                    topo.scratch_addr(act_work2_lease),
-                    topo.scratch_addr(act_scale_lease),
-                    topo.scratch_addr(expert_act_scale_lease),
-                    EPS, seq_len, pool)
+                    topo.x_main(seq_len),
+                    body.pre_ffn_norm.bound(lb),
+                    body.pre_ffn_norm_2.bound(lb),
+                    act_i8_lease.view[I8, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                    expert_act_i8_lease.view[I8, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                    act_work_lease.view[F32, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                    act_work2_lease.view[F32, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                    act_scale_lease.view[F32, C.MAX_SEQ_LEN, 1](sb, seq_len),
+                    expert_act_scale_lease.view[F32, C.MAX_SEQ_LEN, 1](sb, seq_len),
+                    EPS, pool)
             sample.add(self.profile.phase("ffn_quantize"), timed_tp_parallel[Self.tp,do_ffn_quantize](topos, self.main_pools))
 
             @parameter
@@ -1397,20 +1436,18 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                         lc += 1
                 UnsafePointer[Int32, MutAnyOrigin](
                     unsafe_from_address=topo.scratch_addr(local_count_lease))[] = Int32(lc)
+                var sb = topo.scratch_base()
                 return gemma4_moe_phase1[
                     C.MOE_INTERMEDIATE, C.HIDDEN, FWHT_BLK,
                     C.TOP_K, C.NUM_EXPERTS, Self.tp](
-                    I8Ptr(unsafe_from_address=topo.scratch_addr(expert_act_i8_lease)),
-                    F32Ptr(unsafe_from_address=topo.scratch_addr(expert_act_scale_lease)),
+                    expert_act_i8_lease.view[I8, 1, C.HIDDEN](sb, 1),
+                    expert_act_scale_lease.view[F32, 1, 1](sb, 1),
                     routing,
-                    body.experts_gate_up.addr(lb),
-                    C.MOE_GATE_UP_FUSED * C.HIDDEN,
-                    body.experts_gate_up_sc.addr(lb),
-                    C.MOE_GATE_UP_FUSED * 4,
-                    lb + body.experts_gu_colsum,
-                    C.MOE_GATE_UP_FUSED * 4,
-                    I8Ptr(unsafe_from_address=topo.scratch_addr(expert_qi_lease)),
-                    F32Ptr(unsafe_from_address=topo.scratch_addr(expert_blk_scale_lease)),
+                    body.experts_gate_up.bound(lb), C.MOE_GATE_UP_FUSED * C.HIDDEN,
+                    body.experts_gate_up_sc.bound(lb), C.MOE_GATE_UP_FUSED * 4,
+                    body.experts_gu_colsum.bound(lb), C.MOE_GATE_UP_FUSED * 4,
+                    expert_qi_lease.view[I8, C.TOP_K, C.MOE_INTERMEDIATE](sb, C.TOP_K),
+                    expert_blk_scale_lease.view[F32, C.TOP_K, MOE_NUM_BLOCKS](sb, C.TOP_K),
                     rank, pool)
             sample.add(self.profile.phase("expert_phase1"), timed_tp_parallel[Self.tp,do_expert_phase1](topos, self.main_pools))
 
@@ -1420,15 +1457,16 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             def do_dense_phase1[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
+                var sb = topo.scratch_base()
                 return fused_gu_gelu_tanh_wa[DENSE_INT_LOCAL, C.HIDDEN, FWHT_BLK_DENSE_DOWN](
-                    I8Ptr(unsafe_from_address=topo.scratch_addr(act_i8_lease)),
-                    F32Ptr(unsafe_from_address=topo.scratch_addr(act_scale_lease)),
-                    U8Ptr(unsafe_from_address=body.gate_proj.addr(lb)),
-                    body.gate_proj_sc.bound(lb).as_ptr(),
-                    F32Ptr(unsafe_from_address=lb + body.gu_colsum),
-                    I8Ptr(unsafe_from_address=topo.scratch_addr(dense_post_i8_lease)),
-                    F32Ptr(unsafe_from_address=topo.scratch_addr(post_blk_scale_lease)),
-                    seq_len, pool)
+                    act_i8_lease.view[I8, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                    act_scale_lease.view[F32, C.MAX_SEQ_LEN, 1](sb, seq_len),
+                    body.gate_proj.bound(lb),
+                    body.gate_proj_sc.bound(lb),
+                    body.gu_colsum.bound(lb),
+                    dense_post_i8_lease.view[I8, C.MAX_SEQ_LEN, DENSE_INT_LOCAL](sb, seq_len),
+                    post_blk_scale_lease.view[F32, C.MAX_SEQ_LEN, DENSE_DOWN_NUM_BLK](sb, seq_len),
+                    pool)
             sample.add(self.profile.phase("dense_phase1"), timed_tp_parallel[Self.tp,do_dense_phase1](topos, self.main_pools))
 
             @parameter
@@ -1437,19 +1475,17 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
                 var routing = UnsafePointer[Gemma4TopKResult[C.TOP_K], MutAnyOrigin](
                     unsafe_from_address=topo.scratch_addr(routing_lease))[]
+                var sb = topo.scratch_base()
                 return gemma4_moe_phase2[
                     C.HIDDEN, C.MOE_INTERMEDIATE, FWHT_BLK,
                     C.TOP_K, C.NUM_EXPERTS, Self.tp](
-                    I8Ptr(unsafe_from_address=topo.scratch_addr(expert_qi_lease)),
-                    F32Ptr(unsafe_from_address=topo.scratch_addr(expert_blk_scale_lease)),
+                    expert_qi_lease.view[I8, C.TOP_K, C.MOE_INTERMEDIATE](sb, C.TOP_K),
+                    expert_blk_scale_lease.view[F32, C.TOP_K, MOE_NUM_BLOCKS](sb, C.TOP_K),
                     routing,
-                    body.experts_down.addr(lb),
-                    C.HIDDEN * C.MOE_INTERMEDIATE,
-                    body.experts_down_sc.addr(lb),
-                    C.HIDDEN * 4,
-                    lb + body.experts_down_colsum,
-                    C.HIDDEN * MOE_NUM_BLOCKS * 4,
-                    BF16Ptr(unsafe_from_address=topo.scratch_addr(expert_out_lease)),
+                    body.experts_down.bound(lb), C.HIDDEN * C.MOE_INTERMEDIATE,
+                    body.experts_down_sc.bound(lb), C.HIDDEN * 4,
+                    body.experts_down_colsum.bound(lb), C.HIDDEN * MOE_NUM_BLOCKS * 4,
+                    expert_out_lease.view[BF16, C.TOP_K, C.HIDDEN](sb, C.TOP_K),
                     rank, pool)
             sample.add(self.profile.phase("expert_phase2"), timed_tp_parallel[Self.tp,do_expert_phase2](topos, self.main_pools))
 
@@ -1459,25 +1495,28 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             def do_dense_phase2[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
+                var sb = topo.scratch_base()
                 return int8_gemv_blocked_wa[C.HIDDEN, DENSE_INT_LOCAL, FWHT_BLK_DENSE_DOWN](
-                    I8Ptr(unsafe_from_address=topo.scratch_addr(dense_post_i8_lease)),
-                    U8Ptr(unsafe_from_address=body.down_proj.addr(lb)),
-                    F32Ptr(unsafe_from_address=topo.scratch_addr(post_blk_scale_lease)),
-                    body.down_proj_sc.bound(lb).as_ptr(),
-                    F32Ptr(unsafe_from_address=lb + body.down_colsum),
-                    BF16Ptr(unsafe_from_address=topo.scratch_addr(dense_out_lease)),
-                    seq_len, pool)
+                    dense_post_i8_lease.view[I8, C.MAX_SEQ_LEN, DENSE_INT_LOCAL](sb, seq_len),
+                    body.down_proj.bound(lb),
+                    post_blk_scale_lease.view[F32, C.MAX_SEQ_LEN, DENSE_DOWN_NUM_BLK](sb, seq_len),
+                    body.down_proj_sc.bound(lb),
+                    body.down_colsum.bound(lb),
+                    dense_out_lease.view[BF16, C.MAX_SEQ_LEN, C.HIDDEN](sb, seq_len),
+                    pool)
             sample.add(self.profile.phase("dense_phase2"), timed_tp_parallel[Self.tp,do_dense_phase2](topos, self.main_pools))
 
             var dense_normed_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.HIDDEN]()
 
             @parameter
             def do_expert_sum[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
+                var sb = topo.scratch_base()
                 var lc = Int(UnsafePointer[Int32, MutAnyOrigin](
                     unsafe_from_address=topo.scratch_addr(local_count_lease))[] )
                 return expert_sum_dispatch[C.HIDDEN, C.TOP_K](
-                    topo.scratch_addr(expert_out_lease), lc,
-                    topo.x_residual(seq_len).ptr, pool)
+                    expert_out_lease.view[BF16, C.TOP_K, C.HIDDEN](sb, C.TOP_K),
+                    lc,
+                    topo.x_residual(seq_len), pool)
             sample.add(self.profile.phase("pre_reduce"), timed_tp_parallel[Self.tp,do_expert_sum](topos, self.main_pools))
 
             var t_dense_reduce0 = Int(perf_counter_ns())
@@ -1491,10 +1530,12 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             def do_dense_norm[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
+                var sb = topo.scratch_base()
                 return dense_norm_dispatch[C.HIDDEN](
-                    topo.scratch_addr(dense_out_lease),
-                    body.post_ffn_norm_1.addr(lb),
-                    topo.scratch_addr(dense_normed_lease), EPS, pool)
+                    dense_out_lease.view[BF16, 1, C.HIDDEN](sb, 1),
+                    body.post_ffn_norm_1.bound(lb),
+                    dense_normed_lease.view[BF16, 1, C.HIDDEN](sb, 1),
+                    EPS, pool)
             sample.add(self.profile.phase("pre_reduce"), timed_tp_parallel[Self.tp,do_dense_norm](topos, self.main_pools))
 
             var t_mlp_reduce0 = Int(perf_counter_ns())
@@ -1506,13 +1547,14 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             def do_post_reduce[rank: Int, origin: MutOrigin](topo: Gemma4Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.full_base(full_idx) if is_full else topo.sliding_base(sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
+                var sb = topo.scratch_base()
                 var ls = body.layer_scalar.bound(lb).as_ptr()
                 return post_reduce_dispatch[C.HIDDEN](
-                    topo.x_residual(seq_len).ptr,
-                    body.post_ffn_norm_2.addr(lb),
-                    topo.scratch_addr(dense_normed_lease),
-                    body.post_ffn_norm.addr(lb),
-                    topo.x_main(seq_len).ptr, Float32(ls[]), EPS, pool)
+                    topo.x_residual(seq_len),
+                    body.post_ffn_norm_2.bound(lb),
+                    dense_normed_lease.view[BF16, 1, C.HIDDEN](sb, 1),
+                    body.post_ffn_norm.bound(lb),
+                    topo.x_main(seq_len), Float32(ls[]), EPS, pool)
             sample.add(self.profile.phase("post_reduce"), timed_tp_parallel[Self.tp,do_post_reduce](topos, self.main_pools))
 
             dense_normed_lease^.release()
@@ -1539,19 +1581,18 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         act_scale_lease^.release()
 
         # --- Final norm + LM head ---
-        var last_hidden_bf16 = host.x_main(seq_len).ptr
         var lm_act_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.HIDDEN]()
         var lm_act_blk_scale_lease = self.scratch.borrow[Float32, VOCAB_NUM_BLOCKS]()
         var lm_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
         var t_final0 = Int(perf_counter_ns())
         var final_fence = rmsnorm_gamma_fwht_per_block_quantize[
             C.HIDDEN, LM_HEAD_FWHT_BLK](
-            last_hidden_bf16,
-            host.arena_base + host.host.sqrt_gamma_off,
-            host.scratch_addr(lm_act_i8_lease),
-            host.scratch_addr(lm_work_lease),
-            host.scratch_addr(lm_act_blk_scale_lease),
-            EPS, 1, self.main_pools[0])
+            host.x_main(seq_len),
+            host.host.sqrt_gamma.bound(host.arena_base),
+            lm_act_i8_lease.view[I8, 1, C.HIDDEN](host.scratch_base(), 1),
+            lm_work_lease.view[F32, 1, C.HIDDEN](host.scratch_base(), 1),
+            lm_act_blk_scale_lease.view[F32, 1, VOCAB_NUM_BLOCKS](host.scratch_base(), 1),
+            EPS, self.main_pools[0])
         var t_final1 = Int(perf_counter_ns())
         sample.add(self.profile.phase("final_norm"), finish_single_pool_fence(t_final0, t_final1, final_fence^))
 
@@ -1560,16 +1601,16 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
         lm_work_lease^.release()
 
         var logit_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.VOCAB_SIZE]()
-        var logit_view = scratch_tensor_view[BF16, 1, C.VOCAB_SIZE](host.scratch_base(), logit_lease, 1)
+        var logit_view = logit_lease.view[BF16, 1, C.VOCAB_SIZE](host.scratch_base(), 1)
         var t_lm0 = Int(perf_counter_ns())
         var lm_fence = lm_head_gemv[
             C.VOCAB_SIZE, C.HIDDEN, LM_HEAD_FWHT_BLK](
-            host.scratch_addr(lm_act_i8_lease),
-            host.host.embed.addr(host.arena_base),
-            host.scratch_addr(lm_act_blk_scale_lease),
-            host.host.embed_sc.addr(host.arena_base),
-            host.arena_base + host.host.embed_colsum_off,
-            logit_view.ptr,
+            lm_act_i8_lease.view[I8, 1, C.HIDDEN](host.scratch_base(), 1),
+            host.host.embed.bound(host.arena_base),
+            lm_act_blk_scale_lease.view[F32, 1, C.HIDDEN // LM_HEAD_FWHT_BLK](host.scratch_base(), 1),
+            host.host.embed_sc.bound(host.arena_base),
+            host.host.embed_colsum.bound(host.arena_base),
+            logit_view,
             self.main_pools[0])
         var t_lm1 = Int(perf_counter_ns())
         sample.add(self.profile.phase("lm_head"), finish_single_pool_fence(t_lm0, t_lm1, lm_fence^))

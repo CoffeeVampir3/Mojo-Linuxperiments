@@ -31,7 +31,7 @@ comptime MAX_CP_RANKS = 8
 @fieldwise_init
 struct WorkerConfig(Copyable, ImplicitlyCopyable):
     var act_ptr: I8Ptr
-    var wpacked_ptr: U8Ptr
+    var wpacked_ptr: I8Ptr
     var colsum_ptr: F32Ptr
     var weight_scale_ptr: F32Ptr
     var dst_ptr: BF16Ptr
@@ -41,7 +41,7 @@ struct WorkerConfig(Copyable, ImplicitlyCopyable):
 
     def __init__(out self):
         self.act_ptr = I8Ptr()
-        self.wpacked_ptr = U8Ptr()
+        self.wpacked_ptr = I8Ptr()
         self.colsum_ptr = F32Ptr()
         self.weight_scale_ptr = F32Ptr()
         self.dst_ptr = BF16Ptr()
@@ -53,7 +53,7 @@ struct WorkerConfig(Copyable, ImplicitlyCopyable):
 @fieldwise_init
 struct Int8GemvBlockedArgs(Copyable, ImplicitlyCopyable):
     var act: I8Ptr
-    var wpacked: U8Ptr
+    var wpacked: I8Ptr
     var blk_scale: F32Ptr
     var wscale: F32Ptr
     var blk_colsum: F32Ptr
@@ -64,7 +64,7 @@ struct Int8GemvBlockedArgs(Copyable, ImplicitlyCopyable):
 
     def __init__(out self):
         self.act = I8Ptr()
-        self.wpacked = U8Ptr()
+        self.wpacked = I8Ptr()
         self.blk_scale = F32Ptr()
         self.wscale = F32Ptr()
         self.blk_colsum = F32Ptr()
@@ -78,7 +78,7 @@ struct Int8GemvBlockedArgs(Copyable, ImplicitlyCopyable):
 struct FusedGuGeluTanhArgs(Copyable, ImplicitlyCopyable):
     var act_i8: I8Ptr
     var act_scale: F32Ptr
-    var wpacked: U8Ptr
+    var wpacked: I8Ptr
     var wscale: F32Ptr
     var wcolsum: F32Ptr
     var qi_out: I8Ptr
@@ -90,7 +90,7 @@ struct FusedGuGeluTanhArgs(Copyable, ImplicitlyCopyable):
     def __init__(out self):
         self.act_i8 = I8Ptr()
         self.act_scale = F32Ptr()
-        self.wpacked = U8Ptr()
+        self.wpacked = I8Ptr()
         self.wscale = F32Ptr()
         self.wcolsum = F32Ptr()
         self.qi_out = I8Ptr()

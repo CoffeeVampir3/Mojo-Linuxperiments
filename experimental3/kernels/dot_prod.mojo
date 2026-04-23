@@ -84,9 +84,9 @@ def act_broadcast_vnni[width: Int](
 def dot_vnni_broadcasted[width: Int](
     acc: SIMD[DType.int32, width],
     act_bytes: SIMD[DType.uint8, width * 4],
-    wpacked: UnsafePointer[UInt8, MutAnyOrigin],
+    wpacked: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
 ) -> SIMD[DType.int32, width]:
-    var w = wpacked.bitcast[Scalar[DType.int8]]().load[width = width * 4]()
+    var w = wpacked.load[width = width * 4]()
     return vpdpbusd[width](acc, act_bytes, w)
 
 
@@ -94,7 +94,7 @@ def dot_vnni_broadcasted[width: Int](
 def dot_vnni[width: Int](
     acc: SIMD[DType.int32, width],
     act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
-    wpacked: UnsafePointer[UInt8, MutAnyOrigin],
+    wpacked: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     k_pos: Int,
 ) -> SIMD[DType.int32, width]:
     return dot_vnni_broadcasted[width](
@@ -111,10 +111,11 @@ def dot_vnni[width: Int](
 def dot_simd[width: Int](
     acc: SIMD[DType.int32, width],
     act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
-    wpacked: UnsafePointer[UInt8, MutAnyOrigin],
+    wpacked: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     k_pos: Int,
 ) -> SIMD[DType.int32, width]:
     """Non-VNNI fallback: width channels x 4 K values via widen-to-i32 multiply."""
+    # i8 storage loaded as i32 dwords so we can mask out lanes with shifts.
     var wdw = wpacked.bitcast[Scalar[DType.int32]]().load[width=width]()
     var result = acc
     result += SIMD[DType.int32, width](Int32(act_row[k_pos]) + 128) * ((wdw << 24) >> 24)
@@ -133,7 +134,7 @@ def dot_simd[width: Int](
 def dot[width: Int](
     acc: SIMD[DType.int32, width],
     act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
-    wpacked: UnsafePointer[UInt8, MutAnyOrigin],
+    wpacked: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     k_pos: Int,
 ) -> SIMD[DType.int32, width]:
     comptime if CompilationTarget.has_vnni():
@@ -160,7 +161,7 @@ def gemv_tile_width[T: DType, tile: Int]() -> Int:
 def dot_tile_chunked[width: Int](
     acc: SIMD[DType.int32, VNNI_TILE_N],
     act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
-    wpacked: UnsafePointer[UInt8, MutAnyOrigin],
+    wpacked: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     k_pos: Int,
 ) -> SIMD[DType.int32, VNNI_TILE_N]:
     comptime assert VNNI_TILE_N % width == 0,

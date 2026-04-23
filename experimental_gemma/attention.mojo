@@ -21,7 +21,7 @@ from std.collections import InlineArray
 
 from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY, BF16Ptr
 from threading.threading_traits import BurstThreadPool
-from modeling.model_spec import Encoding, Shaped, DynView, CacheView
+from modeling.model_spec import Encoding, Shaped, DynamicView, CacheView
 from simd_math import exp_f32
 
 
@@ -130,8 +130,8 @@ def local_attention[
     QT: Encoding & Shaped, KCT: Encoding & Shaped, VCT: Encoding & Shaped,
     OutT: Encoding & Shaped,
 ](
-    q: DynView[QT], k_cache: CacheView[KCT], v_cache: CacheView[VCT],
-    output: DynView[OutT], pos: Int,
+    q: DynamicView[QT], k_cache: CacheView[KCT], v_cache: CacheView[VCT],
+    output: DynamicView[OutT], pos: Int,
     ref [origin] pool: P,
 ) -> PoolFence[P, origin] where KCT.DTYPE == DType.bfloat16:
     """Sliding-window GQA attention with scale=1.0.
@@ -150,7 +150,7 @@ def local_attention[
     comptime assert head_dim % simd_width_of[DType.float32]() == 0, "local_attention: head_dim must be f32-simd-aligned"
     comptime assert num_heads % num_kv_heads == 0, "local_attention: heads must divide evenly for GQA"
 
-    var seq_len = q.seq_len
+    var seq_len = q.seq_len()
     if seq_len == 0:
         return PoolFence[P, origin].over(pool)
 
@@ -259,8 +259,8 @@ def global_attention[
     QT: Encoding & Shaped, KCT: Encoding & Shaped, VCT: Encoding & Shaped,
     OutT: Encoding & Shaped,
 ](
-    q: DynView[QT], k_cache: CacheView[KCT], v_cache: CacheView[VCT],
-    output: DynView[OutT], pos: Int,
+    q: DynamicView[QT], k_cache: CacheView[KCT], v_cache: CacheView[VCT],
+    output: DynamicView[OutT], pos: Int,
     ref [origin] pool: P,
 ) -> PoolFence[P, origin] where KCT.DTYPE == DType.bfloat16:
     """Full-causal GQA attention with scale=1.0.
@@ -279,7 +279,7 @@ def global_attention[
     comptime assert head_dim % simd_width_of[DType.float32]() == 0, "global_attention: head_dim must be f32-simd-aligned"
     comptime assert num_heads % num_kv_heads == 0, "global_attention: heads must divide evenly for GQA"
 
-    var seq_len = q.seq_len
+    var seq_len = q.seq_len()
     if seq_len == 0:
         return PoolFence[P, origin].over(pool)
 

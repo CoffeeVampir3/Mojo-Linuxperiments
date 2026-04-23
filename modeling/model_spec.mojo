@@ -104,8 +104,20 @@ trait Placed:
 trait Named:
     comptime NAME: StaticString
 
+trait Aligned:
+    comptime ALIGNMENT: Int
+
+trait HasPtr(Encoding):
+    def as_ptr[dtype: DType = Self.DTYPE](self) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]: ...
+    def addr(self) -> Int: ...
+
 trait Dynamic:
-    ...
+    def seq_len(self) -> Int: ...
+
+
+# Shorthand for the common trait compositions used by kernel signatures.
+comptime StaticTensor = Encoding & Shaped & HasPtr & Aligned
+comptime DynamicTensor = Encoding & Shaped & HasPtr & Aligned & Dynamic
 
 
 struct BF16(Encoding):
@@ -181,12 +193,12 @@ struct Shape[
 
 
 # =============================================================================
-# Mat — lightweight Encoding & Shaped for Bound / DynView / CacheView
+# Mat — lightweight Encoding & Shaped for StaticView / DynamicView / CacheView
 #
 # Carries only the local dimensions the kernel needs (ROWS, COLS) plus the
 # dtype.  No sharding, no tp, no placement — those live in LayerBuilder /
 # Shape / WeightDesc where the layout is computed.  Mat is what you hand to
-# a kernel via Bound[Mat[...]] or DynView[Mat[...]].
+# a kernel via StaticView[Mat[...]] or DynamicView[Mat[...]].
 # =============================================================================
 
 struct Mat[E: Encoding, rows: Int, cols: Int](Encoding, Shaped):
@@ -291,57 +303,145 @@ struct PlacedSlot[
         return Self.S.shard_cols(c, n)
 
 
+comptime DEFAULT_ALIGNMENT = 64
+
+
 @fieldwise_init
-struct Bound[T: Encoding & Shaped](Encoding, Shaped):
+struct StaticView[T: Encoding & Shaped, alignment: Int = DEFAULT_ALIGNMENT](
+    Encoding, Shaped, HasPtr, Aligned,
+):
     comptime DTYPE = Self.T.DTYPE
     comptime ELEMENT_BYTES = Self.T.ELEMENT_BYTES
     comptime ROWS = Self.T.ROWS
     comptime COLS = Self.T.COLS
-    var ptr: Int
+    comptime ALIGNMENT = Self.alignment
+    var ptr: UnsafePointer[Scalar[Self.DTYPE], MutAnyOrigin]
 
     @always_inline
     def as_ptr[dtype: DType = Self.DTYPE](self) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
-        return rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
-            UnsafePointer[Scalar[Self.DTYPE], MutAnyOrigin](
-                unsafe_from_address=self.ptr))
+        return rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](self.ptr)
+
+    @always_inline
+    def addr(self) -> Int:
+        return Int(self.ptr)
+
+    @always_inline
+    def load[width: Int = 1](self, offset: Int = 0) -> SIMD[Self.DTYPE, width]:
+        return self.ptr.load[width=width, alignment=Self.ALIGNMENT](offset)
+
+    @always_inline
+    def store[width: Int = 1](self, offset: Int, val: SIMD[Self.DTYPE, width]):
+        self.ptr.store[alignment=Self.ALIGNMENT](offset, val)
+
 
 @fieldwise_init
-struct DynView[T: Encoding & Shaped](Encoding, Shaped, Dynamic):
+struct DynamicView[T: Encoding & Shaped, alignment: Int = DEFAULT_ALIGNMENT](
+    Encoding, Shaped, HasPtr, Aligned, Dynamic,
+):
     comptime DTYPE = Self.T.DTYPE
     comptime ELEMENT_BYTES = Self.T.ELEMENT_BYTES
     comptime ROWS = Self.T.ROWS
     comptime COLS = Self.T.COLS
-    var ptr: Int
-    var seq_len: Int
+    comptime ALIGNMENT = Self.alignment
+    var ptr: UnsafePointer[Scalar[Self.DTYPE], MutAnyOrigin]
+    var runtime_rows: Int
 
     @always_inline
     def as_ptr[dtype: DType = Self.DTYPE](self) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
-        return rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
-            UnsafePointer[Scalar[Self.DTYPE], MutAnyOrigin](
-                unsafe_from_address=self.ptr))
+        return rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](self.ptr)
+
+    @always_inline
+    def addr(self) -> Int:
+        return Int(self.ptr)
+
+    @always_inline
+    def seq_len(self) -> Int:
+        return self.runtime_rows
+
+    @always_inline
+    def load[width: Int = 1](self, offset: Int = 0) -> SIMD[Self.DTYPE, width]:
+        return self.ptr.load[width=width, alignment=Self.ALIGNMENT](offset)
+
+    @always_inline
+    def store[width: Int = 1](self, offset: Int, val: SIMD[Self.DTYPE, width]):
+        self.ptr.store[alignment=Self.ALIGNMENT](offset, val)
+
 
 @fieldwise_init
-struct CacheView[T: Encoding & Shaped](Encoding, Shaped):
+struct CacheView[T: Encoding & Shaped, alignment: Int = DEFAULT_ALIGNMENT](
+    Encoding, Shaped, HasPtr, Aligned,
+):
     comptime DTYPE = Self.T.DTYPE
     comptime ELEMENT_BYTES = Self.T.ELEMENT_BYTES
     comptime ROWS = Self.T.ROWS
     comptime COLS = Self.T.COLS
-    var ptr: Int
+    comptime ALIGNMENT = Self.alignment
+    var ptr: UnsafePointer[Scalar[Self.DTYPE], MutAnyOrigin]
 
     @always_inline
     def as_ptr[dtype: DType = Self.DTYPE](self) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
-        return rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
-            UnsafePointer[Scalar[Self.DTYPE], MutAnyOrigin](
-                unsafe_from_address=self.ptr))
+        return rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](self.ptr)
 
-def bind[T: Encoding & Shaped & Placed & Named](base: Int) -> Bound[T]:
-    return Bound[T](base + T.OFFSET)
+    @always_inline
+    def addr(self) -> Int:
+        return Int(self.ptr)
+
+    @always_inline
+    def load[width: Int = 1](self, offset: Int = 0) -> SIMD[Self.DTYPE, width]:
+        return self.ptr.load[width=width, alignment=Self.ALIGNMENT](offset)
+
+    @always_inline
+    def store[width: Int = 1](self, offset: Int, val: SIMD[Self.DTYPE, width]):
+        self.ptr.store[alignment=Self.ALIGNMENT](offset, val)
+
+
+@fieldwise_init
+struct ScratchView[
+    T: Encoding & Shaped, origin: MutOrigin, alignment: Int = DEFAULT_ALIGNMENT,
+](Encoding, Shaped, HasPtr, Aligned, Dynamic):
+    comptime DTYPE = Self.T.DTYPE
+    comptime ELEMENT_BYTES = Self.T.ELEMENT_BYTES
+    comptime ROWS = Self.T.ROWS
+    comptime COLS = Self.T.COLS
+    comptime ALIGNMENT = Self.alignment
+    var ptr: UnsafePointer[Scalar[Self.DTYPE], Self.origin]
+    var runtime_rows: Int
+
+    @always_inline
+    def as_ptr[dtype: DType = Self.DTYPE](self) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
+        # origin erased at trait surface — release-then-use is caught via the
+        # value (sv) remaining in the caller's scope, not the pointer's origin.
+        return rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
+            self.ptr.as_any_origin())
+
+    @always_inline
+    def addr(self) -> Int:
+        return Int(self.ptr)
+
+    @always_inline
+    def seq_len(self) -> Int:
+        return self.runtime_rows
+
+    @always_inline
+    def load[width: Int = 1](self, offset: Int = 0) -> SIMD[Self.DTYPE, width]:
+        return self.ptr.load[width=width, alignment=Self.ALIGNMENT](offset)
+
+    @always_inline
+    def store[width: Int = 1](self, offset: Int, val: SIMD[Self.DTYPE, width]):
+        self.ptr.store[alignment=Self.ALIGNMENT](offset, val)
+
+    @always_inline
+    def any(self) -> DynamicView[Self.T, Self.alignment]:
+        # Origin-erasing escape for kernel calls that hit Mojo's
+        # argument-exclusivity checker (e.g., in-place ops where two args
+        # derive from the same lease). Use inline at call sites only —
+        # binding the result to a variable loses release-then-use protection.
+        return DynamicView[Self.T, Self.alignment](
+            self.ptr.as_any_origin(), self.runtime_rows)
 
 
 def byte_count[T: Encoding & Shaped]() -> Int:
     return T.ROWS * T.COLS * T.ELEMENT_BYTES
-
-comptime DEFAULT_ALIGNMENT = 64
 
 def next_offset[T: Encoding & Shaped & Placed, alignment: Int = DEFAULT_ALIGNMENT]() -> Int:
     comptime aligned = ((T.OFFSET + alignment - 1) // alignment) * alignment

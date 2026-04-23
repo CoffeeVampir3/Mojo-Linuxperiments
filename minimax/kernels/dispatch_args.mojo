@@ -11,10 +11,10 @@ struct FusedW1W3SiluArgs(Copyable, ImplicitlyCopyable):
     """
     var act_i8: I8Ptr
     var act_scale: F32Ptr
-    var w1_packed: U8Ptr
+    var w1_packed: I8Ptr
     var w1_scale: F32Ptr
     var w1_colsum: F32Ptr
-    var w3_packed: U8Ptr
+    var w3_packed: I8Ptr
     var w3_scale: F32Ptr
     var w3_colsum: F32Ptr
     var qi_out: I8Ptr
@@ -26,10 +26,10 @@ struct FusedW1W3SiluArgs(Copyable, ImplicitlyCopyable):
     def __init__(out self):
         self.act_i8 = I8Ptr()
         self.act_scale = F32Ptr()
-        self.w1_packed = U8Ptr()
+        self.w1_packed = I8Ptr()
         self.w1_scale = F32Ptr()
         self.w1_colsum = F32Ptr()
-        self.w3_packed = U8Ptr()
+        self.w3_packed = I8Ptr()
         self.w3_scale = F32Ptr()
         self.w3_colsum = F32Ptr()
         self.qi_out = I8Ptr()

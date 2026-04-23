@@ -19,7 +19,7 @@ from threading.threading_shared import ptr as tptr
 
 from modeling.model_spec import (
     Encoding, Shaped, Placed, Named,
-    Bound, DynView,
+    StaticView, DynamicView,
 )
 from kernels.kernel_ops import PoolFence
 from simd_math import sqrt, roundeven
@@ -286,11 +286,11 @@ def prefill[
     CosT: Encoding & Shaped, SinT: Encoding & Shaped,
     prefill_chunk: Int = 512,
 ](
-    q: DynView[QT],
+    q: DynamicView[QT],
     q_stride: Int,
     cache: KVCache[max_seq, head_dim, num_kv_heads, num_q_heads],
-    cos_table: Bound[CosT],
-    sin_table: Bound[SinT],
+    cos_table: StaticView[CosT],
+    sin_table: StaticView[SinT],
     scratch: Int,
     pos: Int,
     v_layer_scale: Float32,
@@ -307,8 +307,8 @@ def prefill[
     var vagg_scale = v_layer_scale / (Float32(255.0) * Float32(127.0))
 
     # Scratch layout: [f32 accum | i8 output | AttnCtx | worker configs]
-    var accum_bytes = q.seq_len * q_cols * size_of[Float32]()
-    var qi_bytes = q.seq_len * q_cols * size_of[Scalar[DType.int8]]()
+    var accum_bytes = q.seq_len() * q_cols * size_of[Float32]()
+    var qi_bytes = q.seq_len() * q_cols * size_of[Scalar[DType.int8]]()
     var qi_inv = Float32(127) / v_layer_scale
     var ctx_ptr = UnsafePointer[AttnCtx, MutAnyOrigin](
         unsafe_from_address=scratch + accum_bytes + qi_bytes)
@@ -331,7 +331,7 @@ def prefill[
 
     comptime MAX_POOL_CAPACITY = 128
     var workers_per_group = max(1, pool.get_capacity() // num_kv_heads)
-    var total_q_rows = q.seq_len * gqa_factor
+    var total_q_rows = q.seq_len() * gqa_factor
     var rows_per_worker = (total_q_rows + workers_per_group - 1) // workers_per_group
     var total_jobs = num_kv_heads * workers_per_group
 
@@ -351,7 +351,7 @@ def prefill[
             ws[].q_row_start = q_start
             ws[].q_row_end = q_end
             ws[].pos = pos
-            ws[].seq_len = q.seq_len
+            ws[].seq_len = q.seq_len()
             ws[].vagg_scale = vagg_scale
 
             jobs[job_idx] = PrefillKernelArgs(Int(ctx_ptr), ws_base)

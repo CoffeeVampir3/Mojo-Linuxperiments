@@ -11,13 +11,13 @@ channels are skipped by a partial RoPE apply wrapper.
 
 from std.sys.info import simd_width_of
 
-from modeling.model_spec import Encoding, Shaped, Bound, DynView
+from modeling.model_spec import Encoding, Shaped, StaticView, DynamicView
 from kernels.kv_rotors import rope_partial
 from simd_math import sincos
 
 
 def init_sliding_rope_tables[CosT: Encoding & Shaped, SinT: Encoding & Shaped](
-    cos_buf: Bound[CosT], sin_buf: Bound[SinT],
+    cos_buf: StaticView[CosT], sin_buf: StaticView[SinT],
 ) where CosT.DTYPE == DType.float32:
     """Sliding RoPE: theta=10000, full head_dim=256 rotation.
 
@@ -47,7 +47,7 @@ def init_sliding_rope_tables[CosT: Encoding & Shaped, SinT: Encoding & Shaped](
 
 
 def init_full_rope_tables[CosT: Encoding & Shaped, SinT: Encoding & Shaped](
-    cos_buf: Bound[CosT], sin_buf: Bound[SinT],
+    cos_buf: StaticView[CosT], sin_buf: StaticView[SinT],
 ) where CosT.DTYPE == DType.float32:
     """Full-attention RoPE: theta=1000000, partial rotation (128 of 512 dims).
 
@@ -84,7 +84,7 @@ def init_full_rope_tables[CosT: Encoding & Shaped, SinT: Encoding & Shaped](
 
 def apply_full_rope[num_heads: Int,
     XT: Encoding & Shaped, CosT: Encoding & Shaped, SinT: Encoding & Shaped](
-    x: DynView[XT], cos_table: Bound[CosT], sin_table: Bound[SinT], pos: Int,
+    x: DynamicView[XT], cos_table: StaticView[CosT], sin_table: StaticView[SinT], pos: Int,
 ) where CosT.DTYPE == DType.float32:
     """Apply Gemma4 full-attention RoPE using the compact 128-dim rotary cache."""
     comptime assert XT.DTYPE == DType.bfloat16, "full rope: input must be bf16"
