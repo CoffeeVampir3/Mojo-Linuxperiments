@@ -7,9 +7,9 @@ of a seq_len × N × K problem, or one N-tile of a decode problem).
 When seq_len == 1 the dispatch collapses to a single decode GEMV. When
 seq_len > 1 (prompt prefill) the dispatch partitions rows across pool
 workers, and each worker walks the per-row gemv.mojo kernels. That inner
-per-row walk is the AMX-lift surface: replacing gemv_row / gemv_row_blocked
-with tile-based AMX kernels here will give prefill throughput without
-touching decode.
+per-row walk is the AMX-lift surface: replacing gemv_row / blocked GEMV
+with tile-based AMX kernels here will give prefill throughput without touching
+decode.
 
 Also hosts the lm_head worker (decode N-parallel scan into bf16 logits).
 Structurally M=1 always; workers N-parallelize the same dot across pool.
@@ -22,7 +22,8 @@ from std.collections import InlineArray
 from kernels.vnni import VNNI_N_STEP, VNNI_K_STEP, VNNI_TILE_N, VNNI_BLK, compute_n_block
 from experimental3.kernels.dot_prod import vpdpbusd
 from experimental3.kernels.gemv import (
-    gemv_row, gemv_row_blocked, gemv_row_blocked_wa, lm_head_row_dot,
+    gemv_row, gemv_row_blocked_bf16_scaled, gemv_row_blocked_wa,
+    lm_head_row_dot,
 )
 from experimental3.kernels.fwht import fwht_block
 from experimental3.kernels.quantize import absmax_quantize_i8
@@ -76,43 +77,21 @@ def int8_gemv_decode_worker[N: Int, K: Int](cfg: WorkerConfig):
 def int8_gemv_blocked_worker[N: Int, K: Int, fwht_blk: Int](
     args: Int8GemvBlockedArgs,
 ):
-    """M-split prefill: full-N GEMV per row. Output bf16[N] * output_scale."""
-    comptime width = simd_width_of[DType.float32]()
-
-    var dst_buf = InlineArray[Float32, N](fill=Float32(0))
-    var dp = UnsafePointer(to=dst_buf).bitcast[Float32]()
-    gemv_row_blocked[N, K, fwht_blk](args.act, args.wpacked, args.blk_scale,
-        args.wscale, args.blk_colsum, dp)
-
-    var scale = SIMD[DType.float32, width](args.output_scale)
-    var k = 0
-    while k + width <= N:
-        (args.dst + k).store(((dp + k).load[width=width]() * scale).cast[DType.bfloat16]())
-        k += width
+    """Blocked GEMV worker that writes final scaled bf16 directly."""
+    gemv_row_blocked_bf16_scaled[N, K, fwht_blk](
+        args.act, args.wpacked, args.blk_scale,
+        args.wscale, args.blk_colsum, args.dst,
+        args.output_scale, args.n_out, args.colsum_stride)
 
 
 def int8_gemv_blocked_decode_worker[N: Int, K: Int, fwht_blk: Int](
     args: Int8GemvBlockedArgs,
 ):
-    """N-split decode: each worker handles a sub-range of output elements.
-
-    Pointers are pre-offset by the dispatcher. n_out holds the sub-N count.
-    blk_colsum is pre-offset to n_start but the stride between blocks is
-    still full N, passed via colsum_stride.
-    """
-    comptime width = simd_width_of[DType.float32]()
-
-    var sub_n = args.n_out
-    var dst_buf = InlineArray[Float32, N](fill=Float32(0))
-    var dp = UnsafePointer(to=dst_buf).bitcast[Float32]()
-    gemv_row_blocked[N, K, fwht_blk](args.act, args.wpacked, args.blk_scale,
-        args.wscale, args.blk_colsum, dp, sub_n, args.colsum_stride)
-
-    var scale = SIMD[DType.float32, width](args.output_scale)
-    var k = 0
-    while k + width <= sub_n:
-        (args.dst + k).store(((dp + k).load[width=width]() * scale).cast[DType.bfloat16]())
-        k += width
+    """N-split decode worker that writes final scaled bf16 directly."""
+    gemv_row_blocked_bf16_scaled[N, K, fwht_blk](
+        args.act, args.wpacked, args.blk_scale,
+        args.wscale, args.blk_colsum, args.dst,
+        args.output_scale, args.n_out, args.colsum_stride)
 
 
 def int8_gemv_blocked_wa_worker[N: Int, K: Int, fwht_blk: Int](
@@ -288,4 +267,3 @@ def lm_head_worker[K: Int, fwht_blk: Int](args: LmHeadArgs):
             w_blk_scales_row,
             w_blk_colsums_row)
         dst[n] = dot_f32.cast[DType.bfloat16]()
-

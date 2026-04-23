@@ -6,7 +6,8 @@ in gemm.mojo. Pure dot primitives live in dot_prod.mojo.
 
 Three blocked-dequant variants:
   gemv_row             per-row weight scale, per-row act scale
-  gemv_row_blocked     per-row weight scale, per-K-block act scale
+  gemv_row_blocked_bf16_scaled
+                       per-row weight scale, per-K-block act scale, direct bf16
   gemv_row_blocked_wa  same as above, supports fwht_blk < VNNI_K_STEP
 
 Plus:
@@ -21,7 +22,7 @@ from kernels.vnni import VNNI_N_STEP, VNNI_K_STEP, VNNI_TILE_N, VNNI_BLK, comput
 from experimental3.kernels.dot_prod import (
     vpdpbusd, dot, dot_tile_chunked, gemv_tile_width,
 )
-from experimental3.common_math import I8Ptr, F32Ptr
+from experimental3.common_math import I8Ptr, F32Ptr, BF16Ptr
 
 
 # ============================================================================
@@ -91,36 +92,33 @@ def gemv_row[N: Int, K: Int, OutDType: DType](
                 var result = corrected * act_sc * (wsc + n_base).load[width=width]()
                 (dst + n_base).store(result.cast[OutDType]())
 
-
 # ============================================================================
-# gemv_row_blocked — per-K-block activation scales
+# gemv_row_blocked_bf16_scaled — per-K-block activation scales
 # ============================================================================
 
 
-def gemv_row_blocked[N: Int, K: Int, fwht_block_size: Int](
+def gemv_row_blocked_bf16_scaled[N: Int, K: Int, fwht_block_size: Int](
     act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     wpacked: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     block_scales: UnsafePointer[Float32, MutAnyOrigin],
     wsc: UnsafePointer[Float32, MutAnyOrigin],
     block_colsums: UnsafePointer[Float32, MutAnyOrigin],
-    dst: UnsafePointer[Float32, MutAnyOrigin],
+    dst: BF16Ptr,
+    output_scale: Float32,
     subrange: Int = N,
     colsum_stride: Int = N,
 ):
-    """GEMV with per-K-block activation scales. Accumulates per block in i32,
-    dequants to f32 per block, then applies per-row weight scale.
+    """Blocked GEMV that writes final scaled bf16 directly.
 
-    subrange defaults to N. For N-split decode, pre-offset pointers and
-    pass the sub-range count. colsum_stride is the row-stride of
-    block_colsums (always full matrix N, since colsums are not split).
-    subrange must be a multiple of VNNI_N_STEP (32).
+    Accumulates each K block in i32, dequants to f32, applies per-row weight
+    scale and output scale, then stores bf16 without a full-N f32 scratch pass.
     """
     debug_assert(K % fwht_block_size == 0,
-        "gemv_row_blocked: K must be a multiple of fwht_block_size")
+        "gemv_row_blocked_bf16_scaled: K must be a multiple of fwht_block_size")
     debug_assert(fwht_block_size >= VNNI_K_STEP,
-        "gemv_row_blocked: fwht_block_size must be >= VNNI_K_STEP (64)")
+        "gemv_row_blocked_bf16_scaled: fwht_block_size must be >= VNNI_K_STEP")
     debug_assert(subrange % VNNI_N_STEP == 0,
-        "gemv_row_blocked: subrange must be a multiple of VNNI_N_STEP (32)")
+        "gemv_row_blocked_bf16_scaled: subrange must be a multiple of VNNI_N_STEP")
     comptime num_blocks = K // fwht_block_size
     comptime width = simd_width_of[DType.int32]()
     comptime passes_per_subtile = VNNI_TILE_N // width
@@ -129,6 +127,7 @@ def gemv_row_blocked[N: Int, K: Int, fwht_block_size: Int](
 
     var n_block = compute_n_block(subrange, K)
     var packed_off = 0
+    var route_scale = SIMD[DType.float32, width](output_scale)
 
     for nb in range(0, subrange, n_block):
         var nb_size = min(n_block, subrange - nb)
@@ -162,7 +161,8 @@ def gemv_row_blocked[N: Int, K: Int, fwht_block_size: Int](
                     f32_acc[a] += corrected * blk_dequant
             for a in range(acc_count):
                 var n_base = nb + ns + a * width
-                (dst + n_base).store(f32_acc[a] * (wsc + n_base).load[width=width]())
+                var weighted = f32_acc[a] * (wsc + n_base).load[width=width]()
+                (dst + n_base).store((weighted * route_scale).cast[DType.bfloat16]())
 
 
 # ============================================================================
