@@ -1,15 +1,3 @@
-"""Gemma 4 shared infrastructure — config + layer-type routing.
-
-LayerShard / LayerBuilder used to live here; they are now in modeling_common
-since every architecture uses them.
-"""
-
-
-# =============================================================================
-# Architecture config — shared across bf16 and ButterQuant models
-# =============================================================================
-
-
 struct Gemma4BaseConfig:
     comptime HIDDEN = 2816
     comptime NUM_LAYERS = 30

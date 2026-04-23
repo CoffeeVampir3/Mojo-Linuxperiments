@@ -13,13 +13,14 @@ from modeling.model_spec import (
     Shape, DynamicView, WeightDesc,
     DynamicTensor, StaticTensor,
     DEFAULT_ALIGNMENT, LogitsView,
+    HOST_RANK,
 )
 from modeling.gemma4_common import (
     Gemma4BaseConfig, is_full_layer,
 )
 from modeling.modeling_common import (
     SlotOffset, Repeated, SectionBuilder, align_up,
-    LayerShard, LayerBuilder,
+    LayerBuilder,
 )
 from modeling.loader import discover_shards, load_weights_from_descs
 from kernels.kernel_ops import (
@@ -176,26 +177,25 @@ struct Gemma4Topology[tp: Int](Copyable, ImplicitlyCopyable):
 
 def emit_body[tp: Int](mut b: LayerBuilder, mut e: List[WeightDesc]) -> BodyRefs[tp]:
     comptime S = Gemma4Shapes[tp]
-    comptime R = LayerShard.REPL
     comptime H = C.HIDDEN
     comptime NE = C.NUM_EXPERTS
     return BodyRefs[tp](
-        input_norm      = SlotOffset[BF16, Shape[H, 1]](b.bf(e, "input_layernorm.weight", H, 1, R)),
-        post_attn_norm  = SlotOffset[BF16, Shape[H, 1]](b.bf(e, "post_attention_layernorm.weight", H, 1, R)),
-        pre_ffn_norm    = SlotOffset[BF16, Shape[H, 1]](b.bf(e, "pre_feedforward_layernorm.weight", H, 1, R)),
-        pre_ffn_norm_2  = SlotOffset[BF16, Shape[H, 1]](b.bf(e, "pre_feedforward_layernorm_2.weight", H, 1, R)),
-        post_ffn_norm_1 = SlotOffset[BF16, Shape[H, 1]](b.bf(e, "post_feedforward_layernorm_1.weight", H, 1, R)),
-        post_ffn_norm_2 = SlotOffset[BF16, Shape[H, 1]](b.bf(e, "post_feedforward_layernorm_2.weight", H, 1, R)),
-        post_ffn_norm   = SlotOffset[BF16, Shape[H, 1]](b.bf(e, "post_feedforward_layernorm.weight", H, 1, R)),
-        gate_proj       = SlotOffset[BF16, S.GateUp](b.bfs[S.GateUp](e, "mlp.gate_proj.weight")),
-        up_proj         = SlotOffset[BF16, S.GateUp](b.bfs[S.GateUp](e, "mlp.up_proj.weight")),
-        down_proj       = SlotOffset[BF16, S.Down](b.bfs[S.Down](e, "mlp.down_proj.weight")),
-        router_proj     = SlotOffset[BF16, Shape[NE, H]](b.bf(e, "router.proj.weight", NE, H, R)),
-        router_scale    = SlotOffset[BF16, Shape[H, 1]](b.bf(e, "router.scale", H, 1, R)),
-        router_pes      = SlotOffset[BF16, Shape[NE, 1]](b.bf(e, "router.per_expert_scale", NE, 1, R)),
-        experts_gate_up = SlotOffset[BF16, S.ExpertsGateUp](b.bfs[S.ExpertsGateUp](e, "experts.gate_up_proj")),
-        experts_down    = SlotOffset[BF16, S.ExpertsDown](b.bfs[S.ExpertsDown](e, "experts.down_proj")),
-        layer_scalar    = SlotOffset[BF16, Shape[1, 1]](b.bf(e, "layer_scalar", 1, 1, R)),
+        input_norm      = b.bfs[Shape[H, 1]](e, "input_layernorm.weight"),
+        post_attn_norm  = b.bfs[Shape[H, 1]](e, "post_attention_layernorm.weight"),
+        pre_ffn_norm    = b.bfs[Shape[H, 1]](e, "pre_feedforward_layernorm.weight"),
+        pre_ffn_norm_2  = b.bfs[Shape[H, 1]](e, "pre_feedforward_layernorm_2.weight"),
+        post_ffn_norm_1 = b.bfs[Shape[H, 1]](e, "post_feedforward_layernorm_1.weight"),
+        post_ffn_norm_2 = b.bfs[Shape[H, 1]](e, "post_feedforward_layernorm_2.weight"),
+        post_ffn_norm   = b.bfs[Shape[H, 1]](e, "post_feedforward_layernorm.weight"),
+        gate_proj       = b.bfs[S.GateUp](e, "mlp.gate_proj.weight"),
+        up_proj         = b.bfs[S.GateUp](e, "mlp.up_proj.weight"),
+        down_proj       = b.bfs[S.Down](e, "mlp.down_proj.weight"),
+        router_proj     = b.bfs[Shape[NE, H]](e, "router.proj.weight"),
+        router_scale    = b.bfs[Shape[H, 1]](e, "router.scale"),
+        router_pes      = b.bfs[Shape[NE, 1]](e, "router.per_expert_scale"),
+        experts_gate_up = b.bfs[S.ExpertsGateUp](e, "experts.gate_up_proj"),
+        experts_down    = b.bfs[S.ExpertsDown](e, "experts.down_proj"),
+        layer_scalar    = b.bfs[Shape[1, 1]](e, "layer_scalar"),
     )
 
 
@@ -204,14 +204,13 @@ def emit_sliding[tp: Int](
 ) -> Tuple[SlidingLayerRefs[tp], Int]:
     var b = LayerBuilder(tp, prefix, layer_base)
     comptime S = Gemma4Shapes[tp]
-    comptime R = LayerShard.REPL
     var attn = SlidingAttnRefs[tp](
-        q_proj = SlotOffset[BF16, S.SlidingQ](b.bfs[S.SlidingQ](e, "self_attn.q_proj.weight")),
-        k_proj = SlotOffset[BF16, S.SlidingKV](b.bfs[S.SlidingKV](e, "self_attn.k_proj.weight")),
-        v_proj = SlotOffset[BF16, S.SlidingKV](b.bfs[S.SlidingKV](e, "self_attn.v_proj.weight")),
-        o_proj = SlotOffset[BF16, S.SlidingO](b.bfs[S.SlidingO](e, "self_attn.o_proj.weight")),
-        q_norm = SlotOffset[BF16, Shape[C.HEAD_DIM_SLIDING, 1]](b.bf(e, "self_attn.q_norm.weight", C.HEAD_DIM_SLIDING, 1, R)),
-        k_norm = SlotOffset[BF16, Shape[C.HEAD_DIM_SLIDING, 1]](b.bf(e, "self_attn.k_norm.weight", C.HEAD_DIM_SLIDING, 1, R)),
+        q_proj = b.bfs[S.SlidingQ](e, "self_attn.q_proj.weight"),
+        k_proj = b.bfs[S.SlidingKV](e, "self_attn.k_proj.weight"),
+        v_proj = b.bfs[S.SlidingKV](e, "self_attn.v_proj.weight"),
+        o_proj = b.bfs[S.SlidingO](e, "self_attn.o_proj.weight"),
+        q_norm = b.bfs[Shape[C.HEAD_DIM_SLIDING, 1]](e, "self_attn.q_norm.weight"),
+        k_norm = b.bfs[Shape[C.HEAD_DIM_SLIDING, 1]](e, "self_attn.k_norm.weight"),
     )
     return (SlidingLayerRefs[tp](attn=attn, body=emit_body[tp](b, e)), b.cursor)
 
@@ -221,13 +220,12 @@ def emit_full[tp: Int](
 ) -> Tuple[FullLayerRefs[tp], Int]:
     var b = LayerBuilder(tp, prefix, layer_base)
     comptime S = Gemma4Shapes[tp]
-    comptime R = LayerShard.REPL
     var attn = FullAttnRefs[tp](
-        q_proj = SlotOffset[BF16, S.FullQ](b.bfs[S.FullQ](e, "self_attn.q_proj.weight")),
-        k_proj = SlotOffset[BF16, S.FullK](b.bfs[S.FullK](e, "self_attn.k_proj.weight")),
-        o_proj = SlotOffset[BF16, S.FullO](b.bfs[S.FullO](e, "self_attn.o_proj.weight")),
-        q_norm = SlotOffset[BF16, Shape[C.HEAD_DIM_FULL, 1]](b.bf(e, "self_attn.q_norm.weight", C.HEAD_DIM_FULL, 1, R)),
-        k_norm = SlotOffset[BF16, Shape[C.HEAD_DIM_FULL, 1]](b.bf(e, "self_attn.k_norm.weight", C.HEAD_DIM_FULL, 1, R)),
+        q_proj = b.bfs[S.FullQ](e, "self_attn.q_proj.weight"),
+        k_proj = b.bfs[S.FullK](e, "self_attn.k_proj.weight"),
+        o_proj = b.bfs[S.FullO](e, "self_attn.o_proj.weight"),
+        q_norm = b.bfs[Shape[C.HEAD_DIM_FULL, 1]](e, "self_attn.q_norm.weight"),
+        k_norm = b.bfs[Shape[C.HEAD_DIM_FULL, 1]](e, "self_attn.k_norm.weight"),
     )
     return (FullLayerRefs[tp](attn=attn, body=emit_body[tp](b, e)), b.cursor)
 
@@ -344,14 +342,11 @@ def build_gemma4_plan[tp: Int]() -> Gemma4LoadPlan[tp]:
 
     # Host section
     var host_off = align_up(state.bytes())
-    comptime HOST = LayerShard.HOST
     var hb = LayerBuilder(tp, "", 0)
     hb.cursor = host_off
     var host = HostSlots(
-        final_norm=SlotOffset[BF16, Shape[C.HIDDEN, 1]](
-            hb.bf(descs, "model.language_model.norm.weight", C.HIDDEN, 1, HOST)),
-        embed=SlotOffset[BF16, Shape[C.VOCAB_SIZE, C.HIDDEN]](
-            hb.bf(descs, "model.language_model.embed_tokens.weight", C.VOCAB_SIZE, C.HIDDEN, HOST)))
+        final_norm=hb.bfs[Shape[C.HIDDEN, 1]](descs, "model.language_model.norm.weight", target_rank=HOST_RANK),
+        embed=hb.bfs[Shape[C.VOCAB_SIZE, C.HIDDEN]](descs, "model.language_model.embed_tokens.weight", target_rank=HOST_RANK))
 
     var topo = Gemma4Topology[tp](
         arena_base=0,

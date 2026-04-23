@@ -1,11 +1,7 @@
 from std.pathlib import Path
 from std.memory import UnsafePointer
 
-from modeling.model_spec import (
-    Encoding, Shaped, Placed, Named, byte_count,
-    Absorbed,
-    WeightIterable, WeightDesc, weight_desc,
-)
+from modeling.model_spec import WeightDesc
 from safetensors.parser import parse_safetensors_header, SafetensorsHeader, TensorMeta
 from linux.io_uring import IoRing, ReadOp, run_reads_multi
 from notstdcollections import HeapMoveArray
@@ -166,80 +162,6 @@ def resolve_and_emit(
 struct LoadResult(Movable):
     var bytes_loaded: Int
     var num_ops: Int
-
-
-def load_weights[
-    M: WeightIterable,
-    io_depth: Int = DEFAULT_IO_DEPTH,
-    mask_size: Int = DEFAULT_MASK_SIZE,
-](
-    paths: List[Path],
-    arena_bases: List[Int],
-    numa_topo: NumaTopology,
-) -> Optional[LoadResult]:
-    """Load weights from one or more safetensors files into pre-allocated arenas.
-
-    Supports sharded checkpoints: each tensor is looked up across all shard
-    headers, and reads are issued from the correct file.
-    """
-    var headers = HeapMoveArray[SafetensorsHeader](len(paths))
-    for i in range(len(paths)):
-        var header_opt = parse_safetensors_header(paths[i])
-        if not header_opt:
-            print("failed to parse:", String(paths[i]))
-            return None
-        headers.push(header_opt.take())
-
-    var targeted_weights = List[WeightDesc]()
-    var distributed_weights = List[WeightDesc]()
-
-    @parameter
-    def collect[T: Encoding & Shaped & Placed & Named](prefix: String, base: Int):
-        comptime if conforms_to(T, Absorbed):
-            pass
-        else:
-            var desc = weight_desc[T](prefix, base)
-            if desc.target_rank >= 0:
-                targeted_weights.append(desc^)
-            else:
-                distributed_weights.append(desc^)
-
-    M.for_each_weight[collect]()
-
-    var tp = len(arena_bases)
-    var ops_per_rank = List[List[ReadOp[]]]()
-    for _ in range(tp):
-        ops_per_rank.append(List[ReadOp[]]())
-
-    var all_ranks = List[Int]()
-    for r in range(tp):
-        all_ranks.append(r)
-
-    for w in targeted_weights:
-        var ranks = List[Int]()
-        ranks.append(w.target_rank % tp)
-        if not resolve_and_emit(w, headers, arena_bases, ranks, ops_per_rank):
-            return None
-    for w in distributed_weights:
-        if not resolve_and_emit(w, headers, arena_bases, all_ranks, ops_per_rank):
-            return None
-
-    return run_load[io_depth, mask_size](paths, numa_topo, ops_per_rank^)
-
-
-def load_safetensors[
-    M: WeightIterable,
-    io_depth: Int = DEFAULT_IO_DEPTH,
-    mask_size: Int = DEFAULT_MASK_SIZE,
-](
-    path: Path,
-    arena_bases: List[Int],
-    numa_topo: NumaTopology,
-) -> Optional[LoadResult]:
-    """Load weights from a single safetensors file."""
-    var paths = List[Path]()
-    paths.append(path)
-    return load_weights[M, io_depth, mask_size](paths, arena_bases, numa_topo)
 
 
 def load_weights_from_descs[

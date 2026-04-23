@@ -20,7 +20,7 @@ from modeling.model_spec import (
 from quant.source_format import Bf16Converter, Fp8E4M3Block128Converter
 from modeling.modeling_common import (
     SlotOffset, TensorRef, Repeated, SectionBuilder, align_up,
-    LayerShard, LayerBuilder,
+    LayerBuilder,
 )
 from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY, embed_lookup
 from kernels.reductions import small_allreduce, ring_broadcast
@@ -323,7 +323,6 @@ def emit_layer[tp: Int](
     prefix: String, layer_base: Int, mut e: List[WeightDesc],
 ) -> Tuple[LayerRefs[tp], Int]:
     var b = LayerBuilder(tp, prefix, layer_base)
-    comptime ROW, COL, REPL = LayerShard.ROW, LayerShard.COL, LayerShard.REPL
     comptime H  = C.HIDDEN
     comptime MI = C.MOE_INTERMEDIATE
     comptime NE = C.NUM_EXPERTS
@@ -332,29 +331,26 @@ def emit_layer[tp: Int](
     comptime q_n_loc  = C.Q_DIM // tp
     comptime kv_n_loc = C.KV_DIM // tp
     comptime o_num_blk = C.NUM_HEADS // tp
-    comptime bf16 = size_of[Scalar[DType.bfloat16]]()
 
-    # --- Attention projections (fused QKV: weights contiguous, scales contiguous) ---
     comptime qkv_n_loc = q_n_loc + 2 * kv_n_loc
-    var qkv_proj_off = b.q(e, "self_attn.q_proj.weight", C.Q_DIM, H, ROW)
-    _ = b.q(e, "self_attn.k_proj.weight", C.KV_DIM, H, ROW)
-    _ = b.q(e, "self_attn.v_proj.weight", C.KV_DIM, H, ROW)
-    var qkv_proj = SlotOffset[I8, Shape[C.Q_DIM + 2 * C.KV_DIM, H]](qkv_proj_off)
+    var qkv_proj_off = b.qs[Shape[C.Q_DIM, H, shard_n=True, tp=tp]](e, "self_attn.q_proj.weight")
+    _ = b.qs[Shape[C.KV_DIM, H, shard_n=True, tp=tp]](e, "self_attn.k_proj.weight")
+    _ = b.qs[Shape[C.KV_DIM, H, shard_n=True, tp=tp]](e, "self_attn.v_proj.weight")
+    var qkv_proj = SlotOffset[I8, Shape[C.Q_DIM + 2 * C.KV_DIM, H]](qkv_proj_off.offset)
 
-    var qkv_sc_off = b.f(e, "self_attn.q_proj.weight_scale", C.Q_DIM, 1, ROW)
-    _ = b.f(e, "self_attn.k_proj.weight_scale", C.KV_DIM, 1, ROW)
-    _ = b.f(e, "self_attn.v_proj.weight_scale", C.KV_DIM, 1, ROW)
-    var qkv_proj_sc = SlotOffset[F32, Shape[C.Q_DIM + 2 * C.KV_DIM, 1]](qkv_sc_off)
+    var qkv_sc_off = b.fs[Shape[C.Q_DIM, 1, shard_n=True, tp=tp]](e, "self_attn.q_proj.weight_scale")
+    _ = b.fs[Shape[C.KV_DIM, 1, shard_n=True, tp=tp]](e, "self_attn.k_proj.weight_scale")
+    _ = b.fs[Shape[C.KV_DIM, 1, shard_n=True, tp=tp]](e, "self_attn.v_proj.weight_scale")
+    var qkv_proj_sc = SlotOffset[F32, Shape[C.Q_DIM + 2 * C.KV_DIM, 1]](qkv_sc_off.offset)
 
     var o_proj = SlotOffset[I8, Shape[H, C.Q_DIM]](
-        b.q(e, "self_attn.o_proj.weight", H, C.Q_DIM, COL))
-    var o_proj_sc = SlotOffset[F32, Shape[H, 1]](
-        b.f(e, "self_attn.o_proj.weight_scale", H, 1, REPL))
+        b.qs[Shape[H, C.Q_DIM, shard_m=True, tp=tp]](e, "self_attn.o_proj.weight").offset)
+    var o_proj_sc = b.fs[Shape[H, 1]](e, "self_attn.o_proj.weight_scale")
 
     var q_norm = SlotOffset[BF16, Shape[C.Q_DIM, 1]](
-        b.bf(e, "self_attn.q_norm.weight", C.Q_DIM, 1, ROW))
+        b.bfs[Shape[C.Q_DIM, 1, shard_n=True, tp=tp]](e, "self_attn.q_norm.weight").offset)
     var k_norm = SlotOffset[BF16, Shape[C.KV_DIM, 1]](
-        b.bf(e, "self_attn.k_norm.weight", C.KV_DIM, 1, ROW))
+        b.bfs[Shape[C.KV_DIM, 1, shard_n=True, tp=tp]](e, "self_attn.k_norm.weight").offset)
 
     var qkv_colsum = b.colsum_slot[F32, Shape[qkv_n_loc, 1]]()
     var o_colsum = b.colsum_slot[F32, Shape[H * o_num_blk, 1]]()
@@ -366,19 +362,13 @@ def emit_layer[tp: Int](
         qkv_colsum=qkv_colsum, o_colsum=o_colsum,
     )
 
-    # --- Norms ---
-    var input_norm = SlotOffset[BF16, Shape[H, 1]](
-        b.bf(e, "input_layernorm.weight", H, 1, REPL))
-    var post_attn_norm = SlotOffset[BF16, Shape[H, 1]](
-        b.bf(e, "post_attention_layernorm.weight", H, 1, REPL))
+    var input_norm = b.bfs[Shape[H, 1]](e, "input_layernorm.weight")
+    var post_attn_norm = b.bfs[Shape[H, 1]](e, "post_attention_layernorm.weight")
     var input_norm_sqrt = b.colsum_slot[BF16, Shape[H, 1]]()
     var post_attn_norm_sqrt = b.colsum_slot[BF16, Shape[H, 1]]()
 
-    # --- Router (F32, not butterquantized) ---
-    var router_proj = SlotOffset[F32, Shape[NE, H]](
-        b.f(e, "block_sparse_moe.gate.weight", NE, H, REPL))
-    var router_bias = SlotOffset[F32, Shape[NE, 1]](
-        b.f(e, "block_sparse_moe.e_score_correction_bias", NE, 1, REPL))
+    var router_proj = b.fs[Shape[NE, H]](e, "block_sparse_moe.gate.weight")
+    var router_bias = b.fs[Shape[NE, 1]](e, "block_sparse_moe.e_score_correction_bias")
 
     # --- Experts (w1=gate, w3=up, w2=down) ---
     # Arena stores experts contiguously (ROW-sharded over the NE*rows axis).
@@ -532,33 +522,26 @@ def build_minimax_plan[tp: Int]() -> MiniMaxM27LoadPlan[tp]:
         C.MAX_SEQ_LEN, C.HEAD_DIM, KV_HEADS_LOCAL, HEADS_LOCAL].TOTAL_BYTES
     var kv_cache_off = state.reserve_bytes(C.NUM_LAYERS * kv_cache_stride)
 
-    # Host section
-    comptime HOST = LayerShard.HOST
     comptime vocab_num_blocks = C.HIDDEN // LM_OUTPUT_HEAD_FWHT_BLK
     var host_off = align_up(state.bytes())
     var hb = LayerBuilder(tp, "", 0)
     hb.cursor = host_off
 
-    var final_norm_off = hb.bf(descs, "model.norm.weight", C.HIDDEN, 1, HOST)
+    var final_norm_off = hb.bfs[Shape[C.HIDDEN, 1]](descs, "model.norm.weight", target_rank=HOST_RANK)
 
-    var embed_off = hb.bf(descs, "model.embed_tokens.weight",
-                         C.VOCAB_SIZE, C.HIDDEN, HOST)
+    var embed_off = hb.bfs[Shape[C.VOCAB_SIZE, C.HIDDEN]](descs, "model.embed_tokens.weight", target_rank=HOST_RANK)
 
-    var lm_output_head_off = hb.q(descs, "lm_head.weight",
-                                 C.VOCAB_SIZE, C.HIDDEN, HOST)
-    var lm_output_head_sc_off = hb.f(descs, "lm_head.weight_scale",
-                                    C.VOCAB_SIZE, vocab_num_blocks, HOST)
+    var lm_output_head_off = hb.qs[Shape[C.VOCAB_SIZE, C.HIDDEN]](descs, "lm_head.weight", target_rank=HOST_RANK)
+    var lm_output_head_sc_off = hb.fs[Shape[C.VOCAB_SIZE, vocab_num_blocks]](descs, "lm_head.weight_scale", target_rank=HOST_RANK)
     var lm_output_head_colsum = hb.colsum_slot[F32, Shape[C.VOCAB_SIZE, vocab_num_blocks]]()
     var lm_output_head_sqrt_gamma = hb.colsum_slot[BF16, Shape[C.HIDDEN, 1]]()
     var host_bytes = hb.cursor
 
     var host = HostSlots(
-        final_norm=SlotOffset[BF16, Shape[C.HIDDEN, 1]](final_norm_off),
-        embed=SlotOffset[BF16, Shape[C.VOCAB_SIZE, C.HIDDEN]](embed_off),
-        lm_output_head=SlotOffset[I8, Shape[C.VOCAB_SIZE, C.HIDDEN]](
-            lm_output_head_off),
-        lm_output_head_sc=SlotOffset[F32, Shape[C.VOCAB_SIZE, vocab_num_blocks]](
-            lm_output_head_sc_off),
+        final_norm=final_norm_off,
+        embed=embed_off,
+        lm_output_head=lm_output_head_off,
+        lm_output_head_sc=lm_output_head_sc_off,
         lm_output_head_colsum=lm_output_head_colsum,
         lm_output_head_sqrt_gamma=lm_output_head_sqrt_gamma,
     )

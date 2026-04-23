@@ -2,90 +2,6 @@ from std.memory import UnsafePointer
 from modeling.linear_borrow_pool import ScratchLease
 
 
-# =============================================================================
-# Packing strategy — must be defined first as Placed references PackFn
-# =============================================================================
-
-comptime PackFn = def(
-    UnsafePointer[UInt8, MutAnyOrigin],  # src: row-major source
-    UnsafePointer[UInt8, MutAnyOrigin],  # dst: packed destination
-    Int, Int,                            # rows, cols
-) thin -> None
-
-def pack_noop(
-    src: UnsafePointer[UInt8, MutAnyOrigin],
-    dst: UnsafePointer[UInt8, MutAnyOrigin],
-    rows: Int, cols: Int,
-):
-    pass
-
-trait PackingStrategy:
-    comptime PACK_FN: PackFn
-
-struct Unpacked(PackingStrategy):
-    comptime PACK_FN = pack_noop
-
-
-# =============================================================================
-# Kernel tiling — composable per-dimension constraints
-#
-# Atomic traits: each declares one axis of the kernel's tile structure.
-# Composed structs: Kernel2DTiling (row + col), Kernel3DTiling (+ panel).
-# Consumers take trait bounds on the axes they need.
-# New dimensions are additive — one trait per axis.
-# =============================================================================
-
-trait RowTiled:
-    """Kernel tiles the row (N/output) dimension in steps of ROW_TILE."""
-    comptime ROW_TILE: Int
-
-trait ColTiled:
-    """Kernel tiles the col (K/reduction) dimension in steps of COL_TILE."""
-    comptime COL_TILE: Int
-
-trait PanelHeight:
-    """Kernel processes the activation (M) dimension in panels of PANEL."""
-    comptime PANEL: Int
-
-struct Kernel2DTiling[row_tile: Int, col_tile: Int](RowTiled, ColTiled, PanelHeight):
-    comptime ROW_TILE = Self.row_tile
-    comptime COL_TILE = Self.col_tile
-    comptime PANEL = 1
-
-struct Kernel3DTiling[row_tile: Int, col_tile: Int, panel: Int](RowTiled, ColTiled, PanelHeight):
-    comptime ROW_TILE = Self.row_tile
-    comptime COL_TILE = Self.col_tile
-    comptime PANEL = Self.panel
-
-comptime Untiled = Kernel2DTiling[1, 1]
-
-
-# =============================================================================
-# Weight classification
-#
-# Lifecycle traits — a weight tag declares the full pipeline disposition:
-#   Quantizable      : quantized (FWHT + int8), per-row scale in output
-#   Gamma             : quantized with the weight side of a sqrt-gamma split
-#   Passthrough       : copied through quantizer unchanged, loaded, used
-#   Absorbed          : consumed during quantization (gamma source), absent
-# =============================================================================
-
-trait WeightTag: ...
-trait Quantizable: ...
-trait Gamma: ...
-trait PassthroughTag: ...
-trait Absorbed: ...
-
-struct IsQuantizable(WeightTag, Quantizable): ...
-struct IsGammaQuantizable(WeightTag, Quantizable, Gamma): ...
-struct IsPassthrough(WeightTag, PassthroughTag): ...
-struct IsAbsorbed(WeightTag, Absorbed): ...
-
-
-# =============================================================================
-# Core traits
-# =============================================================================
-
 trait Encoding:
     comptime DTYPE: DType
     comptime ELEMENT_BYTES: Int
@@ -93,16 +9,6 @@ trait Encoding:
 trait Shaped:
     comptime ROWS: Int
     comptime COLS: Int
-
-trait Placed:
-    comptime OFFSET: Int
-    comptime GLOBAL_ROWS: Int
-    comptime GLOBAL_COLS: Int
-    comptime PACK_FN: PackFn
-    comptime TARGET_RANK: Int
-
-trait Named:
-    comptime NAME: StaticString
 
 trait Aligned:
     comptime ALIGNMENT: Int
@@ -155,12 +61,6 @@ trait ShapeLike:
     comptime ELEMS: Int
 
     @staticmethod
-    def bytes_for[elem_bytes: Int]() -> Int: ...
-    @staticmethod
-    def row_bytes_for[elem_bytes: Int]() -> Int: ...
-    @staticmethod
-    def col_bytes_for[elem_bytes: Int]() -> Int: ...
-    @staticmethod
     def bytes[E: Encoding]() -> Int: ...
     @staticmethod
     def row_bytes[E: Encoding]() -> Int: ...
@@ -186,20 +86,6 @@ struct Shape[
     comptime ELEMS = Self.N * Self.M
 
     @staticmethod
-    def bytes_for[elem_bytes: Int]() -> Int:
-        return Self.ELEMS * elem_bytes
-
-    @staticmethod
-    def row_bytes_for[elem_bytes: Int]() -> Int:
-        """Bytes for one row: M elements."""
-        return Self.M * elem_bytes
-
-    @staticmethod
-    def col_bytes_for[elem_bytes: Int]() -> Int:
-        """Bytes for one column: N elements."""
-        return Self.N * elem_bytes
-
-    @staticmethod
     def bytes[E: Encoding]() -> Int:
         """Bytes for the full static tensor: N * M * element-bytes(E)."""
         return Self.ELEMS * E.ELEMENT_BYTES
@@ -221,98 +107,18 @@ struct Shape[
 
 
 # =============================================================================
-# Legacy DimStrategy / ShardStrategy — used by SmolLM2 PlacedSlot chain
-# =============================================================================
-
-trait DimStrategy:
-    @staticmethod
-    def local(d: Int, tp: Int) -> Int: ...
-
-struct Divide(DimStrategy):
-    @staticmethod
-    def local(d: Int, tp: Int) -> Int:
-        return d // tp
-
-struct Keep(DimStrategy):
-    @staticmethod
-    def local(d: Int, tp: Int) -> Int:
-        return d
-
-
-trait ShardStrategy:
-    @staticmethod
-    def shard_rows(r: Int, tp: Int) -> Int: ...
-    @staticmethod
-    def shard_cols(c: Int, tp: Int) -> Int: ...
-
-struct Shard2D[Row: DimStrategy, Col: DimStrategy](ShardStrategy):
-    @staticmethod
-    def shard_rows(r: Int, tp: Int) -> Int:
-        return Self.Row.local(r, tp)
-    @staticmethod
-    def shard_cols(c: Int, tp: Int) -> Int:
-        return Self.Col.local(c, tp)
-
-comptime RowShard = Shard2D[Divide, Keep]
-comptime ColShard = Shard2D[Keep, Divide]
-comptime Replicated = Shard2D[Keep, Keep]
-
-
-# =============================================================================
 # Placement locality
 #
-# target_rank on a PlacedSlot says where the loader is allowed to write the
-# weight. The default (DISTRIBUTED) means every rank participates: replicated
-# slots get a copy on each rank, sharded slots get their slice. A non-negative
-# target_rank pins the slot to a single rank's arena — used for host-only
-# weights (final norm, embed, lm head) that only one rank ever reads, and for
-# per-expert MoE sharding where the rank is determined by expert ID.
+# target_rank on a weight slot says where the loader is allowed to write it.
+# DISTRIBUTED (-1) means every rank participates: replicated slots get a copy
+# on each rank, sharded slots get their slice. A non-negative target_rank pins
+# the slot to a single rank's arena — used for host-only weights (final norm,
+# embed, lm head) that only one rank ever reads, and for per-expert MoE
+# sharding where the rank is determined by expert ID.
 # =============================================================================
 
 comptime DISTRIBUTED = -1
 comptime HOST_RANK = 0
-
-
-struct Slot[E: Encoding, S: ShardStrategy, rows: Int, cols: Int, tp: Int](
-    Encoding, Shaped
-):
-    comptime DTYPE = Self.E.DTYPE
-    comptime ELEMENT_BYTES = Self.E.ELEMENT_BYTES
-    comptime ROWS = Self.S.shard_rows(Self.rows, Self.tp)
-    comptime COLS = Self.S.shard_cols(Self.cols, Self.tp)
-
-struct PlacedSlot[
-    E: Encoding, S: ShardStrategy,
-    rows: Int, cols: Int, tp: Int, offset: Int,
-    name: StringLiteral,
-    Tag: WeightTag = IsPassthrough,
-    Packing: PackingStrategy = Unpacked,
-    Tiling: RowTiled & ColTiled & PanelHeight = Untiled,
-    target_rank: Int = DISTRIBUTED,
-](
-    Encoding, Shaped, Placed, Named, ShardStrategy,
-    Quantizable where conforms_to(Tag, Quantizable),
-    Gamma where conforms_to(Tag, Gamma),
-    PassthroughTag where conforms_to(Tag, PassthroughTag),
-    Absorbed where conforms_to(Tag, Absorbed),
-):
-    comptime DTYPE = Self.E.DTYPE
-    comptime ELEMENT_BYTES = Self.E.ELEMENT_BYTES
-    comptime ROWS = Self.S.shard_rows(Self.rows, Self.tp)
-    comptime COLS = Self.S.shard_cols(Self.cols, Self.tp)
-    comptime OFFSET = Self.offset
-    comptime GLOBAL_ROWS = Self.rows
-    comptime GLOBAL_COLS = Self.cols
-    comptime NAME: StaticString = Self.name
-    comptime PACK_FN = Self.Packing.PACK_FN
-    comptime TARGET_RANK = Self.target_rank
-
-    @staticmethod
-    def shard_rows(r: Int, n: Int) -> Int:
-        return Self.S.shard_rows(r, n)
-    @staticmethod
-    def shard_cols(c: Int, n: Int) -> Int:
-        return Self.S.shard_cols(c, n)
 
 
 comptime DEFAULT_ALIGNMENT = 64
@@ -447,14 +253,6 @@ struct ScratchView[
             self.ptr.as_any_origin(), self.runtime_rows)
 
 
-def byte_count[T: Encoding & Shaped]() -> Int:
-    return T.ROWS * T.COLS * T.ELEMENT_BYTES
-
-def next_offset[T: Encoding & Shaped & Placed, alignment: Int = DEFAULT_ALIGNMENT]() -> Int:
-    comptime aligned = ((T.OFFSET + alignment - 1) // alignment) * alignment
-    return aligned + byte_count[T]()
-
-
 @fieldwise_init
 struct WeightDesc(Copyable):
     var name: String
@@ -471,29 +269,6 @@ struct WeightDesc(Copyable):
     var absorbed: Bool
     var target_rank: Int
 
-def weight_desc[T: Encoding & Shaped & Placed & Named](
-    prefix: String = "", base: Int = 0,
-) -> WeightDesc:
-    comptime is_quantizable = conforms_to(T, Quantizable)
-    comptime is_absorbed = conforms_to(T, Absorbed)
-    return WeightDesc(
-        name=prefix + String(T.NAME), arena_offset=base + T.OFFSET,
-        dtype=T.DTYPE, element_bytes=T.ELEMENT_BYTES,
-        global_rows=T.GLOBAL_ROWS, global_cols=T.GLOBAL_COLS,
-        local_rows=T.ROWS, local_cols=T.COLS,
-        data_rows=T.ROWS, data_cols=T.COLS,
-        quantizable=is_quantizable,
-        absorbed=is_absorbed,
-        target_rank=T.TARGET_RANK,
-    )
-
-
-trait WeightIterable:
-    @staticmethod
-    def for_each_weight[
-        func: def[T: Encoding & Shaped & Placed & Named] (String, Int) capturing -> None,
-    ](): ...
-
 
 # =============================================================================
 # Quantizer tasks
@@ -508,7 +283,6 @@ trait WeightIterable:
 # =============================================================================
 
 
-from std.memory import UnsafePointer
 from quant.source_format import Converter
 
 
@@ -721,36 +495,6 @@ struct TwoSidedAbsorbed[Src: Converter](QuantizeSpec):
     def is_per_block(self) -> Bool: return False
     def gamma_source(self) -> String: return self.gamma
     def two_sided_head_dim(self) -> Int: return self.hdim
-
-
-trait Dims:
-    comptime HIDDEN: Int
-    comptime NUM_LAYERS: Int
-
-trait Attention:
-    comptime NUM_HEADS: Int
-    comptime HEAD_DIM: Int
-
-trait GQA:
-    comptime NUM_KV_HEADS: Int
-    comptime KV_HIDDEN: Int
-    comptime GQA_FACTOR: Int
-
-trait FFN:
-    comptime INTERMEDIATE: Int
-
-trait Vocab:
-    comptime VOCAB_SIZE: Int
-    comptime TIE_EMBEDDINGS: Bool
-
-trait Sequence:
-    comptime MAX_SEQ_LEN: Int
-
-trait RoPEConfig:
-    comptime ROPE_THETA: Float64
-
-trait RMSNormConfig:
-    comptime RMS_NORM_EPS: Float64
 
 
 # =============================================================================

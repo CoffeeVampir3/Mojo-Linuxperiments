@@ -21,7 +21,7 @@ from modeling.gemma4_common import (
 )
 from modeling.modeling_common import (
     SlotOffset, TensorRef, Repeated, SectionBuilder, align_up,
-    LayerShard, LayerBuilder,
+    LayerBuilder,
 )
 from kernels.kernel_ops import PoolFence, BF16Ptr
 from kernels.reductions import ring_allreduce, small_allreduce, ring_broadcast, ring_allgather
@@ -261,62 +261,42 @@ struct Gemma4Topology[tp: Int](Copyable, ImplicitlyCopyable):
 
 
 def emit_body[tp: Int](mut b: LayerBuilder, mut e: List[WeightDesc]) -> BodyRefs[tp]:
-    comptime ROW, COL, REPL = LayerShard.ROW, LayerShard.COL, LayerShard.REPL
     comptime H = C.HIDDEN
     comptime NE = C.NUM_EXPERTS
     comptime GU = C.MOE_GATE_UP_FUSED
     comptime MI = C.MOE_INTERMEDIATE
     comptime S = Gemma4Shapes[tp]
-    comptime o_num_blk = C.NUM_HEADS // tp
     comptime experts_local = NE // tp
 
     # Order is not arbitrary (contiguousness assumed by some ops)
-    var input_norm = SlotOffset[BF16, Shape[H, 1]](
-        b.bf(e, "input_layernorm.weight", H, 1, REPL))
-    var post_attn_norm = SlotOffset[BF16, Shape[H, 1]](
-        b.bf(e, "post_attention_layernorm.weight", H, 1, REPL))
-    var pre_ffn_norm = SlotOffset[BF16, Shape[H, 1]](
-        b.bf(e, "pre_feedforward_layernorm.weight", H, 1, REPL))
-    var pre_ffn_norm_2 = SlotOffset[BF16, Shape[H, 1]](
-        b.bf(e, "pre_feedforward_layernorm_2.weight", H, 1, REPL))
-    var post_ffn_norm_1 = SlotOffset[BF16, Shape[H, 1]](
-        b.bf(e, "post_feedforward_layernorm_1.weight", H, 1, REPL))
-    var post_ffn_norm_2 = SlotOffset[BF16, Shape[H, 1]](
-        b.bf(e, "post_feedforward_layernorm_2.weight", H, 1, REPL))
-    var post_ffn_norm = SlotOffset[BF16, Shape[H, 1]](
-        b.bf(e, "post_feedforward_layernorm.weight", H, 1, REPL))
-    var layer_scalar = SlotOffset[BF16, Shape[1, 1]](
-        b.bf(e, "layer_scalar", 1, 1, REPL))
+    var input_norm = b.bfs[Shape[H, 1]](e, "input_layernorm.weight")
+    var post_attn_norm = b.bfs[Shape[H, 1]](e, "post_attention_layernorm.weight")
+    var pre_ffn_norm = b.bfs[Shape[H, 1]](e, "pre_feedforward_layernorm.weight")
+    var pre_ffn_norm_2 = b.bfs[Shape[H, 1]](e, "pre_feedforward_layernorm_2.weight")
+    var post_ffn_norm_1 = b.bfs[Shape[H, 1]](e, "post_feedforward_layernorm_1.weight")
+    var post_ffn_norm_2 = b.bfs[Shape[H, 1]](e, "post_feedforward_layernorm_2.weight")
+    var post_ffn_norm = b.bfs[Shape[H, 1]](e, "post_feedforward_layernorm.weight")
+    var layer_scalar = b.bfs[Shape[1, 1]](e, "layer_scalar")
 
-    var gate_proj = SlotOffset[I8, S.GateUp](
-        b.qs[S.GateUp](e, "mlp.gate_proj.weight"))
-    var up_proj = SlotOffset[I8, S.GateUp](
-        b.qs[S.GateUp](e, "mlp.up_proj.weight"))
-    var gate_proj_sc = SlotOffset[F32, S.GateUpScale](
-        b.fs[S.GateUpScale](e, "mlp.gate_proj.weight_scale"))
-    var up_proj_sc = SlotOffset[F32, S.GateUpScale](
-        b.fs[S.GateUpScale](e, "mlp.up_proj.weight_scale"))
+    var gate_proj = b.qs[S.GateUp](e, "mlp.gate_proj.weight")
+    var up_proj = b.qs[S.GateUp](e, "mlp.up_proj.weight")
+    var gate_proj_sc = b.fs[S.GateUpScale](e, "mlp.gate_proj.weight_scale")
+    var up_proj_sc = b.fs[S.GateUpScale](e, "mlp.up_proj.weight_scale")
 
-    var down_proj = SlotOffset[I8, S.Down](
-        b.qs[S.Down](e, "mlp.down_proj.weight"))
-    var down_proj_sc = SlotOffset[F32, Shape[H, 1]](
-        b.f(e, "mlp.down_proj.weight_scale", H, 1, REPL))
-    var router_scale = SlotOffset[BF16, Shape[H, 1]](
-        b.bf(e, "router.scale", H, 1, REPL))
-    var router_proj = SlotOffset[I8, Shape[NE, H]](
-        b.q(e, "router.proj.weight", NE, H, REPL))
-    var router_proj_sc = SlotOffset[F32, Shape[NE, 1]](
-        b.f(e, "router.proj.weight_scale", NE, 1, REPL))
-    var router_pes = SlotOffset[BF16, Shape[NE, 1]](
-        b.bf(e, "router.per_expert_scale", NE, 1, REPL))
+    var down_proj = b.qs[S.Down](e, "mlp.down_proj.weight")
+    var down_proj_sc = b.fs[Shape[H, 1]](e, "mlp.down_proj.weight_scale")
+    var router_scale = b.bfs[Shape[H, 1]](e, "router.scale")
+    var router_proj = b.qs[Shape[NE, H]](e, "router.proj.weight")
+    var router_proj_sc = b.fs[Shape[NE, 1]](e, "router.proj.weight_scale")
+    var router_pes = b.bfs[Shape[NE, 1]](e, "router.per_expert_scale")
     var experts_gate_up = SlotOffset[I8, Shape[NE * GU, H]](
-        b.q(e, "experts.gate_up_proj", NE * GU, H, ROW))
+        b.qs[Shape[NE * GU, H, shard_n=True, tp=tp]](e, "experts.gate_up_proj").offset)
     var experts_gate_up_sc = SlotOffset[F32, Shape[NE * GU, 1]](
-        b.f(e, "experts.gate_up_proj_scale", NE * GU, 1, ROW))
+        b.fs[Shape[NE * GU, 1, shard_n=True, tp=tp]](e, "experts.gate_up_proj_scale").offset)
     var experts_down = SlotOffset[I8, Shape[NE * H, MI]](
-        b.q(e, "experts.down_proj", NE * H, MI, ROW))
+        b.qs[Shape[NE * H, MI, shard_n=True, tp=tp]](e, "experts.down_proj").offset)
     var experts_down_sc = SlotOffset[F32, Shape[NE * H, 1]](
-        b.f(e, "experts.down_proj_scale", NE * H, 1, ROW))
+        b.fs[Shape[NE * H, 1, shard_n=True, tp=tp]](e, "experts.down_proj_scale").offset)
     var gu_colsum = b.colsum_slot[F32, Shape[S.DENSE_INT_LOCAL * 2, 1]]()
     var down_colsum = b.colsum_slot[F32, Shape[H * S.DENSE_DOWN_NUM_BLK, 1]]()
     var router_colsum = b.colsum_slot[F32, Shape[NE, 1]]()
@@ -358,23 +338,19 @@ def emit_sliding[tp: Int](
     prefix: String, layer_base: Int, mut e: List[WeightDesc],
 ) -> Tuple[SlidingLayerRefs[tp], Int]:
     var b = LayerBuilder(tp, prefix, layer_base)
-    comptime ROW, COL, REPL = LayerShard.ROW, LayerShard.COL, LayerShard.REPL
     comptime H = C.HIDDEN
     comptime HDS = C.HEAD_DIM_SLIDING
-    comptime o_num_blk = C.NUM_HEADS // tp
-    comptime q_n_loc = C.Q_DIM_SLIDING // tp
-    comptime kv_n = 2 * (C.KV_DIM_SLIDING // tp)
     var attn = SlidingAttnRefs[tp](
-        q_proj    = SlotOffset[I8, Shape[C.Q_DIM_SLIDING, H]](b.q(e, "self_attn.q_proj.weight", C.Q_DIM_SLIDING, H, ROW)),
-        k_proj    = SlotOffset[I8, Shape[C.KV_DIM_SLIDING, H]](b.q(e, "self_attn.k_proj.weight", C.KV_DIM_SLIDING, H, ROW)),
-        v_proj    = SlotOffset[I8, Shape[C.KV_DIM_SLIDING, H]](b.q(e, "self_attn.v_proj.weight", C.KV_DIM_SLIDING, H, ROW)),
-        q_proj_sc = SlotOffset[F32, Shape[C.Q_DIM_SLIDING, 1]](b.f(e, "self_attn.q_proj.weight_scale", C.Q_DIM_SLIDING, 1, ROW)),
-        k_proj_sc = SlotOffset[F32, Shape[C.KV_DIM_SLIDING, 1]](b.f(e, "self_attn.k_proj.weight_scale", C.KV_DIM_SLIDING, 1, ROW)),
-        v_proj_sc = SlotOffset[F32, Shape[C.KV_DIM_SLIDING, 1]](b.f(e, "self_attn.v_proj.weight_scale", C.KV_DIM_SLIDING, 1, ROW)),
-        o_proj    = SlotOffset[I8, Shape[H, C.Q_DIM_SLIDING]](b.q(e, "self_attn.o_proj.weight", H, C.Q_DIM_SLIDING, COL)),
-        o_proj_sc = SlotOffset[F32, Shape[H, 1]](b.f(e, "self_attn.o_proj.weight_scale", H, 1, REPL)),
-        q_norm    = SlotOffset[BF16, Shape[HDS, 1]](b.bf(e, "self_attn.q_norm.weight", HDS, 1, REPL)),
-        k_norm    = SlotOffset[BF16, Shape[HDS, 1]](b.bf(e, "self_attn.k_norm.weight", HDS, 1, REPL)),
+        q_proj    = SlotOffset[I8, Shape[C.Q_DIM_SLIDING, H]](b.qs[Shape[C.Q_DIM_SLIDING, H, shard_n=True, tp=tp]](e, "self_attn.q_proj.weight").offset),
+        k_proj    = SlotOffset[I8, Shape[C.KV_DIM_SLIDING, H]](b.qs[Shape[C.KV_DIM_SLIDING, H, shard_n=True, tp=tp]](e, "self_attn.k_proj.weight").offset),
+        v_proj    = SlotOffset[I8, Shape[C.KV_DIM_SLIDING, H]](b.qs[Shape[C.KV_DIM_SLIDING, H, shard_n=True, tp=tp]](e, "self_attn.v_proj.weight").offset),
+        q_proj_sc = SlotOffset[F32, Shape[C.Q_DIM_SLIDING, 1]](b.fs[Shape[C.Q_DIM_SLIDING, 1, shard_n=True, tp=tp]](e, "self_attn.q_proj.weight_scale").offset),
+        k_proj_sc = SlotOffset[F32, Shape[C.KV_DIM_SLIDING, 1]](b.fs[Shape[C.KV_DIM_SLIDING, 1, shard_n=True, tp=tp]](e, "self_attn.k_proj.weight_scale").offset),
+        v_proj_sc = SlotOffset[F32, Shape[C.KV_DIM_SLIDING, 1]](b.fs[Shape[C.KV_DIM_SLIDING, 1, shard_n=True, tp=tp]](e, "self_attn.v_proj.weight_scale").offset),
+        o_proj    = SlotOffset[I8, Shape[H, C.Q_DIM_SLIDING]](b.qs[Shape[H, C.Q_DIM_SLIDING, shard_m=True, tp=tp]](e, "self_attn.o_proj.weight").offset),
+        o_proj_sc = b.fs[Shape[H, 1]](e, "self_attn.o_proj.weight_scale"),
+        q_norm    = b.bfs[Shape[HDS, 1]](e, "self_attn.q_norm.weight"),
+        k_norm    = b.bfs[Shape[HDS, 1]](e, "self_attn.k_norm.weight"),
         q_colsum  = b.colsum_slot[F32, Shape[C.Q_DIM_SLIDING // tp, 1]](),
         kv_colsum = b.colsum_slot[F32, Shape[2 * (C.KV_DIM_SLIDING // tp), 1]](),
         o_colsum  = b.colsum_slot[F32, Shape[H * (C.NUM_HEADS // tp), 1]](),
@@ -386,20 +362,17 @@ def emit_full[tp: Int](
     prefix: String, layer_base: Int, mut e: List[WeightDesc],
 ) -> Tuple[FullLayerRefs[tp], Int]:
     var b = LayerBuilder(tp, prefix, layer_base)
-    comptime ROW, COL, REPL = LayerShard.ROW, LayerShard.COL, LayerShard.REPL
     comptime H = C.HIDDEN
     comptime HDF = C.HEAD_DIM_FULL
-    comptime o_num_blk = C.NUM_HEADS // tp
-    comptime q_n_loc = C.Q_DIM_FULL // tp
     var attn = FullAttnRefs[tp](
-        q_proj    = SlotOffset[I8, Shape[C.Q_DIM_FULL, H]](b.q(e, "self_attn.q_proj.weight", C.Q_DIM_FULL, H, ROW)),
-        k_proj    = SlotOffset[I8, Shape[C.KV_DIM_FULL, H]](b.q(e, "self_attn.k_proj.weight", C.KV_DIM_FULL, H, REPL)),
-        q_proj_sc = SlotOffset[F32, Shape[C.Q_DIM_FULL, 1]](b.f(e, "self_attn.q_proj.weight_scale", C.Q_DIM_FULL, 1, ROW)),
-        k_proj_sc = SlotOffset[F32, Shape[C.KV_DIM_FULL, 1]](b.f(e, "self_attn.k_proj.weight_scale", C.KV_DIM_FULL, 1, REPL)),
-        o_proj    = SlotOffset[I8, Shape[H, C.Q_DIM_FULL]](b.q(e, "self_attn.o_proj.weight", H, C.Q_DIM_FULL, COL)),
-        o_proj_sc = SlotOffset[F32, Shape[H, 1]](b.f(e, "self_attn.o_proj.weight_scale", H, 1, REPL)),
-        q_norm    = SlotOffset[BF16, Shape[HDF, 1]](b.bf(e, "self_attn.q_norm.weight", HDF, 1, REPL)),
-        k_norm    = SlotOffset[BF16, Shape[HDF, 1]](b.bf(e, "self_attn.k_norm.weight", HDF, 1, REPL)),
+        q_proj    = SlotOffset[I8, Shape[C.Q_DIM_FULL, H]](b.qs[Shape[C.Q_DIM_FULL, H, shard_n=True, tp=tp]](e, "self_attn.q_proj.weight").offset),
+        k_proj    = b.qs[Shape[C.KV_DIM_FULL, H]](e, "self_attn.k_proj.weight"),
+        q_proj_sc = SlotOffset[F32, Shape[C.Q_DIM_FULL, 1]](b.fs[Shape[C.Q_DIM_FULL, 1, shard_n=True, tp=tp]](e, "self_attn.q_proj.weight_scale").offset),
+        k_proj_sc = b.fs[Shape[C.KV_DIM_FULL, 1]](e, "self_attn.k_proj.weight_scale"),
+        o_proj    = SlotOffset[I8, Shape[H, C.Q_DIM_FULL]](b.qs[Shape[H, C.Q_DIM_FULL, shard_m=True, tp=tp]](e, "self_attn.o_proj.weight").offset),
+        o_proj_sc = b.fs[Shape[H, 1]](e, "self_attn.o_proj.weight_scale"),
+        q_norm    = b.bfs[Shape[HDF, 1]](e, "self_attn.q_norm.weight"),
+        k_norm    = b.bfs[Shape[HDF, 1]](e, "self_attn.k_norm.weight"),
         q_colsum  = b.colsum_slot[F32, Shape[C.Q_DIM_FULL // tp, 1]](),
         k_colsum  = b.colsum_slot[F32, Shape[C.KV_DIM_FULL, 1]](),
         o_colsum  = b.colsum_slot[F32, Shape[H * (C.NUM_HEADS // tp), 1]](),
@@ -419,7 +392,7 @@ def calculate_peak_scratch[tp: Int]() -> Int:
     comptime topk_bytes = size_of[Gemma4TopKResult[C.TOP_K]]()
     comptime int32_bytes = size_of[Int32]()
     comptime S = Gemma4Shapes[tp]
-    comptime gateup_col_bytes = S.GateUp.col_bytes_for[i8]()
+    comptime gateup_col_bytes = S.GateUp.col_bytes[I8]()
 
     comptime persistent = (
         scratch_block_bytes[f32]()
@@ -564,22 +537,21 @@ def build_gemma4_plan[tp: Int]() -> Gemma4LoadPlan[tp]:
 
     # Host section
     var host_off = align_up(state.bytes())
-    comptime HOST = LayerShard.HOST
     comptime vocab_num_blocks = C.HIDDEN // LM_HEAD_FWHT_BLK
     var hb = LayerBuilder(tp, "", 0)
     hb.cursor = host_off
-    var final_norm_off = hb.bf(descs, "model.language_model.norm.weight", C.HIDDEN, 1, HOST)
-    var embed_off = hb.q(descs, "model.language_model.embed_tokens.weight", C.VOCAB_SIZE, C.HIDDEN, HOST)
-    var embed_sc_off = hb.f(descs, "model.language_model.embed_tokens.weight_scale", C.VOCAB_SIZE, vocab_num_blocks, HOST)
+    var final_norm_off = hb.bfs[Shape[C.HIDDEN, 1]](descs, "model.language_model.norm.weight", target_rank=HOST_RANK)
+    var embed_off = hb.qs[Shape[C.VOCAB_SIZE, C.HIDDEN]](descs, "model.language_model.embed_tokens.weight", target_rank=HOST_RANK)
+    var embed_sc_off = hb.fs[Shape[C.VOCAB_SIZE, vocab_num_blocks]](descs, "model.language_model.embed_tokens.weight_scale", target_rank=HOST_RANK)
     var embed_colsum = hb.colsum_slot[F32, Shape[C.VOCAB_SIZE, vocab_num_blocks]]()
     var sqrt_gamma = hb.colsum_slot[BF16, Shape[C.HIDDEN, 1]]()
     var inv_sqrt_gamma = hb.colsum_slot[F32, Shape[C.HIDDEN, 1]]()
     var host_bytes = hb.cursor
 
     var host = HostSlots(
-        final_norm=SlotOffset[BF16, Shape[C.HIDDEN, 1]](final_norm_off),
-        embed=SlotOffset[I8, Shape[C.VOCAB_SIZE, C.HIDDEN]](embed_off),
-        embed_sc=SlotOffset[F32, Shape[C.VOCAB_SIZE, vocab_num_blocks]](embed_sc_off),
+        final_norm=final_norm_off,
+        embed=embed_off,
+        embed_sc=embed_sc_off,
         embed_colsum=embed_colsum,
         sqrt_gamma=sqrt_gamma,
         inv_sqrt_gamma=inv_sqrt_gamma)

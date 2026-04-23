@@ -20,7 +20,6 @@ Block sizes for cache locality:
 from std.collections import InlineArray
 from std.memory import UnsafePointer, memcpy
 
-from modeling.model_spec import PackingStrategy, PackFn
 from simd_math.matrixops import transpose_generic
 
 
@@ -33,11 +32,6 @@ comptime VNNI_N_STEP = 32
 comptime VNNI_K_STEP = 64
 comptime VNNI_TILE_N = 16
 comptime VNNI_BLK = 4
-
-
-# =============================================================================
-# VnniPacked — packing strategy for vpdpbusd weight layout
-# =============================================================================
 
 
 @always_inline
@@ -62,7 +56,6 @@ def pack_vnni(
 
     src and dst must not overlap. Reads row-major data from src,
     writes packed tiles with dword-transposed sub-tiles to dst.
-    Conforms to PackFn.
     """
     var N = rows
     var K = cols
@@ -103,7 +96,3 @@ def pack_vnni(
                     var t1 = (dst + tile_base + VNNI_TILE_N * VNNI_K_STEP).bitcast[Int32]()
                     transpose_generic[DType.int32, 16](t0, dword_stride, t0, VNNI_TILE_N, scratch)
                     transpose_generic[DType.int32, 16](t1, dword_stride, t1, VNNI_TILE_N, scratch)
-
-
-struct VnniPacked(PackingStrategy):
-    comptime PACK_FN = pack_vnni

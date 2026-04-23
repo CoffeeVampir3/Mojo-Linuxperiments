@@ -16,7 +16,7 @@ from modeling.model_spec import (
 )
 from modeling.modeling_common import (
     SlotOffset, Repeated, SectionBuilder, align_up,
-    LayerShard, LayerBuilder,
+    LayerBuilder,
 )
 from modeling.loader import discover_shards, load_weights_from_descs
 from kernels.kernel_ops import (
@@ -149,19 +149,13 @@ struct SmolLM2Topology[tp: Int](Copyable, ImplicitlyCopyable):
 
 def emit_body[tp: Int](mut b: LayerBuilder, mut e: List[WeightDesc]) -> BodyRefs[tp]:
     comptime S = SmolLM2Shapes[tp]
-    comptime REPL = LayerShard.REPL
-    comptime H = C.HIDDEN
+    comptime NormShape = Shape[C.HIDDEN, 1]
     return BodyRefs[tp](
-        input_norm=SlotOffset[BF16, Shape[H, 1]](
-            b.bf(e, "input_layernorm.weight", H, 1, REPL)),
-        post_attn_norm=SlotOffset[BF16, Shape[H, 1]](
-            b.bf(e, "post_attention_layernorm.weight", H, 1, REPL)),
-        gate_proj=SlotOffset[BF16, S.GateUp](
-            b.bfs[S.GateUp](e, "mlp.gate_proj.weight")),
-        up_proj=SlotOffset[BF16, S.GateUp](
-            b.bfs[S.GateUp](e, "mlp.up_proj.weight")),
-        down_proj=SlotOffset[BF16, S.Down](
-            b.bfs[S.Down](e, "mlp.down_proj.weight")),
+        input_norm=b.bfs[NormShape](e, "input_layernorm.weight"),
+        post_attn_norm=b.bfs[NormShape](e, "post_attention_layernorm.weight"),
+        gate_proj=b.bfs[S.GateUp](e, "mlp.gate_proj.weight"),
+        up_proj=b.bfs[S.GateUp](e, "mlp.up_proj.weight"),
+        down_proj=b.bfs[S.Down](e, "mlp.down_proj.weight"),
     )
 
 
@@ -171,21 +165,20 @@ def emit_layer[tp: Int](
     var b = LayerBuilder(tp, prefix, layer_base)
     comptime S = SmolLM2Shapes[tp]
     var attn = AttentionRefs[tp](
-        q_proj=SlotOffset[BF16, S.QProj](b.bfs[S.QProj](e, "self_attn.q_proj.weight")),
-        k_proj=SlotOffset[BF16, S.KVProj](b.bfs[S.KVProj](e, "self_attn.k_proj.weight")),
-        v_proj=SlotOffset[BF16, S.KVProj](b.bfs[S.KVProj](e, "self_attn.v_proj.weight")),
-        o_proj=SlotOffset[BF16, S.OProj](b.bfs[S.OProj](e, "self_attn.o_proj.weight")),
+        q_proj=b.bfs[S.QProj](e, "self_attn.q_proj.weight"),
+        k_proj=b.bfs[S.KVProj](e, "self_attn.k_proj.weight"),
+        v_proj=b.bfs[S.KVProj](e, "self_attn.v_proj.weight"),
+        o_proj=b.bfs[S.OProj](e, "self_attn.o_proj.weight"),
     )
     return (LayerRefs[tp](attn=attn, body=emit_body[tp](b, e)), b.cursor)
 
 
 def calculate_peak_scratch[tp: Int]() -> Int:
     comptime S = SmolLM2Shapes[tp]
-    comptime bf16 = BF16.ELEMENT_BYTES
 
-    comptime q_raw_bytes = S.QAct.bytes_for[bf16]()
-    comptime kv_raw_bytes = S.KVAct.bytes_for[bf16]()
-    comptime mlp_raw_bytes = S.MLPAct.bytes_for[bf16]()
+    comptime q_raw_bytes = S.QAct.bytes[BF16]()
+    comptime kv_raw_bytes = S.KVAct.bytes[BF16]()
+    comptime mlp_raw_bytes = S.MLPAct.bytes[BF16]()
     comptime q_bytes = scratch_block_bytes[q_raw_bytes]()
     comptime kv_bytes = scratch_block_bytes[kv_raw_bytes]()
     comptime mlp_bytes = scratch_block_bytes[mlp_raw_bytes]()
@@ -243,14 +236,13 @@ def build_smollm2_plan[tp: Int]() -> SmolLM2LoadPlan[tp]:
         sin=state.reserve[F32, Shape[C.MAX_SEQ_LEN, C.HEAD_DIM // 2]]())
 
     var host_off = align_up(state.bytes())
-    comptime HOST = LayerShard.HOST
     var hb = LayerBuilder(tp, "", 0)
     hb.cursor = host_off
+    comptime FinalNormShape = Shape[C.HIDDEN, 1]
+    comptime EmbedShape = Shape[C.VOCAB_SIZE, C.HIDDEN]
     var host = HostSlots(
-        final_norm=SlotOffset[BF16, Shape[C.HIDDEN, 1]](
-            hb.bf(descs, "model.norm.weight", C.HIDDEN, 1, HOST)),
-        embed=SlotOffset[BF16, Shape[C.VOCAB_SIZE, C.HIDDEN]](
-            hb.bf(descs, "model.embed_tokens.weight", C.VOCAB_SIZE, C.HIDDEN, HOST)))
+        final_norm=hb.bfs[FinalNormShape](descs, "model.norm.weight", target_rank=HOST_RANK),
+        embed=hb.bfs[EmbedShape](descs, "model.embed_tokens.weight", target_rank=HOST_RANK))
 
     var topo = SmolLM2Topology[tp](
         arena_base=0,
