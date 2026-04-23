@@ -10,7 +10,7 @@ import linux.sys as linux
 from modeling.model_spec import (
     Encoding, Shaped, Aligned, HasPtr, Dynamic,
     StaticTensor, DynamicTensor,
-    StaticView, DynamicView, CacheView,
+    StaticView, DynamicView,
 )
 from simd_math import exp_f32
 

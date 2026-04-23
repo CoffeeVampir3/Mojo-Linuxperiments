@@ -1,24 +1,44 @@
-"""Shared atomic modeling primitives.
-
-Typed refs carry static tensor semantics through layout/build time.
-Repeated[T] carries placement topology.
-SectionBuilder emits typed state/aux refs and derives byte counts from
-reservation side effects.
-"""
-
 from std.memory import UnsafePointer
 
 from modeling.model_spec import (
     Encoding, Shaped, BF16, F32, I8,
-    Shape, ShapeLike, StaticView, DynamicView, CacheView, ScratchView,
+    Shape, ShapeLike, StaticView, DynamicView, ScratchView,
     DEFAULT_ALIGNMENT, WeightDesc, HOST_RANK, DISTRIBUTED,
+    align_up,
 )
 from modeling.linear_borrow_pool import ScratchLease, ScratchPool
 
 
-@always_inline
-def align_up(value: Int, alignment: Int = DEFAULT_ALIGNMENT) -> Int:
-    return ((value + alignment - 1) // alignment) * alignment
+@fieldwise_init
+struct ArenaLayout(Copyable, ImplicitlyCopyable):
+    """Common arena metadata shared by every model topology.
+
+    `base` is the per-rank arena start address. The sizing fields describe
+    the layout the loader/runtime expects: distributed (weights) +
+    state (activations, KV cache, rope, scratch) form the main arena;
+    host is a separate single-rank region for shared artifacts like embed.
+    """
+    var base: Int
+    var distributed_bytes: Int
+    var state_bytes: Int
+    var host_bytes: Int
+    var scratch_off: Int
+    var scratch_capacity: Int
+
+    def bind(self, new_base: Int) -> Self:
+        var t = self
+        t.base = new_base
+        return t
+
+    def arena_bytes(self) -> Int:
+        return self.distributed_bytes + self.state_bytes
+
+    def host_arena_bytes(self) -> Int:
+        return self.host_bytes
+
+    @always_inline
+    def scratch_base(self) -> Int:
+        return self.base + self.scratch_off
 
 
 @fieldwise_init
@@ -40,12 +60,6 @@ struct TensorRef[E: Encoding, S: ShapeLike](Copyable, ImplicitlyCopyable):
             seq_len)
 
     @always_inline
-    def bound_cache(self, base: Int) -> CacheView[Self.E, Self.S]:
-        return CacheView[Self.E, Self.S](
-            UnsafePointer[Scalar[Self.E.DTYPE], MutAnyOrigin](
-                unsafe_from_address=base + self.offset))
-
-    @always_inline
     def bound_row(self, base: Int, row: Int) -> StaticView[Self.E, Shape[1, Self.S.M]]:
         """View a single row at runtime offset. Used for per-position table
         lookups (rope cos/sin tables, etc.) where the row index is dynamic
@@ -58,9 +72,6 @@ struct TensorRef[E: Encoding, S: ShapeLike](Copyable, ImplicitlyCopyable):
     @always_inline
     def addr(self, base: Int) -> Int:
         return base + self.offset
-
-
-comptime SlotOffset[E: Encoding, S: ShapeLike] = TensorRef[E, S]
 
 
 @fieldwise_init
@@ -88,12 +99,12 @@ struct SectionBuilder:
         self.cursor = align_up(self.cursor, alignment)
 
     @always_inline
-    def reserve[E: Encoding, S: ShapeLike](mut self) -> SlotOffset[E, S]:
+    def reserve[E: Encoding, S: ShapeLike](mut self) -> TensorRef[E, S]:
         self.align()
         comptime size = S.bytes[E]()
         var off = self.cursor
         self.cursor += size
-        return SlotOffset[E, S](off)
+        return TensorRef[E, S](off)
 
     @always_inline
     def reserve_bytes(mut self, nbytes: Int, alignment: Int = DEFAULT_ALIGNMENT) -> Int:
@@ -105,11 +116,6 @@ struct SectionBuilder:
     @always_inline
     def bytes(self) -> Int:
         return self.cursor
-
-
-# =============================================================================
-# Layer builder — cursor-based weight catalog emitter
-# =============================================================================
 
 
 @fieldwise_init
@@ -132,7 +138,7 @@ struct LayerBuilder(Movable):
             quantizable: Bool = False,
             target_rank: Int = DISTRIBUTED) -> TensorRef[E, S]:
         comptime alloc = S.bytes[E]()
-        var off = ((self.cursor + DEFAULT_ALIGNMENT - 1) // DEFAULT_ALIGNMENT) * DEFAULT_ALIGNMENT
+        var off = align_up(self.cursor)
         self.cursor = off + alloc
         entries.append(WeightDesc(
             name=self.layer_prefix + suffix,
@@ -141,7 +147,7 @@ struct LayerBuilder(Movable):
             global_rows=S.GLOBAL_N, global_cols=S.GLOBAL_M,
             local_rows=S.N, local_cols=S.M,
             data_rows=S.DATA_N, data_cols=S.DATA_M,
-            quantizable=quantizable, absorbed=False,
+            quantizable=quantizable,
             target_rank=target_rank,
         ))
         return TensorRef[E, S](off)
@@ -162,10 +168,19 @@ struct LayerBuilder(Movable):
         return self.emit_shape[BF16, S](entries, suffix, False, target_rank)
 
     @always_inline
-    def colsum_slot[E: Encoding, S: ShapeLike](mut self) -> SlotOffset[E, S]:
-        """Typed colsum reservation — returns a SlotOffset for view-based
+    def colsum_slot[E: Encoding, S: ShapeLike](mut self) -> TensorRef[E, S]:
+        """Typed colsum reservation — returns a TensorRef for view-based
         access."""
         comptime nbytes = S.bytes[E]()
         var off = self.cursor
         self.cursor += nbytes
-        return SlotOffset[E, S](off)
+        return TensorRef[E, S](off)
+
+    @always_inline
+    def reserve_block(mut self, nbytes: Int) -> Int:
+        """Reserve an aligned byte block for sub-slab emission. Used when a
+        single contiguous region is later populated by multiple per-element
+        WeightDescs (e.g. per-expert MoE weights in one arena region)."""
+        var off = align_up(self.cursor)
+        self.cursor = off + nbytes
+        return off

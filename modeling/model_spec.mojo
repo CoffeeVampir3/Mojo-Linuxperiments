@@ -39,17 +39,13 @@ struct I8(Encoding):
     comptime ELEMENT_BYTES = 1
 
 
-# =============================================================================
-# Shape — single source of truth for tensor geometry under TP
-#
-# Encodes global dimensions, sharding, alignment, and tp degree. All derived
-# quantities (local dims, data dims, padding, byte counts) are comptime.
-# Downstream code (LayerBuilder, loader, kernels) reads from Shape instead
-# of recomputing dimensions independently.
-# =============================================================================
+comptime DEFAULT_ALIGNMENT = 64
 
-def _align_up(val: Int, a: Int) -> Int:
-    return ((val + a - 1) // a) * a
+
+@always_inline
+def align_up(value: Int, alignment: Int = DEFAULT_ALIGNMENT) -> Int:
+    return ((value + alignment - 1) // alignment) * alignment
+
 
 trait ShapeLike:
     comptime GLOBAL_N: Int
@@ -79,8 +75,8 @@ struct Shape[
     comptime GLOBAL_M = Self.global_m
     comptime DATA_N = Self.global_n // Self.tp if Self.shard_n else Self.global_n
     comptime DATA_M = Self.global_m // Self.tp if Self.shard_m else Self.global_m
-    comptime N = _align_up(Self.DATA_N, Self.align_n)
-    comptime M = _align_up(Self.DATA_M, Self.align_m)
+    comptime N = align_up(Self.DATA_N, Self.align_n)
+    comptime M = align_up(Self.DATA_M, Self.align_m)
     comptime PAD_N = Self.N - Self.DATA_N
     comptime PAD_M = Self.M - Self.DATA_M
     comptime ELEMS = Self.N * Self.M
@@ -106,22 +102,8 @@ struct Shape[
         return rows * Self.M * E.ELEMENT_BYTES
 
 
-# =============================================================================
-# Placement locality
-#
-# target_rank on a weight slot says where the loader is allowed to write it.
-# DISTRIBUTED (-1) means every rank participates: replicated slots get a copy
-# on each rank, sharded slots get their slice. A non-negative target_rank pins
-# the slot to a single rank's arena — used for host-only weights (final norm,
-# embed, lm head) that only one rank ever reads, and for per-expert MoE
-# sharding where the rank is determined by expert ID.
-# =============================================================================
-
 comptime DISTRIBUTED = -1
 comptime HOST_RANK = 0
-
-
-comptime DEFAULT_ALIGNMENT = 64
 
 
 @fieldwise_init
@@ -186,34 +168,6 @@ struct DynamicView[E: Encoding, S: ShapeLike, alignment: Int = DEFAULT_ALIGNMENT
 
 
 @fieldwise_init
-struct CacheView[E: Encoding, S: ShapeLike, alignment: Int = DEFAULT_ALIGNMENT](
-    Encoding, Shaped, HasPtr, Aligned,
-):
-    comptime DTYPE = Self.E.DTYPE
-    comptime ELEMENT_BYTES = Self.E.ELEMENT_BYTES
-    comptime ROWS = Self.S.N
-    comptime COLS = Self.S.M
-    comptime ALIGNMENT = Self.alignment
-    var ptr: UnsafePointer[Scalar[Self.DTYPE], MutAnyOrigin]
-
-    @always_inline
-    def as_ptr[dtype: DType = Self.DTYPE](self) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
-        return rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](self.ptr)
-
-    @always_inline
-    def addr(self) -> Int:
-        return Int(self.ptr)
-
-    @always_inline
-    def load[width: Int = 1](self, offset: Int = 0) -> SIMD[Self.DTYPE, width]:
-        return self.ptr.load[width=width, alignment=Self.ALIGNMENT](offset)
-
-    @always_inline
-    def store[width: Int = 1](self, offset: Int, val: SIMD[Self.DTYPE, width]):
-        self.ptr.store[alignment=Self.ALIGNMENT](offset, val)
-
-
-@fieldwise_init
 struct ScratchView[
     E: Encoding, S: ShapeLike, origin: MutOrigin,
     alignment: Int = DEFAULT_ALIGNMENT,
@@ -266,21 +220,7 @@ struct WeightDesc(Copyable):
     var data_rows: Int
     var data_cols: Int
     var quantizable: Bool
-    var absorbed: Bool
     var target_rank: Int
-
-
-# =============================================================================
-# Quantizer tasks
-#
-# Each task struct is parameterized on `[Src: Converter]` and conforms to
-# `QuantizeSpec`. The quantizer processes tasks through a `TaskVisitor`
-# trait — generic processor functions that receive `T: QuantizeSpec` with
-# full comptime access to source format and typed convert, zero runtime
-# switches.
-#
-# User code is declarative: `visitor.quantize(PerRow[Bf16](name, block))`.
-# =============================================================================
 
 
 from quant.source_format import Converter
@@ -314,9 +254,6 @@ trait QuantizeSpec:
 trait TaskVisitor:
     def quantize[T: QuantizeSpec](mut self, task: T) -> Bool: ...
     def passthrough(mut self, name: String, expected_dtype: DType) -> Bool: ...
-
-
-# --- Concrete task types, parameterized on Converter -----------------------
 
 
 struct PerRow[Src: Converter](QuantizeSpec):
@@ -495,11 +432,6 @@ struct TwoSidedAbsorbed[Src: Converter](QuantizeSpec):
     def is_per_block(self) -> Bool: return False
     def gamma_source(self) -> String: return self.gamma
     def two_sided_head_dim(self) -> Int: return self.hdim
-
-
-# =============================================================================
-# Logits view — non-owning read-only access to model output
-# =============================================================================
 
 
 @explicit_destroy

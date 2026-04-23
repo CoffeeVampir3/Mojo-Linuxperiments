@@ -1,21 +1,3 @@
-"""Linear-type scratch offset pool.
-
-ScratchPool is a single offset allocator. It doesn't know about arena
-bases or pointers — it just hands out byte offsets and tracks usage.
-Each rank materializes a real pointer by adding its own scratch base.
-
-ScratchLease holds the offset and byte size. On release, the offset
-range is returned to the pool (LIFO). Leases are rounded up to 64-byte
-blocks so every lease offset is 64-byte aligned. @explicit_destroy ensures
-every borrow is released.
-
-Usage:
-    var pool = ScratchPool(capacity)
-    var lease = pool.borrow[Float32, 1536]()  # lease.offset = 0
-    # In closure: DynamicView[T](rv.scratch_base() + lease.offset, seq_len)
-    lease^.release()                           # offset returned
-"""
-
 from std.sys.info import size_of
 from std.os import abort
 
@@ -34,11 +16,6 @@ def scratch_block_bytes[nbytes: Int]() -> Int:
 def scratch_lease_bytes[T: AnyType, count: Int]() -> Int:
     comptime raw_byte_size = count * size_of[T]()
     return scratch_block_bytes[raw_byte_size]()
-
-
-# =============================================================================
-# ScratchLease — linear offset token
-# =============================================================================
 
 
 @explicit_destroy
@@ -90,31 +67,24 @@ struct ScratchLease(Movable):
     @always_inline
     def view[
         o: MutOrigin, //,
-        E: Encoding, rows: Int, cols: Int,
+        E: Encoding, S: ShapeLike,
     ](
         ref [o] self, scratch_base: Int, seq_len: Int,
         element_offset: Int = 0,
-    ) -> ScratchView[E, Shape[rows, cols], o]:
+    ) -> ScratchView[E, S, o]:
         """Bridge from scratch lease to typed view.
 
         Origin comes from the lease reference: release-then-use on any
-        derived view fails at compile time. Scratch is always contiguous
-        with no sharding or alignment padding, so the synthesized
-        Shape[rows, cols] uses the defaults.
+        derived view fails at compile time.
 
         element_offset: element-unit offset into the lease (e.g., to split
         a [K; V] buffer into separate K and V views from one lease).
         """
-        return ScratchView[E, Shape[rows, cols], o](
+        return ScratchView[E, S, o](
             UnsafePointer[Scalar[E.DTYPE], o](
                 unsafe_from_address=(scratch_base + self.offset
                     + element_offset * E.ELEMENT_BYTES)),
             seq_len)
-
-
-# =============================================================================
-# ScratchPool — single offset allocator
-# =============================================================================
 
 
 struct ScratchPool(Movable):

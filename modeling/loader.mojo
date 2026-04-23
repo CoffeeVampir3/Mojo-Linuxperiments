@@ -186,8 +186,6 @@ def load_weights_from_descs[
     var distributed_weights = List[WeightDesc]()
     for i in range(len(descs)):
         var d = descs[i].copy()
-        if d.absorbed:
-            continue
         if d.target_rank >= 0:
             targeted_weights.append(d^)
         else:
