@@ -27,12 +27,11 @@ from experimental3.kernels.dispatch_args import RouterTopkArgs
 # ============================================================================
 
 
-def router_topk_kernel[num_experts: Int, k: Int](args: RouterTopkArgs):
+def router_topk_kernel[num_experts: Int, k: Int](args: RouterTopkArgs[k]):
     """Softmax → top-k → renormalize → per-expert scale."""
     var result = softmax_topk_renorm[num_experts, k](
         args.logits, args.per_expert_scale)
-    UnsafePointer[Gemma4TopKResult[k], MutAnyOrigin](
-        unsafe_from_address=Int(args.result_ptr))[] = result
+    args.result_ptr[] = result
 
 
 # ============================================================================

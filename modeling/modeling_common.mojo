@@ -10,7 +10,7 @@ from std.memory import UnsafePointer
 
 from modeling.model_spec import (
     Encoding, Shaped,
-    Shape, ShapeLike, Mat, StaticView, DynamicView, ScratchView,
+    Shape, ShapeLike, StaticView, DynamicView, CacheView, ScratchView,
     DEFAULT_ALIGNMENT, WeightDesc, HOST_RANK, DISTRIBUTED,
 )
 from modeling.linear_borrow_pool import ScratchLease, ScratchPool
@@ -21,86 +21,39 @@ def align_up(value: Int, alignment: Int = DEFAULT_ALIGNMENT) -> Int:
     return ((value + alignment - 1) // alignment) * alignment
 
 
-comptime StaticTensorView[E: Encoding, S: ShapeLike] = StaticView[Mat[E, S.N, S.M]]
-comptime DynamicTensorView[E: Encoding, S: ShapeLike] = DynamicView[Mat[E, S.N, S.M]]
-
-
-@always_inline
-def static_tensor_view[E: Encoding, S: ShapeLike](
-    base: Int, slot: TensorRef[E, S],
-) -> StaticTensorView[E, S]:
-    return StaticTensorView[E, S](
-        UnsafePointer[Scalar[E.DTYPE], MutAnyOrigin](
-            unsafe_from_address=base + slot.offset))
-
-
-@always_inline
-def dynamic_tensor_view[E: Encoding, S: ShapeLike](
-    base: Int, slot: TensorRef[E, S], seq_len: Int,
-) -> DynamicTensorView[E, S]:
-    return DynamicTensorView[E, S](
-        UnsafePointer[Scalar[E.DTYPE], MutAnyOrigin](
-            unsafe_from_address=base + slot.offset),
-        seq_len)
-
-
-@explicit_destroy
-struct BorrowedScratchTensor[E: Encoding, rows: Int, cols: Int](Movable):
-    """Linear wrapper: lease + base + seq_len. .view() returns a MutAnyOrigin
-    DynamicView for convenience. Release consumes the wrapper linearly."""
-    var lease: ScratchLease
-    var base: Int
-    var seq_len: Int
-
-    def __init__(out self, var lease: ScratchLease, base: Int, seq_len: Int):
-        self.lease = lease^
-        self.base = base
-        self.seq_len = seq_len
-
-    @always_inline
-    def view(self) -> DynamicView[Mat[Self.E, Self.rows, Self.cols]]:
-        return DynamicView[Mat[Self.E, Self.rows, Self.cols]](
-            UnsafePointer[Scalar[Self.E.DTYPE], MutAnyOrigin](
-                unsafe_from_address=self.base + self.lease.offset),
-            self.seq_len)
-
-    @always_inline
-    def addr(self) -> Int:
-        return self.base + self.lease.offset
-
-    def release(deinit self):
-        self.lease^.release()
-
-
-@always_inline
-def borrow_scratch_tensor[E: Encoding, rows: Int, cols: Int](
-    mut pool: ScratchPool, base: Int, seq_len: Int,
-) -> BorrowedScratchTensor[E, rows, cols]:
-    var lease = pool.borrow[Scalar[E.DTYPE], rows * cols]()
-    return BorrowedScratchTensor[E, rows, cols](lease^, base, seq_len)
-
-
-@always_inline
-def scratch_ptr[T: AnyType](
-    scratch_base: Int, read lease: ScratchLease,
-) -> UnsafePointer[T, MutAnyOrigin]:
-    """Lift a lease to a typed pointer; used where the caller needs a raw
-    UnsafePointer rather than a view (e.g., pass-through to LogitsView or
-    to sub-kernels that take raw pointers)."""
-    return UnsafePointer[T, MutAnyOrigin](
-        unsafe_from_address=scratch_base + lease.offset)
-
-
 @fieldwise_init
 struct TensorRef[E: Encoding, S: ShapeLike](Copyable, ImplicitlyCopyable):
     """Typed offset for one materialized tensor family."""
     var offset: Int
 
     @always_inline
-    def bound(self, base: Int) -> StaticView[Mat[Self.E, Self.S.N, Self.S.M]]:
-        return StaticView[Mat[Self.E, Self.S.N, Self.S.M]](
+    def bound(self, base: Int) -> StaticView[Self.E, Self.S]:
+        return StaticView[Self.E, Self.S](
             UnsafePointer[Scalar[Self.E.DTYPE], MutAnyOrigin](
                 unsafe_from_address=base + self.offset))
+
+    @always_inline
+    def bound_dyn(self, base: Int, seq_len: Int) -> DynamicView[Self.E, Self.S]:
+        return DynamicView[Self.E, Self.S](
+            UnsafePointer[Scalar[Self.E.DTYPE], MutAnyOrigin](
+                unsafe_from_address=base + self.offset),
+            seq_len)
+
+    @always_inline
+    def bound_cache(self, base: Int) -> CacheView[Self.E, Self.S]:
+        return CacheView[Self.E, Self.S](
+            UnsafePointer[Scalar[Self.E.DTYPE], MutAnyOrigin](
+                unsafe_from_address=base + self.offset))
+
+    @always_inline
+    def bound_row(self, base: Int, row: Int) -> StaticView[Self.E, Shape[1, Self.S.M]]:
+        """View a single row at runtime offset. Used for per-position table
+        lookups (rope cos/sin tables, etc.) where the row index is dynamic
+        but the column width is comptime-fixed by the slot's Shape."""
+        return StaticView[Self.E, Shape[1, Self.S.M]](
+            UnsafePointer[Scalar[Self.E.DTYPE], MutAnyOrigin](
+                unsafe_from_address=base + self.offset
+                    + row * Self.S.M * Self.E.ELEMENT_BYTES))
 
     @always_inline
     def addr(self, base: Int) -> Int:
@@ -250,16 +203,9 @@ struct LayerBuilder(Movable):
         return self.emit_shape[S, 2](entries, suffix, DType.bfloat16, False, target_rank)
 
     @always_inline
-    def colsum(mut self, nbytes: Int) -> Int:
-        var off = self.cursor
-        self.cursor += nbytes
-        return off
-
-    @always_inline
     def colsum_slot[E: Encoding, S: ShapeLike](mut self) -> SlotOffset[E, S]:
         """Typed colsum reservation — returns a SlotOffset for view-based
-        access. Replaces `colsum(nbytes)` at sites that pass the result to
-        trait-composed dispatch kernels."""
+        access."""
         comptime nbytes = S.bytes_for[E.ELEMENT_BYTES]()
         var off = self.cursor
         self.cursor += nbytes

@@ -10,7 +10,6 @@ from std.sys.info import simd_width_of
 from modeling.model_spec import (
     Encoding, Shaped, Aligned, HasPtr, Dynamic,
     StaticTensor, DynamicTensor,
-    StaticView, DynamicView,
 )
 from simd_math import sincos
 
@@ -69,8 +68,8 @@ def yarn_linear_ramp(low: Int, high: Int, i: Int) -> Float64:
     return Float64(i - low) / Float64(high - low)
 
 
-def init_rope_tables[CosT: Encoding & Shaped, SinT: Encoding & Shaped](
-    cos_buf: StaticView[CosT], sin_buf: StaticView[SinT],
+def init_rope_tables[CosT: StaticTensor, SinT: StaticTensor](
+    cos_buf: CosT, sin_buf: SinT,
     theta: Float64 = 10000.0,
     factor: Float64 = 1.0,
     original_max_pos: Int = 4096,

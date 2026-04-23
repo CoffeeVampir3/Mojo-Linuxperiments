@@ -8,7 +8,7 @@ The fused gelu_tanh_mul computes: dst = gelu_tanh(gate) * up
 
 from std.sys.info import simd_width_of
 
-from modeling.model_spec import Encoding, Shaped, DynamicView
+from modeling.model_spec import DynamicTensor
 from simd_math import exp_f32
 
 
@@ -28,8 +28,8 @@ def gelu_tanh_f32[width: Int](x: SIMD[DType.float32, width]) -> SIMD[DType.float
     return 0.5 * x * (1.0 + tanh_f32(inner))
 
 
-def gelu_tanh_mul[GT: Encoding & Shaped, UT: Encoding & Shaped, DstT: Encoding & Shaped](
-    gate: DynamicView[GT], up: DynamicView[UT], dst: DynamicView[DstT],
+def gelu_tanh_mul[GT: DynamicTensor, UT: DynamicTensor, DstT: DynamicTensor](
+    gate: GT, up: UT, dst: DstT,
 ):
     """dst = gelu_tanh(gate) * up. F32 compute, bf16 I/O."""
     comptime assert GT.DTYPE == DType.bfloat16, "gelu_tanh_mul: gate must be bf16"

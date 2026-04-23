@@ -13,6 +13,7 @@ InlineArray and passed by value through BurstThreadPool.dispatch.
 from std.collections import InlineArray
 
 from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr, BF16Ptr
+from experimental_gemma.router import Gemma4TopKResult
 
 
 # ============================================================================
@@ -128,15 +129,15 @@ struct LmHeadArgs(Copyable, ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct RouterTopkArgs(Copyable, ImplicitlyCopyable):
+struct RouterTopkArgs[k: Int](Copyable, ImplicitlyCopyable):
     var logits: BF16Ptr
     var per_expert_scale: BF16Ptr
-    var result_ptr: U8Ptr
+    var result_ptr: UnsafePointer[Gemma4TopKResult[Self.k], MutAnyOrigin]
 
     def __init__(out self):
         self.logits = BF16Ptr()
         self.per_expert_scale = BF16Ptr()
-        self.result_ptr = U8Ptr()
+        self.result_ptr = UnsafePointer[Gemma4TopKResult[Self.k], MutAnyOrigin]()
 
 
 # ============================================================================

@@ -7,7 +7,7 @@ from threading.threading_shared import ptr as tptr
 from notstdcollections import HeapMoveArray
 import linux.sys as linux
 
-from modeling.model_spec import Encoding, Shaped
+from modeling.model_spec import Encoding, Shaped, ShapeLike
 
 comptime AtomicInt32 = Atomic[DType.int32]
 
@@ -35,7 +35,7 @@ def done_ptr(state_base: Int, rank: Int) -> UnsafePointer[Int32, MutAnyOrigin]:
 
 
 def small_allreduce[
-    T: Encoding & Shaped, tp: Int, residual_add: Bool = False,
+    E: Encoding, S: ShapeLike, tp: Int, residual_add: Bool = False,
 ](
     ptrs: InlineArray[Int, tp],
     seq_len: Int,
@@ -48,7 +48,7 @@ def small_allreduce[
     adds to dst_ptrs (x_main), broadcasts updated dst_ptrs[0] to other ranks.
     Saves one full read+write pass of the reduced buffer.
     """
-    var total = seq_len * T.COLS
+    var total = seq_len * S.M
     if total <= 0 or tp <= 1:
         comptime if residual_add:
             if total > 0 and tp == 1:
@@ -79,7 +79,7 @@ def small_allreduce[
                 acc += tptr[Scalar[DType.bfloat16]](ptrs[r]).load[width=width](i).cast[DType.float32]()
             dst.store(i, acc.cast[DType.bfloat16]())
 
-    var total_bytes = total * T.ELEMENT_BYTES
+    var total_bytes = total * E.ELEMENT_BYTES
     comptime if residual_add:
         for r in range(1, tp):
             memcpy(
@@ -233,7 +233,7 @@ struct FusedConfig:
 
 def ring_broadcast[
     P: BurstThreadPool, //,
-    T: Encoding & Shaped, tp: Int,
+    E: Encoding, S: ShapeLike, tp: Int,
 ](
     src_ptr: Int,
     dst_ptrs: InlineArray[Int, tp],
@@ -243,7 +243,7 @@ def ring_broadcast[
     """Parallel pull broadcast. All destination ranks memcpy from source
     simultaneously via per-node workers. ~26 GB/s aggregate on 4 NUMA nodes.
     """
-    var total_bytes = seq_len * T.COLS * T.ELEMENT_BYTES
+    var total_bytes = S.rows_bytes[E](seq_len)
     if total_bytes <= 0 or tp <= 1:
         return
 
@@ -267,7 +267,7 @@ def ring_broadcast[
 
 def ring_allreduce[
     P: BurstThreadPool, //,
-    T: Encoding & Shaped, tp: Int, residual_add: Bool = False,
+    E: Encoding, S: ShapeLike, tp: Int, residual_add: Bool = False,
 ](
     ptrs: InlineArray[Int, tp],
     seq_len: Int,
@@ -283,9 +283,9 @@ def ring_allreduce[
     adds to dst_ptrs (x_main), gathers from dst_ptrs. x_main must be
     identical across ranks before the call (replicated residual stream).
     """
-    comptime assert T.DTYPE == DType.bfloat16, "ring_allreduce: only bf16 tensors are supported"
-    comptime assert T.ELEMENT_BYTES == 2, "ring_allreduce: bf16 byte width mismatch"
-    comptime cols = T.COLS
+    comptime assert E.DTYPE == DType.bfloat16, "ring_allreduce: only bf16 tensors are supported"
+    comptime assert E.ELEMENT_BYTES == 2, "ring_allreduce: bf16 byte width mismatch"
+    comptime cols = S.M
     var total_elements = seq_len * cols
     if total_elements <= 0 or tp <= 1:
         comptime if residual_add:

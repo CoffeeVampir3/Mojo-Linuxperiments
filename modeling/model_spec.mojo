@@ -160,6 +160,14 @@ trait ShapeLike:
     def row_bytes_for[elem_bytes: Int]() -> Int: ...
     @staticmethod
     def col_bytes_for[elem_bytes: Int]() -> Int: ...
+    @staticmethod
+    def bytes[E: Encoding]() -> Int: ...
+    @staticmethod
+    def row_bytes[E: Encoding]() -> Int: ...
+    @staticmethod
+    def col_bytes[E: Encoding]() -> Int: ...
+    @staticmethod
+    def rows_bytes[E: Encoding](rows: Int) -> Int: ...
 
 struct Shape[
     global_n: Int, global_m: Int,
@@ -191,21 +199,25 @@ struct Shape[
         """Bytes for one column: N elements."""
         return Self.N * elem_bytes
 
+    @staticmethod
+    def bytes[E: Encoding]() -> Int:
+        """Bytes for the full static tensor: N * M * element-bytes(E)."""
+        return Self.ELEMS * E.ELEMENT_BYTES
 
-# =============================================================================
-# Mat — lightweight Encoding & Shaped for StaticView / DynamicView / CacheView
-#
-# Carries only the local dimensions the kernel needs (ROWS, COLS) plus the
-# dtype.  No sharding, no tp, no placement — those live in LayerBuilder /
-# Shape / WeightDesc where the layout is computed.  Mat is what you hand to
-# a kernel via StaticView[Mat[...]] or DynamicView[Mat[...]].
-# =============================================================================
+    @staticmethod
+    def row_bytes[E: Encoding]() -> Int:
+        """Bytes for one row (M elements) of encoding E."""
+        return Self.M * E.ELEMENT_BYTES
 
-struct Mat[E: Encoding, rows: Int, cols: Int](Encoding, Shaped):
-    comptime DTYPE = Self.E.DTYPE
-    comptime ELEMENT_BYTES = Self.E.ELEMENT_BYTES
-    comptime ROWS = Self.rows
-    comptime COLS = Self.cols
+    @staticmethod
+    def col_bytes[E: Encoding]() -> Int:
+        """Bytes for one column (N elements) of encoding E."""
+        return Self.N * E.ELEMENT_BYTES
+
+    @staticmethod
+    def rows_bytes[E: Encoding](rows: Int) -> Int:
+        """Bytes for `rows` rows of M elements each (for dynamic seq_len)."""
+        return rows * Self.M * E.ELEMENT_BYTES
 
 
 # =============================================================================
@@ -307,13 +319,13 @@ comptime DEFAULT_ALIGNMENT = 64
 
 
 @fieldwise_init
-struct StaticView[T: Encoding & Shaped, alignment: Int = DEFAULT_ALIGNMENT](
+struct StaticView[E: Encoding, S: ShapeLike, alignment: Int = DEFAULT_ALIGNMENT](
     Encoding, Shaped, HasPtr, Aligned,
 ):
-    comptime DTYPE = Self.T.DTYPE
-    comptime ELEMENT_BYTES = Self.T.ELEMENT_BYTES
-    comptime ROWS = Self.T.ROWS
-    comptime COLS = Self.T.COLS
+    comptime DTYPE = Self.E.DTYPE
+    comptime ELEMENT_BYTES = Self.E.ELEMENT_BYTES
+    comptime ROWS = Self.S.N
+    comptime COLS = Self.S.M
     comptime ALIGNMENT = Self.alignment
     var ptr: UnsafePointer[Scalar[Self.DTYPE], MutAnyOrigin]
 
@@ -335,13 +347,13 @@ struct StaticView[T: Encoding & Shaped, alignment: Int = DEFAULT_ALIGNMENT](
 
 
 @fieldwise_init
-struct DynamicView[T: Encoding & Shaped, alignment: Int = DEFAULT_ALIGNMENT](
+struct DynamicView[E: Encoding, S: ShapeLike, alignment: Int = DEFAULT_ALIGNMENT](
     Encoding, Shaped, HasPtr, Aligned, Dynamic,
 ):
-    comptime DTYPE = Self.T.DTYPE
-    comptime ELEMENT_BYTES = Self.T.ELEMENT_BYTES
-    comptime ROWS = Self.T.ROWS
-    comptime COLS = Self.T.COLS
+    comptime DTYPE = Self.E.DTYPE
+    comptime ELEMENT_BYTES = Self.E.ELEMENT_BYTES
+    comptime ROWS = Self.S.N
+    comptime COLS = Self.S.M
     comptime ALIGNMENT = Self.alignment
     var ptr: UnsafePointer[Scalar[Self.DTYPE], MutAnyOrigin]
     var runtime_rows: Int
@@ -368,13 +380,13 @@ struct DynamicView[T: Encoding & Shaped, alignment: Int = DEFAULT_ALIGNMENT](
 
 
 @fieldwise_init
-struct CacheView[T: Encoding & Shaped, alignment: Int = DEFAULT_ALIGNMENT](
+struct CacheView[E: Encoding, S: ShapeLike, alignment: Int = DEFAULT_ALIGNMENT](
     Encoding, Shaped, HasPtr, Aligned,
 ):
-    comptime DTYPE = Self.T.DTYPE
-    comptime ELEMENT_BYTES = Self.T.ELEMENT_BYTES
-    comptime ROWS = Self.T.ROWS
-    comptime COLS = Self.T.COLS
+    comptime DTYPE = Self.E.DTYPE
+    comptime ELEMENT_BYTES = Self.E.ELEMENT_BYTES
+    comptime ROWS = Self.S.N
+    comptime COLS = Self.S.M
     comptime ALIGNMENT = Self.alignment
     var ptr: UnsafePointer[Scalar[Self.DTYPE], MutAnyOrigin]
 
@@ -397,20 +409,19 @@ struct CacheView[T: Encoding & Shaped, alignment: Int = DEFAULT_ALIGNMENT](
 
 @fieldwise_init
 struct ScratchView[
-    T: Encoding & Shaped, origin: MutOrigin, alignment: Int = DEFAULT_ALIGNMENT,
+    E: Encoding, S: ShapeLike, origin: MutOrigin,
+    alignment: Int = DEFAULT_ALIGNMENT,
 ](Encoding, Shaped, HasPtr, Aligned, Dynamic):
-    comptime DTYPE = Self.T.DTYPE
-    comptime ELEMENT_BYTES = Self.T.ELEMENT_BYTES
-    comptime ROWS = Self.T.ROWS
-    comptime COLS = Self.T.COLS
+    comptime DTYPE = Self.E.DTYPE
+    comptime ELEMENT_BYTES = Self.E.ELEMENT_BYTES
+    comptime ROWS = Self.S.N
+    comptime COLS = Self.S.M
     comptime ALIGNMENT = Self.alignment
     var ptr: UnsafePointer[Scalar[Self.DTYPE], Self.origin]
     var runtime_rows: Int
 
     @always_inline
     def as_ptr[dtype: DType = Self.DTYPE](self) -> UnsafePointer[Scalar[dtype], MutAnyOrigin]:
-        # origin erased at trait surface — release-then-use is caught via the
-        # value (sv) remaining in the caller's scope, not the pointer's origin.
         return rebind[UnsafePointer[Scalar[dtype], MutAnyOrigin]](
             self.ptr.as_any_origin())
 
@@ -431,12 +442,8 @@ struct ScratchView[
         self.ptr.store[alignment=Self.ALIGNMENT](offset, val)
 
     @always_inline
-    def any(self) -> DynamicView[Self.T, Self.alignment]:
-        # Origin-erasing escape for kernel calls that hit Mojo's
-        # argument-exclusivity checker (e.g., in-place ops where two args
-        # derive from the same lease). Use inline at call sites only —
-        # binding the result to a variable loses release-then-use protection.
-        return DynamicView[Self.T, Self.alignment](
+    def any(self) -> DynamicView[Self.E, Self.S, Self.alignment]:
+        return DynamicView[Self.E, Self.S, Self.alignment](
             self.ptr.as_any_origin(), self.runtime_rows)
 
 

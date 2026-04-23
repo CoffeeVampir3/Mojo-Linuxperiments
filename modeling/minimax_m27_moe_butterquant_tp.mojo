@@ -11,7 +11,7 @@ from threading.threading_traits import BurstThreadPool
 
 from modeling.model_spec import (
     Encoding, Shaped, BF16, F32, I8,
-    Shape, ShapeLike, Mat, DynamicView, StaticView,
+    Shape, ShapeLike, DynamicView, StaticView,
     WeightDesc, DEFAULT_ALIGNMENT, LogitsView,
     TaskVisitor, QuantizeSpec,
     PerRow, PerRowAbsorbed, PerBlockAbsorbed, TwoSidedAbsorbed,
@@ -19,10 +19,7 @@ from modeling.model_spec import (
 )
 from quant.source_format import Bf16Converter, Fp8E4M3Block128Converter
 from modeling.modeling_common import (
-    SlotOffset, Repeated, SectionBuilder, align_up,
-    StaticTensorView, DynamicTensorView,
-    dynamic_tensor_view,
-    scratch_ptr,
+    SlotOffset, TensorRef, Repeated, SectionBuilder, align_up,
     LayerShard, LayerBuilder,
 )
 from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY, embed_lookup
@@ -260,44 +257,8 @@ struct MiniMaxM27Topology[tp: Int](Copyable, ImplicitlyCopyable):
         return self.host_bytes
 
     @always_inline
-    def layer_base(self, idx: Int) -> Int:
-        return self.arena_base + self.layers.off + idx * self.layers.stride
-
-    @always_inline
-    def state_base(self) -> Int:
-        return self.arena_base + self.distributed_bytes
-
-    @always_inline
     def scratch_base(self) -> Int:
-        return self.state_base() + self.scratch_off
-
-    @always_inline
-    def scratch_addr(self, read lease: ScratchLease) -> Int:
-        return self.scratch_base() + lease.offset
-
-    @always_inline
-    def x_main(self, seq_len: Int) -> DynamicTensorView[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]:
-        return dynamic_tensor_view(self.state_base(), self.activations.x_main, seq_len)
-
-    @always_inline
-    def x_residual(self, seq_len: Int) -> DynamicTensorView[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]]:
-        return dynamic_tensor_view(self.state_base(), self.activations.x_residual, seq_len)
-
-    @always_inline
-    def kv_cache_base(self, idx: Int) -> Int:
-        return self.state_base() + self.kv_cache_off + idx * self.kv_cache_stride
-
-    @always_inline
-    def rope_cos_row(self, pos: Int) -> StaticView[Mat[F32, 1, C.ROPE_DIM // 2]]:
-        var off = self.state_base() + self.rope.cos.offset + pos * (C.ROPE_DIM // 2) * size_of[Float32]()
-        return StaticView[Mat[F32, 1, C.ROPE_DIM // 2]](
-            UnsafePointer[Scalar[F32.DTYPE], MutAnyOrigin](unsafe_from_address=off))
-
-    @always_inline
-    def rope_sin_row(self, pos: Int) -> StaticView[Mat[F32, 1, C.ROPE_DIM // 2]]:
-        var off = self.state_base() + self.rope.sin.offset + pos * (C.ROPE_DIM // 2) * size_of[Float32]()
-        return StaticView[Mat[F32, 1, C.ROPE_DIM // 2]](
-            UnsafePointer[Scalar[F32.DTYPE], MutAnyOrigin](unsafe_from_address=off))
+        return self.arena_base + self.scratch_off
 
 
 def emit_expert_block(
@@ -552,6 +513,7 @@ def build_minimax_plan[tp: Int]() -> MiniMaxM27LoadPlan[tp]:
     comptime f32  = size_of[Float32]()
 
     var state = SectionBuilder()
+    state.cursor = distributed
     var activations = ActivationSlots(
         x_main=state.reserve[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](),
         x_residual=state.reserve[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](),
@@ -573,7 +535,7 @@ def build_minimax_plan[tp: Int]() -> MiniMaxM27LoadPlan[tp]:
     # Host section
     comptime HOST = LayerShard.HOST
     comptime vocab_num_blocks = C.HIDDEN // LM_OUTPUT_HEAD_FWHT_BLK
-    var host_off = align_up(distributed + state.bytes())
+    var host_off = align_up(state.bytes())
     var hb = LayerBuilder(tp, "", 0)
     hb.cursor = host_off
 
@@ -609,7 +571,7 @@ def build_minimax_plan[tp: Int]() -> MiniMaxM27LoadPlan[tp]:
         scratch_off=scratch_off, scratch_capacity=scratch_cap,
         rope=rope,
         kv_cache_off=kv_cache_off, kv_cache_stride=kv_cache_stride,
-        state_bytes=state.bytes(),
+        state_bytes=state.bytes() - distributed,
         host=host, host_bytes=host_bytes,
     )
     return MiniMaxM27LoadPlan[tp](topo, descs^)
@@ -650,13 +612,15 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
     def x_main_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
         var ptrs = InlineArray[Int, Self.tp](fill=0)
         for r in range(Self.tp):
-            ptrs[r] = self.topos[r].x_main(seq_len).addr()
+            var topo = self.topos[r]
+            ptrs[r] = topo.activations.x_main.addr(topo.arena_base)
         return ptrs^
 
     def x_residual_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
         var ptrs = InlineArray[Int, Self.tp](fill=0)
         for r in range(Self.tp):
-            ptrs[r] = self.topos[r].x_residual(seq_len).addr()
+            var topo = self.topos[r]
+            ptrs[r] = topo.activations.x_residual.addr(topo.arena_base)
         return ptrs^
 
     def token_buffer(mut self) -> UnsafePointer[Scalar[DType.int32], MutAnyOrigin]:
@@ -729,41 +693,46 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
         for rank in range(Self.tp):
             var topo = self.topos[rank]
-            var sb = topo.state_base()
+            var base = topo.arena_base
             init_rope_tables(
-                topo.rope.cos.bound(sb),
-                topo.rope.sin.bound(sb),
+                topo.rope.cos.bound(base),
+                topo.rope.sin.bound(base),
                 theta=Float64(C.ROPE_THETA))
 
-            var base = topo.arena_base
             for i in range(C.NUM_LAYERS):
-                var lb = topo.layer_base(i)
+                var lb = topo.layers.base(base, i)
                 var layer = topo.layers.proto
 
                 comptime qkv_local = q_local + 2 * kv_local
-                colsum_at(base, lb - base + layer.attn.qkv_proj.offset, lb - base + layer.attn.qkv_colsum.offset,
-                    qkv_local, C.HIDDEN)
-                pack_at(base, lb - base + layer.attn.qkv_proj.offset, qkv_local, C.HIDDEN, pack_scratch)
+                var qkv_slot = TensorRef[I8, Shape[qkv_local, C.HIDDEN]](
+                    offset=layer.attn.qkv_proj.offset)
+                colsum_at(lb, qkv_slot, layer.attn.qkv_colsum)
+                pack_at(lb, qkv_slot, pack_scratch)
 
-                block_colsum_at(base, lb - base + layer.attn.o_proj.offset, lb - base + layer.attn.o_colsum.offset,
-                    C.HIDDEN, q_local, C.HEAD_DIM)
-                pack_at(base, lb - base + layer.attn.o_proj.offset, C.HIDDEN, q_local, pack_scratch)
+                var o_slot = TensorRef[I8, Shape[C.HIDDEN, q_local]](
+                    offset=layer.attn.o_proj.offset)
+                block_colsum_at(lb, o_slot, layer.attn.o_colsum, C.HEAD_DIM)
+                pack_at(lb, o_slot, pack_scratch)
 
-                colsum_at(base, lb - base + layer.body.experts_w1.offset, lb - base + layer.body.experts_w1_colsum.offset,
-                    experts_local * C.MOE_INTERMEDIATE, C.HIDDEN)
-                colsum_at(base, lb - base + layer.body.experts_w3.offset, lb - base + layer.body.experts_w3_colsum.offset,
-                    experts_local * C.MOE_INTERMEDIATE, C.HIDDEN)
+                var experts_w1_slab = TensorRef[I8, Shape[experts_local * C.MOE_INTERMEDIATE, C.HIDDEN]](
+                    offset=layer.body.experts_w1.offset)
+                colsum_at(lb, experts_w1_slab, layer.body.experts_w1_colsum)
+                var experts_w3_slab = TensorRef[I8, Shape[experts_local * C.MOE_INTERMEDIATE, C.HIDDEN]](
+                    offset=layer.body.experts_w3.offset)
+                colsum_at(lb, experts_w3_slab, layer.body.experts_w3_colsum)
                 for e in range(experts_local):
-                    pack_at(base, lb - base + layer.body.experts_w1.offset + e * C.MOE_INTERMEDIATE * C.HIDDEN,
-                        C.MOE_INTERMEDIATE, C.HIDDEN, pack_scratch)
-                    pack_at(base, lb - base + layer.body.experts_w3.offset + e * C.MOE_INTERMEDIATE * C.HIDDEN,
-                        C.MOE_INTERMEDIATE, C.HIDDEN, pack_scratch)
-                    block_colsum_at(base,
-                        lb - base + layer.body.experts_w2.offset + e * C.HIDDEN * C.MOE_INTERMEDIATE,
-                        lb - base + layer.body.experts_w2_colsum.offset + e * C.HIDDEN * MOE_DOWN_NUM_BLK * 4,
-                        C.HIDDEN, C.MOE_INTERMEDIATE, FWHT_BLK_MOE_DOWN)
-                    pack_at(base, lb - base + layer.body.experts_w2.offset + e * C.HIDDEN * C.MOE_INTERMEDIATE,
-                        C.HIDDEN, C.MOE_INTERMEDIATE, pack_scratch)
+                    var expert_w1 = TensorRef[I8, Shape[C.MOE_INTERMEDIATE, C.HIDDEN]](
+                        offset=layer.body.experts_w1.offset + e * C.MOE_INTERMEDIATE * C.HIDDEN)
+                    pack_at(lb, expert_w1, pack_scratch)
+                    var expert_w3 = TensorRef[I8, Shape[C.MOE_INTERMEDIATE, C.HIDDEN]](
+                        offset=layer.body.experts_w3.offset + e * C.MOE_INTERMEDIATE * C.HIDDEN)
+                    pack_at(lb, expert_w3, pack_scratch)
+                    var expert_w2 = TensorRef[I8, Shape[C.HIDDEN, C.MOE_INTERMEDIATE]](
+                        offset=layer.body.experts_w2.offset + e * C.HIDDEN * C.MOE_INTERMEDIATE)
+                    var expert_w2_colsum = TensorRef[F32, Shape[C.HIDDEN * MOE_DOWN_NUM_BLK, 1]](
+                        offset=layer.body.experts_w2_colsum.offset + e * C.HIDDEN * MOE_DOWN_NUM_BLK * 4)
+                    block_colsum_at(lb, expert_w2, expert_w2_colsum, FWHT_BLK_MOE_DOWN)
+                    pack_at(lb, expert_w2, pack_scratch)
 
                 compute_sqrt_gamma[C.HIDDEN](
                     layer.body.input_norm.bound(lb).as_ptr(),
@@ -775,8 +744,8 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
             if rank == HOST_RANK:
                 block_colsum_row_major_at(base,
-                    topo.host.lm_output_head.offset, topo.host.lm_output_head_colsum.offset,
-                    C.VOCAB_SIZE, C.HIDDEN, LM_OUTPUT_HEAD_FWHT_BLK)
+                    topo.host.lm_output_head, topo.host.lm_output_head_colsum,
+                    LM_OUTPUT_HEAD_FWHT_BLK)
                 compute_sqrt_gamma[C.HIDDEN](
                     topo.host.final_norm.bound(base).as_ptr(),
                     topo.host.lm_output_head_sqrt_gamma.bound(base).as_ptr())
@@ -855,13 +824,14 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         comptime HPG = C.HPG
         comptime HEADS_PER_RANK = S.NUM_HEADS_LOCAL
         comptime KV_PER_RANK = S.NUM_KV_HEADS_LOCAL
-        comptime X_SLOT = Mat[BF16, C.MAX_SEQ_LEN, C.HIDDEN]
+        comptime XShape = Shape[C.MAX_SEQ_LEN, C.HIDDEN]
         comptime VOCAB_NUM_BLOCKS = C.HIDDEN // LM_OUTPUT_HEAD_FWHT_BLK
         comptime Q_GROUP_BF16 = HPG * C.HEAD_DIM * 2
         comptime K_HEAD_BF16 = C.HEAD_DIM * 2
         comptime V_HEAD_BF16 = C.HEAD_DIM * 2
         comptime PARTIAL_F32S = (
             KV_PER_RANK * C.MAX_ATTN_CHUNKS * HPG * (2 + C.HEAD_DIM))
+        comptime ROPE_HALF = C.ROPE_DIM // 2
 
         var t_forward0 = Int(perf_counter_ns())
         var sample = ForwardSample(pos)
@@ -872,14 +842,16 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         var t_embed0 = Int(perf_counter_ns())
         var embed_fence = embed_lookup(
             host.host.embed.bound(host.arena_base),
-            tokens_ptr, host.x_main(seq_len),
+            tokens_ptr,
+            host.activations.x_main.bound_dyn(host.arena_base, seq_len),
             self.main_pools[0])
         var t_embed1 = Int(perf_counter_ns())
         sample.add(self.profile.phase("embed"), finish_single_pool_fence(t_embed0, t_embed1, embed_fence^))
 
         var t_bcast0 = Int(perf_counter_ns())
-        ring_broadcast[X_SLOT, Self.tp](
-            host.x_main(seq_len).addr(), self.x_main_ptrs(seq_len), seq_len, self.main_pools)
+        ring_broadcast[BF16, XShape, Self.tp](
+            host.activations.x_main.addr(host.arena_base),
+            self.x_main_ptrs(seq_len), seq_len, self.main_pools)
         sample.add(self.profile.phase("broadcast"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_bcast0))
 
         var act_scale_lease = self.scratch.borrow[Float32, 1]()
@@ -901,11 +873,12 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
             var t_attn_quant0 = Int(perf_counter_ns())
             for r in range(Self.tp):
-                var lb = topos[r].layer_base(layer_idx)
-                var layer = topos[r].layers.proto
-                var sb = topos[r].scratch_base()
+                var topo_r = topos[r]
+                var lb = topo_r.layers.base(topo_r.arena_base, layer_idx)
+                var layer = topo_r.layers.proto
+                var sb = topo_r.scratch_base()
                 var args = RmsNormFwhtQuantArgs(
-                    topos[r].x_main(seq_len).as_ptr[DType.bfloat16](),
+                    topo_r.activations.x_main.bound_dyn(topo_r.arena_base, seq_len).as_ptr[DType.bfloat16](),
                     layer.body.input_norm_sqrt.bound(lb).as_ptr[DType.bfloat16](),
                     attn_i8_lease.view[I8, 1, C.HIDDEN](sb, 1).as_ptr[DType.int8](),
                     attn_work_lease.view[F32, 1, C.HIDDEN](sb, 1).as_ptr[DType.float32](),
@@ -918,7 +891,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
             @parameter
             def do_qkv_gemv[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
-                var lb = topo.layer_base(layer_idx)
+                var lb = topo.layers.base(topo.arena_base, layer_idx)
                 var layer = topo.layers.proto
                 var sb = topo.scratch_base()
                 return int8_gemv[QKV_LOCAL, C.HIDDEN](
@@ -956,9 +929,11 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             # Phase 4: K/V cache write (NKV_LOCAL parallel jobs per rank)
             @parameter
             def do_kv_write[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
-                var lb = topo.layer_base(layer_idx)
+                var lb = topo.layers.base(topo.arena_base, layer_idx)
                 var layer = topo.layers.proto
                 var sb = topo.scratch_base()
+                var cos_row = topo.rope.cos.bound_row(topo.arena_base, pos)
+                var sin_row = topo.rope.sin.bound_row(topo.arena_base, pos)
                 return kv_write_dispatch[
                     C.HEAD_DIM, C.ROPE_DIM, C.ROPE_PAIR_STRIDE,
                     C.MAX_SEQ_LEN, KV_PER_RANK](
@@ -967,9 +942,9 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     qkv_lease.view[BF16, 1, KV_LOCAL](sb, 1, element_offset=Q_LOCAL + KV_LOCAL).any(),
                     layer.attn.q_norm.bound(lb),
                     layer.attn.k_norm.bound(lb),
-                    topo.rope_cos_row(pos), topo.rope_sin_row(pos),
+                    cos_row, sin_row,
                     inv_rms_q, inv_rms_k,
-                    topo.kv_cache_base(layer_idx), pos,
+                    topo.arena_base + topo.kv_cache_off + layer_idx * topo.kv_cache_stride, pos,
                     pool)
             sample.add(self.profile.phase("kv_write"), timed_tp_parallel[Self.tp,do_kv_write](topos, self.main_pools))
 
@@ -991,9 +966,10 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             var t_qprep0 = Int(perf_counter_ns())
             for kv in range(KV_PER_RANK):
                 for r in range(Self.tp):
-                    var lb = topos[r].layer_base(layer_idx)
-                    var layer = topos[r].layers.proto
-                    var sb = topos[r].scratch_base()
+                    var topo_r = topos[r]
+                    var lb = topo_r.layers.base(topo_r.arena_base, layer_idx)
+                    var layer = topo_r.layers.proto
+                    var sb = topo_r.scratch_base()
                     var q_view = qkv_lease.view[BF16, 1, HPG * C.HEAD_DIM](
                         sb, 1, element_offset=kv * HPG * C.HEAD_DIM)
                     var q_norm_off_elems = kv * HPG * C.HEAD_DIM
@@ -1007,8 +983,8 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     var qp_args = AttnGroupArgs()
                     qp_args.q_bf16_base = q_view.as_ptr[DType.bfloat16]()
                     qp_args.q_norm_ptr = q_norm_ptr
-                    qp_args.cos_ptr = topos[r].rope_cos_row(pos).as_ptr[DType.float32]()
-                    qp_args.sin_ptr = topos[r].rope_sin_row(pos).as_ptr[DType.float32]()
+                    qp_args.cos_ptr = topo_r.rope.cos.bound_row(topo_r.arena_base, pos).as_ptr[DType.float32]()
+                    qp_args.sin_ptr = topo_r.rope.sin.bound_row(topo_r.arena_base, pos).as_ptr[DType.float32]()
                     qp_args.inv_rms_q = inv_rms_q
                     qp_args.qi_out = qi_out_view.as_ptr[DType.int8]()
                     qp_args.head_scale_ptr = qi_biases_view.as_ptr[DType.float32]()
@@ -1018,16 +994,17 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
             @parameter
             def do_chunk_score_all[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
+                var sb = topo.scratch_base()
                 return chunked_score_dispatch_multi[
                     C.HEAD_DIM, HPG, C.MAX_SEQ_LEN, KV_PER_RANK,
                     C.MAX_ATTN_CHUNKS](
-                    topo.scratch_addr(q_i8_lease),
-                    topo.scratch_addr(qi_biases_lease),
-                    topo.scratch_addr(q_scales_lease),
-                    topo.kv_cache_base(layer_idx),
+                    sb + q_i8_lease.offset,
+                    sb + qi_biases_lease.offset,
+                    sb + q_scales_lease.offset,
+                    topo.arena_base + topo.kv_cache_off + layer_idx * topo.kv_cache_stride,
                     0, KV_PER_RANK,
                     context_len, Int(pool.get_capacity()),
-                    topo.scratch_addr(partial_lease),
+                    sb + partial_lease.offset,
                     pool)
             sample.add(self.profile.phase("attention"), timed_tp_parallel[Self.tp,do_chunk_score_all](topos, self.main_pools))
 
@@ -1061,7 +1038,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             # Phase 6: O projection
             @parameter
             def do_o_proj[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
-                var lb = topo.layer_base(layer_idx)
+                var lb = topo.layers.base(topo.arena_base, layer_idx)
                 var layer = topo.layers.proto
                 var sb = topo.scratch_base()
                 return int8_gemv_blocked[C.HIDDEN, Q_LOCAL, C.HEAD_DIM](
@@ -1070,7 +1047,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     attn_head_sc_lease.view[F32, C.MAX_SEQ_LEN, Q_LOCAL // C.HEAD_DIM](sb, seq_len),
                     layer.attn.o_proj_sc.bound(lb),
                     layer.attn.o_colsum.bound(lb),
-                    topo.x_residual(seq_len),
+                    topo.activations.x_residual.bound_dyn(topo.arena_base, seq_len),
                     pool)
             sample.add(self.profile.phase("o_proj"), timed_tp_parallel[Self.tp,do_o_proj](topos, self.main_pools))
 
@@ -1080,7 +1057,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
             # Allreduce O-proj + fused residual add: x_main += sum(x_residual)
             var t_attn_reduce0 = Int(perf_counter_ns())
-            small_allreduce[X_SLOT, Self.tp, residual_add=True](
+            small_allreduce[BF16, XShape, Self.tp, residual_add=True](
                 self.x_residual_ptrs(seq_len), seq_len,
                 self.x_main_ptrs(seq_len))
             sample.add(self.profile.phase("attn_reduce"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_attn_reduce0))
@@ -1101,11 +1078,12 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
             var t_dual_norm0 = Int(perf_counter_ns())
             for r in range(Self.tp):
-                var lb = topos[r].layer_base(layer_idx)
-                var layer = topos[r].layers.proto
-                var sb = topos[r].scratch_base()
+                var topo_r = topos[r]
+                var lb = topo_r.layers.base(topo_r.arena_base, layer_idx)
+                var layer = topo_r.layers.proto
+                var sb = topo_r.scratch_base()
                 var args = RmsNormDualOutputArgs(
-                    topos[r].x_main(seq_len).as_ptr[DType.bfloat16](),
+                    topo_r.activations.x_main.bound_dyn(topo_r.arena_base, seq_len).as_ptr[DType.bfloat16](),
                     layer.body.post_attn_norm_sqrt.bound(lb).as_ptr[DType.bfloat16](),
                     layer.body.post_attn_norm.bound(lb).as_ptr[DType.bfloat16](),
                     moe_i8_lease.view[I8, 1, C.HIDDEN](sb, 1).as_ptr[DType.int8](),
@@ -1128,23 +1106,24 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
             @parameter
             def do_router_fused[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
-                var lb = topo.layer_base(layer_idx)
+                var lb = topo.layers.base(topo.arena_base, layer_idx)
                 var layer = topo.layers.proto
                 var sb = topo.scratch_base()
                 return router_fused_dispatch[C.NUM_EXPERTS, C.HIDDEN, C.TOP_K](
                     normed_bf16_lease.view[BF16, 1, C.HIDDEN](sb, 1),
                     layer.body.router_proj.bound(lb),
                     layer.body.router_bias.bound(lb),
-                    U8Ptr(unsafe_from_address=topo.scratch_addr(candidates_lease)),
+                    candidates_lease.as_ptr[RouterCandidate](sb),
                     pool)
             sample.add(self.profile.phase("router_proj"), timed_tp_parallel[Self.tp,do_router_fused](topos, self.main_pools))
 
             var t_merge0 = Int(perf_counter_ns())
             for r in range(Self.tp):
+                var sb_r = topos[r].scratch_base()
                 var num_workers = min(C.NUM_EXPERTS // C.TOP_K, Int(self.main_pools[r].get_capacity()))
-                var merge_args = RouterMergeArgs(
-                    U8Ptr(unsafe_from_address=topos[r].scratch_addr(candidates_lease)),
-                    U8Ptr(unsafe_from_address=topos[r].scratch_addr(routing_lease)),
+                var merge_args = RouterMergeArgs[C.TOP_K](
+                    candidates_lease.as_ptr[RouterCandidate](sb_r),
+                    routing_lease.as_ptr[TopKResult[C.TOP_K]](sb_r),
                     num_workers * C.TOP_K)
                 router_merge_and_renorm[C.TOP_K](merge_args)
             sample.add(self.profile.phase("router_topk"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_merge0))
@@ -1163,11 +1142,10 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
             @parameter
             def do_expert_phase1[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
-                var lb = topo.layer_base(layer_idx)
+                var lb = topo.layers.base(topo.arena_base, layer_idx)
                 var layer = topo.layers.proto
                 var sb = topo.scratch_base()
-                var routing = UnsafePointer[TopKResult[C.TOP_K], MutAnyOrigin](
-                    unsafe_from_address=topo.scratch_addr(routing_lease))[]
+                var routing = routing_lease.as_ptr[TopKResult[C.TOP_K]](sb)[]
                 comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
                 var expert_base = rank * experts_per_rank
                 var lc = 0
@@ -1175,8 +1153,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     var eid = routing.indices[s]
                     if eid >= expert_base and eid < expert_base + experts_per_rank:
                         lc += 1
-                UnsafePointer[Int32, MutAnyOrigin](
-                    unsafe_from_address=topo.scratch_addr(local_count_lease))[] = Int32(lc)
+                local_count_lease.as_ptr[Int32](sb)[] = Int32(lc)
                 return minimax_moe_phase1[
                     C.MOE_INTERMEDIATE, C.HIDDEN, FWHT_BLK,
                     C.TOP_K, C.NUM_EXPERTS, Self.tp](
@@ -1203,11 +1180,10 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             # Phase 10: expert down (w2)
             @parameter
             def do_expert_phase2[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
-                var lb = topo.layer_base(layer_idx)
+                var lb = topo.layers.base(topo.arena_base, layer_idx)
                 var layer = topo.layers.proto
                 var sb = topo.scratch_base()
-                var routing = UnsafePointer[TopKResult[C.TOP_K], MutAnyOrigin](
-                    unsafe_from_address=topo.scratch_addr(routing_lease))[]
+                var routing = routing_lease.as_ptr[TopKResult[C.TOP_K]](sb)[]
                 return minimax_moe_phase2[
                     C.HIDDEN, C.MOE_INTERMEDIATE, FWHT_BLK_MOE_DOWN,
                     C.TOP_K, C.NUM_EXPERTS, Self.tp](
@@ -1227,17 +1203,17 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             # Phase 11: expert reduce + fused allreduce + residual add
             var t_expert_sum0 = Int(perf_counter_ns())
             for r in range(Self.tp):
-                var sb = topos[r].scratch_base()
-                var lc = Int(UnsafePointer[Int32, MutAnyOrigin](
-                    unsafe_from_address=topos[r].scratch_addr(local_count_lease))[])
+                var topo_r = topos[r]
+                var sb = topo_r.scratch_base()
+                var lc = Int(local_count_lease.as_ptr[Int32](sb)[])
                 accumulate_expert_outputs[C.HIDDEN, C.TOP_K](
                     expert_out_lease.view[BF16, C.TOP_K, C.HIDDEN](sb, C.TOP_K).as_ptr[DType.bfloat16](),
                     lc,
-                    topos[r].x_residual(seq_len).as_ptr[DType.bfloat16]())
+                    topo_r.activations.x_residual.bound_dyn(topo_r.arena_base, seq_len).as_ptr[DType.bfloat16]())
             sample.add(self.profile.phase("expert_sum"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_expert_sum0))
 
             var t_ffn_reduce0 = Int(perf_counter_ns())
-            small_allreduce[X_SLOT, Self.tp, residual_add=True](
+            small_allreduce[BF16, XShape, Self.tp, residual_add=True](
                 self.x_residual_ptrs(seq_len), seq_len,
                 self.x_main_ptrs(seq_len))
             sample.add(self.profile.phase("ffn_reduce"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_ffn_reduce0))
@@ -1260,7 +1236,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         var t_final0 = Int(perf_counter_ns())
         var final_fence = rmsnorm_gamma_fwht_per_block_quantize[
             C.HIDDEN, LM_OUTPUT_HEAD_FWHT_BLK](
-            host.x_main(seq_len),
+            host.activations.x_main.bound_dyn(host.arena_base, seq_len),
             host.host.lm_output_head_sqrt_gamma.bound(host.arena_base),
             lm_act_i8_lease.view[I8, 1, C.HIDDEN](host.scratch_base(), 1),
             lm_work_lease.view[F32, 1, C.HIDDEN](host.scratch_base(), 1),
@@ -1291,7 +1267,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         # Argmax (no softcap in MiniMax)
         comptime width = simd_width_of[DType.float32]()
         var logits = LogitsView[C.VOCAB_SIZE](
-            scratch_ptr[Scalar[DType.bfloat16]](host.scratch_base(), logit_lease), logit_lease^)
+            logit_view.as_ptr[DType.bfloat16](), logit_lease^)
         var best_val = Float32(-1e30)
         var best_idx = Int32(0)
         for j in range(0, C.VOCAB_SIZE, width):

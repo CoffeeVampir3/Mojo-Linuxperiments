@@ -18,11 +18,12 @@ from minimax.kernels.dispatch_args import (
     FusedW1W3SiluArgs,
     AttnGroupArgs,
     RouterCandidate,
+    TopKResult,
     RouterFusedArgs,
 )
 from minimax.kernels.gemm import fused_w1_w3_silu_worker
 from minimax.kernels.attention import kv_write_kernel
-from minimax.kernels.router import TopKResult, router_fused_worker
+from minimax.kernels.router import router_fused_worker
 
 
 # ============================================================================
@@ -47,7 +48,7 @@ def router_fused_dispatch[
     act_bf16: ActT,
     weight_f32: WT,
     bias_f32: BT,
-    candidates: U8Ptr,
+    candidates: UnsafePointer[RouterCandidate, MutAnyOrigin],
     ref [origin] pool: P,
 ) -> PoolFence[P, origin]:
     comptime assert ActT.DTYPE == DType.bfloat16, "router_fused: act must be bf16"
@@ -69,7 +70,7 @@ def router_fused_dispatch[
         if start >= num_experts:
             break
         var count = min(rows_per_worker, num_experts - start)
-        var slot = candidates + i * k * size_of[RouterCandidate]()
+        var slot = candidates + i * k
         jobs[actual] = RouterFusedArgs(
             act_p, weight_p, bias_p, slot, start, count)
         actual += 1

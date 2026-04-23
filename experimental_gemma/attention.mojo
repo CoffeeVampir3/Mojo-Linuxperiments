@@ -21,7 +21,7 @@ from std.collections import InlineArray
 
 from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY, BF16Ptr
 from threading.threading_traits import BurstThreadPool
-from modeling.model_spec import Encoding, Shaped, DynamicView, CacheView
+from modeling.model_spec import DynamicTensor, StaticTensor
 from simd_math import exp_f32
 
 
@@ -127,11 +127,11 @@ def local_attention[
     P: BurstThreadPool, origin: MutOrigin, //,
     num_heads: Int, num_kv_heads: Int, head_dim: Int,
     window_size: Int,
-    QT: Encoding & Shaped, KCT: Encoding & Shaped, VCT: Encoding & Shaped,
-    OutT: Encoding & Shaped,
+    QT: DynamicTensor, KCT: StaticTensor, VCT: StaticTensor,
+    OutT: DynamicTensor,
 ](
-    q: DynamicView[QT], k_cache: CacheView[KCT], v_cache: CacheView[VCT],
-    output: DynamicView[OutT], pos: Int,
+    q: QT, k_cache: KCT, v_cache: VCT,
+    output: OutT, pos: Int,
     ref [origin] pool: P,
 ) -> PoolFence[P, origin] where KCT.DTYPE == DType.bfloat16:
     """Sliding-window GQA attention with scale=1.0.
@@ -256,11 +256,11 @@ def global_attention_kernel[
 def global_attention[
     P: BurstThreadPool, origin: MutOrigin, //,
     num_heads: Int, num_kv_heads: Int, head_dim: Int,
-    QT: Encoding & Shaped, KCT: Encoding & Shaped, VCT: Encoding & Shaped,
-    OutT: Encoding & Shaped,
+    QT: DynamicTensor, KCT: StaticTensor, VCT: StaticTensor,
+    OutT: DynamicTensor,
 ](
-    q: DynamicView[QT], k_cache: CacheView[KCT], v_cache: CacheView[VCT],
-    output: DynamicView[OutT], pos: Int,
+    q: QT, k_cache: KCT, v_cache: VCT,
+    output: OutT, pos: Int,
     ref [origin] pool: P,
 ) -> PoolFence[P, origin] where KCT.DTYPE == DType.bfloat16:
     """Full-causal GQA attention with scale=1.0.

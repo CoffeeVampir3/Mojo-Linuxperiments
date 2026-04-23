@@ -1,3 +1,5 @@
+from std.collections import InlineArray
+
 from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr, BF16Ptr
 
 
@@ -131,6 +133,12 @@ struct RouterCandidate(Copyable, ImplicitlyCopyable):
 
 
 @fieldwise_init
+struct TopKResult[k: Int](Copyable, ImplicitlyCopyable, Movable):
+    var indices: InlineArray[Int, Self.k]
+    var weights: InlineArray[Float32, Self.k]
+
+
+@fieldwise_init
 struct RouterFusedArgs(Copyable, ImplicitlyCopyable):
     """Args for fused router worker: f32 GEMV + sigmoid + local top-K.
 
@@ -140,7 +148,7 @@ struct RouterFusedArgs(Copyable, ImplicitlyCopyable):
     var act_bf16: BF16Ptr
     var weight_f32: F32Ptr
     var bias_f32: F32Ptr
-    var candidates: U8Ptr
+    var candidates: UnsafePointer[RouterCandidate, MutAnyOrigin]
     var n_start: Int
     var n_count: Int
 
@@ -148,25 +156,25 @@ struct RouterFusedArgs(Copyable, ImplicitlyCopyable):
         self.act_bf16 = BF16Ptr()
         self.weight_f32 = F32Ptr()
         self.bias_f32 = F32Ptr()
-        self.candidates = U8Ptr()
+        self.candidates = UnsafePointer[RouterCandidate, MutAnyOrigin]()
         self.n_start = 0
         self.n_count = 0
 
 
 @fieldwise_init
-struct RouterMergeArgs(Copyable, ImplicitlyCopyable):
+struct RouterMergeArgs[k: Int](Copyable, ImplicitlyCopyable):
     """Args for router candidate-merge + renorm.
 
     candidates: num_candidates × RouterCandidate scratch from phase 1.
     result_ptr: TopKResult[k] destination.
     """
-    var candidates: U8Ptr
-    var result_ptr: U8Ptr
+    var candidates: UnsafePointer[RouterCandidate, MutAnyOrigin]
+    var result_ptr: UnsafePointer[TopKResult[Self.k], MutAnyOrigin]
     var num_candidates: Int
 
     def __init__(out self):
-        self.candidates = U8Ptr()
-        self.result_ptr = U8Ptr()
+        self.candidates = UnsafePointer[RouterCandidate, MutAnyOrigin]()
+        self.result_ptr = UnsafePointer[TopKResult[Self.k], MutAnyOrigin]()
         self.num_candidates = 0
 
 

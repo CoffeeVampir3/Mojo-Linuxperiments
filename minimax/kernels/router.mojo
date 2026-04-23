@@ -5,14 +5,8 @@ from experimental3.common_math import F32Ptr, BF16Ptr
 from minimax.kernels.activations import sigmoid_f32
 from minimax.kernels.gemm import f32_gemv_row
 from minimax.kernels.dispatch_args import (
-    RouterCandidate, RouterFusedArgs, RouterMergeArgs,
+    RouterCandidate, TopKResult, RouterFusedArgs, RouterMergeArgs,
 )
-
-
-@fieldwise_init
-struct TopKResult[k: Int](Copyable, ImplicitlyCopyable, Movable):
-    var indices: InlineArray[Int, Self.k]
-    var weights: InlineArray[Float32, Self.k]
 
 
 def router_fused_worker[hidden: Int, k: Int](args: RouterFusedArgs):
@@ -46,13 +40,11 @@ def router_fused_worker[hidden: Int, k: Int](args: RouterFusedArgs):
             score_buf[slot] = score
             raw_buf[slot] = raw
 
-    var out = UnsafePointer[RouterCandidate, MutAnyOrigin](
-        unsafe_from_address=Int(args.candidates))
     for s in range(k):
-        out[s] = RouterCandidate(eid_buf[s], score_buf[s], raw_buf[s])
+        args.candidates[s] = RouterCandidate(eid_buf[s], score_buf[s], raw_buf[s])
 
 
-def router_merge_and_renorm[k: Int](args: RouterMergeArgs):
+def router_merge_and_renorm[k: Int](args: RouterMergeArgs[k]):
     """Phase 2: merge worker candidates → TopKResult[k], renormalize.
 
     Scalar insert each candidate into a K-slot sorted buffer, then
@@ -62,13 +54,11 @@ def router_merge_and_renorm[k: Int](args: RouterMergeArgs):
     var score_buf = InlineArray[Float32, k](fill=Float32(-1e30))
     var raw_buf = InlineArray[Float32, k](fill=Float32(0))
 
-    var cands = UnsafePointer[RouterCandidate, MutAnyOrigin](
-        unsafe_from_address=Int(args.candidates))
     for c in range(args.num_candidates):
-        var score = cands[c].score
+        var score = args.candidates[c].score
         if score > score_buf[k - 1]:
-            var eid = cands[c].eid
-            var raw = cands[c].raw
+            var eid = args.candidates[c].eid
+            var raw = args.candidates[c].raw
             var slot = k - 1
             while slot > 0 and score > score_buf[slot - 1]:
                 eid_buf[slot] = eid_buf[slot - 1]
@@ -92,5 +82,4 @@ def router_merge_and_renorm[k: Int](args: RouterMergeArgs):
         result.indices[s] = Int(eid_buf[s])
         result.weights[s] = raw_buf[s] * inv
 
-    UnsafePointer[TopKResult[k], MutAnyOrigin](
-        unsafe_from_address=Int(args.result_ptr))[] = result
+    args.result_ptr[] = result

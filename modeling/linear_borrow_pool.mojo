@@ -19,7 +19,7 @@ Usage:
 from std.sys.info import size_of
 from std.os import abort
 
-from modeling.model_spec import Encoding, Shaped, Mat, ScratchView
+from modeling.model_spec import Encoding, Shaped, Shape, ShapeLike, ScratchView
 
 
 comptime SCRATCH_LEASE_ALIGNMENT = 64
@@ -69,22 +69,43 @@ struct ScratchLease(Movable):
         self.pool_offset_ptr[] -= self.byte_size
 
     @always_inline
+    def as_ptr[
+        o: MutOrigin, //,
+        T: AnyType,
+    ](
+        ref [o] self, scratch_base: Int, element_offset: Int = 0,
+    ) -> UnsafePointer[T, o]:
+        """Typed pointer into the lease's region.
+
+        Origin is inferred from the lease reference, so release-then-use
+        on any pointer derived from this call trips the compile-time
+        lifetime checker. Used for packed-struct buffers (router
+        candidates, top-K results, etc.) where a 2D view makes no sense
+        but typed pointer access is still appropriate.
+        """
+        return UnsafePointer[T, o](
+            unsafe_from_address=scratch_base + self.offset
+                + element_offset * size_of[T]())
+
+    @always_inline
     def view[
         o: MutOrigin, //,
         E: Encoding, rows: Int, cols: Int,
     ](
         ref [o] self, scratch_base: Int, seq_len: Int,
         element_offset: Int = 0,
-    ) -> ScratchView[Mat[E, rows, cols], o]:
+    ) -> ScratchView[E, Shape[rows, cols], o]:
         """Bridge from scratch lease to typed view.
 
         Origin comes from the lease reference: release-then-use on any
-        derived view fails at compile time.
+        derived view fails at compile time. Scratch is always contiguous
+        with no sharding or alignment padding, so the synthesized
+        Shape[rows, cols] uses the defaults.
 
         element_offset: element-unit offset into the lease (e.g., to split
         a [K; V] buffer into separate K and V views from one lease).
         """
-        return ScratchView[Mat[E, rows, cols], o](
+        return ScratchView[E, Shape[rows, cols], o](
             UnsafePointer[Scalar[E.DTYPE], o](
                 unsafe_from_address=(scratch_base + self.offset
                     + element_offset * E.ELEMENT_BYTES)),

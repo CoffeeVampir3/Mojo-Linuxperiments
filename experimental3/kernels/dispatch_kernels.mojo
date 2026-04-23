@@ -20,7 +20,7 @@ from threading.threading_traits import BurstThreadPool
 from modeling.model_spec import (
     Encoding, Shaped, Aligned, HasPtr, Dynamic,
     StaticTensor, DynamicTensor,
-    StaticView, DynamicView, Mat, BF16,
+    StaticView, DynamicView, Shape, BF16,
 )
 from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY
 
@@ -678,15 +678,17 @@ def router_topk_dispatch[
     P: BurstThreadPool, origin: MutOrigin, //,
     num_experts: Int, k: Int,
 ](
-    logits: LgT, per_expert_scale: PesT, result_ptr: Int, ref [origin] pool: P,
+    logits: LgT, per_expert_scale: PesT,
+    result_ptr: UnsafePointer[Gemma4TopKResult[k], MutAnyOrigin],
+    ref [origin] pool: P,
 ) -> PoolFence[P, origin]:
     comptime assert LgT.DTYPE == DType.bfloat16, "router_topk: logits must be bf16"
     comptime assert PesT.DTYPE == DType.bfloat16, "router_topk: per_expert_scale must be bf16"
-    var args = RouterTopkArgs(
+    var args = RouterTopkArgs[k](
         logits.as_ptr[DType.bfloat16](),
         per_expert_scale.as_ptr[DType.bfloat16](),
-        U8Ptr(unsafe_from_address=result_ptr))
-    pool.dispatch[RouterTopkArgs, router_topk_kernel[num_experts, k]](
+        result_ptr)
+    pool.dispatch[RouterTopkArgs[k], router_topk_kernel[num_experts, k]](
         UnsafePointer(to=args), 1)
     return PoolFence[P, origin].over(pool)
 
@@ -997,11 +999,11 @@ def rmsnorm_fwht_quantize[
 ) -> PoolFence[P, origin]:
     """RMSNorm + FWHT + per-row i8. No gamma.
 
-    Passes StaticView[Mat[BF16, 1, 1]] as a dummy gamma — has_gamma=False
-    means the worker never dereferences it."""
+    Passes a dummy gamma view — has_gamma=False means the worker never
+    dereferences it."""
     var dummy_ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
         unsafe_from_address=0)
-    var dummy_gamma = StaticView[Mat[BF16, 1, 1]](dummy_ptr)
+    var dummy_gamma = StaticView[BF16, Shape[1, 1]](dummy_ptr)
     return rmsnorm_fwht_quant[cols, block, False, False](
         input, dummy_gamma, qi, work, scale, eps, pool)
 
