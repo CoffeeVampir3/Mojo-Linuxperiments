@@ -17,12 +17,14 @@ from minimax.kernels.qk_prep import prep_q_head
 from minimax.kernels.dispatch_args import (
     FusedW1W3SiluArgs,
     AttnGroupArgs,
+    KVWriteBatchArgs,
+    QPrepBatchArgs,
     RouterCandidate,
     TopKResult,
     RouterFusedArgs,
 )
 from minimax.kernels.gemm import fused_w1_w3_silu_worker
-from minimax.kernels.attention import kv_write_kernel
+from minimax.kernels.attention import kv_write_kernel, kv_write_batch_kernel, q_prep_batch_kernel
 from minimax.kernels.router import router_fused_worker
 
 
@@ -89,86 +91,84 @@ def router_fused_dispatch[
 
 
 def kv_write_dispatch[
-    QT: DynamicTensor, KT: DynamicTensor, VT: DynamicTensor,
-    QnT: StaticTensor, KnT: StaticTensor,
-    CosT: StaticTensor, SinT: StaticTensor,
     P: BurstThreadPool, origin: MutOrigin, //,
     head_dim: Int, rope_dim: Int, pair_stride: Int,
-    max_seq: Int, num_kv_heads: Int,
+    max_seq: Int, num_kv_heads: Int, qkv_local: Int,
+    q_local: Int, rope_half: Int,
 ](
-    q_bf16: QT, k_bf16: KT, v_bf16: VT,
-    q_norm: QnT, k_norm: KnT,
-    cos_table: CosT, sin_table: SinT,
-    inv_rms_q: Float32, inv_rms_k: Float32,
-    cache_base: Int, cache_pos: Int,
+    qkv_ptr: BF16Ptr,
+    k_norm_ptr: BF16Ptr,
+    cos_base: F32Ptr,
+    sin_base: F32Ptr,
+    inv_rms_k_arr: F32Ptr,
+    cache_base: Int,
+    start_pos: Int,
+    pos_count: Int,
     ref [origin] pool: P,
 ) -> PoolFence[P, origin]:
-    comptime assert QT.DTYPE == DType.bfloat16, "kv_write: q must be bf16"
-    comptime assert KT.DTYPE == DType.bfloat16, "kv_write: k must be bf16"
-    comptime assert VT.DTYPE == DType.bfloat16, "kv_write: v must be bf16"
-    comptime assert QnT.DTYPE == DType.bfloat16, "kv_write: q_norm must be bf16"
-    comptime assert KnT.DTYPE == DType.bfloat16, "kv_write: k_norm must be bf16"
-    comptime assert CosT.DTYPE == DType.float32, "kv_write: cos must be f32"
-    comptime assert SinT.DTYPE == DType.float32, "kv_write: sin must be f32"
-
-    comptime HPG = 1
-    var jobs = InlineArray[AttnGroupArgs, 8](fill=AttnGroupArgs())
-    comptime K_HEAD_BF16 = head_dim * 2
-    comptime V_HEAD_BF16 = head_dim * 2
-
-    var q_p = q_bf16.as_ptr[DType.bfloat16]()
-    var k_p = k_bf16.as_ptr[DType.bfloat16]()
-    var v_p = v_bf16.as_ptr[DType.bfloat16]()
-    var q_norm_p = q_norm.as_ptr[DType.bfloat16]()
-    var k_norm_p = k_norm.as_ptr[DType.bfloat16]()
-    var cos_p = cos_table.as_ptr[DType.float32]()
-    var sin_p = sin_table.as_ptr[DType.float32]()
     var cache = U8Ptr(unsafe_from_address=cache_base)
+    var jobs = InlineArray[KVWriteBatchArgs, 8](fill=KVWriteBatchArgs())
 
     for g in range(num_kv_heads):
-        jobs[g] = AttnGroupArgs(
-            q_bf16_base=q_p,
-            k_bf16_ptr=k_p + g * head_dim,
-            v_bf16_ptr=v_p + g * head_dim,
-            q_norm_ptr=q_norm_p,
-            k_norm_ptr=k_norm_p + g * head_dim,
-            cos_ptr=cos_p,
-            sin_ptr=sin_p,
-            inv_rms_q=inv_rms_q,
-            inv_rms_k=inv_rms_k,
+        jobs[g] = KVWriteBatchArgs(
+            k_bf16_base=qkv_ptr + g * head_dim + q_local,
+            v_bf16_base=qkv_ptr + g * head_dim + q_local + num_kv_heads * head_dim,
+            qkv_row_stride=qkv_local,
+            k_norm_ptr=k_norm_ptr + g * head_dim,
+            cos_base=cos_base,
+            sin_base=sin_base,
+            rope_row_elems=rope_half,
+            inv_rms_k_arr=inv_rms_k_arr,
             cache_base=cache,
-            cache_pos=cache_pos,
-            kv_head=g,
-            context_len=0,
-            qi_out=I8Ptr(),
-            head_scale_ptr=F32Ptr())
-    pool.dispatch[AttnGroupArgs,
-        kv_write_kernel[head_dim, rope_dim, pair_stride, max_seq, num_kv_heads]](
+            start_pos=start_pos,
+            pos_count=pos_count,
+            kv_head=g)
+    pool.dispatch[KVWriteBatchArgs,
+        kv_write_batch_kernel[head_dim, rope_dim, pair_stride, max_seq, num_kv_heads]](
         UnsafePointer(to=jobs[0]), num_kv_heads)
     return PoolFence[P, origin].over(pool)
 
 
 # ============================================================================
-# Q prep kernel — called on the main thread, reuses AttnGroupArgs plumbing
+# Q prep dispatch — one job per (KV head, rank), batch all positions
 # ============================================================================
 
 
-def q_prep_kernel[
+def q_prep_batch_dispatch[
     head_dim: Int, rope_dim: Int, pair_stride: Int,
-    heads_per_group: Int,
-](args: AttnGroupArgs):
-    comptime inv_sqrt_hd = 1.0 / sqrt[DType.float32, 1](Float32(head_dim))
-    var qi_biases = F32Ptr(unsafe_from_address=Int(args.head_scale_ptr))
-    var q_scales = F32Ptr(unsafe_from_address=args.context_len)
-    for qh in range(heads_per_group):
-        var result = prep_q_head[head_dim, rope_dim, pair_stride](
-            args.q_bf16_base + qh * head_dim,
-            args.q_norm_ptr + qh * head_dim,
-            args.cos_ptr, args.sin_ptr,
-            args.inv_rms_q,
-            (args.qi_out + qh * head_dim).bitcast[Int8]())
-        qi_biases[qh] = result[0]
-        q_scales[qh] = result[1] * inv_sqrt_hd
+    heads_per_group: Int, num_kv_heads: Int,
+    qkv_local: Int, rope_half: Int,
+](
+    qkv_ptr: BF16Ptr,
+    q_norm_ptr: BF16Ptr,
+    cos_base: F32Ptr,
+    sin_base: F32Ptr,
+    inv_rms_q_arr: F32Ptr,
+    qi_out: I8Ptr,
+    qi_biases_out: F32Ptr,
+    q_scales_out: F32Ptr,
+    start_pos: Int,
+    pos_count: Int,
+):
+    for kv in range(num_kv_heads):
+        var args = QPrepBatchArgs(
+            q_bf16_base=qkv_ptr + kv * heads_per_group * head_dim,
+            qkv_row_stride=qkv_local,
+            q_norm_ptr=q_norm_ptr + kv * heads_per_group * head_dim,
+            cos_base=cos_base,
+            sin_base=sin_base,
+            rope_row_elems=rope_half,
+            inv_rms_q_arr=inv_rms_q_arr,
+            qi_out=qi_out + kv * heads_per_group * pos_count * head_dim,
+            qi_out_head_stride=pos_count * head_dim,
+            qi_biases_out=qi_biases_out + kv * heads_per_group * pos_count,
+            qi_biases_head_stride=pos_count,
+            q_scales_out=q_scales_out + kv * heads_per_group * pos_count,
+            q_scales_head_stride=pos_count,
+            start_pos=start_pos,
+            pos_count=pos_count,
+            kv_head=kv)
+        q_prep_batch_kernel[head_dim, rope_dim, pair_stride, heads_per_group](args)
 
 
 comptime ATTN_PG_PER_WORKER = 32

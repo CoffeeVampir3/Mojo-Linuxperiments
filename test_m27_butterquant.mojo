@@ -47,10 +47,10 @@ def load_and_run[
     var t1 = perf_counter_ns()
     for i in range(prompt_len - 1):
         tp_ptr[0] = Scalar[DType.int32](token_ids[i])
-        _ = model.forward_decode(Int(tp_ptr), i)
+        _ = model.forward(Int(tp_ptr), i, 1)
 
     tp_ptr[0] = Scalar[DType.int32](token_ids[prompt_len - 1])
-    var next_id = Int(model.forward_decode(Int(tp_ptr), prompt_len - 1))
+    var next_id = Int(model.forward(Int(tp_ptr), prompt_len - 1, 1))
     var prefill_ms = (perf_counter_ns() - t1) / 1_000_000
 
     var generated = List[Int]()
@@ -70,7 +70,7 @@ def load_and_run[
     if next_id != MiniMaxM27Config.EOS_TOKEN_ID:
         for step in range(1, MAX_NEW_TOKENS):
             tp_ptr[0] = Scalar[DType.int32](next_id)
-            next_id = Int(model.forward_decode(Int(tp_ptr), pos))
+            next_id = Int(model.forward(Int(tp_ptr), pos, 1))
             generated.append(next_id)
             pos += 1
 

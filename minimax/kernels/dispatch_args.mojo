@@ -116,6 +116,74 @@ struct AttnGroupArgs(Copyable, ImplicitlyCopyable):
 
 
 @fieldwise_init
+struct KVWriteBatchArgs(Copyable, ImplicitlyCopyable):
+    var k_bf16_base: BF16Ptr
+    var v_bf16_base: BF16Ptr
+    var qkv_row_stride: Int
+    var k_norm_ptr: BF16Ptr
+    var cos_base: F32Ptr
+    var sin_base: F32Ptr
+    var rope_row_elems: Int
+    var inv_rms_k_arr: F32Ptr
+    var cache_base: U8Ptr
+    var start_pos: Int
+    var pos_count: Int
+    var kv_head: Int
+
+    def __init__(out self):
+        self.k_bf16_base = BF16Ptr()
+        self.v_bf16_base = BF16Ptr()
+        self.qkv_row_stride = 0
+        self.k_norm_ptr = BF16Ptr()
+        self.cos_base = F32Ptr()
+        self.sin_base = F32Ptr()
+        self.rope_row_elems = 0
+        self.inv_rms_k_arr = F32Ptr()
+        self.cache_base = U8Ptr()
+        self.start_pos = 0
+        self.pos_count = 0
+        self.kv_head = 0
+
+
+@fieldwise_init
+struct QPrepBatchArgs(Copyable, ImplicitlyCopyable):
+    var q_bf16_base: BF16Ptr
+    var qkv_row_stride: Int
+    var q_norm_ptr: BF16Ptr
+    var cos_base: F32Ptr
+    var sin_base: F32Ptr
+    var rope_row_elems: Int
+    var inv_rms_q_arr: F32Ptr
+    var qi_out: I8Ptr
+    var qi_out_head_stride: Int
+    var qi_biases_out: F32Ptr
+    var qi_biases_head_stride: Int
+    var q_scales_out: F32Ptr
+    var q_scales_head_stride: Int
+    var start_pos: Int
+    var pos_count: Int
+    var kv_head: Int
+
+    def __init__(out self):
+        self.q_bf16_base = BF16Ptr()
+        self.qkv_row_stride = 0
+        self.q_norm_ptr = BF16Ptr()
+        self.cos_base = F32Ptr()
+        self.sin_base = F32Ptr()
+        self.rope_row_elems = 0
+        self.inv_rms_q_arr = F32Ptr()
+        self.qi_out = I8Ptr()
+        self.qi_out_head_stride = 0
+        self.qi_biases_out = F32Ptr()
+        self.qi_biases_head_stride = 0
+        self.q_scales_out = F32Ptr()
+        self.q_scales_head_stride = 0
+        self.start_pos = 0
+        self.pos_count = 0
+        self.kv_head = 0
+
+
+@fieldwise_init
 struct MergeQuantArgs(Copyable, ImplicitlyCopyable):
     var partial_base: F32Ptr
     var num_chunks: Int
