@@ -16,6 +16,11 @@ trait BurstThreadPool(Movable, ImplicitlyDestructible):
     def last_worker_timestamp(self) -> Int: ...
 
 
+trait CheapSmallPhaseDispatchPool(BurstThreadPool):
+    """Pool whose hot-path dispatch is cheap enough for tiny phases."""
+    pass
+
+
 trait SleepableThreadPool:
     def wake(mut self): ...
     def sleep(mut self): ...

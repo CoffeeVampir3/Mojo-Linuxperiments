@@ -33,6 +33,7 @@ from experimental3.profiler import (
     PhaseTiming, finish_single_pool_fence, timed_tp_parallel,
     ForwardSample, ForwardLogger,
 )
+from experimental3.small_phase_dispatch import run_tp_single_job_phase
 from experimental3.init_weights import (
     PackColsumTask, make_pack_colsum_task, dispatch_pack_colsum_tasks, colsum_at,
 )
@@ -52,6 +53,7 @@ from experimental3.kernels.rmsnorm import (
 from minimax.kernels.router import TopKResult, router_merge_multi_and_renorm
 from minimax.kernels.dispatch_args import (
     RouterCandidate, RmsNormDualOutputArgs, AttnGroupArgs,
+    MergeQuantArgs,
 )
 from minimax.kernels.dispatch_kernels import (
     router_fused_dispatch,
@@ -65,7 +67,7 @@ from minimax.kernels.dispatch_kernels import (
 )
 from minimax.kernels.rmsnorm import rmsnorm_dual_output_worker
 from kernels.worker_init import worker_init_dispatch
-from minimax.kernels.attention import merge_and_quantize_kernel
+from minimax.kernels.attention import merge_quant_worker
 
 
 # =============================================================================
@@ -862,21 +864,28 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             var attn_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.HIDDEN]()
             var attn_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
 
-            var t_attn_quant0 = Int(perf_counter_ns())
+            var attn_quant_jobs = InlineArray[
+                RmsNormFwhtQuantArgs, Self.tp](uninitialized=True)
             for r in range(Self.tp):
                 var topo_r = topos[r]
                 var lb = topo_r.layers.base(topo_r.arena.base, layer_idx)
                 var layer = topo_r.layers.proto
                 var sb = topo_r.arena.scratch_base()
-                var args = RmsNormFwhtQuantArgs(
+                attn_quant_jobs[r] = RmsNormFwhtQuantArgs(
                     topo_r.activations.x_main.bound_dyn(topo_r.arena.base, seq_len).as_ptr[DType.bfloat16](),
                     layer.body.input_norm_sqrt.bound(lb).as_ptr[DType.bfloat16](),
                     attn_i8_lease.view[I8, Shape[1, C.HIDDEN]](sb, 1).as_ptr[DType.int8](),
                     attn_work_lease.view[F32, Shape[1, C.HIDDEN]](sb, 1).as_ptr[DType.float32](),
                     act_scale_lease.view[F32, Shape[1, 1]](sb, 1).as_ptr[DType.float32](),
                     EPS, 0, seq_len)
-                rmsnorm_fwht_quant_worker[C.HIDDEN, FWHT_BLK_HIDDEN, True, False](args)
-            sample.add(self.profile.phase("attn_quantize"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_attn_quant0))
+            sample.add(
+                self.profile.phase("attn_quantize"),
+                run_tp_single_job_phase[
+                    Self.tp,
+                    rmsnorm_fwht_quant_worker[
+                        C.HIDDEN, FWHT_BLK_HIDDEN, True, False],
+                ](UnsafePointer(to=attn_quant_jobs[0]), self.main_pools),
+            )
 
             # Phase 2: fused QKV projection (contiguous output)
 
@@ -999,27 +1008,31 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     pool)
             sample.add(self.profile.phase("attention"), timed_tp_parallel[Self.tp,do_chunk_score_all](topos, self.main_pools))
 
-            var t_merge_q0 = Int(perf_counter_ns())
-            comptime CHUNK_F32_STRIDE = HPG * (2 + C.HEAD_DIM)
-            for kv in range(KV_PER_RANK):
-                for r in range(Self.tp):
-                    var nc = attn_chunk_count(
+            var merge_quant_jobs = InlineArray[
+                MergeQuantArgs, Self.tp](uninitialized=True)
+            for r in range(Self.tp):
+                var sb = topos[r].arena.scratch_base()
+                merge_quant_jobs[r] = MergeQuantArgs(
+                    partial_lease.view[F32, Shape[1, PARTIAL_F32S]](
+                        sb, 1).as_ptr[DType.float32](),
+                    attn_chunk_count(
                         context_len, Int(self.main_pools[r].get_capacity()),
-                        C.MAX_ATTN_CHUNKS)
-                    if nc > 0:
-                        var sb = topos[r].arena.scratch_base()
-                        var partial = partial_lease.view[F32, Shape[1, CHUNK_F32_STRIDE]](
-                            sb, 1, element_offset=kv * nc * CHUNK_F32_STRIDE
-                        ).as_ptr[DType.float32]()
-                        var qi_out = attn_qi_lease.view[I8, Shape[1, HPG * C.HEAD_DIM]](
-                            sb, 1, element_offset=kv * HPG * C.HEAD_DIM
-                        ).as_ptr[DType.int8]()
-                        var head_sc = attn_head_sc_lease.view[F32, Shape[1, HPG]](
-                            sb, 1, element_offset=kv * HPG
-                        ).as_ptr[DType.float32]()
-                        merge_and_quantize_kernel[C.HEAD_DIM, HPG, C.MAX_ATTN_CHUNKS](
-                            partial, nc, qi_out, head_sc)
-            sample.add(self.profile.phase("merge_quant"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_merge_q0))
+                        C.MAX_ATTN_CHUNKS),
+                    attn_qi_lease.view[
+                        I8, Shape[1, KV_PER_RANK * HPG * C.HEAD_DIM]](
+                        sb, 1).as_ptr[DType.int8](),
+                    attn_head_sc_lease.view[
+                        F32, Shape[1, KV_PER_RANK * HPG]](
+                        sb, 1).as_ptr[DType.float32](),
+                )
+            sample.add(
+                self.profile.phase("merge_quant"),
+                run_tp_single_job_phase[
+                    Self.tp,
+                    merge_quant_worker[
+                        C.HEAD_DIM, HPG, C.MAX_ATTN_CHUNKS, KV_PER_RANK],
+                ](UnsafePointer(to=merge_quant_jobs[0]), self.main_pools),
+            )
 
             partial_lease^.release()
             q_scales_lease^.release()
@@ -1067,13 +1080,14 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             var normed_bf16_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.HIDDEN]()
             var moe_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
 
-            var t_dual_norm0 = Int(perf_counter_ns())
+            var dual_norm_jobs = InlineArray[
+                RmsNormDualOutputArgs, Self.tp](uninitialized=True)
             for r in range(Self.tp):
                 var topo_r = topos[r]
                 var lb = topo_r.layers.base(topo_r.arena.base, layer_idx)
                 var layer = topo_r.layers.proto
                 var sb = topo_r.arena.scratch_base()
-                var args = RmsNormDualOutputArgs(
+                dual_norm_jobs[r] = RmsNormDualOutputArgs(
                     topo_r.activations.x_main.bound_dyn(topo_r.arena.base, seq_len).as_ptr[DType.bfloat16](),
                     layer.body.post_attn_norm_sqrt.bound(lb).as_ptr[DType.bfloat16](),
                     layer.body.post_attn_norm.bound(lb).as_ptr[DType.bfloat16](),
@@ -1082,8 +1096,13 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     moe_scale_lease.view[F32, Shape[1, 1]](sb, 1).as_ptr[DType.float32](),
                     normed_bf16_lease.view[BF16, Shape[1, C.HIDDEN]](sb, 1).as_ptr[DType.bfloat16](),
                     EPS, 0, seq_len)
-                rmsnorm_dual_output_worker[C.HIDDEN, FWHT_BLK_HIDDEN](args)
-            sample.add(self.profile.phase("dual_norm"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_dual_norm0))
+            sample.add(
+                self.profile.phase("dual_norm"),
+                run_tp_single_job_phase[
+                    Self.tp,
+                    rmsnorm_dual_output_worker[C.HIDDEN, FWHT_BLK_HIDDEN],
+                ](UnsafePointer(to=dual_norm_jobs[0]), self.main_pools),
+            )
 
             moe_work_lease^.release()
 

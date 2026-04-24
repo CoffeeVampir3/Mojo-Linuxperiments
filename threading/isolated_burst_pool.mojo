@@ -24,7 +24,9 @@ import linux.sys as linux
 from std.atomic import Atomic, Ordering
 from numa import NumaInfo, CpuMask
 from notstdcollections import HeapMoveArray
-from .threading_traits import BurstThreadPool, SleepableThreadPool
+from .threading_traits import (
+    BurstThreadPool, CheapSmallPhaseDispatchPool, SleepableThreadPool,
+)
 from .threading_shared import (
     AtomicInt32, KernelFn, JoinFlag, SlotLayout,
     MAILBOX_DATA_SLOTS, MAILBOX_DATA_BYTES,
@@ -103,7 +105,9 @@ struct WorkerSlot(Movable):
 # IsolatedBurstPool
 # ============================================================================
 
-struct IsolatedBurstPool[mask_size: Int = 128](BurstThreadPool, SleepableThreadPool):
+struct IsolatedBurstPool[mask_size: Int = 128](
+    CheapSmallPhaseDispatchPool, SleepableThreadPool,
+):
     """Dual-mailbox burst pool for isolated cores.
 
     Workers spin on local mailboxes. Join polls local flags.

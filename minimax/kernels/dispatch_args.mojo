@@ -116,6 +116,20 @@ struct AttnGroupArgs(Copyable, ImplicitlyCopyable):
 
 
 @fieldwise_init
+struct MergeQuantArgs(Copyable, ImplicitlyCopyable):
+    var partial_base: F32Ptr
+    var num_chunks: Int
+    var qi_out: I8Ptr
+    var head_scale_ptr: F32Ptr
+
+    def __init__(out self):
+        self.partial_base = F32Ptr()
+        self.num_chunks = 0
+        self.qi_out = I8Ptr()
+        self.head_scale_ptr = F32Ptr()
+
+
+@fieldwise_init
 struct RouterCandidate(Copyable, ImplicitlyCopyable):
     """One (expert_id, score, raw) entry in a worker-local top-K buffer.
 
@@ -161,4 +175,3 @@ struct RouterFusedArgs(Copyable, ImplicitlyCopyable):
         self.eid_base = 0
         self.n_start = 0
         self.n_count = 0
-

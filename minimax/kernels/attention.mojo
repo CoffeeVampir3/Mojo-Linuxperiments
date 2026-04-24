@@ -6,7 +6,7 @@ from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
 from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.common_math import F32Ptr, BF16Ptr, I8Ptr
 from minimax.kernels.qk_prep import prep_q_head, write_k_head, write_v_direct
-from minimax.kernels.dispatch_args import AttnGroupArgs
+from minimax.kernels.dispatch_args import AttnGroupArgs, MergeQuantArgs
 
 
 # ============================================================================
@@ -121,3 +121,27 @@ def merge_and_quantize_kernel[head_dim: Int, heads_per_group: Int, max_attn_chun
             wp, qi_out + qh * head_dim)
 
     _ = work_arr
+
+
+def merge_quant_worker[
+    head_dim: Int,
+    heads_per_group: Int,
+    max_attn_chunks: Int,
+    kv_heads: Int,
+](args: MergeQuantArgs):
+    if args.num_chunks <= 0:
+        return
+
+    comptime CHUNK_F32_STRIDE = partial_chunk_stride[
+        head_dim, heads_per_group]()
+    comptime KV_QI_STRIDE = heads_per_group * head_dim
+    comptime KV_SCALE_STRIDE = heads_per_group
+
+    for kv in range(kv_heads):
+        merge_and_quantize_kernel[
+            head_dim, heads_per_group, max_attn_chunks](
+            args.partial_base + kv * args.num_chunks * CHUNK_F32_STRIDE,
+            args.num_chunks,
+            args.qi_out + kv * KV_QI_STRIDE,
+            args.head_scale_ptr + kv * KV_SCALE_STRIDE,
+        )
