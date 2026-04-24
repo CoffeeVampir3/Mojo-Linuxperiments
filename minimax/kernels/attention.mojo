@@ -1,13 +1,21 @@
+from std.memory import UnsafePointer
+from std.sys import llvm_intrinsic
 from std.collections import InlineArray
 from std.sys.info import simd_width_of
 
-from simd_math import sqrt, exp_f32
+from simd_math import sqrt, exp_f32, exp_f32_fast, roundeven
+from experimental3.amx import (
+    K_STEP, VNNI_BLK, TILE_BYTES, TILE_M, TILE_N,
+    tilezero, tileload, tilestore, tdpbsud, tdpbusd,
+)
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
 from experimental3.kernels.quantize import absmax_quantize_i8
-from experimental3.common_math import F32Ptr, BF16Ptr, I8Ptr
+from experimental3.common_math import F32Ptr, BF16Ptr, I8Ptr, U8Ptr
+from notstdcollections import AlignedInlineArray
 from minimax.kernels.qk_prep import prep_q_head, write_k_head, write_v_direct
 from minimax.kernels.dispatch_args import (
     AttnGroupArgs, MergeQuantArgs, KVWriteBatchArgs, QPrepBatchArgs,
+    PrefillAttnArgs,
 )
 
 
@@ -181,3 +189,255 @@ def merge_quant_worker[
             args.qi_out + kv * KV_QI_STRIDE,
             args.head_scale_ptr + kv * KV_SCALE_STRIDE,
         )
+
+
+# ============================================================================
+# Prefill attention — one (kv_head, q_tile) per worker, loops HPG heads
+# ============================================================================
+
+
+@always_inline
+def prefetch_cacheline(p: U8Ptr):
+    llvm_intrinsic["llvm.prefetch.p0", NoneType](
+        p, Int32(0), Int32(3), Int32(1))
+
+
+def prefill_attn_worker[
+    head_dim: Int, max_seq: Int,
+    num_kv_heads: Int, num_q_heads: Int,
+    heads_per_group: Int,
+](args: PrefillAttnArgs):
+    var cache = Gemma4KVCache[max_seq, head_dim, num_kv_heads, num_q_heads](
+        Int(args.cache_base))
+    var k_scales = cache.k_scale_ptr(args.kv_head)
+    var v_scales = cache.v_scale_ptr(args.kv_head)
+
+    comptime Q_TILE = 16
+    comptime WIDTH = CACHE_WIDTH
+    comptime V_CHANNEL_GROUPS = head_dim // WIDTH
+    comptime V_CG_BYTES = (WIDTH // VNNI_BLK) * WIDTH * VNNI_BLK
+    comptime V_PG_BYTES = V_CHANNEL_GROUPS * V_CG_BYTES
+    comptime K_PG_BYTES = head_dim // VNNI_BLK * WIDTH * VNNI_BLK
+    comptime SCORE_PG_STRIDE = Q_TILE * WIDTH
+    comptime W_TILE_BYTES = Q_TILE * K_STEP
+    comptime V_GATHER_BYTES = 4 * V_CG_BYTES
+    comptime SIMD_W = simd_width_of[DType.float32]()
+
+    var actual_q = min(args.q_count, Q_TILE)
+    var num_pgs = (args.context_len + WIDTH - 1) // WIDTH
+    var padded_pgs = (num_pgs + 3) & ~3
+    var last_q_pos = args.q_start + actual_q - 1
+    var causal_padded = ((last_q_pos // WIDTH + 1) + 3) & ~3
+    var effective_pgs = min(padded_pgs, causal_padded)
+
+    var neg_inf = SIMD[DType.float32, WIDTH](Float32(-1e30))
+    var valid_lanes = SIMD[DType.int32, WIDTH]()
+    comptime for lane in range(WIDTH):
+        valid_lanes[lane] = Int32(lane)
+
+    var score_arr = AlignedInlineArray[Int32, 4 * SCORE_PG_STRIDE](
+        uninitialized=True)
+    var score_ptr = score_arr.unsafe_ptr()
+    var w_arr = AlignedInlineArray[UInt8, W_TILE_BYTES](fill=UInt8(0))
+    var w_buf = w_arr.unsafe_ptr()
+    var wd_arr = InlineArray[Float32, Q_TILE](fill=Float32(0))
+    var sf_arr = AlignedInlineArray[Float32, Q_TILE * 4 * WIDTH](
+        uninitialized=True)
+    var sf_buf = sf_arr.unsafe_ptr()
+    var v_tile_even = AlignedInlineArray[Scalar[DType.int8], V_GATHER_BYTES](
+        uninitialized=True)
+    var v_tile_odd = AlignedInlineArray[Scalar[DType.int8], V_GATHER_BYTES](
+        uninitialized=True)
+    var v_even_ptr = v_tile_even.unsafe_ptr()
+    var v_odd_ptr = v_tile_odd.unsafe_ptr()
+    var result_arr = AlignedInlineArray[Int32, 2 * TILE_M * TILE_N](
+        uninitialized=True)
+    var result_ptr = result_arr.unsafe_ptr()
+
+    for qh in range(heads_per_group):
+        var q_head = args.q_i8 + qh * args.pos_count * head_dim
+        var qb = args.qi_biases + qh * args.pos_count
+        var qf = args.q_factors + qh * args.pos_count
+
+        var q_arr = AlignedInlineArray[Scalar[DType.int8], Q_TILE * head_dim](
+            fill=Scalar[DType.int8](0))
+        var q_ptr = q_arr.unsafe_ptr()
+        for r in range(actual_q):
+            var src = q_head + r * head_dim
+            var dst = q_ptr + r * head_dim
+            comptime for chunk in range(head_dim // K_STEP):
+                (dst + chunk * K_STEP).store(
+                    (src + chunk * K_STEP).load[width=K_STEP]())
+
+        var running_max = InlineArray[Float32, Q_TILE](fill=Float32(-1e30))
+        var running_sum = InlineArray[Float32, Q_TILE](fill=Float32(0))
+        var v_acc_arr = AlignedInlineArray[Float32, Q_TILE * head_dim](
+            fill=Float32(0))
+        var v_acc = v_acc_arr.unsafe_ptr()
+
+        var pg = 0
+        while pg < effective_pgs:
+            tilezero[4]()
+            tilezero[5]()
+            tilezero[6]()
+            tilezero[7]()
+            tileload[0, DType.int8](q_ptr, head_dim)
+            tileload[1, DType.int8](q_ptr + K_STEP, head_dim)
+
+            var k0 = cache.k_pg_ptr(args.kv_head, pg)
+            var k1 = cache.k_pg_ptr(args.kv_head, pg + 1)
+            var k2 = cache.k_pg_ptr(args.kv_head, pg + 2)
+            var k3 = cache.k_pg_ptr(args.kv_head, pg + 3)
+
+            tileload[2, DType.uint8](k0, WIDTH * VNNI_BLK)
+            tileload[3, DType.uint8](k1, WIDTH * VNNI_BLK)
+            tdpbsud[4, 0, 2]()
+            tdpbsud[5, 0, 3]()
+            tileload[2, DType.uint8](k0 + TILE_BYTES, WIDTH * VNNI_BLK)
+            tileload[3, DType.uint8](k1 + TILE_BYTES, WIDTH * VNNI_BLK)
+            tdpbsud[4, 1, 2]()
+            tdpbsud[5, 1, 3]()
+
+            tileload[2, DType.uint8](k2, WIDTH * VNNI_BLK)
+            tileload[3, DType.uint8](k3, WIDTH * VNNI_BLK)
+            tdpbsud[6, 0, 2]()
+            tdpbsud[7, 0, 3]()
+            tileload[2, DType.uint8](k2 + TILE_BYTES, WIDTH * VNNI_BLK)
+            tileload[3, DType.uint8](k3 + TILE_BYTES, WIDTH * VNNI_BLK)
+            tdpbsud[6, 1, 2]()
+            tdpbsud[7, 1, 3]()
+
+            tilestore[4, DType.int32](score_ptr, WIDTH * 4)
+            tilestore[5, DType.int32](score_ptr + SCORE_PG_STRIDE, WIDTH * 4)
+            tilestore[6, DType.int32](score_ptr + 2 * SCORE_PG_STRIDE, WIDTH * 4)
+            tilestore[7, DType.int32](score_ptr + 3 * SCORE_PG_STRIDE, WIDTH * 4)
+
+            var nxt = pg + 4
+            if nxt < effective_pgs:
+                var k_nxt = cache.k_pg_ptr(args.kv_head, nxt)
+                comptime for ln in range(0, K_PG_BYTES, 64):
+                    prefetch_cacheline((k_nxt + ln).bitcast[UInt8]())
+
+            var batch_max = InlineArray[Float32, Q_TILE](fill=Float32(-1e30))
+            for r in range(actual_q):
+                var q_pos = args.q_start + r
+                for bp in range(4):
+                    var group_start = (pg + bp) * WIDTH
+                    var ctx_valid = (valid_lanes + Int32(group_start)).lt(
+                        SIMD[DType.int32, WIDTH](args.context_len))
+                    var causal_valid = (valid_lanes + Int32(group_start)).le(
+                        SIMD[DType.int32, WIDTH](q_pos))
+                    var valid = ctx_valid & causal_valid
+                    var raw = (score_ptr + bp * SCORE_PG_STRIDE + r * WIDTH).load[
+                        width=WIDTH]().cast[DType.float32]()
+                    var k_sc = k_scales + (pg + bp) * WIDTH
+                    var scores = (raw - qb[r]) * qf[r] * k_sc.load[width=WIDTH]()
+                    scores = valid.select(scores, neg_inf)
+                    (sf_buf + r * 4 * WIDTH + bp * WIDTH).store(scores)
+                    var pg_max = scores.reduce_max()
+                    if pg_max > batch_max[r]:
+                        batch_max[r] = pg_max
+
+            for r in range(actual_q):
+                var new_max = max(running_max[r], batch_max[r])
+                if running_sum[r] > 0 and new_max > running_max[r]:
+                    var rescale = Float32(exp_f32[1](running_max[r] - new_max))
+                    running_sum[r] *= rescale
+                    var acc = v_acc + r * head_dim
+                    var d = 0
+                    while d + WIDTH <= head_dim:
+                        (acc + d).store((acc + d).load[width=WIDTH]() * rescale)
+                        d += WIDTH
+                running_max[r] = new_max
+
+                var w_row = w_buf + r * K_STEP
+                var w_max_all = Float32(-1e30)
+                for bp in range(4):
+                    var v_sc = v_scales + (pg + bp) * WIDTH
+                    var exp_scores = exp_f32_fast[WIDTH](
+                        (sf_buf + r * 4 * WIDTH + bp * WIDTH).load[width=WIDTH]()
+                        - running_max[r])
+                    running_sum[r] += exp_scores.reduce_add()
+                    var w_eff = exp_scores * v_sc.load[width=WIDTH]()
+                    (sf_buf + r * 4 * WIDTH + bp * WIDTH).store(w_eff)
+                    var local_max = w_eff.reduce_max()
+                    if local_max > w_max_all:
+                        w_max_all = local_max
+
+                if w_max_all < Float32(1e-10):
+                    for b in range(K_STEP):
+                        w_row[b] = UInt8(0)
+                    wd_arr[r] = Float32(0)
+                    continue
+
+                var w_scale_val = 255.0 / w_max_all
+                for bp in range(4):
+                    var w_eff = (sf_buf + r * 4 * WIDTH + bp * WIDTH).load[
+                        width=WIDTH]()
+                    var w_u8 = roundeven(w_eff * w_scale_val).clamp(
+                        0.0, 255.0).cast[DType.uint8]()
+                    (w_row + bp * WIDTH).store[width=WIDTH](w_u8)
+                wd_arr[r] = w_max_all / 255.0
+
+            tileload[0, DType.uint8](w_buf, K_STEP)
+
+            for cg_pair in range(V_CHANNEL_GROUPS // 2):
+                var cg_even = cg_pair * 2
+                var cg_odd = cg_even + 1
+                for bp in range(4):
+                    var v_pg = cache.v_pg_ptr(args.kv_head, pg + bp)
+                    var src_even = v_pg + cg_even * V_CG_BYTES
+                    var src_odd = v_pg + cg_odd * V_CG_BYTES
+                    var dst_off = bp * V_CG_BYTES
+                    comptime for chunk in range(V_CG_BYTES // K_STEP):
+                        (v_even_ptr + dst_off + chunk * K_STEP).store(
+                            (src_even + chunk * K_STEP).load[width=K_STEP]())
+                        (v_odd_ptr + dst_off + chunk * K_STEP).store(
+                            (src_odd + chunk * K_STEP).load[width=K_STEP]())
+
+                tileload[2, DType.int8](v_even_ptr, WIDTH * VNNI_BLK)
+                tileload[3, DType.int8](v_odd_ptr, WIDTH * VNNI_BLK)
+                tilezero[4]()
+                tilezero[5]()
+                tdpbusd[4, 0, 2]()
+                tdpbusd[5, 0, 3]()
+                tilestore[4, DType.int32](result_ptr, TILE_N * 4)
+                tilestore[5, DType.int32](result_ptr + TILE_M * TILE_N, TILE_N * 4)
+
+                for r in range(actual_q):
+                    var wd = wd_arr[r]
+                    var r0 = (result_ptr + r * TILE_N).load[
+                        width=WIDTH]().cast[DType.float32]() * wd
+                    var r1 = (result_ptr + TILE_M * TILE_N + r * TILE_N).load[
+                        width=WIDTH]().cast[DType.float32]() * wd
+                    var a_even = v_acc + r * head_dim + cg_even * WIDTH
+                    var a_odd = v_acc + r * head_dim + cg_odd * WIDTH
+                    a_even.store(a_even.load[width=WIDTH]() + r0)
+                    a_odd.store(a_odd.load[width=WIDTH]() + r1)
+
+            pg += 4
+
+        for r in range(actual_q):
+            var row_out = args.qi_out + r * args.qi_out_row_stride
+                + args.head_col_offset + qh * head_dim
+            var inv_sum = Float32(0)
+            if running_sum[r] > Float32(1e-10):
+                inv_sum = Float32(1) / running_sum[r]
+            var src = v_acc + r * head_dim
+            var d = 0
+            while d + SIMD_W <= head_dim:
+                (src + d).store((src + d).load[width=SIMD_W]() * inv_sum)
+                d += SIMD_W
+            var scale = absmax_quantize_i8[head_dim](src, row_out)
+            (args.head_sc_out + r * args.head_sc_row_stride
+                + args.head_col_offset // head_dim + qh)[] = scale
+
+        _ = q_arr
+        _ = v_acc_arr
+
+    _ = score_arr
+    _ = w_arr
+    _ = sf_arr
+    _ = v_tile_even
+    _ = v_tile_odd
+    _ = result_arr

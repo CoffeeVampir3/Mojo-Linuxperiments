@@ -184,6 +184,40 @@ struct QPrepBatchArgs(Copyable, ImplicitlyCopyable):
 
 
 @fieldwise_init
+struct PrefillAttnArgs(Copyable, ImplicitlyCopyable):
+    var q_i8: I8Ptr
+    var qi_biases: F32Ptr
+    var q_factors: F32Ptr
+    var cache_base: U8Ptr
+    var kv_head: Int
+    var q_start: Int
+    var q_count: Int
+    var context_len: Int
+    var qi_out: I8Ptr
+    var qi_out_row_stride: Int
+    var head_sc_out: F32Ptr
+    var head_sc_row_stride: Int
+    var head_col_offset: Int
+    var pos_count: Int
+
+    def __init__(out self):
+        self.q_i8 = I8Ptr()
+        self.qi_biases = F32Ptr()
+        self.q_factors = F32Ptr()
+        self.cache_base = U8Ptr()
+        self.kv_head = 0
+        self.q_start = 0
+        self.q_count = 0
+        self.context_len = 0
+        self.qi_out = I8Ptr()
+        self.qi_out_row_stride = 0
+        self.head_sc_out = F32Ptr()
+        self.head_sc_row_stride = 0
+        self.head_col_offset = 0
+        self.pos_count = 0
+
+
+@fieldwise_init
 struct MergeQuantArgs(Copyable, ImplicitlyCopyable):
     var partial_base: F32Ptr
     var num_chunks: Int

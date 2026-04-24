@@ -19,12 +19,16 @@ from minimax.kernels.dispatch_args import (
     AttnGroupArgs,
     KVWriteBatchArgs,
     QPrepBatchArgs,
+    PrefillAttnArgs,
     RouterCandidate,
     TopKResult,
     RouterFusedArgs,
 )
 from minimax.kernels.gemm import fused_w1_w3_silu_worker
-from minimax.kernels.attention import kv_write_kernel, kv_write_batch_kernel, q_prep_batch_kernel
+from minimax.kernels.attention import (
+    kv_write_kernel, kv_write_batch_kernel, q_prep_batch_kernel,
+    prefill_attn_worker,
+)
 from minimax.kernels.router import router_fused_worker
 
 
@@ -246,6 +250,63 @@ def chunked_score_dispatch_multi[
             head_dim, max_seq, num_kv_heads, 0, heads_per_group,
             max_attn_chunks]](
         UnsafePointer(to=chunk_args[0]), idx)
+    return PoolFence[P, origin].over(pool)
+
+
+# ============================================================================
+# Prefill attention dispatch — (kv_head, q_tile) jobs across pool
+# ============================================================================
+
+
+def prefill_attn_dispatch[
+    P: BurstThreadPool, origin: MutOrigin, //,
+    head_dim: Int, heads_per_group: Int,
+    max_seq: Int, num_kv_heads: Int, num_q_heads: Int,
+    q_local: Int, heads_per_rank: Int,
+](
+    q_i8_base: I8Ptr,
+    qi_biases_base: F32Ptr,
+    q_scales_base: F32Ptr,
+    cache_base: Int,
+    start_pos: Int,
+    seq_len: Int,
+    qi_out: I8Ptr,
+    head_sc_out: F32Ptr,
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
+    comptime Q_TILE = 16
+    var cache = U8Ptr(unsafe_from_address=cache_base)
+
+    var jobs = InlineArray[PrefillAttnArgs, MAX_POOL_CAPACITY](
+        fill=PrefillAttnArgs())
+    var idx = 0
+    for kv in range(num_kv_heads):
+        for tile_start in range(0, seq_len, Q_TILE):
+            var tile_count = min(Q_TILE, seq_len - tile_start)
+            var ctx = start_pos + tile_start + tile_count
+            jobs[idx] = PrefillAttnArgs(
+                q_i8=q_i8_base + kv * heads_per_group * seq_len * head_dim
+                    + tile_start * head_dim,
+                qi_biases=qi_biases_base + kv * heads_per_group * seq_len
+                    + tile_start,
+                q_factors=q_scales_base + kv * heads_per_group * seq_len
+                    + tile_start,
+                cache_base=cache,
+                kv_head=kv,
+                q_start=start_pos + tile_start,
+                q_count=tile_count,
+                context_len=ctx,
+                qi_out=qi_out + tile_start * q_local,
+                qi_out_row_stride=q_local,
+                head_sc_out=head_sc_out + tile_start * heads_per_rank,
+                head_sc_row_stride=heads_per_rank,
+                head_col_offset=kv * heads_per_group * head_dim,
+                pos_count=seq_len)
+            idx += 1
+    pool.dispatch[PrefillAttnArgs,
+        prefill_attn_worker[head_dim, max_seq, num_kv_heads, num_q_heads,
+            heads_per_group]](
+        UnsafePointer(to=jobs[0]), idx)
     return PoolFence[P, origin].over(pool)
 
 

@@ -11,7 +11,7 @@ from threading.threading_traits import BurstThreadPool
 
 from modeling.model_spec import (
     BF16, F32, I8,
-    Shape,
+    Shape, DynamicView,
     WeightDesc, DEFAULT_ALIGNMENT,
     TaskVisitor,
     PerRow, PerRowAbsorbed, PerBlockAbsorbed, TwoSidedAbsorbed,
@@ -61,6 +61,7 @@ from minimax.kernels.dispatch_kernels import (
     kv_write_dispatch,
     q_prep_batch_dispatch,
     chunked_score_dispatch_multi,
+    prefill_attn_dispatch,
     attn_chunk_count,
     minimax_moe_phase1,
     minimax_moe_phase2,
@@ -980,47 +981,64 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     start_pos, seq_len)
             sample.add(self.profile.phase("q_prep"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_qprep0))
 
-            @parameter
-            def do_chunk_score_all[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
-                var sb = topo.arena.scratch_base()
-                return chunked_score_dispatch_multi[
-                    C.HEAD_DIM, HPG, C.MAX_SEQ_LEN, KV_PER_RANK,
-                    C.MAX_ATTN_CHUNKS](
-                    sb + q_i8_lease.offset,
-                    sb + qi_biases_lease.offset,
-                    sb + q_scales_lease.offset,
-                    topo.arena.base + topo.kv_cache_off + layer_idx * topo.kv_cache_stride,
-                    0, KV_PER_RANK,
-                    context_len, Int(pool.get_capacity()),
-                    sb + partial_lease.offset,
-                    pool)
-            sample.add(self.profile.phase("attention"), timed_tp_parallel[Self.tp,do_chunk_score_all](topos, self.main_pools))
+            if seq_len == 1:
+                @parameter
+                def do_chunk_score_all[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
+                    var sb = topo.arena.scratch_base()
+                    return chunked_score_dispatch_multi[
+                        C.HEAD_DIM, HPG, C.MAX_SEQ_LEN, KV_PER_RANK,
+                        C.MAX_ATTN_CHUNKS](
+                        sb + q_i8_lease.offset,
+                        sb + qi_biases_lease.offset,
+                        sb + q_scales_lease.offset,
+                        topo.arena.base + topo.kv_cache_off + layer_idx * topo.kv_cache_stride,
+                        0, KV_PER_RANK,
+                        context_len, Int(pool.get_capacity()),
+                        sb + partial_lease.offset,
+                        pool)
+                sample.add(self.profile.phase("attention"), timed_tp_parallel[Self.tp,do_chunk_score_all](topos, self.main_pools))
 
-            var merge_quant_jobs = InlineArray[
-                MergeQuantArgs, Self.tp](uninitialized=True)
-            for r in range(Self.tp):
-                var sb = topos[r].arena.scratch_base()
-                merge_quant_jobs[r] = MergeQuantArgs(
-                    partial_lease.view[F32, Shape[1, PARTIAL_F32S]](
-                        sb, 1).as_ptr[DType.float32](),
-                    attn_chunk_count(
-                        context_len, Int(self.main_pools[r].get_capacity()),
-                        C.MAX_ATTN_CHUNKS),
-                    attn_qi_lease.view[
-                        I8, Shape[1, KV_PER_RANK * HPG * C.HEAD_DIM]](
-                        sb, 1).as_ptr[DType.int8](),
-                    attn_head_sc_lease.view[
-                        F32, Shape[1, KV_PER_RANK * HPG]](
-                        sb, 1).as_ptr[DType.float32](),
+                var merge_quant_jobs = InlineArray[
+                    MergeQuantArgs, Self.tp](uninitialized=True)
+                for r in range(Self.tp):
+                    var sb = topos[r].arena.scratch_base()
+                    merge_quant_jobs[r] = MergeQuantArgs(
+                        partial_lease.view[F32, Shape[1, PARTIAL_F32S]](
+                            sb, 1).as_ptr[DType.float32](),
+                        attn_chunk_count(
+                            context_len, Int(self.main_pools[r].get_capacity()),
+                            C.MAX_ATTN_CHUNKS),
+                        attn_qi_lease.view[
+                            I8, Shape[1, KV_PER_RANK * HPG * C.HEAD_DIM]](
+                            sb, 1).as_ptr[DType.int8](),
+                        attn_head_sc_lease.view[
+                            F32, Shape[1, KV_PER_RANK * HPG]](
+                            sb, 1).as_ptr[DType.float32](),
+                    )
+                sample.add(
+                    self.profile.phase("merge_quant"),
+                    run_tp_single_job_phase[
+                        Self.tp,
+                        merge_quant_worker[
+                            C.HEAD_DIM, HPG, C.MAX_ATTN_CHUNKS, KV_PER_RANK],
+                    ](UnsafePointer(to=merge_quant_jobs[0]), self.main_pools),
                 )
-            sample.add(
-                self.profile.phase("merge_quant"),
-                run_tp_single_job_phase[
-                    Self.tp,
-                    merge_quant_worker[
-                        C.HEAD_DIM, HPG, C.MAX_ATTN_CHUNKS, KV_PER_RANK],
-                ](UnsafePointer(to=merge_quant_jobs[0]), self.main_pools),
-            )
+            else:
+                @parameter
+                def do_prefill_attn[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
+                    var sb = topo.arena.scratch_base()
+                    return prefill_attn_dispatch[
+                        C.HEAD_DIM, HPG, C.MAX_SEQ_LEN, KV_PER_RANK,
+                        C.NUM_HEADS, Q_LOCAL, HEADS_PER_RANK](
+                        q_i8_lease.as_ptr[Scalar[DType.int8]](sb),
+                        qi_biases_lease.as_ptr[Float32](sb),
+                        q_scales_lease.as_ptr[Float32](sb),
+                        topo.arena.base + topo.kv_cache_off + layer_idx * topo.kv_cache_stride,
+                        start_pos, seq_len,
+                        attn_qi_lease.as_ptr[Scalar[DType.int8]](sb),
+                        attn_head_sc_lease.as_ptr[Float32](sb),
+                        pool)
+                sample.add(self.profile.phase("attention"), timed_tp_parallel[Self.tp,do_prefill_attn](topos, self.main_pools))
 
             partial_lease^.release()
             q_scales_lease^.release()
@@ -1094,138 +1112,129 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
             moe_work_lease^.release()
 
-            # Phase 8: sharded f32 router. Each rank scores only its owned
-            # expert rows, then the main thread merges rank-local candidates
-            # into one global routing result replicated back to every rank.
-            # routing outlives candidates (Phase 9/10 dereference routing), so
-            # routing is borrowed first; candidates is transient to Phase 8.
             var routing_lease = self.scratch.borrow[TopKResult[C.TOP_K], 1]()
             var candidates_lease = self.scratch.borrow[
                 RouterCandidate, ROUTER_CANDIDATES_PER_RANK]()
-
-            @parameter
-            def do_router_fused[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
-                var lb = topo.layers.base(topo.arena.base, layer_idx)
-                var layer = topo.layers.proto
-                var sb = topo.arena.scratch_base()
-                comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
-                var expert_base = rank * experts_per_rank
-                return router_fused_dispatch[experts_per_rank, C.HIDDEN, C.TOP_K](
-                    normed_bf16_lease.view[BF16, Shape[1, C.HIDDEN]](sb, 1),
-                    layer.body.router_proj.bound(lb),
-                    layer.body.router_bias.bound(lb),
-                    candidates_lease.as_ptr[RouterCandidate](sb),
-                    pool,
-                    expert_base)
-            sample.add(self.profile.phase("router_proj"), timed_tp_parallel[Self.tp,do_router_fused](topos, self.main_pools))
-
-            var t_merge0 = Int(perf_counter_ns())
-            var candidate_ptrs = InlineArray[
-                UnsafePointer[RouterCandidate, MutAnyOrigin], Self.tp](
-                uninitialized=True)
-            var candidate_counts = InlineArray[Int, Self.tp](uninitialized=True)
-            for r in range(Self.tp):
-                var sb_r = topos[r].arena.scratch_base()
-                candidate_ptrs[r] = candidates_lease.as_ptr[RouterCandidate](sb_r)
-                candidate_counts[r] = router_num_workers[
-                    C.NUM_EXPERTS // Self.tp, C.TOP_K](
-                    Int(self.main_pools[r].get_capacity())) * C.TOP_K
-            var host_sb = topos[HOST_RANK].arena.scratch_base()
-            router_merge_multi_and_renorm[C.TOP_K, Self.tp](
-                candidate_ptrs, candidate_counts,
-                routing_lease.as_ptr[TopKResult[C.TOP_K]](host_sb))
-            var routing = routing_lease.as_ptr[TopKResult[C.TOP_K]](host_sb)[]
-            self.profile.record_moe_route[C.TOP_K](
-                layer_idx, C.NUM_LAYERS, C.NUM_EXPERTS, Self.tp,
-                routing.indices, routing.weights)
-            for r in range(Self.tp):
-                var sb_r = topos[r].arena.scratch_base()
-                routing_lease.as_ptr[TopKResult[C.TOP_K]](sb_r)[] = routing
-            sample.add(self.profile.phase("router_topk"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_merge0))
-
-
-            candidates_lease^.release()
-            # normed_bf16 and routing remain live: routing is read by Phase 9/10;
-            # normed_bf16 is dead after Phase 8a but held to keep the stack LIFO
-            # (it sits below routing). Released at the end of the layer.
-
-            # Phase 9: expert gate+up (w1/w3 + SiLU)
             var expert_qi_lease = self.scratch.borrow[Scalar[DType.int8], C.TOP_K * C.MOE_INTERMEDIATE]()
             var expert_blk_scale_lease = self.scratch.borrow[Float32, C.TOP_K * MOE_DOWN_NUM_BLK]()
             var expert_out_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.TOP_K * C.HIDDEN]()
             var local_count_lease = self.scratch.borrow[Int32, 1]()
 
-            @parameter
-            def do_expert_phase1[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
-                var lb = topo.layers.base(topo.arena.base, layer_idx)
-                var layer = topo.layers.proto
-                var sb = topo.arena.scratch_base()
-                var routing = routing_lease.as_ptr[TopKResult[C.TOP_K]](sb)[]
-                comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
-                var expert_base = rank * experts_per_rank
-                var lc = 0
-                for s in range(C.TOP_K):
-                    var eid = routing.indices[s]
-                    if eid >= expert_base and eid < expert_base + experts_per_rank:
-                        lc += 1
-                local_count_lease.as_ptr[Int32](sb)[] = Int32(lc)
-                return minimax_moe_phase1[
-                    C.MOE_INTERMEDIATE, C.HIDDEN, FWHT_BLK,
-                    C.TOP_K, C.NUM_EXPERTS, Self.tp](
-                    moe_i8_lease.view[I8, Shape[1, C.HIDDEN]](sb, 1),
-                    moe_scale_lease.view[F32, Shape[1, 1]](sb, 1),
-                    routing,
-                    layer.body.experts_w1.bound(lb),
-                    C.MOE_INTERMEDIATE * C.HIDDEN,
-                    layer.body.experts_w1_sc.bound(lb),
-                    C.MOE_INTERMEDIATE * 4,
-                    layer.body.experts_w1_colsum.bound(lb),
-                    C.MOE_INTERMEDIATE * 4,
-                    layer.body.experts_w3.bound(lb),
-                    C.MOE_INTERMEDIATE * C.HIDDEN,
-                    layer.body.experts_w3_sc.bound(lb),
-                    C.MOE_INTERMEDIATE * 4,
-                    layer.body.experts_w3_colsum.bound(lb),
-                    C.MOE_INTERMEDIATE * 4,
-                    expert_qi_lease.view[I8, Shape[C.TOP_K, C.MOE_INTERMEDIATE]](sb, C.TOP_K),
-                    expert_blk_scale_lease.view[F32, Shape[C.TOP_K, MOE_DOWN_NUM_BLK]](sb, C.TOP_K),
-                    rank, pool)
-            sample.add(self.profile.phase("expert_phase1"), timed_tp_parallel[Self.tp,do_expert_phase1](topos, self.main_pools))
+            var t_moe0 = Int(perf_counter_ns())
+            for token_idx in range(seq_len):
 
-            # Phase 10: expert down (w2)
-            @parameter
-            def do_expert_phase2[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
-                var lb = topo.layers.base(topo.arena.base, layer_idx)
-                var layer = topo.layers.proto
-                var sb = topo.arena.scratch_base()
-                var routing = routing_lease.as_ptr[TopKResult[C.TOP_K]](sb)[]
-                return minimax_moe_phase2[
-                    C.HIDDEN, C.MOE_INTERMEDIATE, FWHT_BLK_MOE_DOWN,
-                    C.TOP_K, C.NUM_EXPERTS, Self.tp](
-                    expert_qi_lease.view[I8, Shape[C.TOP_K, C.MOE_INTERMEDIATE]](sb, C.TOP_K),
-                    expert_blk_scale_lease.view[F32, Shape[C.TOP_K, MOE_DOWN_NUM_BLK]](sb, C.TOP_K),
-                    routing,
-                    layer.body.experts_w2.bound(lb),
-                    C.HIDDEN * C.MOE_INTERMEDIATE,
-                    layer.body.experts_w2_sc.bound(lb),
-                    C.HIDDEN * 4,
-                    layer.body.experts_w2_colsum.bound(lb),
-                    C.HIDDEN * MOE_DOWN_NUM_BLK * 4,
-                    expert_out_lease.view[BF16, Shape[C.TOP_K, C.HIDDEN]](sb, C.TOP_K),
-                    rank, pool)
-            sample.add(self.profile.phase("expert_phase2"), timed_tp_parallel[Self.tp,do_expert_phase2](topos, self.main_pools))
+                @parameter
+                def do_router_fused[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
+                    var lb = topo.layers.base(topo.arena.base, layer_idx)
+                    var layer = topo.layers.proto
+                    var sb = topo.arena.scratch_base()
+                    comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
+                    var expert_base = rank * experts_per_rank
+                    return router_fused_dispatch[experts_per_rank, C.HIDDEN, C.TOP_K](
+                        normed_bf16_lease.view[BF16, Shape[1, C.HIDDEN]](
+                            sb, 1, element_offset=token_idx * C.HIDDEN),
+                        layer.body.router_proj.bound(lb),
+                        layer.body.router_bias.bound(lb),
+                        candidates_lease.as_ptr[RouterCandidate](sb),
+                        pool,
+                        expert_base)
+                _ = timed_tp_parallel[Self.tp,do_router_fused](topos, self.main_pools)
 
-            # Phase 11: expert reduce + fused allreduce + residual add
-            var t_expert_sum0 = Int(perf_counter_ns())
-            for r in range(Self.tp):
-                var topo_r = topos[r]
-                var sb = topo_r.arena.scratch_base()
-                var lc = Int(local_count_lease.as_ptr[Int32](sb)[])
-                accumulate_expert_outputs[C.HIDDEN, C.TOP_K](
-                    expert_out_lease.view[BF16, Shape[C.TOP_K, C.HIDDEN]](sb, C.TOP_K).as_ptr[DType.bfloat16](),
-                    lc,
-                    topo_r.activations.x_residual.bound_dyn(topo_r.arena.base, seq_len).as_ptr[DType.bfloat16]())
-            sample.add(self.profile.phase("expert_sum"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_expert_sum0))
+                var candidate_ptrs = InlineArray[
+                    UnsafePointer[RouterCandidate, MutAnyOrigin], Self.tp](
+                    uninitialized=True)
+                var candidate_counts = InlineArray[Int, Self.tp](uninitialized=True)
+                for r in range(Self.tp):
+                    var sb_r = topos[r].arena.scratch_base()
+                    candidate_ptrs[r] = candidates_lease.as_ptr[RouterCandidate](sb_r)
+                    candidate_counts[r] = router_num_workers[
+                        C.NUM_EXPERTS // Self.tp, C.TOP_K](
+                        Int(self.main_pools[r].get_capacity())) * C.TOP_K
+                var host_sb = topos[HOST_RANK].arena.scratch_base()
+                router_merge_multi_and_renorm[C.TOP_K, Self.tp](
+                    candidate_ptrs, candidate_counts,
+                    routing_lease.as_ptr[TopKResult[C.TOP_K]](host_sb))
+                var routing = routing_lease.as_ptr[TopKResult[C.TOP_K]](host_sb)[]
+                if token_idx == seq_len - 1:
+                    self.profile.record_moe_route[C.TOP_K](
+                        layer_idx, C.NUM_LAYERS, C.NUM_EXPERTS, Self.tp,
+                        routing.indices, routing.weights)
+                for r in range(Self.tp):
+                    var sb_r = topos[r].arena.scratch_base()
+                    routing_lease.as_ptr[TopKResult[C.TOP_K]](sb_r)[] = routing
+
+                @parameter
+                def do_expert_phase1[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
+                    var lb = topo.layers.base(topo.arena.base, layer_idx)
+                    var layer = topo.layers.proto
+                    var sb = topo.arena.scratch_base()
+                    var routing = routing_lease.as_ptr[TopKResult[C.TOP_K]](sb)[]
+                    comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
+                    var expert_base = rank * experts_per_rank
+                    var lc = 0
+                    for s in range(C.TOP_K):
+                        var eid = routing.indices[s]
+                        if eid >= expert_base and eid < expert_base + experts_per_rank:
+                            lc += 1
+                    local_count_lease.as_ptr[Int32](sb)[] = Int32(lc)
+                    return minimax_moe_phase1[
+                        C.MOE_INTERMEDIATE, C.HIDDEN, FWHT_BLK,
+                        C.TOP_K, C.NUM_EXPERTS, Self.tp](
+                        moe_i8_lease.view[I8, Shape[1, C.HIDDEN]](
+                            sb, 1, element_offset=token_idx * C.HIDDEN),
+                        moe_scale_lease.view[F32, Shape[1, 1]](
+                            sb, 1, element_offset=token_idx),
+                        routing,
+                        layer.body.experts_w1.bound(lb),
+                        C.MOE_INTERMEDIATE * C.HIDDEN,
+                        layer.body.experts_w1_sc.bound(lb),
+                        C.MOE_INTERMEDIATE * 4,
+                        layer.body.experts_w1_colsum.bound(lb),
+                        C.MOE_INTERMEDIATE * 4,
+                        layer.body.experts_w3.bound(lb),
+                        C.MOE_INTERMEDIATE * C.HIDDEN,
+                        layer.body.experts_w3_sc.bound(lb),
+                        C.MOE_INTERMEDIATE * 4,
+                        layer.body.experts_w3_colsum.bound(lb),
+                        C.MOE_INTERMEDIATE * 4,
+                        expert_qi_lease.view[I8, Shape[C.TOP_K, C.MOE_INTERMEDIATE]](sb, C.TOP_K),
+                        expert_blk_scale_lease.view[F32, Shape[C.TOP_K, MOE_DOWN_NUM_BLK]](sb, C.TOP_K),
+                        rank, pool)
+                _ = timed_tp_parallel[Self.tp,do_expert_phase1](topos, self.main_pools)
+
+                @parameter
+                def do_expert_phase2[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
+                    var lb = topo.layers.base(topo.arena.base, layer_idx)
+                    var layer = topo.layers.proto
+                    var sb = topo.arena.scratch_base()
+                    var routing = routing_lease.as_ptr[TopKResult[C.TOP_K]](sb)[]
+                    return minimax_moe_phase2[
+                        C.HIDDEN, C.MOE_INTERMEDIATE, FWHT_BLK_MOE_DOWN,
+                        C.TOP_K, C.NUM_EXPERTS, Self.tp](
+                        expert_qi_lease.view[I8, Shape[C.TOP_K, C.MOE_INTERMEDIATE]](sb, C.TOP_K),
+                        expert_blk_scale_lease.view[F32, Shape[C.TOP_K, MOE_DOWN_NUM_BLK]](sb, C.TOP_K),
+                        routing,
+                        layer.body.experts_w2.bound(lb),
+                        C.HIDDEN * C.MOE_INTERMEDIATE,
+                        layer.body.experts_w2_sc.bound(lb),
+                        C.HIDDEN * 4,
+                        layer.body.experts_w2_colsum.bound(lb),
+                        C.HIDDEN * MOE_DOWN_NUM_BLK * 4,
+                        expert_out_lease.view[BF16, Shape[C.TOP_K, C.HIDDEN]](sb, C.TOP_K),
+                        rank, pool)
+                _ = timed_tp_parallel[Self.tp,do_expert_phase2](topos, self.main_pools)
+
+                for r in range(Self.tp):
+                    var topo_r = topos[r]
+                    var sb = topo_r.arena.scratch_base()
+                    var lc = Int(local_count_lease.as_ptr[Int32](sb)[])
+                    accumulate_expert_outputs[C.HIDDEN, C.TOP_K](
+                        expert_out_lease.view[BF16, Shape[C.TOP_K, C.HIDDEN]](sb, C.TOP_K).as_ptr[DType.bfloat16](),
+                        lc,
+                        topo_r.activations.x_residual.bound_dyn(topo_r.arena.base, seq_len).as_ptr[DType.bfloat16]()
+                            + token_idx * C.HIDDEN)
+
+            sample.add(self.profile.phase("moe"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_moe0))
 
             var t_ffn_reduce0 = Int(perf_counter_ns())
             small_allreduce[BF16, XShape, Self.tp, residual_add=True](
@@ -1237,6 +1246,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             expert_out_lease^.release()
             expert_blk_scale_lease^.release()
             expert_qi_lease^.release()
+            candidates_lease^.release()
             routing_lease^.release()
             normed_bf16_lease^.release()
             moe_scale_lease^.release()
@@ -1249,9 +1259,14 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         var lm_act_blk_scale_lease = self.scratch.borrow[Float32, VOCAB_NUM_BLOCKS]()
         var lm_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
         var t_final0 = Int(perf_counter_ns())
+        comptime last_row_shape = Shape[C.MAX_SEQ_LEN, C.HIDDEN]
+        var last_row_ptr = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin](
+            unsafe_from_address=host.arena.base + host.activations.x_main.offset
+                + (seq_len - 1) * C.HIDDEN * 2)
+        var last_row_view = DynamicView[BF16, last_row_shape](last_row_ptr, 1)
         var final_fence = rmsnorm_gamma_fwht_per_block_quantize[
             C.HIDDEN, LM_OUTPUT_HEAD_FWHT_BLK](
-            host.activations.x_main.bound_dyn(host.arena.base, seq_len),
+            last_row_view,
             host.host.lm_output_head_sqrt_gamma.bound(host.arena.base),
             lm_act_i8_lease.view[I8, Shape[1, C.HIDDEN]](host.arena.scratch_base(), 1),
             lm_work_lease.view[F32, Shape[1, C.HIDDEN]](host.arena.scratch_base(), 1),
