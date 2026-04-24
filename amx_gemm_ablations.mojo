@@ -1185,6 +1185,406 @@ def run_bf16_chain_ablation[MID: Int, K: Int, N2: Int](label: String):
     out_b.free()
 
 
+# =============================================================================
+# AMX GEMM blocked: per-K-block activation scales (for O-proj, expert W2).
+#
+# Same 2-2-4 tile config as v1. Accumulates fwht_blk K elements in i32,
+# dequants to f32 with the block's activation scale, sums across blocks.
+# tdpbssd means no colsum correction needed (signed × signed).
+#
+# Used where the activation was FWHT-quantized with per-block scales
+# (e.g. attention output → O-proj, expert phase1 output → expert W2).
+# =============================================================================
+
+
+def amx_gemm_blocked[N: Int, K: Int, fwht_blk: Int](
+    act: I8Ptr,
+    wpacked: I8Ptr,
+    blk_scales: F32Ptr,
+    w_scale: F32Ptr,
+    dst: F32Ptr,
+    M: Int,
+    output_scale: Float32 = Float32(1.0),
+):
+    comptime assert N % N_STEP == 0, "N must be a multiple of N_STEP"
+    comptime assert K % K_STEP == 0, "K must be a multiple of K_STEP"
+    comptime assert K % fwht_blk == 0, "K must be a multiple of fwht_blk"
+    comptime assert fwht_blk % K_STEP == 0, "fwht_blk must be a multiple of K_STEP"
+    comptime num_blocks = K // fwht_blk
+    comptime k_steps_per_block = fwht_blk // K_STEP
+
+    var c_arr = AlignedInlineArray[Int32, M_STEP * N_STEP](fill=Int32(0))
+    var c_buf = c_arr.unsafe_ptr()
+    var f32_arr = AlignedInlineArray[Float32, M_STEP * N_STEP](fill=Float32(0))
+    var f32_buf = f32_arr.unsafe_ptr()
+
+    for mb in range(0, M, M_STEP):
+        var m_count = min(M_STEP, M - mb)
+        var act_mb = act + mb * K
+
+        for nb in range(0, N, N_STEP):
+            for i in range(M_STEP * N_STEP):
+                f32_buf[i] = Float32(0)
+
+            for blk in range(num_blocks):
+                tilezero[4]()
+                tilezero[5]()
+                tilezero[6]()
+                tilezero[7]()
+
+                var k_base = blk * fwht_blk
+                for ks in range(k_steps_per_block):
+                    var k = k_base + ks * K_STEP
+                    tileload[0, DType.int8](act_mb + k, K)
+                    tileload[1, DType.int8](act_mb + 16 * K + k, K)
+
+                    var b_base = wpacked + nb * K + k * N_STEP
+                    tileload[2, DType.int8](b_base, K_STEP)
+                    tileload[3, DType.int8](b_base + TILE_BYTES, K_STEP)
+
+                    tdpbssd[4, 0, 2]()
+                    tdpbssd[5, 0, 3]()
+                    tdpbssd[6, 1, 2]()
+                    tdpbssd[7, 1, 3]()
+
+                comptime stride = N_STEP * 4
+                tilestore[4, DType.int32](c_buf, stride)
+                tilestore[5, DType.int32](c_buf + 16, stride)
+                tilestore[6, DType.int32](c_buf + 16 * N_STEP, stride)
+                tilestore[7, DType.int32](c_buf + 16 * N_STEP + 16, stride)
+
+                for m in range(m_count):
+                    var dq = blk_scales[(mb + m) * num_blocks + blk] / Float32(127)
+                    var row_off = m * N_STEP
+                    for n in range(0, N_STEP, SIMD_W):
+                        var i32_v = (c_buf + row_off + n).load[width=SIMD_W]()
+                        var f32_v = i32_v.cast[DType.float32]() * dq
+                        (f32_buf + row_off + n).store(
+                            (f32_buf + row_off + n).load[width=SIMD_W]() + f32_v)
+
+            for m in range(m_count):
+                var row_off = m * N_STEP
+                for n in range(0, N_STEP, SIMD_W):
+                    var acc = (f32_buf + row_off + n).load[width=SIMD_W]()
+                    var ws = (w_scale + nb + n).load[width=SIMD_W]()
+                    (dst + (mb + m) * N + nb + n).store(acc * ws * output_scale)
+
+    _ = c_arr
+    _ = f32_arr
+
+
+def amx_gemm_blocked_bf16[N: Int, K: Int, fwht_blk: Int](
+    act: I8Ptr,
+    wpacked: I8Ptr,
+    blk_scales: F32Ptr,
+    w_scale: F32Ptr,
+    dst: BF16Ptr,
+    M: Int,
+    output_scale: Float32 = Float32(1.0),
+):
+    comptime assert N % N_STEP == 0
+    comptime assert K % K_STEP == 0
+    comptime assert K % fwht_blk == 0
+    comptime assert fwht_blk % K_STEP == 0
+    comptime num_blocks = K // fwht_blk
+    comptime k_steps_per_block = fwht_blk // K_STEP
+
+    var c_arr = AlignedInlineArray[Int32, M_STEP * N_STEP](fill=Int32(0))
+    var c_buf = c_arr.unsafe_ptr()
+    var f32_arr = AlignedInlineArray[Float32, M_STEP * N_STEP](fill=Float32(0))
+    var f32_buf = f32_arr.unsafe_ptr()
+
+    for mb in range(0, M, M_STEP):
+        var m_count = min(M_STEP, M - mb)
+        var act_mb = act + mb * K
+
+        for nb in range(0, N, N_STEP):
+            for i in range(M_STEP * N_STEP):
+                f32_buf[i] = Float32(0)
+
+            for blk in range(num_blocks):
+                tilezero[4]()
+                tilezero[5]()
+                tilezero[6]()
+                tilezero[7]()
+
+                var k_base = blk * fwht_blk
+                for ks in range(k_steps_per_block):
+                    var k = k_base + ks * K_STEP
+                    tileload[0, DType.int8](act_mb + k, K)
+                    tileload[1, DType.int8](act_mb + 16 * K + k, K)
+
+                    var b_base = wpacked + nb * K + k * N_STEP
+                    tileload[2, DType.int8](b_base, K_STEP)
+                    tileload[3, DType.int8](b_base + TILE_BYTES, K_STEP)
+
+                    tdpbssd[4, 0, 2]()
+                    tdpbssd[5, 0, 3]()
+                    tdpbssd[6, 1, 2]()
+                    tdpbssd[7, 1, 3]()
+
+                comptime stride = N_STEP * 4
+                tilestore[4, DType.int32](c_buf, stride)
+                tilestore[5, DType.int32](c_buf + 16, stride)
+                tilestore[6, DType.int32](c_buf + 16 * N_STEP, stride)
+                tilestore[7, DType.int32](c_buf + 16 * N_STEP + 16, stride)
+
+                for m in range(m_count):
+                    var dq = blk_scales[(mb + m) * num_blocks + blk] / Float32(127)
+                    var row_off = m * N_STEP
+                    for n in range(0, N_STEP, SIMD_W):
+                        var i32_v = (c_buf + row_off + n).load[width=SIMD_W]()
+                        var f32_v = i32_v.cast[DType.float32]() * dq
+                        (f32_buf + row_off + n).store(
+                            (f32_buf + row_off + n).load[width=SIMD_W]() + f32_v)
+
+            for m in range(m_count):
+                var row_off = m * N_STEP
+                for n in range(0, N_STEP, SIMD_W):
+                    var acc = (f32_buf + row_off + n).load[width=SIMD_W]()
+                    var ws = (w_scale + nb + n).load[width=SIMD_W]()
+                    (dst + (mb + m) * N + nb + n).store(
+                        (acc * ws * output_scale).cast[DType.bfloat16]())
+
+    _ = c_arr
+    _ = f32_arr
+
+
+def reference_gemm_blocked_scalar(
+    act: I8Ptr,
+    weight_raw: I8Ptr,
+    blk_scales: F32Ptr,
+    w_scale: F32Ptr,
+    dst: F32Ptr,
+    M: Int, N: Int, K: Int, fwht_blk: Int,
+    output_scale: Float32 = Float32(1.0),
+):
+    var num_blocks = K // fwht_blk
+    for m in range(M):
+        for n in range(N):
+            var f32_sum = Float32(0)
+            for blk in range(num_blocks):
+                var dq = blk_scales[m * num_blocks + blk] / Float32(127)
+                var i32_acc = Int32(0)
+                for kk in range(fwht_blk):
+                    var k = blk * fwht_blk + kk
+                    i32_acc += Int32(act[m * K + k]) * Int32(weight_raw[n * K + k])
+                f32_sum += Float32(i32_acc) * dq
+            dst[m * N + n] = f32_sum * w_scale[n] * output_scale
+
+
+def vnni_gemv_blocked_loop[N: Int, K: Int, fwht_blk: Int](
+    act: I8Ptr,
+    wpacked: I8Ptr,
+    blk_scales: F32Ptr,
+    w_scale: F32Ptr,
+    colsum: F32Ptr,
+    dst: BF16Ptr,
+    M: Int,
+    output_scale: Float32 = Float32(1.0),
+):
+    from experimental3.kernels.gemv import gemv_row_blocked_bf16_scaled
+    for m in range(M):
+        gemv_row_blocked_bf16_scaled[N, K, fwht_blk](
+            act + m * K, wpacked, blk_scales + m * (K // fwht_blk),
+            w_scale, colsum, dst + m * N, output_scale)
+
+
+def bench_amx_blocked[N: Int, K: Int, fwht_blk: Int](
+    act: I8Ptr,
+    wpacked: I8Ptr,
+    blk_scales: F32Ptr,
+    w_scale: F32Ptr,
+    dst: F32Ptr,
+    M: Int,
+    output_scale: Float32,
+    iters: Int,
+    warmup: Int,
+    samples: Int,
+) -> Int:
+    var best = Int(0)
+    for sample in range(samples):
+        for _ in range(warmup):
+            amx_gemm_blocked[N, K, fwht_blk](
+                act, wpacked, blk_scales, w_scale, dst, M, output_scale)
+        var t = Int(perf_counter_ns())
+        for _ in range(iters):
+            amx_gemm_blocked[N, K, fwht_blk](
+                act, wpacked, blk_scales, w_scale, dst, M, output_scale)
+        var ns = (Int(perf_counter_ns()) - t) // iters
+        if sample == 0 or ns < best:
+            best = ns
+    return best
+
+
+def bench_vnni_blocked[N: Int, K: Int, fwht_blk: Int](
+    act: I8Ptr,
+    wpacked: I8Ptr,
+    blk_scales: F32Ptr,
+    w_scale: F32Ptr,
+    colsum: F32Ptr,
+    dst: BF16Ptr,
+    M: Int,
+    output_scale: Float32,
+    iters: Int,
+    warmup: Int,
+    samples: Int,
+) -> Int:
+    var best = Int(0)
+    for sample in range(samples):
+        for _ in range(warmup):
+            vnni_gemv_blocked_loop[N, K, fwht_blk](
+                act, wpacked, blk_scales, w_scale, colsum, dst, M, output_scale)
+        var t = Int(perf_counter_ns())
+        for _ in range(iters):
+            vnni_gemv_blocked_loop[N, K, fwht_blk](
+                act, wpacked, blk_scales, w_scale, colsum, dst, M, output_scale)
+        var ns = (Int(perf_counter_ns()) - t) // iters
+        if sample == 0 or ns < best:
+            best = ns
+    return best
+
+
+def compute_block_colsums(src: I8Ptr, colsum: F32Ptr, N: Int, K: Int, fwht_blk: Int):
+    var num_blocks = K // fwht_blk
+    for n in range(N):
+        for blk in range(num_blocks):
+            var acc = Int32(0)
+            for kk in range(fwht_blk):
+                acc += Int32(src[n * K + blk * fwht_blk + kk])
+            colsum[blk * N + n] = Float32(acc)
+
+
+def run_blocked_ablation[N: Int, K: Int, fwht_blk: Int](label: String):
+    print("=== Blocked GEMM: " + label
+        + " (N=" + String(N) + ", K=" + String(K)
+        + ", fwht_blk=" + String(fwht_blk) + ") ===")
+
+    comptime num_blocks = K // fwht_blk
+
+    var weight_raw = alloc_zeroed[DType.int8](N * K)
+    fill_random_i8(weight_raw, N * K, seed=0xB10C4ED123456789)
+
+    var wpacked = alloc_zeroed[DType.int8](N * K)
+    pack_vnni(weight_raw, wpacked, N, K)
+
+    var w_scale = alloc_zeroed[DType.float32](N)
+    fill_random_f32(w_scale, N, Float32(0.01))
+
+    var colsum = alloc_zeroed[DType.float32](N)
+    compute_colsum(weight_raw, colsum, N, K)
+
+    var blk_colsum = alloc_zeroed[DType.float32](num_blocks * N)
+    compute_block_colsums(weight_raw, blk_colsum, N, K, fwht_blk)
+
+    comptime MAX_M = 4096
+    comptime ACT_ROWS = MAX_M + M_STEP
+    var act = alloc_zeroed[DType.int8](ACT_ROWS * K)
+    fill_random_i8(act, ACT_ROWS * K, seed=0xB10CA0C712340000)
+
+    var blk_scales = alloc_zeroed[DType.float32](ACT_ROWS * num_blocks)
+    fill_random_f32(blk_scales, ACT_ROWS * num_blocks, Float32(1.0))
+
+    var out_ref = alloc_zeroed[DType.float32](ACT_ROWS * N)
+    var out_amx = alloc_zeroed[DType.float32](ACT_ROWS * N)
+    var out_vnni = alloc_zeroed[DType.bfloat16](ACT_ROWS * N)
+
+    var output_scale = Float32(0.85)
+
+    comptime TEST_M = 32
+    reference_gemm_blocked_scalar(act, weight_raw, blk_scales, w_scale,
+        out_ref, TEST_M, N, K, fwht_blk, output_scale)
+    amx_gemm_blocked[N, K, fwht_blk](act, wpacked, blk_scales, w_scale,
+        out_amx, TEST_M, output_scale)
+    vnni_gemv_blocked_loop[N, K, fwht_blk](act, wpacked, blk_scales, w_scale,
+        blk_colsum, out_vnni, TEST_M, output_scale)
+
+    var max_amx = Float32(0)
+    var max_vnni = Float32(0)
+    for i in range(TEST_M * N):
+        var r = out_ref[i]
+        var da = (out_amx[i] - r).__abs__()
+        var dv = (Float32(out_vnni[i]) - r).__abs__()
+        if da > max_amx:
+            max_amx = da
+        if dv > max_vnni:
+            max_vnni = dv
+
+    print("  correctness vs scalar ref (M=" + String(TEST_M) + "):")
+    print("    amx blocked:   max_el=" + String(max_amx))
+    print("    vnni blocked:  max_el=" + String(max_vnni))
+    print("")
+
+    var bench_ms = InlineArray[Int, 8](fill=0)
+    bench_ms[0] = 16
+    bench_ms[1] = 32
+    bench_ms[2] = 64
+    bench_ms[3] = 128
+    bench_ms[4] = 256
+    bench_ms[5] = 512
+    bench_ms[6] = 1024
+    bench_ms[7] = 4096
+
+    print("  blocked prefill scaling (best of samples, ns/token):")
+    print("       M | it | smp | AMX blk | VNNI blk | AMX/VNNI | GOPS AMX")
+    print("  -------|----|-----|---------|----------|----------|--------")
+
+    for idx in range(8):
+        var test_m = bench_ms[idx]
+        if test_m > MAX_M:
+            continue
+
+        var iters = 200
+        if test_m >= 128:
+            iters = 100
+        if test_m >= 512:
+            iters = 30
+        if test_m >= 2048:
+            iters = 5
+        if test_m >= 4096:
+            iters = 2
+
+        var samples = 2
+        if test_m >= 2048:
+            samples = 1
+        var warmup = max(iters // 10, 2)
+
+        var ns_amx = bench_amx_blocked[N, K, fwht_blk](
+            act, wpacked, blk_scales, w_scale, out_amx,
+            test_m, output_scale, iters, warmup, samples)
+        var ns_vnni = bench_vnni_blocked[N, K, fwht_blk](
+            act, wpacked, blk_scales, w_scale, blk_colsum, out_vnni,
+            test_m, output_scale, iters, warmup, samples)
+
+        var ratio = Float32(0)
+        if ns_vnni > 0:
+            ratio = Float32(ns_amx) / Float32(ns_vnni)
+
+        var total_macs = test_m * N * K
+        var gops = Float32(total_macs) / Float32(ns_amx)
+
+        print("  " + String(test_m)
+            + "  | " + String(iters)
+            + " | " + String(samples)
+            + " | " + String(ns_amx // test_m)
+            + " | " + String(ns_vnni // test_m)
+            + " | " + String(ratio)
+            + " | " + String(gops))
+
+    print("")
+
+    weight_raw.free()
+    wpacked.free()
+    w_scale.free()
+    colsum.free()
+    blk_colsum.free()
+    act.free()
+    blk_scales.free()
+    out_ref.free()
+    out_amx.free()
+    out_vnni.free()
+
+
 def main():
     _ = init_intel_amx()
     set_subnormal_zeroing()
@@ -1197,6 +1597,6 @@ def main():
     print("Tile config: 2-2-4 (all tiles 16x64), tdpbssd (i8 x i8 -> i32)")
     print("")
 
-    run_ablation[1536, 3072]("MoE expert W1/W3")
-    run_ablation[3072, 3072]("O-proj shape")
-    run_bf16_chain_ablation[1536, 3072, 3072]("direct bf16 handoff")
+    run_blocked_ablation[3072, 6144, 128]("O-proj (N=3072, K=Q_DIM=6144, blk=HEAD_DIM=128)")
+    run_blocked_ablation[3072, 1536, 128]("Expert W2 (N=3072, K=1536, blk=128)")
+    run_blocked_ablation[3072, 6144, 64]("O-proj blk=64 variant")
