@@ -86,7 +86,7 @@ def dot_vnni_broadcasted[width: Int](
     act_bytes: SIMD[DType.uint8, width * 4],
     wpacked: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
 ) -> SIMD[DType.int32, width]:
-    var w = wpacked.load[width = width * 4]()
+    var w = wpacked.load[width = width * 4, non_temporal=True]()
     return vpdpbusd[width](acc, act_bytes, w)
 
 
@@ -116,7 +116,7 @@ def dot_simd[width: Int](
 ) -> SIMD[DType.int32, width]:
     """Non-VNNI fallback: width channels x 4 K values via widen-to-i32 multiply."""
     # i8 storage loaded as i32 dwords so we can mask out lanes with shifts.
-    var wdw = wpacked.bitcast[Scalar[DType.int32]]().load[width=width]()
+    var wdw = wpacked.bitcast[Scalar[DType.int32]]().load[width=width, non_temporal=True]()
     var result = acc
     result += SIMD[DType.int32, width](Int32(act_row[k_pos]) + 128) * ((wdw << 24) >> 24)
     result += SIMD[DType.int32, width](Int32(act_row[k_pos + 1]) + 128) * ((wdw << 16) >> 24)

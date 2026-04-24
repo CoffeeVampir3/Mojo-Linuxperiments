@@ -72,4 +72,9 @@ rsync -av \
 echo "✓ Synced to $REMOTE_HOST:$REMOTE_PATH"
 echo "→ Building $TARGET on $REMOTE_HOST"
 
-ssh $REMOTE_USER@$REMOTE_HOST "cd $REMOTE_PATH && env MOJO_ENABLE_RUNTIME=0 pixi run mojo build -I . -D ASSERT=all $TARGET && echo '=== PERF STAT ===' && perf stat -e $PERF_EVENTS_CSV ./$BINARY"
+set PERF_DELAY 0
+if test (count $argv) -gt 1
+    set PERF_DELAY $argv[2]
+end
+
+ssh $REMOTE_USER@$REMOTE_HOST "cd $REMOTE_PATH && env MOJO_ENABLE_RUNTIME=0 pixi run mojo build -I . -D ASSERT=all $TARGET && echo '=== PERF STAT ===' && perf stat -D $PERF_DELAY -e $PERF_EVENTS_CSV ./$BINARY"

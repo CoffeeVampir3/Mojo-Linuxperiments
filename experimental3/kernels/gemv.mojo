@@ -277,7 +277,7 @@ def lm_head_row_dot[K: Int, fwht_blk: Int](
             comptime step_k_off = s * vnni_k_step
             var k_off = k_base + step_k_off
             var act_step = (act_u8 + k_off).load[width=vnni_k_step]() ^ u8_bias
-            var w_i8 = (weight_row + k_off).load[width=vnni_k_step]()
+            var w_i8 = (weight_row + k_off).load[width=vnni_k_step, non_temporal=True]()
             i32_acc = vpdpbusd[dp_width](i32_acc, act_step, w_i8)
         var block_dot = i32_acc.reduce_add().cast[DType.float32]()
         var corrected = block_dot - colsum_bias * w_blk_colsums_row[b]

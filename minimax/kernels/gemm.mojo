@@ -159,19 +159,19 @@ def f32_gemv_row[K: Int](
     comptime for i in range(port_unroll):
         var off = i * width
         var a = (act + off).load[width=width]().cast[DType.float32]()
-        var w = (weight_row + off).load[width=width]()
+        var w = (weight_row + off).load[width=width, non_temporal=True]()
         accs[i] = a * w
     var k = step
     while k + step <= K:
         comptime for i in range(port_unroll):
             var off = k + i * width
             var a = (act + off).load[width=width]().cast[DType.float32]()
-            var w = (weight_row + off).load[width=width]()
+            var w = (weight_row + off).load[width=width, non_temporal=True]()
             accs[i] = a.fma(w, accs[i])
         k += step
     while k + width <= K:
         var a = (act + k).load[width=width]().cast[DType.float32]()
-        var w = (weight_row + k).load[width=width]()
+        var w = (weight_row + k).load[width=width, non_temporal=True]()
         accs[0] = a.fma(w, accs[0])
         k += width
     return tree_reduce_accs(accs)
