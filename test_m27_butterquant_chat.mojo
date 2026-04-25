@@ -214,6 +214,36 @@ def stream_token(
     stream.push_bytes(raw_bytes)
 
 
+struct HistoryCache:
+    # Tracks the token prefix that is physically represented in the model KV
+    # cache. A sampled token is not committed here until a later forward call
+    # consumes that token as input and writes its K/V slot.
+    var kv_committed_tokens: List[Int]
+
+    def __init__(out self):
+        self.kv_committed_tokens = List[Int]()
+
+    def committed_len(self) -> Int:
+        return len(self.kv_committed_tokens)
+
+    def last_common_prefix(self, candidate: List[Int]) -> Int:
+        var common = 0
+        var limit = min(len(self.kv_committed_tokens), len(candidate))
+        while common < limit:
+            if self.kv_committed_tokens[common] != candidate[common]:
+                break
+            common += 1
+        return common
+
+    def replace_with(mut self, tokens: List[Int]):
+        self.kv_committed_tokens = List[Int](capacity=len(tokens))
+        for i in range(len(tokens)):
+            self.kv_committed_tokens.append(tokens[i])
+
+    def append_committed(mut self, token_id: Int):
+        self.kv_committed_tokens.append(token_id)
+
+
 def load_and_chat[
     P: BurstThreadPool, //,
     tp: Int,
@@ -245,6 +275,7 @@ def load_and_chat[
 
     var tp_ptr = model.token_buffer()
     var history = chat_preamble()
+    var cache = HistoryCache()
     print("MiniMax-M2.7 chat. Type /quit, quit, or exit to stop.")
     print()
 
@@ -273,9 +304,11 @@ def load_and_chat[
             MAX_NEW_TOKENS, MiniMaxM27Config.MAX_SEQ_LEN - prompt_len)
         model.reset_profile()
 
+        var reuse_tokens = cache.last_common_prefix(token_ids)
+        var prefill_tokens = prompt_len - reuse_tokens
         var t1 = perf_counter_ns()
         var next_id = 0
-        var prefilled = 0
+        var prefilled = reuse_tokens
         while prefilled < prompt_len:
             var chunk_len = min(PREFILL_CHUNK_SIZE, prompt_len - prefilled)
             for i in range(chunk_len):
@@ -284,12 +317,26 @@ def load_and_chat[
             next_id = Int(model.forward(
                 Int(tp_ptr), prefilled, chunk_len, is_last_prefill_chunk))
             prefilled += chunk_len
+
+        if prefill_tokens == 0:
+            # KV contains the full prompt, but logits for the next token are not
+            # cached. Re-run the final prompt token in-place to produce logits.
+            tp_ptr[0] = Scalar[DType.int32](token_ids[prompt_len - 1])
+            next_id = Int(model.forward(Int(tp_ptr), prompt_len - 1, 1, True))
+
+        cache.replace_with(token_ids)
         var prefill_ms = (perf_counter_ns() - t1) / 1_000_000
+        var prefill_work_tokens = prefill_tokens
+        if prefill_work_tokens == 0:
+            prefill_work_tokens = 1
 
         print(
-            "prefill |", prompt_len, "tokens |",
+            "prefill |", prompt_len, "prompt tokens |",
+            reuse_tokens, "reused |",
+            prefill_tokens, "new |",
+            prefill_work_tokens, "work tokens |",
             prefill_ms, "ms |",
-            tokens_per_second(prompt_len, prefill_ms), "t/s",
+            tokens_per_second(prefill_work_tokens, prefill_ms), "t/s",
         )
         model.reset_profile()
 
@@ -307,8 +354,10 @@ def load_and_chat[
             step < max_new_tokens
             and next_id != MiniMaxM27Config.EOS_TOKEN_ID
         ):
-            tp_ptr[0] = Scalar[DType.int32](next_id)
+            var committed_id = next_id
+            tp_ptr[0] = Scalar[DType.int32](committed_id)
             next_id = Int(model.forward(Int(tp_ptr), pos, 1))
+            cache.append_committed(committed_id)
             pos += 1
             step += 1
 
