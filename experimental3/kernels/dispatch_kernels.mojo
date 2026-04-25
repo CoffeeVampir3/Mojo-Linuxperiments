@@ -50,7 +50,7 @@ from experimental3.kernels.dispatch_args import (
     PostReduceArgs,
 )
 from experimental3.kernels.gemm import (
-    int8_gemv_worker, int8_gemv_decode_worker,
+    int8_gemv_decode_worker,
     int8_gemv_blocked_worker, int8_gemv_blocked_decode_worker,
     int8_gemv_blocked_wa_worker,
     fused_gu_gelu_tanh_worker, fused_gu_gelu_tanh_worker_wa,

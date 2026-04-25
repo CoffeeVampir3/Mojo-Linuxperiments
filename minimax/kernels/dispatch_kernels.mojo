@@ -2,7 +2,6 @@ from std.memory import UnsafePointer
 from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
 
-from simd_math import sqrt
 from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY
 from modeling.model_spec import StaticTensor, DynamicTensor
 from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr, BF16Ptr

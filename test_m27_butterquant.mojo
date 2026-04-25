@@ -16,7 +16,6 @@ from modeling.minimax_m27_moe_butterquant_tp import (
 
 comptime TOKENIZER_PATH = "checkpoints/Minimax-M2.7/tokenizer.json"
 comptime MODEL_DIR = "quantized_models"
-comptime VOCAB = MiniMaxM27Config.VOCAB_SIZE
 comptime MAX_NEW_TOKENS = 32
 comptime TP = 4
 
@@ -25,14 +24,14 @@ def load_and_run[
     P: BurstThreadPool, //,
     tp: Int,
 ](
-    numa: NumaInfo,
     numa_topo: NumaTopology,
     var pools: HeapMoveArray[P],
     read tok: BPETokenizer[AutoPreTokenizer, AutoByteTransform],
     read token_ids: List[Int],
 ):
     var t0 = perf_counter_ns()
-    var model_opt = MiniMaxM27ButterQuant[tp, P].load(Path(MODEL_DIR), numa, numa_topo, pools^)
+    var model_opt = MiniMaxM27ButterQuant[tp, P].load(
+        Path(MODEL_DIR), numa_topo, pools^)
     if not model_opt:
         return
     var model = model_opt.take()
@@ -206,10 +205,10 @@ prompt forward profile
         var pools = HeapMoveArray[IsolatedBurstPool[]](TP)
         for rank in range(TP):
             pools.push(IsolatedBurstPool[].for_topology(numa, numa_topo[rank]))
-        load_and_run[TP](numa, numa_topo, pools^, tok, token_ids)
+        load_and_run[TP](numa_topo, pools^, tok, token_ids)
     else:
         print("mode: cold (spin-backoff)")
         var pools = HeapMoveArray[BurstPool[]](TP)
         for rank in range(TP):
             pools.push(BurstPool[].for_topology(numa, numa_topo[rank]))
-        load_and_run[TP](numa, numa_topo, pools^, tok, token_ids)
+        load_and_run[TP](numa_topo, pools^, tok, token_ids)

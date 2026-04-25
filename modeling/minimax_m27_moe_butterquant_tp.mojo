@@ -4,7 +4,7 @@ from std.sys.info import simd_width_of, size_of
 from std.time import perf_counter_ns
 from std.collections import InlineArray
 
-from numa import NumaArena, NumaInfo, NumaTopology
+from numa import NumaArena, NumaTopology
 from notstdcollections import HeapMoveArray
 from threading import BurstPool
 from threading.threading_traits import BurstThreadPool
@@ -94,7 +94,6 @@ struct MiniMaxM27Config:
     comptime HPG = 6
     comptime ROPE_DIM = 64
     comptime ROPE_THETA = 5_000_000
-    comptime MAX_POS = 196608
     # MiniMax uses standard rotate_half: pair stride = ROPE_DIM // 2 = 32.
     # Gemma4 proportional RoPE uses HEAD_DIM // 2 = 256. The pair_stride
     # parameter on write_k_head_normed / rope_apply_partial controls this.
@@ -106,8 +105,6 @@ struct MiniMaxM27Config:
     comptime TOP_K = 8
 
     comptime VOCAB_SIZE = 200064
-    comptime BOS_TOKEN_ID = 200034
-    comptime ROLE_TOKEN_ID = 200019
     comptime EOS_TOKEN_ID = 200020
     comptime RMS_NORM_EPS = 1e-6
 
@@ -150,8 +147,6 @@ struct MiniMaxShapes[tp: Int]:
 
 @fieldwise_init
 struct AttnRefs[tp: Int](Copyable, ImplicitlyCopyable):
-    comptime S = MiniMaxShapes[Self.tp]
-
     var qkv_proj:    TensorRef[I8,  Shape[C.Q_DIM + 2 * C.KV_DIM, C.HIDDEN]]
     var qkv_proj_sc: TensorRef[F32, Shape[C.Q_DIM + 2 * C.KV_DIM, 1]]
     var o_proj:      TensorRef[I8,  Shape[C.HIDDEN, C.Q_DIM]]
@@ -323,11 +318,8 @@ def emit_layer[tp: Int](
     comptime NE = C.NUM_EXPERTS
     comptime S  = MiniMaxShapes[tp]
     comptime experts_local = S.EXPERTS_LOCAL
-    comptime q_n_loc  = C.Q_DIM // tp
-    comptime kv_n_loc = C.KV_DIM // tp
-    comptime o_num_blk = C.NUM_HEADS // tp
-
-    comptime qkv_n_loc = q_n_loc + 2 * kv_n_loc
+    comptime qkv_n_loc = S.QKV_LOCAL
+    comptime o_num_blk = S.NUM_HEADS_LOCAL
     var qkv_proj_off = b.qs[Shape[C.Q_DIM, H, shard_n=True, tp=tp]](e, "self_attn.q_proj.weight")
     _ = b.qs[Shape[C.KV_DIM, H, shard_n=True, tp=tp]](e, "self_attn.k_proj.weight")
     _ = b.qs[Shape[C.KV_DIM, H, shard_n=True, tp=tp]](e, "self_attn.v_proj.weight")
@@ -619,13 +611,6 @@ def build_minimax_plan[tp: Int]() -> MiniMaxM27LoadPlan[tp]:
 
 
 # =============================================================================
-# TP dispatch helper
-# =============================================================================
-
-
-
-
-# =============================================================================
 # Model struct
 # =============================================================================
 
@@ -672,16 +657,16 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         Decode is latency-shaped and small enough for the main-thread reducer.
         Prefill is bandwidth-shaped, so reduce and gather with worker pools.
         """
+        var residual_ptrs = self.x_residual_ptrs()
+        var main_ptrs = self.x_main_ptrs()
         if seq_len == 1:
             small_allreduce[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN], Self.tp,
                 residual_add=True](
-                self.x_residual_ptrs(), seq_len,
-                self.x_main_ptrs())
+                residual_ptrs, seq_len, main_ptrs)
         else:
             parallel_allreduce[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN], Self.tp,
                 residual_add=True](
-                self.x_residual_ptrs(), seq_len, self.main_pools,
-                self.x_main_ptrs())
+                residual_ptrs, seq_len, self.main_pools, main_ptrs)
 
     def token_buffer(mut self) -> UnsafePointer[Scalar[DType.int32], MutAnyOrigin]:
         return UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
@@ -1182,7 +1167,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
     @staticmethod
     def load(
         dir_path: Path,
-        numa: NumaInfo,
         numa_topo: NumaTopology,
         var main_pools: HeapMoveArray[Self.Pool],
     ) -> Optional[Self]:
@@ -1264,7 +1248,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         var t_forward0 = Int(perf_counter_ns())
         var sample = ForwardSample(start_pos, seq_len, produce_next_token)
         var topos = self.topos
-        var host = topos[0]
+        var host = topos[HOST_RANK]
 
         var want_prefill = seq_len > 1
         if want_prefill != self.amx_prefill_mode:
@@ -1334,8 +1318,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                 ](UnsafePointer(to=attn_quant_jobs[0]), self.main_pools),
             )
 
-            # Phase 2: fused QKV projection (contiguous output)
-
             @parameter
             def do_qkv_gemv[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.layers.base(topo.arena.base, layer_idx)
@@ -1353,11 +1335,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
             attn_work_lease^.release()
             attn_i8_lease^.release()
-
-            # Offsets into local QKV buffer
-            comptime Q_OFF = 0
-            comptime K_OFF = Q_LOCAL * 2
-            comptime V_OFF = (Q_LOCAL + KV_LOCAL) * 2
 
             var t_norm_prep0 = Int(perf_counter_ns())
             var inv_rms_q_arr = InlineArray[Float32, PREFILL_CHUNK_SIZE](
@@ -1493,7 +1470,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             qi_biases_lease^.release()
             q_i8_lease^.release()
 
-            # Phase 6: O projection
             @parameter
             def do_o_proj[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
                 var lb = topo.layers.base(topo.arena.base, layer_idx)
@@ -1522,9 +1498,9 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             # FFN BLOCK
             # =============================================================
 
-            # Phase 7: dual-output norm (split-gamma i8 + full-gamma bf16).
+            # Dual-output norm: split-gamma i8 plus full-gamma bf16.
             # LIFO ordering: borrow in reverse order of release-time. Long-lived
-            # leases (used through Phase 9/10/11) sit at the bottom; transient
+            # leases used by the MoE dispatch sit at the bottom; transient
             # scratch (moe_work, only needed during the dual-norm dispatch) is
             # borrowed last so it can be released first.
             var moe_i8_lease = self.scratch.borrow[Scalar[DType.int8], PREFILL_CHUNK_SIZE * C.HIDDEN]()

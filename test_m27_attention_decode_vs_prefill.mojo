@@ -131,7 +131,7 @@ def run_attention_comparison[P: BurstThreadPool, //, tp: Int](
     ).join()
     ring_broadcast[BF16, XShape, tp](
         host.activations.x_main.addr(host.arena.base),
-        model.x_main_ptrs(seq_len),
+        model.x_main_ptrs(),
         seq_len,
         model.main_pools,
     )
@@ -527,7 +527,7 @@ def main():
         for rank in range(TP):
             pools.push(IsolatedBurstPool[].for_topology(numa, numa_topo[rank]))
         var model_opt = MiniMaxM27ButterQuant[TP, IsolatedBurstPool[]].load(
-            Path(MODEL_DIR), numa, numa_topo, pools^)
+            Path(MODEL_DIR), numa_topo, pools^)
         if not model_opt:
             return
         var model = model_opt.take()
@@ -537,7 +537,7 @@ def main():
         for rank in range(TP):
             pools.push(BurstPool[].for_topology(numa, numa_topo[rank]))
         var model_opt = MiniMaxM27ButterQuant[TP, BurstPool[]].load(
-            Path(MODEL_DIR), numa, numa_topo, pools^)
+            Path(MODEL_DIR), numa_topo, pools^)
         if not model_opt:
             return
         var model = model_opt.take()

@@ -447,12 +447,11 @@ def print_variant(label: String, stats: VariantStats):
 def analyze[
     P: BurstThreadPool, //,
 ](
-    numa: NumaInfo,
     numa_topo: NumaTopology,
     var pools: HeapMoveArray[P],
 ) raises:
     var model_opt = MiniMaxM27ButterQuant[TP, P].load(
-        Path(MODEL_DIR), numa, numa_topo, pools^)
+        Path(MODEL_DIR), numa_topo, pools^)
     if not model_opt:
         print("failed to load model")
         return
@@ -737,10 +736,10 @@ def main() raises:
         var pools = HeapMoveArray[IsolatedBurstPool[]](TP)
         for rank in range(TP):
             pools.push(IsolatedBurstPool[].for_topology(numa, numa_topo[rank]))
-        analyze(numa, numa_topo, pools^)
+        analyze(numa_topo, pools^)
     else:
         print("mode: burst")
         var pools = HeapMoveArray[BurstPool[]](TP)
         for rank in range(TP):
             pools.push(BurstPool[].for_topology(numa, numa_topo[rank]))
-        analyze(numa, numa_topo, pools^)
+        analyze(numa_topo, pools^)
