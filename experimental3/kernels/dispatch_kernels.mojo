@@ -57,6 +57,9 @@ from experimental3.kernels.gemm import (
     GEMV_TILE,
     lm_head_worker,
 )
+from experimental3.kernels.gemm_amx import (
+    int8_gemm_amx_worker, int8_gemm_blocked_amx_worker,
+)
 from kernels.vnni import VNNI_N_STEP
 from experimental3.moe import router_topk_kernel
 from experimental3.kernels.sliding_attention import sliding_attn_group_kernel
@@ -154,7 +157,7 @@ def int8_gemv[
             act_p + start * K, wpacked_p, colsum_p,
             weight_scale_p, dst_p + start * N,
             act_scale_p, start, end - start)
-    pool.dispatch[WorkerConfig, int8_gemv_worker[N, K]](
+    pool.dispatch[WorkerConfig, int8_gemm_amx_worker[N, K]](
         UnsafePointer(to=jobs[0]), num_jobs)
     return PoolFence[P, origin].over(pool)
 
@@ -236,7 +239,7 @@ def int8_gemv_blocked[
             blk_scale_p + start * num_blocks, wscale_p, blk_colsum_p,
             dst_p + start * N, output_scale, N, N, end - start)
         actual += 1
-    pool.dispatch[Int8GemvBlockedArgs, int8_gemv_blocked_worker[N, K, fwht_blk]](
+    pool.dispatch[Int8GemvBlockedArgs, int8_gemm_blocked_amx_worker[N, K, fwht_blk]](
         UnsafePointer(to=jobs[0]), actual)
     return PoolFence[P, origin].over(pool)
 

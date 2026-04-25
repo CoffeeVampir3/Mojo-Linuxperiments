@@ -18,6 +18,7 @@ comptime AtomicInt32 = Atomic[DType.int32]
 comptime RANK_STATE_STRIDE = 64
 comptime COUNTER_OFF = 0
 comptime DONE_OFF = 8
+comptime TRACE_PARALLEL_ALLREDUCE = False
 
 
 @always_inline
@@ -111,6 +112,37 @@ struct FusedReduceGatherArgs(Copyable, ImplicitlyCopyable):
     var num_workers: Int
 
 
+@fieldwise_init
+struct ParallelReduceArgs[tp: Int](Copyable, ImplicitlyCopyable):
+    var src_ptrs: InlineArray[Int, Self.tp]
+    var dst_ptrs: InlineArray[Int, Self.tp]
+    var chunk: Int
+    var rem: Int
+    var start_element: Int
+    var end_element: Int
+    var my_rank: Int
+    var worker_idx: Int
+    var num_workers: Int
+
+
+def make_parallel_reduce_args[tp: Int](
+    ptrs: InlineArray[Int, tp],
+    dst_ptrs: InlineArray[Int, tp],
+    chunk: Int,
+    rem: Int,
+    start_element: Int,
+    end_element: Int,
+    my_rank: Int,
+    worker_idx: Int,
+    num_workers: Int,
+) -> ParallelReduceArgs[tp]:
+    comptime assert tp > 0, "parallel allreduce requires at least one rank"
+    return ParallelReduceArgs[tp](
+        ptrs, dst_ptrs, chunk, rem,
+        start_element, end_element, my_rank, worker_idx, num_workers,
+    )
+
+
 def memcpy_kernel(args: MemcpyArgs):
     memcpy(
         dest=tptr[Byte](args.dst),
@@ -125,6 +157,93 @@ def fused_reduce_gather_kernel(args: FusedReduceGatherArgs):
 
 def fused_reduce_gather_add_kernel(args: FusedReduceGatherArgs):
     fused_reduce_gather_impl[True](args)
+
+
+def reduce_chunk_kernel[tp: Int](args: ParallelReduceArgs[tp]):
+    reduce_chunk_impl[False, tp](args)
+
+
+def reduce_chunk_add_kernel[tp: Int](args: ParallelReduceArgs[tp]):
+    reduce_chunk_impl[True, tp](args)
+
+
+def gather_chunks_kernel[tp: Int](args: ParallelReduceArgs[tp]):
+    gather_chunks_impl[False, tp](args)
+
+
+def gather_chunks_add_kernel[tp: Int](args: ParallelReduceArgs[tp]):
+    gather_chunks_impl[True, tp](args)
+
+
+def reduce_chunk_impl[residual_add: Bool, tp: Int](args: ParallelReduceArgs[tp]):
+    """Worker-parallel reduce phase without worker-side cross-rank waits."""
+    var my_rank = args.my_rank
+    var my_out_addr = args.src_ptrs[my_rank]
+    comptime if residual_add:
+        my_out_addr = args.dst_ptrs[my_rank]
+
+    var dst = tptr[Scalar[DType.bfloat16]](my_out_addr)
+    comptime width = simd_width_of[DType.float32]()
+
+    var i = args.start_element
+    while i < args.end_element and i % width != 0:
+        var acc = Float32(tptr[Scalar[DType.bfloat16]](args.src_ptrs[0])[i])
+        for r in range(1, tp):
+            acc += Float32(tptr[Scalar[DType.bfloat16]](args.src_ptrs[r])[i])
+        comptime if residual_add:
+            acc += Float32(dst[i])
+        dst[i] = Scalar[DType.bfloat16](acc)
+        i += 1
+    while i + width <= args.end_element:
+        var acc = tptr[Scalar[DType.bfloat16]](args.src_ptrs[0]).load[
+            width=width](i).cast[DType.float32]()
+        for r in range(1, tp):
+            acc += tptr[Scalar[DType.bfloat16]](args.src_ptrs[r]).load[
+                width=width](i).cast[DType.float32]()
+        comptime if residual_add:
+            acc += (dst + i).load[width=width]().cast[DType.float32]()
+        (dst + i).store(acc.cast[DType.bfloat16]())
+        i += width
+    while i < args.end_element:
+        var acc = Float32(tptr[Scalar[DType.bfloat16]](args.src_ptrs[0])[i])
+        for r in range(1, tp):
+            acc += Float32(tptr[Scalar[DType.bfloat16]](args.src_ptrs[r])[i])
+        comptime if residual_add:
+            acc += Float32(dst[i])
+        dst[i] = Scalar[DType.bfloat16](acc)
+        i += 1
+
+
+def gather_chunks_impl[residual_add: Bool, tp: Int](args: ParallelReduceArgs[tp]):
+    """Worker-parallel gather phase after the main thread joins reduction."""
+    var my_rank = args.my_rank
+    var my_out_addr = args.src_ptrs[my_rank]
+    comptime if residual_add:
+        my_out_addr = args.dst_ptrs[my_rank]
+
+    for src_rank in range(tp):
+        if src_rank == my_rank:
+            continue
+
+        var src_chunk_start = src_rank * args.chunk
+        var src_chunk_count = args.chunk
+        if src_rank == tp - 1:
+            src_chunk_count += args.rem
+        var src_chunk_end = src_chunk_start + src_chunk_count
+
+        var copy_start = max(args.start_element, src_chunk_start)
+        var copy_end = min(args.end_element, src_chunk_end)
+        if copy_start < copy_end:
+            var src_addr = args.src_ptrs[src_rank]
+            comptime if residual_add:
+                src_addr = args.dst_ptrs[src_rank]
+            memcpy(
+                dest=UnsafePointer[Byte, MutAnyOrigin](
+                    unsafe_from_address=my_out_addr + copy_start * 2),
+                src=UnsafePointer[Byte, MutAnyOrigin](
+                    unsafe_from_address=src_addr + copy_start * 2),
+                count=(copy_end - copy_start) * 2,
+            )
 
 
 def fused_reduce_gather_impl[residual_add: Bool](args: FusedReduceGatherArgs):
@@ -353,6 +472,128 @@ def ring_allreduce[
 
     for r in range(tp):
         pools[r].join()
+
+
+def parallel_allreduce[
+    P: BurstThreadPool, //,
+    E: Encoding, S: ShapeLike, tp: Int, residual_add: Bool = False,
+](
+    ptrs: InlineArray[Int, tp],
+    seq_len: Int,
+    mut pools: HeapMoveArray[P],
+    dst_ptrs: InlineArray[Int, tp] = InlineArray[Int, tp](fill=0),
+):
+    """Two-stage worker-parallel allreduce.
+
+    This uses the same shard ownership as ring_allreduce but keeps the barrier
+    on the main thread: dispatch reduce chunks, join all ranks, then dispatch
+    gather copies. That avoids worker-side cross-rank spin waits, which are
+    hard to debug and can hang the entire pool if one rank fails to signal.
+    """
+    comptime assert E.DTYPE == DType.bfloat16, "parallel_allreduce: only bf16 tensors are supported"
+    comptime assert E.ELEMENT_BYTES == 2, "parallel_allreduce: bf16 byte width mismatch"
+    comptime cols = S.M
+    var total_elements = seq_len * cols
+    if total_elements <= 0 or tp <= 1:
+        comptime if residual_add:
+            if total_elements > 0 and tp == 1:
+                comptime width = simd_width_of[DType.float32]()
+                var src = tptr[Scalar[DType.bfloat16]](ptrs[0])
+                var dst = tptr[Scalar[DType.bfloat16]](dst_ptrs[0])
+                var j = 0
+                while j + width <= total_elements:
+                    var s = (src + j).load[width=width]().cast[DType.float32]()
+                    var d = (dst + j).load[width=width]().cast[DType.float32]()
+                    (dst + j).store((d + s).cast[DType.bfloat16]())
+                    j += width
+                while j < total_elements:
+                    dst[j] = Scalar[DType.bfloat16](
+                        Float32(dst[j]) + Float32(src[j]))
+                    j += 1
+        return
+
+    var chunk = total_elements // tp
+    var rem = total_elements - chunk * tp
+
+    comptime if TRACE_PARALLEL_ALLREDUCE:
+        print(
+            "DBG parallel_allreduce begin total=", total_elements,
+            " chunk=", chunk, " rem=", rem)
+
+    var jobs = InlineArray[ParallelReduceArgs[tp], 128](
+        fill=make_parallel_reduce_args[tp](
+            ptrs, dst_ptrs, chunk, rem, 0, 0, 0, 0, 1)
+    )
+
+    for r in range(tp):
+        var rank_start = r * chunk
+        var rank_count = chunk + (rem if r == tp - 1 else 0)
+        var num_workers = pools[r].get_capacity()
+        var elems_per_worker = (rank_count + num_workers - 1) // num_workers
+        comptime if TRACE_PARALLEL_ALLREDUCE:
+            print(
+                "DBG parallel_allreduce reduce dispatch r=", r,
+                " workers=", num_workers,
+                " rank_start=", rank_start,
+                " rank_count=", rank_count,
+                " elems_per_worker=", elems_per_worker)
+        for w in range(num_workers):
+            var w_start = rank_start + w * elems_per_worker
+            var w_end = min(w_start + elems_per_worker, rank_start + rank_count)
+            if w_start >= rank_start + rank_count:
+                w_start = rank_start + rank_count
+                w_end = w_start
+            jobs[w] = make_parallel_reduce_args[tp](
+                ptrs, dst_ptrs, chunk, rem,
+                w_start, w_end, r, w, num_workers)
+        comptime if residual_add:
+            pools[r].dispatch[ParallelReduceArgs[tp], reduce_chunk_add_kernel[tp]](
+                UnsafePointer(to=jobs[0]), num_workers)
+        else:
+            pools[r].dispatch[ParallelReduceArgs[tp], reduce_chunk_kernel[tp]](
+                UnsafePointer(to=jobs[0]), num_workers)
+
+    for r in range(tp):
+        comptime if TRACE_PARALLEL_ALLREDUCE:
+            print("DBG parallel_allreduce reduce join begin r=", r)
+        pools[r].join()
+        comptime if TRACE_PARALLEL_ALLREDUCE:
+            print("DBG parallel_allreduce reduce join done r=", r)
+
+    for r in range(tp):
+        var num_workers = pools[r].get_capacity()
+        var elems_per_worker = (
+            total_elements + num_workers - 1) // num_workers
+        comptime if TRACE_PARALLEL_ALLREDUCE:
+            print(
+                "DBG parallel_allreduce gather dispatch r=", r,
+                " workers=", num_workers,
+                " elems_per_worker=", elems_per_worker)
+        for w in range(num_workers):
+            var w_start = w * elems_per_worker
+            var w_end = min(w_start + elems_per_worker, total_elements)
+            if w_start >= total_elements:
+                w_start = total_elements
+                w_end = w_start
+            jobs[w] = make_parallel_reduce_args[tp](
+                ptrs, dst_ptrs, chunk, rem,
+                w_start, w_end, r, w, num_workers)
+        comptime if residual_add:
+            pools[r].dispatch[ParallelReduceArgs[tp], gather_chunks_add_kernel[tp]](
+                UnsafePointer(to=jobs[0]), num_workers)
+        else:
+            pools[r].dispatch[ParallelReduceArgs[tp], gather_chunks_kernel[tp]](
+                UnsafePointer(to=jobs[0]), num_workers)
+
+    for r in range(tp):
+        comptime if TRACE_PARALLEL_ALLREDUCE:
+            print("DBG parallel_allreduce gather join begin r=", r)
+        pools[r].join()
+        comptime if TRACE_PARALLEL_ALLREDUCE:
+            print("DBG parallel_allreduce gather join done r=", r)
+
+    comptime if TRACE_PARALLEL_ALLREDUCE:
+        print("DBG parallel_allreduce done")
 
 
 struct AllGatherConfig:

@@ -1,5 +1,4 @@
 from std.memory import UnsafePointer
-from std.sys.info import simd_width_of, size_of
 from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
 
@@ -8,7 +7,7 @@ from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY
 from modeling.model_spec import StaticTensor, DynamicTensor
 from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr, BF16Ptr
 from experimental3.kernels.dispatch_args import Int8GemvBlockedArgs, ChunkedAttnArgs
-from experimental3.kernels.gemm import int8_gemv_blocked_worker, int8_gemv_blocked_decode_worker
+from experimental3.kernels.gemm import int8_gemv_blocked_decode_worker
 from kernels.vnni import VNNI_N_STEP
 from experimental3.kv_cache import CACHE_WIDTH
 from minimax.kernels.amx_attention import amx_chunked_attn_kernel
@@ -19,7 +18,6 @@ from minimax.kernels.dispatch_args import (
     SparseRoute,
     SparseMoePhase1Args,
     SparseMoePhase2Args,
-    AttnGroupArgs,
     KVWriteBatchArgs,
     QPrepBatchArgs,
     PrefillAttnArgs,
@@ -32,8 +30,8 @@ from minimax.kernels.gemm import (
     sparse_moe_phase2_worker,
 )
 from minimax.kernels.attention import (
-    kv_write_kernel, kv_write_batch_kernel, q_prep_batch_kernel,
-    prefill_attn_worker,
+    kv_write_batch_kernel, q_prep_batch_kernel,
+    prefill_attn_persistent_worker,
 )
 from minimax.kernels.router import router_fused_worker
 
@@ -257,7 +255,7 @@ def chunked_score_dispatch_multi[
 
 
 # ============================================================================
-# Prefill attention dispatch — (kv_head, q_tile) jobs across pool
+# Prefill attention dispatch — bounded persistent workers across tiles
 # ============================================================================
 
 
@@ -279,37 +277,33 @@ def prefill_attn_dispatch[
 ) -> PoolFence[P, origin]:
     comptime Q_TILE = 16
     var cache = U8Ptr(unsafe_from_address=cache_base)
+    var num_q_tiles = (seq_len + Q_TILE - 1) // Q_TILE
+    var total_work = num_kv_heads * num_q_tiles
+    var num_workers = min(pool.get_capacity(), total_work)
+    if num_workers <= 0:
+        return PoolFence[P, origin].over(pool)
 
     var jobs = InlineArray[PrefillAttnArgs, MAX_POOL_CAPACITY](
         fill=PrefillAttnArgs())
-    var idx = 0
-    for kv in range(num_kv_heads):
-        for tile_start in range(0, seq_len, Q_TILE):
-            var tile_count = min(Q_TILE, seq_len - tile_start)
-            var ctx = start_pos + tile_start + tile_count
-            jobs[idx] = PrefillAttnArgs(
-                q_i8=q_i8_base + kv * heads_per_group * seq_len * head_dim
-                    + tile_start * head_dim,
-                qi_biases=qi_biases_base + kv * heads_per_group * seq_len
-                    + tile_start,
-                q_factors=q_scales_base + kv * heads_per_group * seq_len
-                    + tile_start,
-                cache_base=cache,
-                kv_head=kv,
-                q_start=start_pos + tile_start,
-                q_count=tile_count,
-                context_len=ctx,
-                qi_out=qi_out + tile_start * q_local,
-                qi_out_row_stride=q_local,
-                head_sc_out=head_sc_out + tile_start * heads_per_rank,
-                head_sc_row_stride=heads_per_rank,
-                head_col_offset=kv * heads_per_group * head_dim,
-                pos_count=seq_len)
-            idx += 1
+    for worker in range(num_workers):
+        jobs[worker] = PrefillAttnArgs(
+            q_i8_base=q_i8_base,
+            qi_biases_base=qi_biases_base,
+            q_factors_base=q_scales_base,
+            cache_base=cache,
+            start_pos=start_pos,
+            seq_len=seq_len,
+            qi_out_base=qi_out,
+            qi_out_row_stride=q_local,
+            head_sc_out_base=head_sc_out,
+            head_sc_row_stride=heads_per_rank,
+            worker_id=worker,
+            num_workers=num_workers)
     pool.dispatch[PrefillAttnArgs,
-        prefill_attn_worker[head_dim, max_seq, num_kv_heads, num_q_heads,
-            heads_per_group]](
-        UnsafePointer(to=jobs[0]), idx)
+        prefill_attn_persistent_worker[
+            head_dim, max_seq, num_kv_heads, num_q_heads,
+            heads_per_group, q_local, heads_per_rank]](
+        UnsafePointer(to=jobs[0]), num_workers)
     return PoolFence[P, origin].over(pool)
 
 

@@ -3,7 +3,7 @@ from std.pathlib import Path
 
 comptime DECODE_DIR = "m27_dump_decode"
 comptime PREFILL_DIR = "m27_dump_prefill"
-comptime MAX_PROMPT_POS = 41
+comptime MAX_PROMPT_POS = -1  # < 0 means compare every dumped prompt position.
 comptime PROGRESS_INTERVAL = 20000
 
 
@@ -27,7 +27,12 @@ def should_compare(name: String) raises -> Bool:
     if not name.endswith(".bin"):
         return False
     var pos = prompt_pos(name)
-    return pos >= 0 and pos <= MAX_PROMPT_POS
+    if pos < 0:
+        return False
+    comptime if MAX_PROMPT_POS < 0:
+        return True
+    else:
+        return pos <= MAX_PROMPT_POS
 
 
 def compare_one(name: String) raises -> Bool:

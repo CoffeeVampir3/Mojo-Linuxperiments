@@ -94,13 +94,17 @@ def timed_tp_dispatch_recursive[
     topos: InlineArray[Topo, tp],
     mut pools: HeapMoveArray[Pool],
     mut max_done_ns: Int,
+    mut dispatch_end_ns: Int,
 ):
     comptime if rank < tp:
         var fence = body[rank, origin_of(pools)](topos[rank], pools[rank])
-        timed_tp_dispatch_recursive[rank + 1, tp, body](topos, pools, max_done_ns)
+        timed_tp_dispatch_recursive[rank + 1, tp, body](
+            topos, pools, max_done_ns, dispatch_end_ns)
         var done_ns = fence^.finish()
         if done_ns > max_done_ns:
             max_done_ns = done_ns
+    else:
+        dispatch_end_ns = Int(perf_counter_ns())
 
 
 def timed_tp_parallel[
@@ -114,23 +118,36 @@ def timed_tp_parallel[
 ) -> PhaseTiming:
     var t0 = Int(perf_counter_ns())
     var max_done_ns: Int = 0
-    timed_tp_dispatch_recursive[0, tp, body](topos, pools, max_done_ns)
+    var dispatch_end_ns = t0
+    timed_tp_dispatch_recursive[0, tp, body](
+        topos, pools, max_done_ns, dispatch_end_ns)
     var t_end = Int(perf_counter_ns())
     return phase_timing_from_points(
-        t0, t0, max_done_ns, t0, t_end, max_done_ns > 0)
+        t0, dispatch_end_ns, max_done_ns,
+        dispatch_end_ns, t_end, max_done_ns > 0)
 
 
 struct ForwardSample(Copyable, ImplicitlyCopyable):
     var pos: Int
+    var token_count: Int
+    var produces_next_token: Bool
     var wall_ns: Int
     var phases: InlineArray[PhaseTiming, MAX_PHASES]
 
-    def __init__(out self, pos: Int):
+    def __init__(
+        out self,
+        pos: Int,
+        token_count: Int = 1,
+        produces_next_token: Bool = True,
+    ):
         self.pos = pos
+        self.token_count = token_count if token_count > 0 else 1
+        self.produces_next_token = produces_next_token
         self.wall_ns = 0
         self.phases = InlineArray[PhaseTiming, MAX_PHASES](fill=PhaseTiming())
 
     def add(mut self, phase: Int, timing: PhaseTiming):
+        debug_assert(phase >= 0 and phase < MAX_PHASES, "invalid profile phase")
         self.phases[phase].add(timing)
 
     def phase_sum_ns(self, count: Int) -> Int:
@@ -162,12 +179,24 @@ struct PhaseStats(Copyable, ImplicitlyCopyable):
     var dispatch: NsStats
     var kernel: NsStats
     var join: NsStats
+    var active_total: NsStats
+    var active_dispatch: NsStats
+    var active_kernel: NsStats
+    var active_join: NsStats
+    var active_count: Int
+    var sum_ns: Int
 
     def __init__(out self):
         self.total = NsStats()
         self.dispatch = NsStats()
         self.kernel = NsStats()
         self.join = NsStats()
+        self.active_total = NsStats()
+        self.active_dispatch = NsStats()
+        self.active_kernel = NsStats()
+        self.active_join = NsStats()
+        self.active_count = 0
+        self.sum_ns = 0
 
 
 @fieldwise_init
@@ -285,24 +314,36 @@ def runtime_sqrt(x: Float64) -> Float64:
     return g
 
 
+def histogram_select(counts: List[Int], base: Int, target_idx: Int) -> Int:
+    var seen = 0
+    for offset in range(len(counts)):
+        seen += counts[offset]
+        if seen > target_idx:
+            return base + offset
+    return base + len(counts) - 1
+
+
 def ns_stats(values: List[Int]) -> NsStats:
     var out = NsStats()
     var n = len(values)
     if n == 0:
         return out^
 
-    var sorted = List[Int](capacity=n)
     var sum = Float64(0)
     var sum_sq = Float64(0)
-    var max_ns = 0
+    var min_ns = values[0]
+    var max_ns = values[0]
     for i in range(n):
         var v = values[i]
-        sorted.append(v)
         sum += Float64(v)
         sum_sq += Float64(v) * Float64(v)
+        if v < min_ns:
+            min_ns = v
         if v > max_ns:
             max_ns = v
-    sort_ints(sorted)
+    var p50_idx = percentile_index(n, 50)
+    var p90_idx = percentile_index(n, 90)
+    var p99_idx = percentile_index(n, 99)
 
     var mean = sum / Float64(n)
     var variance = sum_sq / Float64(n) - mean * mean
@@ -311,23 +352,65 @@ def ns_stats(values: List[Int]) -> NsStats:
 
     out.mean_ns = Int(mean)
     out.stddev_ns = Int(runtime_sqrt(variance))
-    out.p50_ns = sorted[percentile_index(n, 50)]
-    out.p90_ns = sorted[percentile_index(n, 90)]
-    out.p99_ns = sorted[percentile_index(n, 99)]
     out.max_ns = max_ns
+
+    var value_range = max_ns - min_ns
+    if n > 4096 and value_range >= 0 and value_range <= 262_144:
+        var counts = List[Int](length=value_range + 1, fill=0)
+        for i in range(n):
+            var idx = values[i] - min_ns
+            counts[idx] = counts[idx] + 1
+        out.p50_ns = histogram_select(counts, min_ns, p50_idx)
+        out.p90_ns = histogram_select(counts, min_ns, p90_idx)
+        out.p99_ns = histogram_select(counts, min_ns, p99_idx)
+        return out^
+
+    var sorted = List[Int](capacity=n)
+    for i in range(n):
+        sorted.append(values[i])
+    sort_ints(sorted)
+
+    out.p50_ns = sorted[p50_idx]
+    out.p90_ns = sorted[p90_idx]
+    out.p99_ns = sorted[p99_idx]
     return out^
 
 
 def phase_stats(dispatch_vals: List[Int], kernel_vals: List[Int], join_vals: List[Int]) -> PhaseStats:
     var totals = List[Int](capacity=len(dispatch_vals))
+    var active_totals = List[Int]()
+    var active_dispatch = List[Int]()
+    var active_kernel = List[Int]()
+    var active_join = List[Int]()
+    var sum_ns = 0
     for i in range(len(dispatch_vals)):
-        totals.append(dispatch_vals[i] + kernel_vals[i] + join_vals[i])
+        var total = dispatch_vals[i] + kernel_vals[i] + join_vals[i]
+        totals.append(total)
+        sum_ns += total
+        if total > 0:
+            active_totals.append(total)
+            active_dispatch.append(dispatch_vals[i])
+            active_kernel.append(kernel_vals[i])
+            active_join.append(join_vals[i])
     var out = PhaseStats()
     out.total = ns_stats(totals)
     out.dispatch = ns_stats(dispatch_vals)
     out.kernel = ns_stats(kernel_vals)
     out.join = ns_stats(join_vals)
+    out.active_total = ns_stats(active_totals)
+    out.active_dispatch = ns_stats(active_dispatch)
+    out.active_kernel = ns_stats(active_kernel)
+    out.active_join = ns_stats(active_join)
+    out.active_count = len(active_totals)
+    out.sum_ns = sum_ns
     return out^
+
+
+@always_inline
+def safe_div_int(numer: Int, denom: Int) -> Int:
+    if denom <= 0:
+        return 0
+    return numer // denom
 
 
 def repeat_spaces(count: Int) -> String:
@@ -446,7 +529,7 @@ def sort_phase_rows(mut rows: List[PhaseReportRow]):
     for i in range(1, len(rows)):
         var x = rows[i]
         var j = i
-        while j > 0 and rows[j - 1].stats.total.mean_ns < x.stats.total.mean_ns:
+        while j > 0 and rows[j - 1].stats.sum_ns < x.stats.sum_ns:
             rows[j] = rows[j - 1]
             j -= 1
         rows[j] = x
@@ -527,6 +610,7 @@ struct ForwardLogger(Movable):
             if self.names[i] == name:
                 return i
         var idx = len(self.names)
+        debug_assert(idx < MAX_PHASES, "too many profile phases")
         self.names.append(name)
         return idx
 
@@ -775,30 +859,55 @@ struct ForwardLogger(Movable):
         var phase_sum_vals = List[Int](capacity=n)
         var min_pos = self.samples[0].pos
         var max_pos = self.samples[0].pos
+        var total_wall_ns = 0
+        var total_phase_sum_ns = 0
+        var total_tokens = 0
+        var next_token_forwards = 0
         for i in range(n):
             var s = self.samples[i]
+            var tokens = s.token_count
+            if tokens <= 0:
+                tokens = 1
+            var end_pos = s.pos + tokens - 1
             wall_vals.append(s.wall_ns)
-            phase_sum_vals.append(s.phase_sum_ns(np))
+            var phase_sum_ns = s.phase_sum_ns(np)
+            phase_sum_vals.append(phase_sum_ns)
+            total_wall_ns += s.wall_ns
+            total_phase_sum_ns += phase_sum_ns
+            total_tokens += tokens
+            if s.produces_next_token:
+                next_token_forwards += 1
             if s.pos < min_pos:
                 min_pos = s.pos
-            if s.pos > max_pos:
-                max_pos = s.pos
+            if end_pos > max_pos:
+                max_pos = end_pos
         var wall = ns_stats(wall_vals)
         var phase_sum = ns_stats(phase_sum_vals)
+        var wall_per_token = safe_div_int(total_wall_ns, total_tokens)
+        var phase_sum_per_token = safe_div_int(total_phase_sum_ns, total_tokens)
 
         print(label + " forward profile")
-        print("  samples:   " + String(n))
+        print("  forwards:  " + String(n)
+            + "  input-tokens: " + String(total_tokens)
+            + "  next-token-forwards: " + String(next_token_forwards))
         print("  positions: " + String(min_pos) + ".." + String(max_pos))
-        print("  wall / token")
+        print("  wall / forward")
         print("    avg    " + pad_left(format_ms3(wall.mean_ns), 9)
             + " ms    stddev " + pad_left(format_ms3(wall.stddev_ns), 9) + " ms")
         print("    p50    " + pad_left(format_ms3(wall.p50_ns), 9)
             + " ms    p90    " + pad_left(format_ms3(wall.p90_ns), 9) + " ms")
         print("    p99    " + pad_left(format_ms3(wall.p99_ns), 9)
             + " ms    max    " + pad_left(format_ms3(wall.max_ns), 9) + " ms")
-        print("  phase-sum / token")
-        print("    avg    " + pad_left(format_ms3(phase_sum.mean_ns), 9)
-            + " ms    overlap-counted " + pad_left(format_pct1(phase_sum.mean_ns, wall.mean_ns), 8) + " of wall")
+        print("  wall / input token")
+        print("    aggregate " + pad_left(format_ms3(wall_per_token), 9)
+            + " ms/token")
+        print("  phase-sum")
+        print("    avg/forward " + pad_left(format_ms3(phase_sum.mean_ns), 9)
+            + " ms    aggregate " + pad_left(format_ms3(phase_sum_per_token), 9)
+            + " ms/input-token"
+            + "    overlap-counted "
+            + pad_left(format_pct1(total_phase_sum_ns, total_wall_ns), 8)
+            + " of wall")
         var rows = List[PhaseReportRow](capacity=np)
         for phase_idx in range(np):
             var dispatch_vals = List[Int](capacity=n)
@@ -818,7 +927,9 @@ struct ForwardLogger(Movable):
         for i in range(len(rows)):
             var row = rows[i]
             var ps = row.stats
-            if ps.total.max_ns < 50_000 and ps.dispatch.p99_ns < 50_000 and ps.join.p99_ns < 50_000:
+            if ps.active_count == 0:
+                continue
+            if ps.active_total.max_ns < 50_000 and ps.active_dispatch.p99_ns < 50_000 and ps.active_join.p99_ns < 50_000:
                 if omitted.byte_length() > 0:
                     omitted += ", "
                 omitted += self.names[row.phase_idx]
@@ -827,40 +938,48 @@ struct ForwardLogger(Movable):
                 if top_summary.byte_length() > 0:
                     top_summary += "  "
                 top_summary += self.names[row.phase_idx] + " "
-                top_summary += format_pct1(ps.total.mean_ns, wall.mean_ns)
+                top_summary += format_pct1(ps.sum_ns, total_wall_ns)
                 shown += 1
 
         if top_summary.byte_length() > 0:
             print("  hot path:  " + top_summary)
-        print("  note: phase timings are local elapsed times; overlapped phases can sum above 100% of wall.")
+        print("  note: share is total phase time / total wall time. avg/forward includes skipped forwards; active columns only include forwards where the phase ran.")
 
         print("  phases")
         print("    "
             + pad_right("phase", 20)
-            + pad_left("vs wall", 8) + "  "
-            + pad_left("avg", 9) + "  "
-            + pad_left("p99", 9) + "  "
-            + pad_left("max", 9)
-            + " | dispatch avg/p99 | kernel avg/p99 | join avg/p99  [ms]")
-        print("    " + repeat_spaces(20) + "--------  ---------  ---------  --------- | ---------------- | -------------- | ------------")
+            + pad_left("share", 8) + "  "
+            + pad_left("avg/fwd", 9) + "  "
+            + pad_left("avg/tok", 9) + "  "
+            + pad_left("act avg", 9) + "  "
+            + pad_left("act p99", 9) + "  "
+            + pad_left("act max", 9) + "  "
+            + pad_left("runs", 9)
+            + " | dispatch a/p99 | kernel a/p99 | join a/p99  [ms]")
+        print("    " + repeat_spaces(20) + "--------  ---------  ---------  ---------  ---------  ---------  --------- | -------------- | ------------ | ----------")
 
         for i in range(len(rows)):
             var row = rows[i]
             var ps = row.stats
-            if ps.total.max_ns < 50_000 and ps.dispatch.p99_ns < 50_000 and ps.join.p99_ns < 50_000:
+            if ps.active_count == 0:
+                continue
+            if ps.active_total.max_ns < 50_000 and ps.active_dispatch.p99_ns < 50_000 and ps.active_join.p99_ns < 50_000:
                 continue
             print("    "
                 + pad_right(self.names[row.phase_idx], 20)
-                + pad_left(format_pct1(ps.total.mean_ns, wall.mean_ns), 8) + "  "
+                + pad_left(format_pct1(ps.sum_ns, total_wall_ns), 8) + "  "
                 + pad_left(format_ms3(ps.total.mean_ns), 9) + "  "
-                + pad_left(format_ms3(ps.total.p99_ns), 9) + "  "
-                + pad_left(format_ms3(ps.total.max_ns), 9)
-                + " | " + pad_left(format_ms3(ps.dispatch.mean_ns), 8)
-                + "/" + pad_left(format_ms3(ps.dispatch.p99_ns), 8)
-                + " | " + pad_left(format_ms3(ps.kernel.mean_ns), 8)
-                + "/" + pad_left(format_ms3(ps.kernel.p99_ns), 8)
-                + " | " + pad_left(format_ms3(ps.join.mean_ns), 8)
-                + "/" + pad_left(format_ms3(ps.join.p99_ns), 8))
+                + pad_left(format_ms3(safe_div_int(ps.sum_ns, total_tokens)), 9) + "  "
+                + pad_left(format_ms3(ps.active_total.mean_ns), 9) + "  "
+                + pad_left(format_ms3(ps.active_total.p99_ns), 9) + "  "
+                + pad_left(format_ms3(ps.active_total.max_ns), 9) + "  "
+                + pad_left(String(ps.active_count) + "/" + String(n), 9)
+                + " | " + pad_left(format_ms3(ps.active_dispatch.mean_ns), 6)
+                + "/" + pad_left(format_ms3(ps.active_dispatch.p99_ns), 6)
+                + " | " + pad_left(format_ms3(ps.active_kernel.mean_ns), 6)
+                + "/" + pad_left(format_ms3(ps.active_kernel.p99_ns), 6)
+                + " | " + pad_left(format_ms3(ps.active_join.mean_ns), 6)
+                + "/" + pad_left(format_ms3(ps.active_join.p99_ns), 6))
         if omitted.byte_length() > 0:
             print("    omitted tiny phases: " + omitted)
         self.report_moe()

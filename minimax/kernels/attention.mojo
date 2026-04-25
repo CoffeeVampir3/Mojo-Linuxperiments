@@ -15,8 +15,8 @@ from experimental3.common_math import F32Ptr, BF16Ptr, I8Ptr, U8Ptr
 from notstdcollections import AlignedInlineArray
 from minimax.kernels.qk_prep import prep_q_head, write_k_head, write_v_direct
 from minimax.kernels.dispatch_args import (
-    AttnGroupArgs, MergeQuantArgs, KVWriteBatchArgs, QPrepBatchArgs,
-    PrefillAttnArgs,
+    MergeQuantArgs, KVWriteBatchArgs, QPrepBatchArgs,
+    PrefillAttnArgs, PrefillAttnTileArgs,
 )
 
 
@@ -193,7 +193,7 @@ def merge_quant_worker[
 
 
 # ============================================================================
-# Prefill attention — one (kv_head, q_tile) per worker, loops HPG heads
+# Prefill attention — tile body plus persistent worker scheduling
 # ============================================================================
 
 
@@ -207,7 +207,7 @@ def prefill_attn_worker[
     head_dim: Int, max_seq: Int,
     num_kv_heads: Int, num_q_heads: Int,
     heads_per_group: Int,
-](args: PrefillAttnArgs):
+](args: PrefillAttnTileArgs):
     var cache = Gemma4KVCache[max_seq, head_dim, num_kv_heads, num_q_heads](
         Int(args.cache_base))
     var k_scales = cache.k_scale_ptr(args.kv_head)
@@ -456,3 +456,44 @@ def prefill_attn_worker[
     _ = w_arr
     _ = sf_arr
     _ = bcast_arr
+
+
+def prefill_attn_persistent_worker[
+    head_dim: Int, max_seq: Int,
+    num_kv_heads: Int, num_q_heads: Int,
+    heads_per_group: Int,
+    q_local: Int, heads_per_rank: Int,
+](args: PrefillAttnArgs):
+    comptime Q_TILE = 16
+    var num_q_tiles = (args.seq_len + Q_TILE - 1) // Q_TILE
+    var total_work = num_kv_heads * num_q_tiles
+    var work_id = args.worker_id
+    while work_id < total_work:
+        var kv = work_id // num_q_tiles
+        var q_tile = work_id - kv * num_q_tiles
+        var tile_start = q_tile * Q_TILE
+        var tile_count = min(Q_TILE, args.seq_len - tile_start)
+        var ctx = args.start_pos + tile_start + tile_count
+
+        var tile_args = PrefillAttnTileArgs(
+            q_i8=args.q_i8_base + kv * heads_per_group * args.seq_len * head_dim
+                + tile_start * head_dim,
+            qi_biases=args.qi_biases_base + kv * heads_per_group * args.seq_len
+                + tile_start,
+            q_factors=args.q_factors_base + kv * heads_per_group * args.seq_len
+                + tile_start,
+            cache_base=args.cache_base,
+            kv_head=kv,
+            q_start=args.start_pos + tile_start,
+            q_count=tile_count,
+            context_len=ctx,
+            qi_out=args.qi_out_base + tile_start * q_local,
+            qi_out_row_stride=q_local,
+            head_sc_out=args.head_sc_out_base + tile_start * heads_per_rank,
+            head_sc_row_stride=heads_per_rank,
+            head_col_offset=kv * heads_per_group * head_dim,
+            pos_count=args.seq_len)
+        prefill_attn_worker[
+            head_dim, max_seq, num_kv_heads, num_q_heads, heads_per_group](
+            tile_args)
+        work_id += args.num_workers

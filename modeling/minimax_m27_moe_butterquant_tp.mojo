@@ -23,7 +23,7 @@ from modeling.modeling_common import (
     LayerBuilder, ArenaLayout,
 )
 from kernels.kernel_ops import PoolFence, embed_lookup
-from kernels.reductions import small_allreduce, ring_broadcast
+from kernels.reductions import small_allreduce, parallel_allreduce, ring_broadcast
 from kernels.kv_rotors import init_rope_tables
 from simd_math import set_subnormal_zeroing
 from modeling.linear_borrow_pool import (
@@ -637,25 +637,41 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         self.amx_prefill_mode = False
 
 
-    def x_main_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
+    def x_main_ptrs(self) -> InlineArray[Int, Self.tp]:
         var ptrs = InlineArray[Int, Self.tp](fill=0)
         for r in range(Self.tp):
             var topo = self.topos[r]
             ptrs[r] = topo.activations.x_main.addr(topo.arena.base)
         return ptrs^
 
-    def x_residual_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
+    def x_residual_ptrs(self) -> InlineArray[Int, Self.tp]:
         var ptrs = InlineArray[Int, Self.tp](fill=0)
         for r in range(Self.tp):
             var topo = self.topos[r]
             ptrs[r] = topo.activations.x_residual.addr(topo.arena.base)
         return ptrs^
 
+    def residual_add_allreduce(mut self, seq_len: Int):
+        """x_main += allreduce(x_residual), replicated across ranks.
+
+        Decode is latency-shaped and small enough for the main-thread reducer.
+        Prefill is bandwidth-shaped, so reduce and gather with worker pools.
+        """
+        if seq_len == 1:
+            small_allreduce[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN], Self.tp,
+                residual_add=True](
+                self.x_residual_ptrs(), seq_len,
+                self.x_main_ptrs())
+        else:
+            parallel_allreduce[BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN], Self.tp,
+                residual_add=True](
+                self.x_residual_ptrs(), seq_len, self.main_pools,
+                self.x_main_ptrs())
+
     def token_buffer(mut self) -> UnsafePointer[Scalar[DType.int32], MutAnyOrigin]:
         return UnsafePointer[Scalar[DType.int32], MutAnyOrigin](
             unsafe_from_address=self.topos[0].arena.scratch_base())
 
-    @staticmethod
     @staticmethod
     def describe_quantization[V: TaskVisitor](mut visitor: V) -> Bool:
         comptime Fp8 = Fp8E4M3Block128Converter
@@ -790,19 +806,18 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         normed_origin: MutOrigin,
     ](
         mut self,
+        mut sample: ForwardSample,
         layer_idx: Int,
         seq_len: Int,
         ref [moe_i8_origin] moe_i8_lease: ScratchLease,
         ref [moe_scale_origin] moe_scale_lease: ScratchLease,
         ref [normed_origin] normed_bf16_lease: ScratchLease,
-    ) -> PhaseTiming:
+    ):
         """Decode-shaped MoE: route one token, run selected expert GEMVs, combine."""
         var topos = self.topos
         var routing_lease = self.scratch.borrow[TopKResult[C.TOP_K], 1]()
         var candidates_lease = self.scratch.borrow[
             RouterCandidate, C.TOP_K]()
-
-        var t_moe0 = Int(perf_counter_ns())
 
         @parameter
         def do_router_fused[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
@@ -820,9 +835,12 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                 candidates_lease.as_ptr[RouterCandidate](sb),
                 pool,
                 expert_base)
-        _ = timed_tp_parallel[Self.tp,do_router_fused](
-            topos, self.main_pools)
+        sample.add(
+            self.profile.phase("moe_router"),
+            timed_tp_parallel[Self.tp,do_router_fused](
+                topos, self.main_pools))
 
+        var t_merge0 = Int(perf_counter_ns())
         var candidate_ptrs = InlineArray[
             UnsafePointer[RouterCandidate, MutAnyOrigin], Self.tp](
             uninitialized=True)
@@ -843,6 +861,9 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         for r in range(Self.tp):
             var sb_r = topos[r].arena.scratch_base()
             routing_lease.as_ptr[TopKResult[C.TOP_K]](sb_r)[] = routing
+        sample.add(
+            self.profile.phase("moe_route_merge"),
+            PhaseTiming.opaque(Int(perf_counter_ns()) - t_merge0))
 
         candidates_lease^.release()
 
@@ -891,8 +912,10 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                 expert_blk_scale_lease.view[
                     F32, Shape[C.TOP_K, MOE_DOWN_NUM_BLK]](sb, C.TOP_K),
                 rank, pool)
-        _ = timed_tp_parallel[Self.tp,do_expert_phase1](
-            topos, self.main_pools)
+        sample.add(
+            self.profile.phase("moe_phase1"),
+            timed_tp_parallel[Self.tp,do_expert_phase1](
+                topos, self.main_pools))
 
         @parameter
         def do_expert_phase2[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
@@ -917,9 +940,12 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                 expert_out_lease.view[
                     BF16, Shape[C.TOP_K, C.HIDDEN]](sb, C.TOP_K),
                 rank, pool)
-        _ = timed_tp_parallel[Self.tp,do_expert_phase2](
-            topos, self.main_pools)
+        sample.add(
+            self.profile.phase("moe_phase2"),
+            timed_tp_parallel[Self.tp,do_expert_phase2](
+                topos, self.main_pools))
 
+        var t_accum0 = Int(perf_counter_ns())
         for r in range(Self.tp):
             var topo_r = topos[r]
             var sb = topo_r.arena.scratch_base()
@@ -932,14 +958,15 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                 topo_r.activations.x_residual.bound_dyn(
                     topo_r.arena.base, seq_len
                 ).as_ptr[DType.bfloat16]())
+        sample.add(
+            self.profile.phase("moe_output_accum"),
+            PhaseTiming.opaque(Int(perf_counter_ns()) - t_accum0))
 
-        var elapsed = PhaseTiming.opaque(Int(perf_counter_ns()) - t_moe0)
         local_count_lease^.release()
         expert_out_lease^.release()
         expert_blk_scale_lease^.release()
         expert_qi_lease^.release()
         routing_lease^.release()
-        return elapsed
 
     def moe_phase_prefill[
         moe_i8_origin: MutOrigin,
@@ -953,15 +980,13 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         ref [moe_i8_origin] moe_i8_lease: ScratchLease,
         ref [moe_scale_origin] moe_scale_lease: ScratchLease,
         ref [normed_origin] normed_bf16_lease: ScratchLease,
-    ) -> PhaseTiming:
+    ):
         """Prefill-shaped MoE: route the chunk, bucket local routes, sparse compute."""
         var topos = self.topos
         var routing_lease = self.scratch.borrow[
             TopKResult[C.TOP_K], PREFILL_CHUNK_SIZE]()
         var candidates_lease = self.scratch.borrow[
             RouterCandidate, PREFILL_CHUNK_SIZE * C.TOP_K]()
-
-        var t_moe0 = Int(perf_counter_ns())
 
         @parameter
         def do_router_fused[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
@@ -1002,10 +1027,9 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     host_sb, token_idx))
             var routing = routing_lease.as_ptr[
                 TopKResult[C.TOP_K]](host_sb, token_idx)[]
-            if token_idx == seq_len - 1:
-                self.profile.record_moe_route[C.TOP_K](
-                    layer_idx, C.NUM_LAYERS, C.NUM_EXPERTS, Self.tp,
-                    routing.indices, routing.weights)
+            self.profile.record_moe_route[C.TOP_K](
+                layer_idx, C.NUM_LAYERS, C.NUM_EXPERTS, Self.tp,
+                routing.indices, routing.weights)
             for r in range(Self.tp):
                 var sb_r = topos[r].arena.scratch_base()
                 routing_lease.as_ptr[
@@ -1131,7 +1155,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             timed_tp_parallel[Self.tp,do_sparse_expert_phase2](
                 topos, self.main_pools))
 
-        var elapsed = PhaseTiming.opaque(Int(perf_counter_ns()) - t_moe0)
         moe_accum_lease^.release()
         expert_blk_scale_lease^.release()
         expert_qi_lease^.release()
@@ -1140,7 +1163,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         route_offsets_lease^.release()
         route_counts_lease^.release()
         routing_lease^.release()
-        return elapsed
 
     @staticmethod
     def load(
@@ -1191,25 +1213,25 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         var loaded = result.take()
         print("loaded", loaded.bytes_loaded // (1024 * 1024), "MB in", loaded.num_ops, "ops")
 
-        print("DBG: prefault begin")
         for rank in range(Self.tp):
             _ = arenas[rank].prefault(plan.topology.arena.distributed_bytes, plan.topology.arena.state_bytes)
-        print("DBG: prefault done")
 
         var topos = InlineArray[MiniMaxM27Topology[Self.tp], Self.tp](fill=plan.topology)
         for rank in range(Self.tp):
             topos[rank] = plan.topology.bind(Int(arenas[rank].base))
-        print("DBG: topos bind done")
 
         var scratch = ScratchPool(plan.topology.arena.scratch_capacity)
-        print("DBG: scratch pool done")
         var model = Self(arenas^, main_pools^, scratch^, topos)
-        print("DBG: model ctor done, calling init_state")
         model.init_state()
-        print("DBG: init_state returned")
         return model^
 
-    def forward(mut self, tokens_ptr: Int, start_pos: Int, seq_len: Int) -> Int32:
+    def forward(
+        mut self,
+        tokens_ptr: Int,
+        start_pos: Int,
+        seq_len: Int,
+        produce_next_token: Bool = True,
+    ) -> Int32:
         comptime S = MiniMaxShapes[Self.tp]
         comptime EPS = Float32(C.RMS_NORM_EPS)
         comptime Q_LOCAL = S.Q_LOCAL
@@ -1220,15 +1242,12 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         comptime XShape = Shape[C.MAX_SEQ_LEN, C.HIDDEN]
         comptime VOCAB_NUM_BLOCKS = C.HIDDEN // LM_OUTPUT_HEAD_FWHT_BLK
         comptime VOCAB_LOCAL = C.VOCAB_SIZE // Self.tp
-        comptime Q_GROUP_BF16 = HPG * C.HEAD_DIM * 2
-        comptime K_HEAD_BF16 = C.HEAD_DIM * 2
-        comptime V_HEAD_BF16 = C.HEAD_DIM * 2
         comptime PARTIAL_F32S = (
             KV_PER_RANK * C.MAX_ATTN_CHUNKS * HPG * (2 + C.HEAD_DIM))
         comptime ROPE_HALF = C.ROPE_DIM // 2
 
         var t_forward0 = Int(perf_counter_ns())
-        var sample = ForwardSample(start_pos)
+        var sample = ForwardSample(start_pos, seq_len, produce_next_token)
         var topos = self.topos
         var host = topos[0]
         var dump_dir = String("m27_dump_decode")
@@ -1266,13 +1285,12 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         var t_bcast0 = Int(perf_counter_ns())
         ring_broadcast[BF16, XShape, Self.tp](
             host.activations.x_main.addr(host.arena.base),
-            self.x_main_ptrs(seq_len), seq_len, self.main_pools)
+            self.x_main_ptrs(), seq_len, self.main_pools)
         sample.add(self.profile.phase("broadcast"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_bcast0))
 
         var act_scale_lease = self.scratch.borrow[Float32, PREFILL_CHUNK_SIZE]()
 
         for layer_idx in range(C.NUM_LAYERS):
-
             # =============================================================
             # ATTENTION BLOCK
             # =============================================================
@@ -1580,9 +1598,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
             # Allreduce O-proj + fused residual add: x_main += sum(x_residual)
             var t_attn_reduce0 = Int(perf_counter_ns())
-            small_allreduce[BF16, XShape, Self.tp, residual_add=True](
-                self.x_residual_ptrs(seq_len), seq_len,
-                self.x_main_ptrs(seq_len))
+            self.residual_add_allreduce(seq_len)
             sample.add(self.profile.phase("attn_reduce"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_attn_reduce0))
             comptime if M27_DUMP_ENABLED:
                 for dump_row in range(seq_len):
@@ -1658,20 +1674,16 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             moe_work_lease^.release()
 
             if seq_len == 1:
-                sample.add(
-                    self.profile.phase("moe"),
-                    self.moe_phase_decode(
-                        layer_idx, seq_len,
-                        moe_i8_lease, moe_scale_lease, normed_bf16_lease))
+                self.moe_phase_decode(
+                    sample, layer_idx, seq_len,
+                    moe_i8_lease, moe_scale_lease, normed_bf16_lease)
             else:
-                _ = self.moe_phase_prefill(
+                self.moe_phase_prefill(
                     sample, layer_idx, seq_len,
                     moe_i8_lease, moe_scale_lease, normed_bf16_lease)
 
             var t_ffn_reduce0 = Int(perf_counter_ns())
-            small_allreduce[BF16, XShape, Self.tp, residual_add=True](
-                self.x_residual_ptrs(seq_len), seq_len,
-                self.x_main_ptrs(seq_len))
+            self.residual_add_allreduce(seq_len)
             sample.add(self.profile.phase("ffn_reduce"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_ffn_reduce0))
             comptime if M27_DUMP_ENABLED:
                 for dump_row in range(seq_len):
@@ -1691,6 +1703,11 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             moe_i8_lease^.release()
 
         act_scale_lease^.release()
+
+        if not produce_next_token:
+            sample.wall_ns = Int(perf_counter_ns()) - t_forward0
+            self.profile.record(sample)
+            return Int32(-1)
 
         # --- Final norm + row-sharded LM head ---
         var lm_act_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.HIDDEN]()
