@@ -16,6 +16,9 @@ from minimax.kernels.amx_attention import amx_chunked_attn_kernel
 from minimax.kernels.qk_prep import prep_q_head
 from minimax.kernels.dispatch_args import (
     FusedW1W3SiluArgs,
+    SparseRoute,
+    SparseMoePhase1Args,
+    SparseMoePhase2Args,
     AttnGroupArgs,
     KVWriteBatchArgs,
     QPrepBatchArgs,
@@ -24,7 +27,10 @@ from minimax.kernels.dispatch_args import (
     TopKResult,
     RouterFusedArgs,
 )
-from minimax.kernels.gemm import fused_w1_w3_silu_worker
+from minimax.kernels.gemm import (
+    fused_w1_w3_silu_worker, sparse_moe_phase1_worker,
+    sparse_moe_phase2_worker,
+)
 from minimax.kernels.attention import (
     kv_write_kernel, kv_write_batch_kernel, q_prep_batch_kernel,
     prefill_attn_worker,
@@ -33,55 +39,52 @@ from minimax.kernels.router import router_fused_worker
 
 
 # ============================================================================
-# Fused router — f32 GEMV + sigmoid + bias + local top-K (phase 1)
+# Fused router — centered bf16 GEMV + gauge pivot + local top-K (phase 1)
 # ============================================================================
 
 
-@always_inline
-def router_num_workers[num_experts: Int, k: Int](pool_capacity: Int) -> Int:
-    """Shared formula: phase-1 worker count = min(num_experts/k, pool cap).
-    Constrained by k so every worker has ≥ k rows and produces a full
-    local top-K."""
-    comptime max_workers = num_experts // k
-    return min(max_workers, pool_capacity)
-
-
 def router_fused_dispatch[
-    ActT: DynamicTensor, WT: StaticTensor, BT: StaticTensor,
+    ActT: DynamicTensor, WT: StaticTensor, GT: StaticTensor, BT: StaticTensor,
     P: BurstThreadPool, origin: MutOrigin, //,
     num_experts: Int, hidden: Int, k: Int,
 ](
     act_bf16: ActT,
-    weight_f32: WT,
+    weight_bf16: WT,
+    gauge_bf16: GT,
     bias_f32: BT,
     candidates: UnsafePointer[RouterCandidate, MutAnyOrigin],
     ref [origin] pool: P,
     expert_base: Int = 0,
 ) -> PoolFence[P, origin]:
     comptime assert ActT.DTYPE == DType.bfloat16, "router_fused: act must be bf16"
-    comptime assert WT.DTYPE == DType.float32, "router_fused: weight must be f32"
+    comptime assert WT.DTYPE == DType.bfloat16, "router_fused: weight must be bf16"
+    comptime assert GT.DTYPE == DType.bfloat16, "router_fused: gauge must be bf16"
     comptime assert BT.DTYPE == DType.float32, "router_fused: bias must be f32"
 
-    var num_workers = router_num_workers[num_experts, k](pool.get_capacity())
-    if num_workers <= 0:
+    var seq_len = act_bf16.seq_len()
+    if seq_len == 0:
         return PoolFence[P, origin].over(pool)
-    var rows_per_worker = (num_experts + num_workers - 1) // num_workers
 
     var act_p = act_bf16.as_ptr[DType.bfloat16]()
-    var weight_p = weight_f32.as_ptr[DType.float32]()
+    var weight_p = weight_bf16.as_ptr[DType.bfloat16]()
+    var gauge_p = gauge_bf16.as_ptr[DType.bfloat16]()
     var bias_p = bias_f32.as_ptr[DType.float32]()
 
     var jobs = InlineArray[RouterFusedArgs, MAX_POOL_CAPACITY](
         fill=RouterFusedArgs())
     var actual = 0
+
+    var num_workers = min(seq_len, pool.get_capacity())
+    var rows_per_worker = (seq_len + num_workers - 1) // num_workers
     for i in range(num_workers):
-        var start = i * rows_per_worker
-        if start >= num_experts:
+        var start_row = i * rows_per_worker
+        if start_row >= seq_len:
             break
-        var count = min(rows_per_worker, num_experts - start)
-        var slot = candidates + i * k
+        var row_count = min(rows_per_worker, seq_len - start_row)
         jobs[actual] = RouterFusedArgs(
-            act_p, weight_p, bias_p, slot, expert_base, start, count)
+            act_p + start_row * hidden, weight_p, gauge_p, bias_p,
+            candidates + start_row * k, expert_base,
+            0, num_experts, row_count, k)
         actual += 1
 
     pool.dispatch[RouterFusedArgs, router_fused_worker[hidden, k]](
@@ -428,6 +431,154 @@ def minimax_moe_phase1[
     return PoolFence[P, origin].over(pool)
 
 
+def minimax_sparse_moe_phase1[
+    AT: DynamicTensor, AsT: DynamicTensor,
+    W1T: StaticTensor, W1ScT: StaticTensor, W1CsT: StaticTensor,
+    W3T: StaticTensor, W3ScT: StaticTensor, W3CsT: StaticTensor,
+    QiT: DynamicTensor, BScT: DynamicTensor,
+    P: BurstThreadPool, origin: MutOrigin, //,
+    experts_per_rank: Int, intermediate: Int, hidden: Int, fwht_blk: Int,
+](
+    act_i8: AT,
+    act_scale: AsT,
+    counts: UnsafePointer[Int32, MutAnyOrigin],
+    offsets: UnsafePointer[Int32, MutAnyOrigin],
+    routes: UnsafePointer[SparseRoute, MutAnyOrigin],
+    w1: W1T, w1_stride_elems: Int,
+    w1_sc: W1ScT, w1_sc_stride_elems: Int,
+    w1_cs: W1CsT, w1_cs_stride_elems: Int,
+    w3: W3T, w3_stride_elems: Int,
+    w3_sc: W3ScT, w3_sc_stride_elems: Int,
+    w3_cs: W3CsT, w3_cs_stride_elems: Int,
+    expert_qi: QiT,
+    expert_blk_scale: BScT,
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
+    """Persistent sparse prefill phase1 over rank-local expert buckets."""
+    comptime assert AT.DTYPE == DType.int8, "sparse_moe_phase1: act must be i8"
+    comptime assert AsT.DTYPE == DType.float32, "sparse_moe_phase1: act_scale must be f32"
+    comptime assert W1T.DTYPE == DType.int8, "sparse_moe_phase1: w1 must be i8"
+    comptime assert W1ScT.DTYPE == DType.float32, "sparse_moe_phase1: w1_sc must be f32"
+    comptime assert W1CsT.DTYPE == DType.float32, "sparse_moe_phase1: w1_cs must be f32"
+    comptime assert W3T.DTYPE == DType.int8, "sparse_moe_phase1: w3 must be i8"
+    comptime assert W3ScT.DTYPE == DType.float32, "sparse_moe_phase1: w3_sc must be f32"
+    comptime assert W3CsT.DTYPE == DType.float32, "sparse_moe_phase1: w3_cs must be f32"
+    comptime assert QiT.DTYPE == DType.int8, "sparse_moe_phase1: expert_qi must be i8"
+    comptime assert BScT.DTYPE == DType.float32, "sparse_moe_phase1: expert_blk_scale must be f32"
+    debug_assert(w1_stride_elems == w3_stride_elems,
+        "sparse_moe_phase1: w1/w3 expert strides must match")
+    debug_assert(w1_sc_stride_elems == w1_cs_stride_elems,
+        "sparse_moe_phase1: w1 scale/colsum strides must match")
+    debug_assert(w1_sc_stride_elems == w3_sc_stride_elems,
+        "sparse_moe_phase1: w1/w3 scale strides must match")
+    debug_assert(w3_sc_stride_elems == w3_cs_stride_elems,
+        "sparse_moe_phase1: w3 scale/colsum strides must match")
+
+    var num_workers = min(experts_per_rank, pool.get_capacity())
+    if num_workers <= 0:
+        return PoolFence[P, origin].over(pool)
+
+    var act_p = act_i8.as_ptr[DType.int8]()
+    var act_scale_p = act_scale.as_ptr[DType.float32]()
+    var w1_p = I8Ptr(unsafe_from_address=w1.addr())
+    var w1_sc_p = F32Ptr(unsafe_from_address=w1_sc.addr())
+    var w1_cs_p = F32Ptr(unsafe_from_address=w1_cs.addr())
+    var w3_p = I8Ptr(unsafe_from_address=w3.addr())
+    var w3_sc_p = F32Ptr(unsafe_from_address=w3_sc.addr())
+    var w3_cs_p = F32Ptr(unsafe_from_address=w3_cs.addr())
+    var expert_qi_p = expert_qi.as_ptr[DType.int8]()
+    var expert_blk_scale_p = expert_blk_scale.as_ptr[DType.float32]()
+
+    var jobs = InlineArray[SparseMoePhase1Args, MAX_POOL_CAPACITY](
+        fill=SparseMoePhase1Args())
+    for i in range(num_workers):
+        jobs[i] = SparseMoePhase1Args(
+            act_p, act_scale_p,
+            counts, offsets, routes,
+            w1_p, w1_sc_p, w1_cs_p,
+            w3_p, w3_sc_p, w3_cs_p,
+            expert_qi_p, expert_blk_scale_p,
+            w1_stride_elems, w1_sc_stride_elems, i, num_workers)
+
+    pool.dispatch[SparseMoePhase1Args,
+        sparse_moe_phase1_worker[
+            experts_per_rank, intermediate, hidden, fwht_blk]](
+        UnsafePointer(to=jobs[0]), num_workers)
+    return PoolFence[P, origin].over(pool)
+
+
+def minimax_sparse_moe_phase2[
+    QiT: DynamicTensor, BScT: DynamicTensor,
+    DnT: StaticTensor, DnScT: StaticTensor, DnCsT: StaticTensor,
+    OutT: DynamicTensor,
+    P: BurstThreadPool, origin: MutOrigin, //,
+    top_k: Int, experts_per_rank: Int,
+    hidden: Int, intermediate: Int, fwht_blk: Int,
+](
+    route_indices: UnsafePointer[Int32, MutAnyOrigin],
+    routes: UnsafePointer[SparseRoute, MutAnyOrigin],
+    expert_qi: QiT,
+    expert_blk_scale: BScT,
+    down: DnT, down_stride_elems: Int,
+    down_sc: DnScT, down_sc_stride_elems: Int,
+    down_bcs: DnCsT, down_bcs_stride_elems: Int,
+    dst: OutT,
+    ref [origin] pool: P,
+) -> PoolFence[P, origin]:
+    """Persistent sparse prefill phase2 over hidden stripes."""
+    comptime assert QiT.DTYPE == DType.int8, "sparse_moe_phase2: expert_qi must be i8"
+    comptime assert BScT.DTYPE == DType.float32, "sparse_moe_phase2: expert_blk_scale must be f32"
+    comptime assert DnT.DTYPE == DType.int8, "sparse_moe_phase2: down must be i8"
+    comptime assert DnScT.DTYPE == DType.float32, "sparse_moe_phase2: down_sc must be f32"
+    comptime assert DnCsT.DTYPE == DType.float32, "sparse_moe_phase2: down_bcs must be f32"
+    comptime assert OutT.DTYPE == DType.bfloat16, "sparse_moe_phase2: dst must be bf16"
+    debug_assert(down_sc_stride_elems == hidden,
+        "sparse_moe_phase2: down scale stride must be hidden")
+    debug_assert(down_bcs_stride_elems == hidden * (intermediate // fwht_blk),
+        "sparse_moe_phase2: down colsum stride must be hidden*num_blocks")
+
+    var seq_len = dst.seq_len()
+    if seq_len == 0:
+        return PoolFence[P, origin].over(pool)
+
+    comptime max_n_workers = hidden // VNNI_N_STEP
+    var num_workers = min(pool.get_capacity(), max_n_workers)
+    if num_workers <= 0:
+        return PoolFence[P, origin].over(pool)
+    var n_per_worker = (
+        ((max_n_workers + num_workers - 1) // num_workers) * VNNI_N_STEP
+    )
+
+    var expert_qi_p = expert_qi.as_ptr[DType.int8]()
+    var expert_blk_scale_p = expert_blk_scale.as_ptr[DType.float32]()
+    var down_p = I8Ptr(unsafe_from_address=down.addr())
+    var down_sc_p = F32Ptr(unsafe_from_address=down_sc.addr())
+    var down_bcs_p = F32Ptr(unsafe_from_address=down_bcs.addr())
+    var dst_p = dst.as_ptr[DType.bfloat16]()
+
+    var jobs = InlineArray[SparseMoePhase2Args, MAX_POOL_CAPACITY](
+        fill=SparseMoePhase2Args())
+    var actual = 0
+    for i in range(num_workers):
+        var n_start = i * n_per_worker
+        if n_start >= hidden:
+            break
+        var n_count = min(n_per_worker, hidden - n_start)
+        jobs[actual] = SparseMoePhase2Args(
+            route_indices, routes,
+            expert_qi_p, expert_blk_scale_p,
+            down_p, down_sc_p, down_bcs_p, dst_p,
+            down_stride_elems, down_sc_stride_elems, down_bcs_stride_elems,
+            seq_len, n_start, n_count)
+        actual += 1
+
+    pool.dispatch[SparseMoePhase2Args,
+        sparse_moe_phase2_worker[
+            top_k, experts_per_rank, hidden, intermediate, fwht_blk]](
+        UnsafePointer(to=jobs[0]), actual)
+    return PoolFence[P, origin].over(pool)
+
+
 # ============================================================================
 # MoE phase 2 — expert down projection with routing weight
 # ============================================================================
@@ -520,7 +671,7 @@ def minimax_moe_phase2[
                 act, wpacked + n_start * intermediate,
                 blk_scale, wscale + n_start,
                 blk_colsum + n_start, dst + n_start,
-                weight, n_count, hidden)
+                weight, n_count, hidden, 1)
             num_jobs += 1
 
     pool.dispatch[Int8GemvBlockedArgs,

@@ -255,25 +255,141 @@ struct TopKResult[k: Int](Copyable, ImplicitlyCopyable, Movable):
 
 
 @fieldwise_init
+struct SparseRoute(Copyable, ImplicitlyCopyable):
+    """One final routed token inside a rank-local expert bucket.
+
+    Phase1 consumes routes through expert bucket ranges:
+      routes[offsets[expert] : offsets[expert + 1]]
+
+    Phase2 consumes routes through route_indices[token, slot], so the local
+    expert is stored explicitly to avoid scanning buckets during combine.
+    """
+    var token: Int32
+    var slot: Int32
+    var local_expert: Int32
+    var weight: Float32
+
+    def __init__(out self):
+        self.token = Int32(-1)
+        self.slot = Int32(-1)
+        self.local_expert = Int32(-1)
+        self.weight = Float32(0)
+
+
+@fieldwise_init
+struct SparseMoePhase1Args(Copyable, ImplicitlyCopyable):
+    """Persistent sparse MoE phase1 worker contract.
+
+    Workers stride over local experts, consume bucketed routes, and write
+    route-major intermediate activations:
+      expert_qi[route_idx, intermediate]
+      expert_blk_scale[route_idx, intermediate / fwht_blk]
+    """
+    var act_i8: I8Ptr
+    var act_scale: F32Ptr
+    var counts: UnsafePointer[Int32, MutAnyOrigin]
+    var offsets: UnsafePointer[Int32, MutAnyOrigin]
+    var routes: UnsafePointer[SparseRoute, MutAnyOrigin]
+    var w1_packed: I8Ptr
+    var w1_scale: F32Ptr
+    var w1_colsum: F32Ptr
+    var w3_packed: I8Ptr
+    var w3_scale: F32Ptr
+    var w3_colsum: F32Ptr
+    var expert_qi: I8Ptr
+    var expert_blk_scale: F32Ptr
+    var expert_stride: Int  # i8 elements per local expert
+    var scale_stride: Int   # f32 elements per local expert
+    var worker_id: Int
+    var num_workers: Int
+
+    def __init__(out self):
+        self.act_i8 = I8Ptr()
+        self.act_scale = F32Ptr()
+        self.counts = UnsafePointer[Int32, MutAnyOrigin]()
+        self.offsets = UnsafePointer[Int32, MutAnyOrigin]()
+        self.routes = UnsafePointer[SparseRoute, MutAnyOrigin]()
+        self.w1_packed = I8Ptr()
+        self.w1_scale = F32Ptr()
+        self.w1_colsum = F32Ptr()
+        self.w3_packed = I8Ptr()
+        self.w3_scale = F32Ptr()
+        self.w3_colsum = F32Ptr()
+        self.expert_qi = I8Ptr()
+        self.expert_blk_scale = F32Ptr()
+        self.expert_stride = 0
+        self.scale_stride = 0
+        self.worker_id = 0
+        self.num_workers = 0
+
+
+@fieldwise_init
+struct SparseMoePhase2Args(Copyable, ImplicitlyCopyable):
+    """Persistent sparse MoE phase2 worker contract.
+
+    Workers own a disjoint hidden-column stripe. They walk token/slot order,
+    use route_indices[token, slot] to find local routes, and accumulate
+    weighted route outputs directly into x_residual[token, hidden stripe].
+    Hidden ownership makes the combine race-free without atomics.
+    """
+    var route_indices: UnsafePointer[Int32, MutAnyOrigin]
+    var routes: UnsafePointer[SparseRoute, MutAnyOrigin]
+    var expert_qi: I8Ptr
+    var expert_blk_scale: F32Ptr
+    var down_packed: I8Ptr
+    var down_scale: F32Ptr
+    var down_colsum: F32Ptr
+    var dst: BF16Ptr
+    var expert_stride: Int  # i8 elements per local expert
+    var scale_stride: Int   # f32 elements per local expert
+    var colsum_stride: Int  # f32 elements per local expert
+    var seq_len: Int
+    var hidden_start: Int
+    var hidden_count: Int
+
+    def __init__(out self):
+        self.route_indices = UnsafePointer[Int32, MutAnyOrigin]()
+        self.routes = UnsafePointer[SparseRoute, MutAnyOrigin]()
+        self.expert_qi = I8Ptr()
+        self.expert_blk_scale = F32Ptr()
+        self.down_packed = I8Ptr()
+        self.down_scale = F32Ptr()
+        self.down_colsum = F32Ptr()
+        self.dst = BF16Ptr()
+        self.expert_stride = 0
+        self.scale_stride = 0
+        self.colsum_stride = 0
+        self.seq_len = 0
+        self.hidden_start = 0
+        self.hidden_count = 0
+
+
+@fieldwise_init
 struct RouterFusedArgs(Copyable, ImplicitlyCopyable):
-    """Args for fused router worker: f32 GEMV + sigmoid + local top-K.
+    """Args for fused router worker: centered bf16 GEMV + gauge pivot + local top-K.
 
     Each worker owns rows [n_start, n_start + n_count) and writes K
     candidates to candidates[0..K) in descending score order.
     """
     var act_bf16: BF16Ptr
-    var weight_f32: F32Ptr
+    var weight_bf16: BF16Ptr
+    var gauge_bf16: BF16Ptr
     var bias_f32: F32Ptr
     var candidates: UnsafePointer[RouterCandidate, MutAnyOrigin]
     var eid_base: Int
     var n_start: Int
     var n_count: Int
+    var row_count: Int
+    var candidate_row_stride: Int
 
     def __init__(out self):
         self.act_bf16 = BF16Ptr()
-        self.weight_f32 = F32Ptr()
+        self.weight_bf16 = BF16Ptr()
+        self.gauge_bf16 = BF16Ptr()
         self.bias_f32 = F32Ptr()
         self.candidates = UnsafePointer[RouterCandidate, MutAnyOrigin]()
         self.eid_base = 0
         self.n_start = 0
         self.n_count = 0
+        self.row_count = 0
+        self.candidate_row_stride = 0

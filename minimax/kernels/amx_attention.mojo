@@ -4,7 +4,7 @@ from std.collections import InlineArray
 
 from experimental3.amx import (
     K_STEP, VNNI_BLK, TILE_BYTES,
-    make_224_decode_config, init_intel_amx, ldtilecfg,
+    make_224_decode_config, make_224_i8_config, init_intel_amx, ldtilecfg,
     tilezero, tileload, tilestore, tdpbsud,
 )
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
@@ -25,6 +25,11 @@ struct AmxConfigArgs(Copyable, ImplicitlyCopyable):
 def amx_config_kernel[heads_per_group: Int](args: AmxConfigArgs):
     _ = init_intel_amx()
     var cfg = make_224_decode_config[heads_per_group]()
+    ldtilecfg(UnsafePointer(to=cfg))
+
+
+def amx_prefill_config_kernel(args: AmxConfigArgs):
+    var cfg = make_224_i8_config()
     ldtilecfg(UnsafePointer(to=cfg))
 
 

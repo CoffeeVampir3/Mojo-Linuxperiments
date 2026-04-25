@@ -5,10 +5,11 @@ from std.sys.info import simd_width_of
 
 from simd_math import sqrt, exp_f32, exp_f32_fast, roundeven
 from experimental3.amx import (
-    K_STEP, VNNI_BLK, TILE_BYTES, TILE_M, TILE_N,
-    tilezero, tileload, tilestore, tdpbsud, tdpbusd,
+    K_STEP, VNNI_BLK, TILE_BYTES,
+    tilezero, tileload, tilestore, tdpbsud,
 )
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
+from experimental3.kernels.dot_prod import vpdpbusd
 from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.common_math import F32Ptr, BF16Ptr, I8Ptr, U8Ptr
 from notstdcollections import AlignedInlineArray
@@ -216,11 +217,10 @@ def prefill_attn_worker[
     comptime WIDTH = CACHE_WIDTH
     comptime V_CHANNEL_GROUPS = head_dim // WIDTH
     comptime V_CG_BYTES = (WIDTH // VNNI_BLK) * WIDTH * VNNI_BLK
-    comptime V_PG_BYTES = V_CHANNEL_GROUPS * V_CG_BYTES
     comptime K_PG_BYTES = head_dim // VNNI_BLK * WIDTH * VNNI_BLK
     comptime SCORE_PG_STRIDE = Q_TILE * WIDTH
     comptime W_TILE_BYTES = Q_TILE * K_STEP
-    comptime V_GATHER_BYTES = 4 * V_CG_BYTES
+    comptime SQ_BYTES = WIDTH * VNNI_BLK
     comptime SIMD_W = simd_width_of[DType.float32]()
 
     var actual_q = min(args.q_count, Q_TILE)
@@ -231,6 +231,7 @@ def prefill_attn_worker[
     var effective_pgs = min(padded_pgs, causal_padded)
 
     var neg_inf = SIMD[DType.float32, WIDTH](Float32(-1e30))
+    var zero_f32 = SIMD[DType.float32, WIDTH](Float32(0))
     var valid_lanes = SIMD[DType.int32, WIDTH]()
     comptime for lane in range(WIDTH):
         valid_lanes[lane] = Int32(lane)
@@ -240,24 +241,23 @@ def prefill_attn_worker[
     var score_ptr = score_arr.unsafe_ptr()
     var w_arr = AlignedInlineArray[UInt8, W_TILE_BYTES](fill=UInt8(0))
     var w_buf = w_arr.unsafe_ptr()
-    var wd_arr = InlineArray[Float32, Q_TILE](fill=Float32(0))
+    var wd_arr = InlineArray[Float32, 4 * Q_TILE](fill=Float32(0))
     var sf_arr = AlignedInlineArray[Float32, Q_TILE * 4 * WIDTH](
         uninitialized=True)
     var sf_buf = sf_arr.unsafe_ptr()
-    var v_tile_even = AlignedInlineArray[Scalar[DType.int8], V_GATHER_BYTES](
+    var bcast_arr = AlignedInlineArray[UInt32, WIDTH](
         uninitialized=True)
-    var v_tile_odd = AlignedInlineArray[Scalar[DType.int8], V_GATHER_BYTES](
-        uninitialized=True)
-    var v_even_ptr = v_tile_even.unsafe_ptr()
-    var v_odd_ptr = v_tile_odd.unsafe_ptr()
-    var result_arr = AlignedInlineArray[Int32, 2 * TILE_M * TILE_N](
-        uninitialized=True)
-    var result_ptr = result_arr.unsafe_ptr()
+    var bcast_ptr = bcast_arr.unsafe_ptr()
+
+    comptime Q_DENOM = Float32(127) * Float32(127)
 
     for qh in range(heads_per_group):
         var q_head = args.q_i8 + qh * args.pos_count * head_dim
         var qb = args.qi_biases + qh * args.pos_count
-        var qf = args.q_factors + qh * args.pos_count
+        var qf_raw = args.q_factors + qh * args.pos_count
+        var qf = InlineArray[Float32, Q_TILE](fill=Float32(0))
+        for r in range(actual_q):
+            qf[r] = qf_raw[r] / Q_DENOM
 
         var q_arr = AlignedInlineArray[Scalar[DType.int8], Q_TILE * head_dim](
             fill=Scalar[DType.int8](0))
@@ -351,82 +351,99 @@ def prefill_attn_worker[
                 running_max[r] = new_max
 
                 var w_row = w_buf + r * K_STEP
-                var w_max_all = Float32(-1e30)
                 for bp in range(4):
+                    var group_start = (pg + bp) * WIDTH
+                    var ctx_valid = (valid_lanes + Int32(group_start)).lt(
+                        SIMD[DType.int32, WIDTH](args.context_len))
+                    var causal_valid = (valid_lanes + Int32(group_start)).le(
+                        SIMD[DType.int32, WIDTH](args.q_start + r))
+                    var valid = ctx_valid & causal_valid
                     var v_sc = v_scales + (pg + bp) * WIDTH
-                    var exp_scores = exp_f32_fast[WIDTH](
+                    var exp_scores = valid.select(exp_f32_fast[WIDTH](
                         (sf_buf + r * 4 * WIDTH + bp * WIDTH).load[width=WIDTH]()
-                        - running_max[r])
+                        - running_max[r]), zero_f32)
                     running_sum[r] += exp_scores.reduce_add()
                     var w_eff = exp_scores * v_sc.load[width=WIDTH]()
-                    (sf_buf + r * 4 * WIDTH + bp * WIDTH).store(w_eff)
-                    var local_max = w_eff.reduce_max()
-                    if local_max > w_max_all:
-                        w_max_all = local_max
+                    var w_max = w_eff.reduce_max()
+                    if w_max < Float32(1e-10):
+                        (w_row + bp * WIDTH).store[width=WIDTH](
+                            SIMD[DType.uint8, WIDTH](0))
+                        wd_arr[bp * Q_TILE + r] = Float32(0)
+                        continue
 
-                if w_max_all < Float32(1e-10):
-                    for b in range(K_STEP):
-                        w_row[b] = UInt8(0)
-                    wd_arr[r] = Float32(0)
-                    continue
-
-                var w_scale_val = 255.0 / w_max_all
-                for bp in range(4):
-                    var w_eff = (sf_buf + r * 4 * WIDTH + bp * WIDTH).load[
-                        width=WIDTH]()
+                    var w_scale_val = 255.0 / w_max
                     var w_u8 = roundeven(w_eff * w_scale_val).clamp(
                         0.0, 255.0).cast[DType.uint8]()
                     (w_row + bp * WIDTH).store[width=WIDTH](w_u8)
-                wd_arr[r] = w_max_all / 255.0
+                    wd_arr[bp * Q_TILE + r] = w_max / 255.0
 
-            tileload[0, DType.uint8](w_buf, K_STEP)
-
-            for cg_pair in range(V_CHANNEL_GROUPS // 2):
-                var cg_even = cg_pair * 2
-                var cg_odd = cg_even + 1
+            for cg in range(V_CHANNEL_GROUPS):
                 for bp in range(4):
                     var v_pg = cache.v_pg_ptr(args.kv_head, pg + bp)
-                    var src_even = v_pg + cg_even * V_CG_BYTES
-                    var src_odd = v_pg + cg_odd * V_CG_BYTES
-                    var dst_off = bp * V_CG_BYTES
-                    comptime for chunk in range(V_CG_BYTES // K_STEP):
-                        (v_even_ptr + dst_off + chunk * K_STEP).store(
-                            (src_even + chunk * K_STEP).load[width=K_STEP]())
-                        (v_odd_ptr + dst_off + chunk * K_STEP).store(
-                            (src_odd + chunk * K_STEP).load[width=K_STEP]())
+                    var v_cg = v_pg + cg * V_CG_BYTES
+                    var v0 = (v_cg + 0 * SQ_BYTES).load[
+                        width=WIDTH * VNNI_BLK]()
+                    var v1 = (v_cg + 1 * SQ_BYTES).load[
+                        width=WIDTH * VNNI_BLK]()
+                    var v2 = (v_cg + 2 * SQ_BYTES).load[
+                        width=WIDTH * VNNI_BLK]()
+                    var v3 = (v_cg + 3 * SQ_BYTES).load[
+                        width=WIDTH * VNNI_BLK]()
 
-                tileload[2, DType.int8](v_even_ptr, WIDTH * VNNI_BLK)
-                tileload[3, DType.int8](v_odd_ptr, WIDTH * VNNI_BLK)
-                tilezero[4]()
-                tilezero[5]()
-                tdpbusd[4, 0, 2]()
-                tdpbusd[5, 0, 3]()
-                tilestore[4, DType.int32](result_ptr, TILE_N * 4)
-                tilestore[5, DType.int32](result_ptr + TILE_M * TILE_N, TILE_N * 4)
+                    for r in range(actual_q):
+                        var wd = wd_arr[bp * Q_TILE + r]
+                        if wd <= Float32(0):
+                            continue
 
-                for r in range(actual_q):
-                    var wd = wd_arr[r]
-                    var r0 = (result_ptr + r * TILE_N).load[
-                        width=WIDTH]().cast[DType.float32]() * wd
-                    var r1 = (result_ptr + TILE_M * TILE_N + r * TILE_N).load[
-                        width=WIDTH]().cast[DType.float32]() * wd
-                    var a_even = v_acc + r * head_dim + cg_even * WIDTH
-                    var a_odd = v_acc + r * head_dim + cg_odd * WIDTH
-                    a_even.store(a_even.load[width=WIDTH]() + r0)
-                    a_odd.store(a_odd.load[width=WIDTH]() + r1)
+                        var w_row = w_buf + r * K_STEP + bp * WIDTH
+                        var w0 = (w_row + 0 * VNNI_BLK).bitcast[UInt32]()[]
+                        bcast_ptr.store(SIMD[DType.uint32, WIDTH](w0))
+                        var a0 = vpdpbusd[WIDTH](
+                            SIMD[DType.int32, WIDTH](0),
+                            bcast_ptr.bitcast[UInt8]().load[
+                                width=WIDTH * VNNI_BLK](),
+                            v0)
+
+                        var w1 = (w_row + 1 * VNNI_BLK).bitcast[UInt32]()[]
+                        bcast_ptr.store(SIMD[DType.uint32, WIDTH](w1))
+                        var a1 = vpdpbusd[WIDTH](
+                            SIMD[DType.int32, WIDTH](0),
+                            bcast_ptr.bitcast[UInt8]().load[
+                                width=WIDTH * VNNI_BLK](),
+                            v1)
+
+                        var w2 = (w_row + 2 * VNNI_BLK).bitcast[UInt32]()[]
+                        bcast_ptr.store(SIMD[DType.uint32, WIDTH](w2))
+                        var a2 = vpdpbusd[WIDTH](
+                            SIMD[DType.int32, WIDTH](0),
+                            bcast_ptr.bitcast[UInt8]().load[
+                                width=WIDTH * VNNI_BLK](),
+                            v2)
+
+                        var w3 = (w_row + 3 * VNNI_BLK).bitcast[UInt32]()[]
+                        bcast_ptr.store(SIMD[DType.uint32, WIDTH](w3))
+                        var a3 = vpdpbusd[WIDTH](
+                            SIMD[DType.int32, WIDTH](0),
+                            bcast_ptr.bitcast[UInt8]().load[
+                                width=WIDTH * VNNI_BLK](),
+                            v3)
+
+                        var dst = v_acc + r * head_dim + cg * WIDTH
+                        dst.store(dst.load[width=WIDTH]() + ((a0 + a1)
+                            + (a2 + a3)).cast[DType.float32]() * wd)
 
             pg += 4
 
         for r in range(actual_q):
             var row_out = args.qi_out + r * args.qi_out_row_stride
                 + args.head_col_offset + qh * head_dim
-            var inv_sum = Float32(0)
+            var inv = Float32(0)
             if running_sum[r] > Float32(1e-10):
-                inv_sum = Float32(1) / running_sum[r]
+                inv = Float32(1) / (Float32(127) * running_sum[r])
             var src = v_acc + r * head_dim
             var d = 0
             while d + SIMD_W <= head_dim:
-                (src + d).store((src + d).load[width=SIMD_W]() * inv_sum)
+                (src + d).store((src + d).load[width=SIMD_W]() * inv)
                 d += SIMD_W
             var scale = absmax_quantize_i8[head_dim](src, row_out)
             (args.head_sc_out + r * args.head_sc_row_stride
@@ -438,6 +455,4 @@ def prefill_attn_worker[
     _ = score_arr
     _ = w_arr
     _ = sf_arr
-    _ = v_tile_even
-    _ = v_tile_odd
-    _ = result_arr
+    _ = bcast_arr

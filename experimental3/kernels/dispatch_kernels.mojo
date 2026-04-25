@@ -214,7 +214,7 @@ def int8_gemv_blocked[
             jobs[actual] = Int8GemvBlockedArgs(
                 act_p, wpacked_p + n_start * K, blk_scale_p,
                 wscale_p + n_start, blk_colsum_p + n_start,
-                dst_p + n_start, output_scale, n_count, N)
+                dst_p + n_start, output_scale, n_count, N, 1)
             actual += 1
         pool.dispatch[Int8GemvBlockedArgs,
             int8_gemv_blocked_decode_worker[N, K, fwht_blk]](
@@ -225,14 +225,19 @@ def int8_gemv_blocked[
     var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
     var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](
         fill=Int8GemvBlockedArgs())
+    var actual = 0
     for i in range(num_jobs):
         var start = i * rows_per_job
-        jobs[i] = Int8GemvBlockedArgs(
+        if start >= seq_len:
+            break
+        var end = min(start + rows_per_job, seq_len)
+        jobs[actual] = Int8GemvBlockedArgs(
             act_p + start * K, wpacked_p,
             blk_scale_p + start * num_blocks, wscale_p, blk_colsum_p,
-            dst_p + start * N, output_scale, N, N)
+            dst_p + start * N, output_scale, N, N, end - start)
+        actual += 1
     pool.dispatch[Int8GemvBlockedArgs, int8_gemv_blocked_worker[N, K, fwht_blk]](
-        UnsafePointer(to=jobs[0]), num_jobs)
+        UnsafePointer(to=jobs[0]), actual)
     return PoolFence[P, origin].over(pool)
 
 
@@ -266,20 +271,26 @@ def int8_gemv_blocked_wa[
     var dst_p = dst.as_ptr[DType.bfloat16]()
 
     var num_jobs = min(seq_len, pool.get_capacity())
+    var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
     comptime num_blocks = K // fwht_blk
 
     var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](
         fill=Int8GemvBlockedArgs())
+    var actual = 0
     for i in range(num_jobs):
-        var start = i
-        jobs[i] = Int8GemvBlockedArgs(
+        var start = i * rows_per_job
+        if start >= seq_len:
+            break
+        var end = min(start + rows_per_job, seq_len)
+        jobs[actual] = Int8GemvBlockedArgs(
             act_p + start * K, wpacked_p,
             blk_scale_p + start * num_blocks,
             wscale_p, blk_colsum_p,
-            dst_p + start * N, Float32(1.0), N, N)
+            dst_p + start * N, Float32(1.0), N, N, end - start)
+        actual += 1
 
     pool.dispatch[Int8GemvBlockedArgs, int8_gemv_blocked_wa_worker[N, K, fwht_blk]](
-        UnsafePointer(to=jobs[0]), num_jobs)
+        UnsafePointer(to=jobs[0]), actual)
     return PoolFence[P, origin].over(pool)
 
 
@@ -661,7 +672,7 @@ def gemma4_moe_phase2[
             F32Ptr(unsafe_from_address=down_sc_base + local_idx * down_sc_stride),
             F32Ptr(unsafe_from_address=down_bcs_base + local_idx * down_bcs_stride),
             expert_out_buf_p + local_count * hidden,
-            routing.weights[s], hidden, hidden,
+            routing.weights[s], hidden, hidden, 1,
         )
         local_count += 1
 

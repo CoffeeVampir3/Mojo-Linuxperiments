@@ -62,6 +62,7 @@ struct Int8GemvBlockedArgs(Copyable, ImplicitlyCopyable):
     var output_scale: Float32
     var n_out: Int
     var colsum_stride: Int
+    var row_count: Int
 
     def __init__(out self):
         self.act = I8Ptr()
@@ -73,6 +74,7 @@ struct Int8GemvBlockedArgs(Copyable, ImplicitlyCopyable):
         self.output_scale = Float32(0)
         self.n_out = 0
         self.colsum_stride = 0
+        self.row_count = 0
 
 
 @fieldwise_init

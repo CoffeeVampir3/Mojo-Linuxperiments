@@ -44,13 +44,11 @@ def load_and_run[
     var prompt_len = len(token_ids)
     model.reset_profile()
 
-    var t1 = perf_counter_ns()
-    for i in range(prompt_len - 1):
-        tp_ptr[0] = Scalar[DType.int32](token_ids[i])
-        _ = model.forward(Int(tp_ptr), i, 1)
+    for i in range(prompt_len):
+        tp_ptr[i] = Scalar[DType.int32](token_ids[i])
 
-    tp_ptr[0] = Scalar[DType.int32](token_ids[prompt_len - 1])
-    var next_id = Int(model.forward(Int(tp_ptr), prompt_len - 1, 1))
+    var t1 = perf_counter_ns()
+    var next_id = Int(model.forward(Int(tp_ptr), 0, prompt_len))
     var prefill_ms = (perf_counter_ns() - t1) / 1_000_000
 
     var generated = List[Int]()

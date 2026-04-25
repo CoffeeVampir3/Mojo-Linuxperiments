@@ -1,6 +1,6 @@
 from std.pathlib import Path
 from std.memory import UnsafePointer
-from std.sys.info import simd_width_of
+from std.sys.info import simd_width_of, size_of
 from std.time import perf_counter_ns
 from std.collections import InlineArray
 
@@ -40,6 +40,7 @@ from experimental3.init_weights import (
 from experimental3.gamma import compute_sqrt_gamma
 from experimental3.common_math import rms_reduce_bf16, inv_rms_from_sum_sq
 from experimental3.kv_cache import Gemma4KVCache
+from experimental3.amx import K_STEP
 from experimental3.kernels.dispatch_kernels import (
     rmsnorm_gamma_fwht_per_block_quantize,
     int8_gemv, int8_gemv_blocked,
@@ -47,27 +48,30 @@ from experimental3.kernels.dispatch_kernels import (
 )
 from experimental3.kernels.dispatch_args import RmsNormFwhtQuantArgs
 from experimental3.kernels.rmsnorm import (
-    rmsnorm_fwht_quant_worker, accumulate_expert_outputs,
+    rmsnorm_fwht_quant_worker,
 )
+from experimental3.tensor_dump import Dumper
 
-from minimax.kernels.router import TopKResult, router_merge_multi_and_renorm
+from minimax.kernels.router import (
+    TopKResult, router_merge_multi_and_renorm, build_sparse_route_schedule,
+)
 from minimax.kernels.dispatch_args import (
     RouterCandidate, RmsNormDualOutputArgs,
-    MergeQuantArgs,
+    MergeQuantArgs, SparseRoute,
 )
 from minimax.kernels.dispatch_kernels import (
     router_fused_dispatch,
-    router_num_workers,
     kv_write_dispatch,
     q_prep_batch_dispatch,
     chunked_score_dispatch_multi,
     prefill_attn_dispatch,
     attn_chunk_count,
-    minimax_moe_phase1,
-    minimax_moe_phase2,
+    minimax_sparse_moe_phase1,
+    minimax_sparse_moe_phase2,
 )
 from minimax.kernels.rmsnorm import rmsnorm_dual_output_worker
 from kernels.worker_init import worker_init_dispatch
+from minimax.kernels.amx_attention import amx_prefill_config_kernel, amx_config_kernel, AmxConfigArgs
 from minimax.kernels.attention import merge_quant_worker
 
 
@@ -122,6 +126,7 @@ comptime LM_OUTPUT_HEAD_FWHT_BLK = 64
 comptime VNNI_ALIGN = 64
 comptime MOE_DOWN_NUM_BLK = C.MOE_INTERMEDIATE // FWHT_BLK_MOE_DOWN
 comptime PREFILL_CHUNK_SIZE = 1024
+comptime M27_DUMP_ENABLED = False
 
 
 # =============================================================================
@@ -168,8 +173,10 @@ struct BodyRefs[tp: Int](Copyable, ImplicitlyCopyable):
     var input_norm_sqrt: TensorRef[BF16, Shape[C.HIDDEN, 1]]
     var post_attn_norm_sqrt: TensorRef[BF16, Shape[C.HIDDEN, 1]]
 
-    # F32 router — sigmoid + correction-bias + top-k is magnitude-sensitive.
-    var router_proj: TensorRef[F32, Shape[C.NUM_EXPERTS, C.HIDDEN, shard_n=True, tp=Self.tp]]
+    # BF16 centered router weights plus a replicated gauge vector. Runtime
+    # reconstructs logits as x @ centered_row + x @ gauge before sigmoid+bias.
+    var router_proj: TensorRef[BF16, Shape[C.NUM_EXPERTS, C.HIDDEN, shard_n=True, tp=Self.tp]]
+    var router_gauge: TensorRef[BF16, Shape[C.HIDDEN, 1]]
     var router_bias: TensorRef[F32, Shape[C.NUM_EXPERTS, 1, shard_n=True, tp=Self.tp]]
 
     # SwiGLU experts: w1=gate, w3=up, w2=down.
@@ -355,7 +362,10 @@ def emit_layer[tp: Int](
     var input_norm_sqrt = b.colsum_slot[BF16, Shape[H, 1]]()
     var post_attn_norm_sqrt = b.colsum_slot[BF16, Shape[H, 1]]()
 
-    var router_proj = b.fs[Shape[NE, H, shard_n=True, tp=tp]](e, "block_sparse_moe.gate.weight")
+    var router_proj = b.bfs[Shape[NE, H, shard_n=True, tp=tp]](
+        e, "block_sparse_moe.gate.weight")
+    var router_gauge = b.bfs[Shape[H, 1]](
+        e, "block_sparse_moe.gate.weight_gauge")
     var router_bias = b.fs[Shape[NE, 1, shard_n=True, tp=tp]](e, "block_sparse_moe.e_score_correction_bias")
 
     # --- Experts (w1=gate, w3=up, w2=down) ---
@@ -387,7 +397,8 @@ def emit_layer[tp: Int](
         input_norm=input_norm, post_attn_norm=post_attn_norm,
         input_norm_sqrt=input_norm_sqrt,
         post_attn_norm_sqrt=post_attn_norm_sqrt,
-        router_proj=router_proj, router_bias=router_bias,
+        router_proj=router_proj, router_gauge=router_gauge,
+        router_bias=router_bias,
         experts_w1=experts_w1, experts_w1_sc=experts_w1_sc,
         experts_w3=experts_w3, experts_w3_sc=experts_w3_sc,
         experts_w2=experts_w2, experts_w2_sc=experts_w2_sc,
@@ -438,21 +449,46 @@ def calculate_peak_scratch[tp: Int]() -> Int:
     )
 
     comptime router_candidate_bytes = 16
-    comptime router_workers_per_rank = C.NUM_EXPERTS // tp // C.TOP_K
-    comptime router_candidates_per_rank = router_workers_per_rank * C.TOP_K
     comptime topk_result_bytes = C.TOP_K * (8 + f32)
-    comptime moe_peak = (
+    comptime sparse_route_bytes = size_of[SparseRoute]()
+    comptime moe_base = (
         scratch_block_bytes[P * C.HIDDEN * i8]()
         + scratch_block_bytes[C.HIDDEN * f32]()
         + scratch_block_bytes[P * f32]()
         + scratch_block_bytes[P * C.HIDDEN * bf16]()
-        + scratch_block_bytes[router_candidates_per_rank * router_candidate_bytes]()
-        + scratch_block_bytes[topk_result_bytes]()
+    )
+    comptime router_stage_extra = (
+        scratch_block_bytes[P * topk_result_bytes]()
+        + scratch_block_bytes[P * C.TOP_K * router_candidate_bytes]()
+    )
+    comptime expert_stage_extra = (
+        scratch_block_bytes[P * topk_result_bytes]()
         + scratch_block_bytes[C.TOP_K * 2 * f32]()
         + scratch_block_bytes[C.TOP_K * C.MOE_INTERMEDIATE * i8]()
         + scratch_block_bytes[C.TOP_K * MOE_DOWN_NUM_BLK * f32]()
         + scratch_block_bytes[C.TOP_K * C.HIDDEN * bf16]()
     )
+    comptime sparse_expert_stage_extra = (
+        scratch_block_bytes[P * topk_result_bytes]()
+        + scratch_block_bytes[S.EXPERTS_LOCAL * 4]()
+        + scratch_block_bytes[(S.EXPERTS_LOCAL + 1) * 4]()
+        + scratch_block_bytes[S.EXPERTS_LOCAL * 4]()
+        + scratch_block_bytes[P * C.TOP_K * 4]()
+        + scratch_block_bytes[P * C.TOP_K * sparse_route_bytes]()
+        + scratch_block_bytes[P * C.TOP_K * C.MOE_INTERMEDIATE * i8]()
+        + scratch_block_bytes[P * C.TOP_K * MOE_DOWN_NUM_BLK * f32]()
+    )
+    comptime moe_expert_stage_extra = (
+        expert_stage_extra
+        if expert_stage_extra > sparse_expert_stage_extra
+        else sparse_expert_stage_extra
+    )
+    comptime moe_extra_peak = (
+        router_stage_extra
+        if router_stage_extra > moe_expert_stage_extra
+        else moe_expert_stage_extra
+    )
+    comptime moe_peak = moe_base + moe_extra_peak
 
     comptime lm_output_head_peak = (
         scratch_block_bytes[C.HIDDEN * i8]()
@@ -581,6 +617,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
     var scratch: ScratchPool
     var topos: InlineArray[MiniMaxM27Topology[Self.tp], Self.tp]
     var profile: ForwardLogger
+    var amx_prefill_mode: Bool
 
     def __init__(out self,
         var arenas: HeapMoveArray[NumaArena[alignment=DEFAULT_ALIGNMENT]],
@@ -593,6 +630,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         self.scratch = sc^
         self.topos = topos
         self.profile = ForwardLogger()
+        self.amx_prefill_mode = False
 
 
     def x_main_ptrs(self, seq_len: Int) -> InlineArray[Int, Self.tp]:
@@ -647,7 +685,7 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             ok &= visitor.passthrough(p + "post_attention_layernorm.weight", DType.bfloat16)
             ok &= visitor.passthrough(p + "self_attn.q_norm.weight", DType.bfloat16)
             ok &= visitor.passthrough(p + "self_attn.k_norm.weight", DType.bfloat16)
-            ok &= visitor.passthrough(p + "block_sparse_moe.gate.weight", DType.float32)
+            ok &= visitor.router_gauge_bf16(p + "block_sparse_moe.gate.weight")
             ok &= visitor.passthrough(p + "block_sparse_moe.e_score_correction_bias",
                 DType.float32)
 
@@ -825,14 +863,33 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         comptime V_HEAD_BF16 = C.HEAD_DIM * 2
         comptime PARTIAL_F32S = (
             KV_PER_RANK * C.MAX_ATTN_CHUNKS * HPG * (2 + C.HEAD_DIM))
-        comptime ROUTER_WORKERS_PER_RANK = C.NUM_EXPERTS // Self.tp // C.TOP_K
-        comptime ROUTER_CANDIDATES_PER_RANK = ROUTER_WORKERS_PER_RANK * C.TOP_K
         comptime ROPE_HALF = C.ROPE_DIM // 2
 
         var t_forward0 = Int(perf_counter_ns())
         var sample = ForwardSample(start_pos)
         var topos = self.topos
         var host = topos[0]
+        var dump_dir = String("m27_dump_decode")
+        if seq_len > 1:
+            dump_dir = String("m27_dump_prefill")
+        var dump = Dumper[M27_DUMP_ENABLED](dump_dir)
+
+        var want_prefill = seq_len > 1
+        if want_prefill != self.amx_prefill_mode:
+            self.amx_prefill_mode = want_prefill
+            for rank in range(Self.tp):
+                var cfg_args = InlineArray[AmxConfigArgs, 128](
+                    fill=AmxConfigArgs())
+                var cap = self.main_pools[rank].get_capacity()
+                if want_prefill:
+                    self.main_pools[rank].dispatch[AmxConfigArgs,
+                        amx_prefill_config_kernel](
+                        UnsafePointer(to=cfg_args[0]), cap)
+                else:
+                    self.main_pools[rank].dispatch[AmxConfigArgs,
+                        amx_config_kernel[C.HPG]](
+                        UnsafePointer(to=cfg_args[0]), cap)
+                self.main_pools[rank].join()
 
         # --- Embed (host rank) ---
         var t_embed0 = Int(perf_counter_ns())
@@ -885,6 +942,21 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                         C.HIDDEN, FWHT_BLK_HIDDEN, True, False],
                 ](UnsafePointer(to=attn_quant_jobs[0]), self.main_pools),
             )
+            comptime if M27_DUMP_ENABLED:
+                for dump_row in range(seq_len):
+                    var dump_pos = start_pos + dump_row
+                    for r in range(Self.tp):
+                        var sb_r = topos[r].arena.scratch_base()
+                        var prefix = "p" + String(dump_pos) + "_l" + String(layer_idx) + "_r" + String(r) + "_"
+                        dump.tap(
+                            prefix + "01_attn_i8",
+                            attn_i8_lease.as_ptr[Scalar[DType.int8]](sb_r)
+                                + dump_row * C.HIDDEN,
+                            C.HIDDEN)
+                        dump.tap(
+                            prefix + "01_act_scale",
+                            act_scale_lease.as_ptr[Float32](sb_r) + dump_row,
+                            1)
 
             # Phase 2: fused QKV projection (contiguous output)
 
@@ -902,6 +974,17 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     act_scale_lease.view[F32, Shape[C.MAX_SEQ_LEN, 1]](sb, seq_len),
                     pool)
             sample.add(self.profile.phase("attn_proj"), timed_tp_parallel[Self.tp,do_qkv_gemv](topos, self.main_pools))
+            comptime if M27_DUMP_ENABLED:
+                for dump_row in range(seq_len):
+                    var dump_pos = start_pos + dump_row
+                    for r in range(Self.tp):
+                        var sb_r = topos[r].arena.scratch_base()
+                        var prefix = "p" + String(dump_pos) + "_l" + String(layer_idx) + "_r" + String(r) + "_"
+                        dump.tap(
+                            prefix + "02_qkv",
+                            qkv_lease.as_ptr[Scalar[DType.bfloat16]](
+                                sb_r, dump_row * QKV_LOCAL),
+                            QKV_LOCAL)
 
             attn_work_lease^.release()
             attn_i8_lease^.release()
@@ -980,6 +1063,46 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     q_scales_lease.as_ptr[Float32](sb),
                     start_pos, seq_len)
             sample.add(self.profile.phase("q_prep"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_qprep0))
+            comptime if M27_DUMP_ENABLED:
+                for dump_row in range(seq_len):
+                    var dump_pos = start_pos + dump_row
+                    for r in range(Self.tp):
+                        var sb_r = topos[r].arena.scratch_base()
+                        var prefix = "p" + String(dump_pos) + "_l" + String(layer_idx) + "_r" + String(r) + "_"
+                        var q_i8_ptr = q_i8_lease.as_ptr[Scalar[DType.int8]](sb_r)
+                        var qb_ptr = qi_biases_lease.as_ptr[Float32](sb_r)
+                        var qs_ptr = q_scales_lease.as_ptr[Float32](sb_r)
+                        var qprep_row = InlineArray[
+                            Scalar[DType.int8], Q_LOCAL](uninitialized=True)
+                        var qprep_bias = InlineArray[
+                            Float32, HEADS_PER_RANK](uninitialized=True)
+                        var qprep_scale = InlineArray[
+                            Float32, HEADS_PER_RANK](uninitialized=True)
+                        var qprep_row_ptr = UnsafePointer(to=qprep_row).bitcast[
+                            Scalar[DType.int8]]()
+                        var qprep_bias_ptr = UnsafePointer(to=qprep_bias).bitcast[
+                            Float32]()
+                        var qprep_scale_ptr = UnsafePointer(to=qprep_scale).bitcast[
+                            Float32]()
+                        for kv in range(KV_PER_RANK):
+                            for h in range(HPG):
+                                var q_off = (
+                                    kv * HPG * seq_len * C.HEAD_DIM
+                                    + h * seq_len * C.HEAD_DIM
+                                    + dump_row * C.HEAD_DIM)
+                                var meta_off = (
+                                    kv * HPG * seq_len + h * seq_len + dump_row)
+                                var head_out = kv * HPG + h
+                                comptime for chunk in range(C.HEAD_DIM // K_STEP):
+                                    (qprep_row_ptr + head_out * C.HEAD_DIM
+                                        + chunk * K_STEP).store(
+                                        (q_i8_ptr + q_off + chunk * K_STEP).load[
+                                            width=K_STEP]())
+                                qprep_bias_ptr[head_out] = qb_ptr[meta_off]
+                                qprep_scale_ptr[head_out] = qs_ptr[meta_off]
+                        dump.tap(prefix + "03_qprep_q_i8", qprep_row_ptr, Q_LOCAL)
+                        dump.tap(prefix + "03_qprep_bias", qprep_bias_ptr, HEADS_PER_RANK)
+                        dump.tap(prefix + "03_qprep_scale", qprep_scale_ptr, HEADS_PER_RANK)
 
             if seq_len == 1:
                 @parameter
@@ -1039,6 +1162,22 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                         attn_head_sc_lease.as_ptr[Float32](sb),
                         pool)
                 sample.add(self.profile.phase("attention"), timed_tp_parallel[Self.tp,do_prefill_attn](topos, self.main_pools))
+            comptime if M27_DUMP_ENABLED:
+                for dump_row in range(seq_len):
+                    var dump_pos = start_pos + dump_row
+                    for r in range(Self.tp):
+                        var sb_r = topos[r].arena.scratch_base()
+                        var prefix = "p" + String(dump_pos) + "_l" + String(layer_idx) + "_r" + String(r) + "_"
+                        dump.tap(
+                            prefix + "04_attn_qi",
+                            attn_qi_lease.as_ptr[Scalar[DType.int8]](sb_r)
+                                + dump_row * Q_LOCAL,
+                            Q_LOCAL)
+                        dump.tap(
+                            prefix + "04_attn_head_sc",
+                            attn_head_sc_lease.as_ptr[Float32](sb_r)
+                                + dump_row * HEADS_PER_RANK,
+                            HEADS_PER_RANK)
 
             partial_lease^.release()
             q_scales_lease^.release()
@@ -1060,6 +1199,18 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     topo.activations.x_residual.bound_dyn(topo.arena.base, seq_len),
                     pool)
             sample.add(self.profile.phase("o_proj"), timed_tp_parallel[Self.tp,do_o_proj](topos, self.main_pools))
+            comptime if M27_DUMP_ENABLED:
+                for dump_row in range(seq_len):
+                    var dump_pos = start_pos + dump_row
+                    for r in range(Self.tp):
+                        var topo_r = topos[r]
+                        var prefix = "p" + String(dump_pos) + "_l" + String(layer_idx) + "_r" + String(r) + "_"
+                        dump.tap(
+                            prefix + "05_o_proj_x_residual",
+                            topo_r.activations.x_residual.bound_dyn(
+                                topo_r.arena.base, seq_len).as_ptr[DType.bfloat16]()
+                                + dump_row * C.HIDDEN,
+                            C.HIDDEN)
 
             attn_head_sc_lease^.release()
             attn_qi_lease^.release()
@@ -1071,6 +1222,18 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                 self.x_residual_ptrs(seq_len), seq_len,
                 self.x_main_ptrs(seq_len))
             sample.add(self.profile.phase("attn_reduce"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_attn_reduce0))
+            comptime if M27_DUMP_ENABLED:
+                for dump_row in range(seq_len):
+                    var dump_pos = start_pos + dump_row
+                    for r in range(Self.tp):
+                        var topo_r = topos[r]
+                        var prefix = "p" + String(dump_pos) + "_l" + String(layer_idx) + "_r" + String(r) + "_"
+                        dump.tap(
+                            prefix + "06_attn_reduce_x_main",
+                            topo_r.activations.x_main.bound_dyn(
+                                topo_r.arena.base, seq_len).as_ptr[DType.bfloat16]()
+                                + dump_row * C.HIDDEN,
+                            C.HIDDEN)
 
             # =============================================================
             # FFN BLOCK
@@ -1109,130 +1272,188 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     rmsnorm_dual_output_worker[C.HIDDEN, FWHT_BLK_HIDDEN],
                 ](UnsafePointer(to=dual_norm_jobs[0]), self.main_pools),
             )
+            comptime if M27_DUMP_ENABLED:
+                for dump_row in range(seq_len):
+                    var dump_pos = start_pos + dump_row
+                    for r in range(Self.tp):
+                        var sb_r = topos[r].arena.scratch_base()
+                        var prefix = "p" + String(dump_pos) + "_l" + String(layer_idx) + "_r" + String(r) + "_"
+                        dump.tap(
+                            prefix + "07_moe_i8",
+                            moe_i8_lease.as_ptr[Scalar[DType.int8]](sb_r)
+                                + dump_row * C.HIDDEN,
+                            C.HIDDEN)
+                        dump.tap(
+                            prefix + "07_moe_scale",
+                            moe_scale_lease.as_ptr[Float32](sb_r) + dump_row,
+                            1)
+                        dump.tap(
+                            prefix + "07_normed_bf16",
+                            normed_bf16_lease.as_ptr[Scalar[DType.bfloat16]](sb_r)
+                                + dump_row * C.HIDDEN,
+                            C.HIDDEN)
 
             moe_work_lease^.release()
 
-            var routing_lease = self.scratch.borrow[TopKResult[C.TOP_K], 1]()
+            var routing_lease = self.scratch.borrow[
+                TopKResult[C.TOP_K], PREFILL_CHUNK_SIZE]()
             var candidates_lease = self.scratch.borrow[
-                RouterCandidate, ROUTER_CANDIDATES_PER_RANK]()
-            var expert_qi_lease = self.scratch.borrow[Scalar[DType.int8], C.TOP_K * C.MOE_INTERMEDIATE]()
-            var expert_blk_scale_lease = self.scratch.borrow[Float32, C.TOP_K * MOE_DOWN_NUM_BLK]()
-            var expert_out_lease = self.scratch.borrow[Scalar[DType.bfloat16], C.TOP_K * C.HIDDEN]()
-            var local_count_lease = self.scratch.borrow[Int32, 1]()
+                RouterCandidate, PREFILL_CHUNK_SIZE * C.TOP_K]()
 
             var t_moe0 = Int(perf_counter_ns())
+
+            @parameter
+            def do_router_fused[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
+                var lb = topo.layers.base(topo.arena.base, layer_idx)
+                var layer = topo.layers.proto
+                var sb = topo.arena.scratch_base()
+                comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
+                var expert_base = rank * experts_per_rank
+                return router_fused_dispatch[experts_per_rank, C.HIDDEN, C.TOP_K](
+                    normed_bf16_lease.view[
+                        BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](sb, seq_len),
+                    layer.body.router_proj.bound(lb),
+                    layer.body.router_gauge.bound(lb),
+                    layer.body.router_bias.bound(lb),
+                    candidates_lease.as_ptr[RouterCandidate](sb),
+                    pool,
+                    expert_base)
+            _ = timed_tp_parallel[Self.tp,do_router_fused](topos, self.main_pools)
+
             for token_idx in range(seq_len):
-
-                @parameter
-                def do_router_fused[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
-                    var lb = topo.layers.base(topo.arena.base, layer_idx)
-                    var layer = topo.layers.proto
-                    var sb = topo.arena.scratch_base()
-                    comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
-                    var expert_base = rank * experts_per_rank
-                    return router_fused_dispatch[experts_per_rank, C.HIDDEN, C.TOP_K](
-                        normed_bf16_lease.view[BF16, Shape[1, C.HIDDEN]](
-                            sb, 1, element_offset=token_idx * C.HIDDEN),
-                        layer.body.router_proj.bound(lb),
-                        layer.body.router_bias.bound(lb),
-                        candidates_lease.as_ptr[RouterCandidate](sb),
-                        pool,
-                        expert_base)
-                _ = timed_tp_parallel[Self.tp,do_router_fused](topos, self.main_pools)
-
                 var candidate_ptrs = InlineArray[
                     UnsafePointer[RouterCandidate, MutAnyOrigin], Self.tp](
                     uninitialized=True)
                 var candidate_counts = InlineArray[Int, Self.tp](uninitialized=True)
                 for r in range(Self.tp):
                     var sb_r = topos[r].arena.scratch_base()
-                    candidate_ptrs[r] = candidates_lease.as_ptr[RouterCandidate](sb_r)
-                    candidate_counts[r] = router_num_workers[
-                        C.NUM_EXPERTS // Self.tp, C.TOP_K](
-                        Int(self.main_pools[r].get_capacity())) * C.TOP_K
+                    var candidates = candidates_lease.as_ptr[RouterCandidate](sb_r)
+                    candidate_ptrs[r] = candidates + token_idx * C.TOP_K
+                    candidate_counts[r] = C.TOP_K
                 var host_sb = topos[HOST_RANK].arena.scratch_base()
                 router_merge_multi_and_renorm[C.TOP_K, Self.tp](
                     candidate_ptrs, candidate_counts,
-                    routing_lease.as_ptr[TopKResult[C.TOP_K]](host_sb))
-                var routing = routing_lease.as_ptr[TopKResult[C.TOP_K]](host_sb)[]
+                    routing_lease.as_ptr[TopKResult[C.TOP_K]](
+                        host_sb, token_idx))
+                var routing = routing_lease.as_ptr[
+                    TopKResult[C.TOP_K]](host_sb, token_idx)[]
                 if token_idx == seq_len - 1:
                     self.profile.record_moe_route[C.TOP_K](
                         layer_idx, C.NUM_LAYERS, C.NUM_EXPERTS, Self.tp,
                         routing.indices, routing.weights)
                 for r in range(Self.tp):
                     var sb_r = topos[r].arena.scratch_base()
-                    routing_lease.as_ptr[TopKResult[C.TOP_K]](sb_r)[] = routing
+                    routing_lease.as_ptr[
+                        TopKResult[C.TOP_K]](sb_r, token_idx)[] = routing
 
-                @parameter
-                def do_expert_phase1[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
-                    var lb = topo.layers.base(topo.arena.base, layer_idx)
-                    var layer = topo.layers.proto
-                    var sb = topo.arena.scratch_base()
-                    var routing = routing_lease.as_ptr[TopKResult[C.TOP_K]](sb)[]
-                    comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
-                    var expert_base = rank * experts_per_rank
-                    var lc = 0
-                    for s in range(C.TOP_K):
-                        var eid = routing.indices[s]
-                        if eid >= expert_base and eid < expert_base + experts_per_rank:
-                            lc += 1
-                    local_count_lease.as_ptr[Int32](sb)[] = Int32(lc)
-                    return minimax_moe_phase1[
-                        C.MOE_INTERMEDIATE, C.HIDDEN, FWHT_BLK,
-                        C.TOP_K, C.NUM_EXPERTS, Self.tp](
-                        moe_i8_lease.view[I8, Shape[1, C.HIDDEN]](
-                            sb, 1, element_offset=token_idx * C.HIDDEN),
-                        moe_scale_lease.view[F32, Shape[1, 1]](
-                            sb, 1, element_offset=token_idx),
-                        routing,
-                        layer.body.experts_w1.bound(lb),
-                        C.MOE_INTERMEDIATE * C.HIDDEN,
-                        layer.body.experts_w1_sc.bound(lb),
-                        C.MOE_INTERMEDIATE * 4,
-                        layer.body.experts_w1_colsum.bound(lb),
-                        C.MOE_INTERMEDIATE * 4,
-                        layer.body.experts_w3.bound(lb),
-                        C.MOE_INTERMEDIATE * C.HIDDEN,
-                        layer.body.experts_w3_sc.bound(lb),
-                        C.MOE_INTERMEDIATE * 4,
-                        layer.body.experts_w3_colsum.bound(lb),
-                        C.MOE_INTERMEDIATE * 4,
-                        expert_qi_lease.view[I8, Shape[C.TOP_K, C.MOE_INTERMEDIATE]](sb, C.TOP_K),
-                        expert_blk_scale_lease.view[F32, Shape[C.TOP_K, MOE_DOWN_NUM_BLK]](sb, C.TOP_K),
-                        rank, pool)
-                _ = timed_tp_parallel[Self.tp,do_expert_phase1](topos, self.main_pools)
+            candidates_lease^.release()
 
-                @parameter
-                def do_expert_phase2[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
-                    var lb = topo.layers.base(topo.arena.base, layer_idx)
-                    var layer = topo.layers.proto
-                    var sb = topo.arena.scratch_base()
-                    var routing = routing_lease.as_ptr[TopKResult[C.TOP_K]](sb)[]
-                    return minimax_moe_phase2[
-                        C.HIDDEN, C.MOE_INTERMEDIATE, FWHT_BLK_MOE_DOWN,
-                        C.TOP_K, C.NUM_EXPERTS, Self.tp](
-                        expert_qi_lease.view[I8, Shape[C.TOP_K, C.MOE_INTERMEDIATE]](sb, C.TOP_K),
-                        expert_blk_scale_lease.view[F32, Shape[C.TOP_K, MOE_DOWN_NUM_BLK]](sb, C.TOP_K),
-                        routing,
-                        layer.body.experts_w2.bound(lb),
-                        C.HIDDEN * C.MOE_INTERMEDIATE,
-                        layer.body.experts_w2_sc.bound(lb),
-                        C.HIDDEN * 4,
-                        layer.body.experts_w2_colsum.bound(lb),
-                        C.HIDDEN * MOE_DOWN_NUM_BLK * 4,
-                        expert_out_lease.view[BF16, Shape[C.TOP_K, C.HIDDEN]](sb, C.TOP_K),
-                        rank, pool)
-                _ = timed_tp_parallel[Self.tp,do_expert_phase2](topos, self.main_pools)
+            comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
+            var route_counts_lease = self.scratch.borrow[Int32, experts_per_rank]()
+            var route_offsets_lease = self.scratch.borrow[Int32, experts_per_rank + 1]()
+            var route_cursors_lease = self.scratch.borrow[Int32, experts_per_rank]()
+            var route_indices_lease = self.scratch.borrow[
+                Int32, PREFILL_CHUNK_SIZE * C.TOP_K]()
+            var routes_lease = self.scratch.borrow[
+                SparseRoute, PREFILL_CHUNK_SIZE * C.TOP_K]()
+            var expert_qi_lease = self.scratch.borrow[
+                Scalar[DType.int8],
+                PREFILL_CHUNK_SIZE * C.TOP_K * C.MOE_INTERMEDIATE]()
+            var expert_blk_scale_lease = self.scratch.borrow[
+                Float32, PREFILL_CHUNK_SIZE * C.TOP_K * MOE_DOWN_NUM_BLK]()
 
-                for r in range(Self.tp):
-                    var topo_r = topos[r]
-                    var sb = topo_r.arena.scratch_base()
-                    var lc = Int(local_count_lease.as_ptr[Int32](sb)[])
-                    accumulate_expert_outputs[C.HIDDEN, C.TOP_K](
-                        expert_out_lease.view[BF16, Shape[C.TOP_K, C.HIDDEN]](sb, C.TOP_K).as_ptr[DType.bfloat16](),
-                        lc,
-                        topo_r.activations.x_residual.bound_dyn(topo_r.arena.base, seq_len).as_ptr[DType.bfloat16]()
-                            + token_idx * C.HIDDEN)
+            for r in range(Self.tp):
+                var sb = topos[r].arena.scratch_base()
+                _ = build_sparse_route_schedule[C.TOP_K, experts_per_rank](
+                    routing_lease.as_ptr[TopKResult[C.TOP_K]](sb),
+                    seq_len,
+                    r,
+                    route_counts_lease.as_ptr[Int32](sb),
+                    route_offsets_lease.as_ptr[Int32](sb),
+                    route_cursors_lease.as_ptr[Int32](sb),
+                    route_indices_lease.as_ptr[Int32](sb),
+                    routes_lease.as_ptr[SparseRoute](sb),
+                )
+
+            @parameter
+            def do_sparse_expert_phase1[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
+                var lb = topo.layers.base(topo.arena.base, layer_idx)
+                var layer = topo.layers.proto
+                var sb = topo.arena.scratch_base()
+                return minimax_sparse_moe_phase1[
+                    experts_per_rank, C.MOE_INTERMEDIATE, C.HIDDEN, FWHT_BLK](
+                    moe_i8_lease.view[
+                        I8, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](sb, seq_len),
+                    moe_scale_lease.view[
+                        F32, Shape[C.MAX_SEQ_LEN, 1]](sb, seq_len),
+                    route_counts_lease.as_ptr[Int32](sb),
+                    route_offsets_lease.as_ptr[Int32](sb),
+                    routes_lease.as_ptr[SparseRoute](sb),
+                    layer.body.experts_w1.bound(lb),
+                    C.MOE_INTERMEDIATE * C.HIDDEN,
+                    layer.body.experts_w1_sc.bound(lb),
+                    C.MOE_INTERMEDIATE,
+                    layer.body.experts_w1_colsum.bound(lb),
+                    C.MOE_INTERMEDIATE,
+                    layer.body.experts_w3.bound(lb),
+                    C.MOE_INTERMEDIATE * C.HIDDEN,
+                    layer.body.experts_w3_sc.bound(lb),
+                    C.MOE_INTERMEDIATE,
+                    layer.body.experts_w3_colsum.bound(lb),
+                    C.MOE_INTERMEDIATE,
+                    expert_qi_lease.view[
+                        I8,
+                        Shape[
+                            PREFILL_CHUNK_SIZE * C.TOP_K,
+                            C.MOE_INTERMEDIATE,
+                        ],
+                    ](sb, PREFILL_CHUNK_SIZE * C.TOP_K),
+                    expert_blk_scale_lease.view[
+                        F32,
+                        Shape[
+                            PREFILL_CHUNK_SIZE * C.TOP_K,
+                            MOE_DOWN_NUM_BLK,
+                        ],
+                    ](sb, PREFILL_CHUNK_SIZE * C.TOP_K),
+                    pool)
+            _ = timed_tp_parallel[Self.tp,do_sparse_expert_phase1](
+                topos, self.main_pools)
+
+            @parameter
+            def do_sparse_expert_phase2[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
+                var lb = topo.layers.base(topo.arena.base, layer_idx)
+                var layer = topo.layers.proto
+                var sb = topo.arena.scratch_base()
+                return minimax_sparse_moe_phase2[
+                    C.TOP_K, experts_per_rank,
+                    C.HIDDEN, C.MOE_INTERMEDIATE, FWHT_BLK_MOE_DOWN](
+                    route_indices_lease.as_ptr[Int32](sb),
+                    routes_lease.as_ptr[SparseRoute](sb),
+                    expert_qi_lease.view[
+                        I8,
+                        Shape[
+                            PREFILL_CHUNK_SIZE * C.TOP_K,
+                            C.MOE_INTERMEDIATE,
+                        ],
+                    ](sb, PREFILL_CHUNK_SIZE * C.TOP_K),
+                    expert_blk_scale_lease.view[
+                        F32,
+                        Shape[
+                            PREFILL_CHUNK_SIZE * C.TOP_K,
+                            MOE_DOWN_NUM_BLK,
+                        ],
+                    ](sb, PREFILL_CHUNK_SIZE * C.TOP_K),
+                    layer.body.experts_w2.bound(lb),
+                    C.HIDDEN * C.MOE_INTERMEDIATE,
+                    layer.body.experts_w2_sc.bound(lb),
+                    C.HIDDEN,
+                    layer.body.experts_w2_colsum.bound(lb),
+                    C.HIDDEN * MOE_DOWN_NUM_BLK,
+                    topo.activations.x_residual.bound_dyn(
+                        topo.arena.base, seq_len),
+                    pool)
+            _ = timed_tp_parallel[Self.tp,do_sparse_expert_phase2](
+                topos, self.main_pools)
 
             sample.add(self.profile.phase("moe"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_moe0))
 
@@ -1241,12 +1462,26 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                 self.x_residual_ptrs(seq_len), seq_len,
                 self.x_main_ptrs(seq_len))
             sample.add(self.profile.phase("ffn_reduce"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_ffn_reduce0))
+            comptime if M27_DUMP_ENABLED:
+                for dump_row in range(seq_len):
+                    var dump_pos = start_pos + dump_row
+                    for r in range(Self.tp):
+                        var topo_r = topos[r]
+                        var prefix = "p" + String(dump_pos) + "_l" + String(layer_idx) + "_r" + String(r) + "_"
+                        dump.tap(
+                            prefix + "08_ffn_reduce_x_main",
+                            topo_r.activations.x_main.bound_dyn(
+                                topo_r.arena.base, seq_len).as_ptr[DType.bfloat16]()
+                                + dump_row * C.HIDDEN,
+                            C.HIDDEN)
 
-            local_count_lease^.release()
-            expert_out_lease^.release()
             expert_blk_scale_lease^.release()
             expert_qi_lease^.release()
-            candidates_lease^.release()
+            routes_lease^.release()
+            route_indices_lease^.release()
+            route_cursors_lease^.release()
+            route_offsets_lease^.release()
+            route_counts_lease^.release()
             routing_lease^.release()
             normed_bf16_lease^.release()
             moe_scale_lease^.release()

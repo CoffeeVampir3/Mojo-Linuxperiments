@@ -33,6 +33,7 @@ from quant.source_format import Converter
 
 comptime PtrU8 = UnsafePointer[UInt8, MutAnyOrigin]
 comptime PtrF32 = UnsafePointer[Float32, MutAnyOrigin]
+comptime PtrBF16 = UnsafePointer[Scalar[DType.bfloat16], MutAnyOrigin]
 comptime PtrI8 = UnsafePointer[Scalar[DType.int8], MutAnyOrigin]
 comptime WIDTH = simd_width_of[DType.float32]()
 comptime DEFAULT_PANEL_ROWS = 2048
@@ -181,6 +182,11 @@ def f32_addr(mut buf: List[Float32]) -> PtrF32:
 @always_inline
 def i8_addr(mut buf: List[Scalar[DType.int8]]) -> PtrI8:
     return PtrI8(unsafe_from_address=Int(buf.unsafe_ptr()))
+
+
+@always_inline
+def bf16_addr(mut buf: List[Scalar[DType.bfloat16]]) -> PtrBF16:
+    return PtrBF16(unsafe_from_address=Int(buf.unsafe_ptr()))
 
 
 # =============================================================================
@@ -520,6 +526,52 @@ struct Planner(TaskVisitor, Movable):
             weight_off, weight_off + byte_size))
         return True
 
+    def router_gauge_bf16(mut self, name: String) -> Bool:
+        if not self.ok:
+            return False
+        self.count += 1
+
+        var loc_opt = find_tensor(self.headers, name)
+        if not loc_opt:
+            print("quantize: missing router tensor " + name)
+            self.ok = False
+            return False
+        var loc = loc_opt.value()
+        if loc.dtype != DType.float32:
+            print("quantize: router dtype mismatch for " + name
+                + " expected F32, found " + dtype_string(loc.dtype))
+            self.ok = False
+            return False
+        var rows = loc.rows
+        var cols = loc.cols
+        if rows <= 0 or cols <= 0:
+            print("quantize: invalid router shape for " + name)
+            self.ok = False
+            return False
+        if cols % WIDTH != 0:
+            print("quantize: router cols must be f32-simd-aligned for " + name)
+            self.ok = False
+            return False
+        var expected_bytes = rows * cols * 4
+        if loc.byte_size() != expected_bytes:
+            print("quantize: router byte size mismatch for " + name)
+            self.ok = False
+            return False
+
+        var centered_bytes = rows * cols * 2
+        var gauge_bytes = cols * 2
+        var centered_off = self.offset
+        var gauge_off = centered_off + centered_bytes
+        self.offset = gauge_off + gauge_bytes
+
+        self.entries.append(OutputEntry(
+            name, DType.bfloat16, rows, cols,
+            centered_off, centered_off + centered_bytes))
+        self.entries.append(OutputEntry(
+            name + "_gauge", DType.bfloat16, cols, 1,
+            gauge_off, gauge_off + gauge_bytes))
+        return True
+
 
 # =============================================================================
 # Executor — TaskVisitor that reads, converts, quantizes, and writes.
@@ -743,6 +795,104 @@ struct Executor(TaskVisitor):
 
         self.total_bytes += primary_bytes
         self.num_passthrough += 1
+        return True
+
+    def router_gauge_bf16(mut self, name: String) -> Bool:
+        if not self.ok:
+            return False
+        ref centered_entry = self.planner.entries[self.entry_idx]
+        ref gauge_entry = self.planner.entries[self.entry_idx + 1]
+        self.entry_idx += 2
+
+        var rows = centered_entry.rows
+        var cols = centered_entry.cols
+        var prefix = "  [" + String(self.task_idx + 1) + "/" + String(self.total_tasks) + "] "
+        print(prefix + "router gauge bf16: " + name
+            + " [" + String(rows) + "x" + String(cols) + "]"
+            + " gauge=[" + String(gauge_entry.rows) + "x"
+            + String(gauge_entry.cols) + "]")
+        self.task_idx += 1
+
+        var loc = find_tensor(self.planner.headers, name).value()
+        var primary_shard = loc.shard
+        var primary_start = self.planner.headers[loc.shard].data_offset + loc.start
+        var primary_bytes = loc.byte_size()
+        var total = rows * cols
+
+        var src_buf = List[Float32](length=total, fill=Float32(0))
+        var gauge_buf = List[Float32](length=cols, fill=Float32(0))
+        var centered_buf = List[Scalar[DType.bfloat16]](
+            length=total, fill=Scalar[DType.bfloat16](0))
+        var gauge_bf16_buf = List[Scalar[DType.bfloat16]](
+            length=cols, fill=Scalar[DType.bfloat16](0))
+
+        var src = f32_addr(src_buf)
+        var gauge = f32_addr(gauge_buf)
+        var centered = bf16_addr(centered_buf)
+        var gauge_bf16 = bf16_addr(gauge_bf16_buf)
+
+        if not self.rio.read(primary_shard, primary_start,
+                src.bitcast[UInt8](), primary_bytes):
+            print("quantize: failed to read router tensor for " + name)
+            self.ok = False
+            return False
+
+        var r = 0
+        while r < rows:
+            var row = src + r * cols
+            var k = 0
+            while k + WIDTH <= cols:
+                (gauge + k).store(
+                    (gauge + k).load[width=WIDTH]()
+                    + (row + k).load[width=WIDTH]())
+                k += WIDTH
+            r += 1
+
+        var inv_rows = SIMD[DType.float32, WIDTH](
+            Float32(1.0) / Float32(rows))
+        var k = 0
+        while k + WIDTH <= cols:
+            var g = (gauge + k).load[width=WIDTH]() * inv_rows
+            (gauge + k).store(g)
+            (gauge_bf16 + k).store(g.cast[DType.bfloat16]())
+            k += WIDTH
+
+        r = 0
+        while r < rows:
+            var row = src + r * cols
+            var out = centered + r * cols
+            k = 0
+            while k + WIDTH <= cols:
+                var v = (
+                    (row + k).load[width=WIDTH]()
+                    - (gauge + k).load[width=WIDTH]()
+                )
+                (out + k).store(v.cast[DType.bfloat16]())
+                k += WIDTH
+            r += 1
+
+        if not self.rio.write(
+                self.output_file_idx,
+                self.data_start + centered_entry.data_start,
+                centered.bitcast[UInt8](),
+                centered_entry.byte_size()):
+            self.ok = False
+            return False
+        if not self.rio.write(
+                self.output_file_idx,
+                self.data_start + gauge_entry.data_start,
+                gauge_bf16.bitcast[UInt8](),
+                gauge_entry.byte_size()):
+            self.ok = False
+            return False
+
+        _ = src_buf^
+        _ = gauge_buf^
+        _ = centered_buf^
+        _ = gauge_bf16_buf^
+
+        self.total_bytes += centered_entry.byte_size() + gauge_entry.byte_size()
+        self.num_quantized += 1
         return True
 
 

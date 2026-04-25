@@ -29,6 +29,5 @@ struct Dumper[Enabled: Bool = False]:
                 var fh = FileHandle(path, "w")
                 fh.write_bytes(Span[UInt8, MutAnyOrigin](ptr=raw, length=num_bytes))
                 fh.close()
-                print("dump:", label, num_bytes, "bytes")
             except:
                 print("Dumper: write failed for", label)

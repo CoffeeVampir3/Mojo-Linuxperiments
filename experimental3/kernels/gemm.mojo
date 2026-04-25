@@ -78,10 +78,12 @@ def int8_gemv_blocked_worker[N: Int, K: Int, fwht_blk: Int](
     args: Int8GemvBlockedArgs,
 ):
     """Blocked GEMV worker that writes final scaled bf16 directly."""
-    gemv_row_blocked_bf16_scaled[N, K, fwht_blk](
-        args.act, args.wpacked, args.blk_scale,
-        args.wscale, args.blk_colsum, args.dst,
-        args.output_scale, args.n_out, args.colsum_stride)
+    comptime num_blocks = K // fwht_blk
+    for m in range(args.row_count):
+        gemv_row_blocked_bf16_scaled[N, K, fwht_blk](
+            args.act + m * K, args.wpacked, args.blk_scale + m * num_blocks,
+            args.wscale, args.blk_colsum, args.dst + m * N,
+            args.output_scale, args.n_out, args.colsum_stride)
 
 
 def int8_gemv_blocked_decode_worker[N: Int, K: Int, fwht_blk: Int](
@@ -98,16 +100,20 @@ def int8_gemv_blocked_wa_worker[N: Int, K: Int, fwht_blk: Int](
     args: Int8GemvBlockedArgs,
 ):
     comptime width = simd_width_of[DType.float32]()
-    var dst_buf = InlineArray[Float32, N](fill=Float32(0))
-    var dp = UnsafePointer(to=dst_buf).bitcast[Float32]()
-    gemv_row_blocked_wa[N, K, fwht_blk](args.act, args.wpacked, args.blk_scale,
-        args.wscale, args.blk_colsum, dp)
+    comptime num_blocks = K // fwht_blk
+    for m in range(args.row_count):
+        var dst_buf = InlineArray[Float32, N](fill=Float32(0))
+        var dp = UnsafePointer(to=dst_buf).bitcast[Float32]()
+        gemv_row_blocked_wa[N, K, fwht_blk](
+            args.act + m * K, args.wpacked, args.blk_scale + m * num_blocks,
+            args.wscale, args.blk_colsum, dp)
 
-    var scale = SIMD[DType.float32, width](args.output_scale)
-    var k = 0
-    while k + width <= N:
-        (args.dst + k).store(((dp + k).load[width=width]() * scale).cast[DType.bfloat16]())
-        k += width
+        var scale = SIMD[DType.float32, width](args.output_scale)
+        var k = 0
+        while k + width <= N:
+            (args.dst + m * N + k).store(
+                ((dp + k).load[width=width]() * scale).cast[DType.bfloat16]())
+            k += width
 
 
 # ============================================================================
