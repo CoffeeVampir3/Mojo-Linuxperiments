@@ -30,7 +30,7 @@ comptime MAX_CP_RANKS = 8
 
 
 @fieldwise_init
-struct WorkerConfig(Copyable, ImplicitlyCopyable):
+struct WorkerConfig(Copyable, ImplicitlyCopyable, Defaultable):
     var act_ptr: I8Ptr
     var wpacked_ptr: I8Ptr
     var colsum_ptr: F32Ptr
@@ -52,7 +52,7 @@ struct WorkerConfig(Copyable, ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct Int8GemvBlockedArgs(Copyable, ImplicitlyCopyable):
+struct Int8GemvBlockedArgs(Copyable, ImplicitlyCopyable, Defaultable):
     var act: I8Ptr
     var wpacked: I8Ptr
     var blk_scale: F32Ptr

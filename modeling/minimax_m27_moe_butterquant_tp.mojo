@@ -42,7 +42,6 @@ from experimental3.init_weights import (
 from experimental3.gamma import compute_sqrt_gamma
 from experimental3.common_math import rms_reduce_bf16, inv_rms_from_sum_sq
 from experimental3.kv_cache import Gemma4KVCache
-from experimental3.amx import K_STEP
 from experimental3.kernels.dispatch_kernels import (
     rmsnorm_gamma_fwht_per_block_quantize,
     int8_gemv, int8_gemv_blocked,
@@ -52,7 +51,6 @@ from experimental3.kernels.dispatch_args import RmsNormFwhtQuantArgs
 from experimental3.kernels.rmsnorm import (
     rmsnorm_fwht_quant_worker, accumulate_expert_outputs,
 )
-from experimental3.tensor_dump import Dumper
 
 from minimax.kernels.router import (
     TopKResult, router_merge_multi_and_renorm, build_sparse_route_schedule,
@@ -127,10 +125,8 @@ comptime FWHT_BLK = 128
 comptime FWHT_BLK_HIDDEN = 128
 comptime FWHT_BLK_MOE_DOWN = 128
 comptime LM_OUTPUT_HEAD_FWHT_BLK = 64
-comptime VNNI_ALIGN = 64
 comptime MOE_DOWN_NUM_BLK = C.MOE_INTERMEDIATE // FWHT_BLK_MOE_DOWN
 comptime PREFILL_CHUNK_SIZE = 1024
-comptime M27_DUMP_ENABLED = False
 
 
 # =============================================================================
@@ -424,6 +420,7 @@ def calculate_peak_scratch[tp: Int]() -> Int:
     comptime bf16 = 2
     comptime f32  = 4
     comptime i8   = 1
+    comptime i32  = size_of[Int32]()
     comptime P = PREFILL_CHUNK_SIZE
 
     comptime HPG = C.HPG
@@ -452,47 +449,65 @@ def calculate_peak_scratch[tp: Int]() -> Int:
         attn_phase1_peak if attn_phase1_peak > attn_phase2_peak else attn_phase2_peak
     )
 
-    comptime router_candidate_bytes = 16
-    comptime topk_result_bytes = C.TOP_K * (8 + f32)
+    comptime router_candidate_bytes = size_of[RouterCandidate]()
+    comptime topk_result_bytes = size_of[TopKResult[C.TOP_K]]()
     comptime sparse_route_bytes = size_of[SparseRoute]()
-    comptime moe_base = (
-        scratch_block_bytes[P * C.HIDDEN * i8]()
-        + scratch_block_bytes[C.HIDDEN * f32]()
+    comptime moe_persistent = (
+        act_scale_bytes
+        + scratch_block_bytes[P * C.HIDDEN * i8]()
         + scratch_block_bytes[P * f32]()
         + scratch_block_bytes[P * C.HIDDEN * bf16]()
     )
-    comptime router_stage_extra = (
-        scratch_block_bytes[P * topk_result_bytes]()
-        + scratch_block_bytes[P * C.TOP_K * router_candidate_bytes]()
+    comptime moe_dual_norm_peak = (
+        moe_persistent + scratch_block_bytes[C.HIDDEN * f32]()
     )
-    comptime expert_stage_extra = (
-        scratch_block_bytes[P * topk_result_bytes]()
-        + scratch_block_bytes[C.TOP_K * 2 * f32]()
+    comptime decode_router_peak = (
+        moe_persistent
+        + scratch_block_bytes[topk_result_bytes]()
+        + scratch_block_bytes[C.TOP_K * router_candidate_bytes]()
+    )
+    comptime decode_expert_peak = (
+        moe_persistent
+        + scratch_block_bytes[topk_result_bytes]()
         + scratch_block_bytes[C.TOP_K * C.MOE_INTERMEDIATE * i8]()
         + scratch_block_bytes[C.TOP_K * MOE_DOWN_NUM_BLK * f32]()
         + scratch_block_bytes[C.TOP_K * C.HIDDEN * bf16]()
+        + scratch_block_bytes[i32]()
     )
-    comptime sparse_expert_stage_extra = (
-        scratch_block_bytes[P * topk_result_bytes]()
-        + scratch_block_bytes[S.EXPERTS_LOCAL * 4]()
-        + scratch_block_bytes[(S.EXPERTS_LOCAL + 1) * 4]()
-        + scratch_block_bytes[S.EXPERTS_LOCAL * 4]()
+    comptime prefill_router_peak = (
+        moe_persistent
+        + scratch_block_bytes[P * topk_result_bytes]()
+        + scratch_block_bytes[P * C.TOP_K * router_candidate_bytes]()
+    )
+    comptime prefill_sparse_expert_peak = (
+        moe_persistent
+        + scratch_block_bytes[P * topk_result_bytes]()
+        + scratch_block_bytes[S.EXPERTS_LOCAL * i32]()
+        + scratch_block_bytes[(S.EXPERTS_LOCAL + 1) * i32]()
+        + scratch_block_bytes[S.EXPERTS_LOCAL * i32]()
         + scratch_block_bytes[P * C.TOP_K * sparse_route_bytes]()
         + scratch_block_bytes[P * C.TOP_K * C.MOE_INTERMEDIATE * i8]()
         + scratch_block_bytes[P * C.TOP_K * MOE_DOWN_NUM_BLK * f32]()
         + scratch_block_bytes[P * C.HIDDEN * f32]()
     )
-    comptime moe_expert_stage_extra = (
-        expert_stage_extra
-        if expert_stage_extra > sparse_expert_stage_extra
-        else sparse_expert_stage_extra
+    comptime moe_decode_peak = (
+        decode_router_peak
+        if decode_router_peak > decode_expert_peak else decode_expert_peak
     )
-    comptime moe_extra_peak = (
-        router_stage_extra
-        if router_stage_extra > moe_expert_stage_extra
-        else moe_expert_stage_extra
+    comptime moe_prefill_peak = (
+        prefill_router_peak
+        if prefill_router_peak > prefill_sparse_expert_peak
+        else prefill_sparse_expert_peak
     )
-    comptime moe_peak = moe_base + moe_extra_peak
+    comptime moe_decode_or_prefill_peak = (
+        moe_decode_peak
+        if moe_decode_peak > moe_prefill_peak else moe_prefill_peak
+    )
+    comptime moe_peak = (
+        moe_dual_norm_peak
+        if moe_dual_norm_peak > moe_decode_or_prefill_peak
+        else moe_decode_or_prefill_peak
+    )
 
     comptime lm_output_head_peak = (
         scratch_block_bytes[C.HIDDEN * i8]()
@@ -1250,10 +1265,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         var sample = ForwardSample(start_pos, seq_len, produce_next_token)
         var topos = self.topos
         var host = topos[0]
-        var dump_dir = String("m27_dump_decode")
-        if seq_len > 1:
-            dump_dir = String("m27_dump_prefill")
-        var dump = Dumper[M27_DUMP_ENABLED](dump_dir)
 
         var want_prefill = seq_len > 1
         if want_prefill != self.amx_prefill_mode:
@@ -1322,21 +1333,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                         C.HIDDEN, FWHT_BLK_HIDDEN, True, False],
                 ](UnsafePointer(to=attn_quant_jobs[0]), self.main_pools),
             )
-            comptime if M27_DUMP_ENABLED:
-                for dump_row in range(seq_len):
-                    var dump_pos = start_pos + dump_row
-                    for r in range(Self.tp):
-                        var sb_r = topos[r].arena.scratch_base()
-                        var prefix = "p" + String(dump_pos) + "_l" + String(layer_idx) + "_r" + String(r) + "_"
-                        dump.tap(
-                            prefix + "01_attn_i8",
-                            attn_i8_lease.as_ptr[Scalar[DType.int8]](sb_r)
-                                + dump_row * C.HIDDEN,
-                            C.HIDDEN)
-                        dump.tap(
-                            prefix + "01_act_scale",
-                            act_scale_lease.as_ptr[Float32](sb_r) + dump_row,
-                            1)
 
             # Phase 2: fused QKV projection (contiguous output)
 
@@ -1354,17 +1350,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     act_scale_lease.view[F32, Shape[C.MAX_SEQ_LEN, 1]](sb, seq_len),
                     pool)
             sample.add(self.profile.phase("attn_proj"), timed_tp_parallel[Self.tp,do_qkv_gemv](topos, self.main_pools))
-            comptime if M27_DUMP_ENABLED:
-                for dump_row in range(seq_len):
-                    var dump_pos = start_pos + dump_row
-                    for r in range(Self.tp):
-                        var sb_r = topos[r].arena.scratch_base()
-                        var prefix = "p" + String(dump_pos) + "_l" + String(layer_idx) + "_r" + String(r) + "_"
-                        dump.tap(
-                            prefix + "02_qkv",
-                            qkv_lease.as_ptr[Scalar[DType.bfloat16]](
-                                sb_r, dump_row * QKV_LOCAL),
-                            QKV_LOCAL)
 
             attn_work_lease^.release()
             attn_i8_lease^.release()
@@ -1443,46 +1428,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     q_scales_lease.as_ptr[Float32](sb),
                     start_pos, seq_len)
             sample.add(self.profile.phase("q_prep"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_qprep0))
-            comptime if M27_DUMP_ENABLED:
-                for dump_row in range(seq_len):
-                    var dump_pos = start_pos + dump_row
-                    for r in range(Self.tp):
-                        var sb_r = topos[r].arena.scratch_base()
-                        var prefix = "p" + String(dump_pos) + "_l" + String(layer_idx) + "_r" + String(r) + "_"
-                        var q_i8_ptr = q_i8_lease.as_ptr[Scalar[DType.int8]](sb_r)
-                        var qb_ptr = qi_biases_lease.as_ptr[Float32](sb_r)
-                        var qs_ptr = q_scales_lease.as_ptr[Float32](sb_r)
-                        var qprep_row = InlineArray[
-                            Scalar[DType.int8], Q_LOCAL](uninitialized=True)
-                        var qprep_bias = InlineArray[
-                            Float32, HEADS_PER_RANK](uninitialized=True)
-                        var qprep_scale = InlineArray[
-                            Float32, HEADS_PER_RANK](uninitialized=True)
-                        var qprep_row_ptr = UnsafePointer(to=qprep_row).bitcast[
-                            Scalar[DType.int8]]()
-                        var qprep_bias_ptr = UnsafePointer(to=qprep_bias).bitcast[
-                            Float32]()
-                        var qprep_scale_ptr = UnsafePointer(to=qprep_scale).bitcast[
-                            Float32]()
-                        for kv in range(KV_PER_RANK):
-                            for h in range(HPG):
-                                var q_off = (
-                                    kv * HPG * seq_len * C.HEAD_DIM
-                                    + h * seq_len * C.HEAD_DIM
-                                    + dump_row * C.HEAD_DIM)
-                                var meta_off = (
-                                    kv * HPG * seq_len + h * seq_len + dump_row)
-                                var head_out = kv * HPG + h
-                                comptime for chunk in range(C.HEAD_DIM // K_STEP):
-                                    (qprep_row_ptr + head_out * C.HEAD_DIM
-                                        + chunk * K_STEP).store(
-                                        (q_i8_ptr + q_off + chunk * K_STEP).load[
-                                            width=K_STEP]())
-                                qprep_bias_ptr[head_out] = qb_ptr[meta_off]
-                                qprep_scale_ptr[head_out] = qs_ptr[meta_off]
-                        dump.tap(prefix + "03_qprep_q_i8", qprep_row_ptr, Q_LOCAL)
-                        dump.tap(prefix + "03_qprep_bias", qprep_bias_ptr, HEADS_PER_RANK)
-                        dump.tap(prefix + "03_qprep_scale", qprep_scale_ptr, HEADS_PER_RANK)
 
             if seq_len == 1:
                 @parameter
@@ -1542,22 +1487,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                         attn_head_sc_lease.as_ptr[Float32](sb),
                         pool)
                 sample.add(self.profile.phase("attention"), timed_tp_parallel[Self.tp,do_prefill_attn](topos, self.main_pools))
-            comptime if M27_DUMP_ENABLED:
-                for dump_row in range(seq_len):
-                    var dump_pos = start_pos + dump_row
-                    for r in range(Self.tp):
-                        var sb_r = topos[r].arena.scratch_base()
-                        var prefix = "p" + String(dump_pos) + "_l" + String(layer_idx) + "_r" + String(r) + "_"
-                        dump.tap(
-                            prefix + "04_attn_qi",
-                            attn_qi_lease.as_ptr[Scalar[DType.int8]](sb_r)
-                                + dump_row * Q_LOCAL,
-                            Q_LOCAL)
-                        dump.tap(
-                            prefix + "04_attn_head_sc",
-                            attn_head_sc_lease.as_ptr[Float32](sb_r)
-                                + dump_row * HEADS_PER_RANK,
-                            HEADS_PER_RANK)
 
             partial_lease^.release()
             q_scales_lease^.release()
@@ -1579,18 +1508,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     topo.activations.x_residual.bound_dyn(topo.arena.base, seq_len),
                     pool)
             sample.add(self.profile.phase("o_proj"), timed_tp_parallel[Self.tp,do_o_proj](topos, self.main_pools))
-            comptime if M27_DUMP_ENABLED:
-                for dump_row in range(seq_len):
-                    var dump_pos = start_pos + dump_row
-                    for r in range(Self.tp):
-                        var topo_r = topos[r]
-                        var prefix = "p" + String(dump_pos) + "_l" + String(layer_idx) + "_r" + String(r) + "_"
-                        dump.tap(
-                            prefix + "05_o_proj_x_residual",
-                            topo_r.activations.x_residual.bound_dyn(
-                                topo_r.arena.base, seq_len).as_ptr[DType.bfloat16]()
-                                + dump_row * C.HIDDEN,
-                            C.HIDDEN)
 
             attn_head_sc_lease^.release()
             attn_qi_lease^.release()
@@ -1600,18 +1517,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             var t_attn_reduce0 = Int(perf_counter_ns())
             self.residual_add_allreduce(seq_len)
             sample.add(self.profile.phase("attn_reduce"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_attn_reduce0))
-            comptime if M27_DUMP_ENABLED:
-                for dump_row in range(seq_len):
-                    var dump_pos = start_pos + dump_row
-                    for r in range(Self.tp):
-                        var topo_r = topos[r]
-                        var prefix = "p" + String(dump_pos) + "_l" + String(layer_idx) + "_r" + String(r) + "_"
-                        dump.tap(
-                            prefix + "06_attn_reduce_x_main",
-                            topo_r.activations.x_main.bound_dyn(
-                                topo_r.arena.base, seq_len).as_ptr[DType.bfloat16]()
-                                + dump_row * C.HIDDEN,
-                            C.HIDDEN)
 
             # =============================================================
             # FFN BLOCK
@@ -1650,26 +1555,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     rmsnorm_dual_output_worker[C.HIDDEN, FWHT_BLK_HIDDEN],
                 ](UnsafePointer(to=dual_norm_jobs[0]), self.main_pools),
             )
-            comptime if M27_DUMP_ENABLED:
-                for dump_row in range(seq_len):
-                    var dump_pos = start_pos + dump_row
-                    for r in range(Self.tp):
-                        var sb_r = topos[r].arena.scratch_base()
-                        var prefix = "p" + String(dump_pos) + "_l" + String(layer_idx) + "_r" + String(r) + "_"
-                        dump.tap(
-                            prefix + "07_moe_i8",
-                            moe_i8_lease.as_ptr[Scalar[DType.int8]](sb_r)
-                                + dump_row * C.HIDDEN,
-                            C.HIDDEN)
-                        dump.tap(
-                            prefix + "07_moe_scale",
-                            moe_scale_lease.as_ptr[Float32](sb_r) + dump_row,
-                            1)
-                        dump.tap(
-                            prefix + "07_normed_bf16",
-                            normed_bf16_lease.as_ptr[Scalar[DType.bfloat16]](sb_r)
-                                + dump_row * C.HIDDEN,
-                            C.HIDDEN)
 
             moe_work_lease^.release()
 
@@ -1685,18 +1570,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             var t_ffn_reduce0 = Int(perf_counter_ns())
             self.residual_add_allreduce(seq_len)
             sample.add(self.profile.phase("ffn_reduce"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_ffn_reduce0))
-            comptime if M27_DUMP_ENABLED:
-                for dump_row in range(seq_len):
-                    var dump_pos = start_pos + dump_row
-                    for r in range(Self.tp):
-                        var topo_r = topos[r]
-                        var prefix = "p" + String(dump_pos) + "_l" + String(layer_idx) + "_r" + String(r) + "_"
-                        dump.tap(
-                            prefix + "08_ffn_reduce_x_main",
-                            topo_r.activations.x_main.bound_dyn(
-                                topo_r.arena.base, seq_len).as_ptr[DType.bfloat16]()
-                                + dump_row * C.HIDDEN,
-                            C.HIDDEN)
 
             normed_bf16_lease^.release()
             moe_scale_lease^.release()

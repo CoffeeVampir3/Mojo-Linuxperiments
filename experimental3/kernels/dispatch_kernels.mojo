@@ -60,6 +60,7 @@ from experimental3.kernels.gemm import (
 from experimental3.kernels.gemm_amx import (
     int8_gemm_amx_worker, int8_gemm_blocked_amx_worker,
 )
+from experimental3.kernels.dispatch_helpers import tile_and_dispatch
 from kernels.vnni import VNNI_N_STEP
 from experimental3.moe import router_topk_kernel
 from experimental3.kernels.sliding_attention import sliding_attn_group_kernel
@@ -147,19 +148,15 @@ def int8_gemv[
             UnsafePointer(to=jobs[0]), actual)
         return PoolFence[P, origin].over(pool)
 
-    var num_jobs = min(seq_len, pool.get_capacity())
-    var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
-    var jobs = InlineArray[WorkerConfig, MAX_POOL_CAPACITY](fill=WorkerConfig())
-    for i in range(num_jobs):
-        var start = i * rows_per_job
-        var end = min(start + rows_per_job, seq_len)
-        jobs[i] = WorkerConfig(
+    @parameter
+    def factory(start: Int, count: Int) -> WorkerConfig:
+        return WorkerConfig(
             act_p + start * K, wpacked_p, colsum_p,
             weight_scale_p, dst_p + start * N,
-            act_scale_p, start, end - start)
-    pool.dispatch[WorkerConfig, int8_gemm_amx_worker[N, K]](
-        UnsafePointer(to=jobs[0]), num_jobs)
-    return PoolFence[P, origin].over(pool)
+            act_scale_p, start, count)
+    return tile_and_dispatch[
+        kernel=int8_gemm_amx_worker[N, K], factory=factory,
+    ](seq_len, pool)
 
 
 # ============================================================================
@@ -224,24 +221,15 @@ def int8_gemv_blocked[
             UnsafePointer(to=jobs[0]), actual)
         return PoolFence[P, origin].over(pool)
 
-    var num_jobs = min(seq_len, pool.get_capacity())
-    var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
-    var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](
-        fill=Int8GemvBlockedArgs())
-    var actual = 0
-    for i in range(num_jobs):
-        var start = i * rows_per_job
-        if start >= seq_len:
-            break
-        var end = min(start + rows_per_job, seq_len)
-        jobs[actual] = Int8GemvBlockedArgs(
+    @parameter
+    def factory(start: Int, count: Int) -> Int8GemvBlockedArgs:
+        return Int8GemvBlockedArgs(
             act_p + start * K, wpacked_p,
             blk_scale_p + start * num_blocks, wscale_p, blk_colsum_p,
-            dst_p + start * N, output_scale, N, N, end - start)
-        actual += 1
-    pool.dispatch[Int8GemvBlockedArgs, int8_gemm_blocked_amx_worker[N, K, fwht_blk]](
-        UnsafePointer(to=jobs[0]), actual)
-    return PoolFence[P, origin].over(pool)
+            dst_p + start * N, output_scale, N, N, count)
+    return tile_and_dispatch[
+        kernel=int8_gemm_blocked_amx_worker[N, K, fwht_blk], factory=factory,
+    ](seq_len, pool)
 
 
 def int8_gemv_blocked_wa[
