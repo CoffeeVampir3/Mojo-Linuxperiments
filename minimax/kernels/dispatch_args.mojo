@@ -261,8 +261,9 @@ struct SparseRoute(Copyable, ImplicitlyCopyable):
     Phase1 consumes routes through expert bucket ranges:
       routes[offsets[expert] : offsets[expert + 1]]
 
-    Phase2 consumes routes through route_indices[token, slot], so the local
-    expert is stored explicitly to avoid scanning buckets during combine.
+    Phase2 consumes the same expert buckets and scatters weighted rows back to
+    the owning token. The local expert is stored explicitly so bucket workers
+    never need to recover it from the offsets table.
     """
     var token: Int32
     var slot: Int32
@@ -287,15 +288,12 @@ struct SparseMoePhase1Args(Copyable, ImplicitlyCopyable):
     """
     var act_i8: I8Ptr
     var act_scale: F32Ptr
-    var counts: UnsafePointer[Int32, MutAnyOrigin]
     var offsets: UnsafePointer[Int32, MutAnyOrigin]
     var routes: UnsafePointer[SparseRoute, MutAnyOrigin]
     var w1_packed: I8Ptr
     var w1_scale: F32Ptr
-    var w1_colsum: F32Ptr
     var w3_packed: I8Ptr
     var w3_scale: F32Ptr
-    var w3_colsum: F32Ptr
     var expert_qi: I8Ptr
     var expert_blk_scale: F32Ptr
     var expert_stride: Int  # i8 elements per local expert
@@ -306,15 +304,12 @@ struct SparseMoePhase1Args(Copyable, ImplicitlyCopyable):
     def __init__(out self):
         self.act_i8 = I8Ptr()
         self.act_scale = F32Ptr()
-        self.counts = UnsafePointer[Int32, MutAnyOrigin]()
         self.offsets = UnsafePointer[Int32, MutAnyOrigin]()
         self.routes = UnsafePointer[SparseRoute, MutAnyOrigin]()
         self.w1_packed = I8Ptr()
         self.w1_scale = F32Ptr()
-        self.w1_colsum = F32Ptr()
         self.w3_packed = I8Ptr()
         self.w3_scale = F32Ptr()
-        self.w3_colsum = F32Ptr()
         self.expert_qi = I8Ptr()
         self.expert_blk_scale = F32Ptr()
         self.expert_stride = 0
@@ -325,20 +320,21 @@ struct SparseMoePhase1Args(Copyable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct SparseMoePhase2Args(Copyable, ImplicitlyCopyable):
-    """Persistent sparse MoE phase2 worker contract.
+    """Bucketed sparse MoE phase2 worker contract.
 
-    Workers own a disjoint hidden-column stripe. They walk token/slot order,
-    use route_indices[token, slot] to find local routes, and accumulate
-    weighted route outputs directly into x_residual[token, hidden stripe].
-    Hidden ownership makes the combine race-free without atomics.
+    Workers own a disjoint hidden-column stripe. They zero a f32 accumulator
+    for that stripe, walk rank-local expert buckets, add weighted route outputs
+    into accumulator[token, hidden], then cast once to bf16. Hidden ownership
+    keeps the scatter/add race-free without atomics.
     """
-    var route_indices: UnsafePointer[Int32, MutAnyOrigin]
+    var offsets: UnsafePointer[Int32, MutAnyOrigin]
     var routes: UnsafePointer[SparseRoute, MutAnyOrigin]
     var expert_qi: I8Ptr
     var expert_blk_scale: F32Ptr
     var down_packed: I8Ptr
     var down_scale: F32Ptr
     var down_colsum: F32Ptr
+    var accum: F32Ptr
     var dst: BF16Ptr
     var expert_stride: Int  # i8 elements per local expert
     var scale_stride: Int   # f32 elements per local expert
@@ -348,13 +344,14 @@ struct SparseMoePhase2Args(Copyable, ImplicitlyCopyable):
     var hidden_count: Int
 
     def __init__(out self):
-        self.route_indices = UnsafePointer[Int32, MutAnyOrigin]()
+        self.offsets = UnsafePointer[Int32, MutAnyOrigin]()
         self.routes = UnsafePointer[SparseRoute, MutAnyOrigin]()
         self.expert_qi = I8Ptr()
         self.expert_blk_scale = F32Ptr()
         self.down_packed = I8Ptr()
         self.down_scale = F32Ptr()
         self.down_colsum = F32Ptr()
+        self.accum = F32Ptr()
         self.dst = BF16Ptr()
         self.expert_stride = 0
         self.scale_stride = 0

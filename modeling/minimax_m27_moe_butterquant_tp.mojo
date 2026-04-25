@@ -26,7 +26,9 @@ from kernels.kernel_ops import PoolFence, embed_lookup
 from kernels.reductions import small_allreduce, ring_broadcast
 from kernels.kv_rotors import init_rope_tables
 from simd_math import set_subnormal_zeroing
-from modeling.linear_borrow_pool import ScratchPool, scratch_block_bytes
+from modeling.linear_borrow_pool import (
+    ScratchLease, ScratchPool, scratch_block_bytes,
+)
 from modeling.loader import discover_shards, load_weights_from_descs
 
 from experimental3.profiler import (
@@ -48,7 +50,7 @@ from experimental3.kernels.dispatch_kernels import (
 )
 from experimental3.kernels.dispatch_args import RmsNormFwhtQuantArgs
 from experimental3.kernels.rmsnorm import (
-    rmsnorm_fwht_quant_worker,
+    rmsnorm_fwht_quant_worker, accumulate_expert_outputs,
 )
 from experimental3.tensor_dump import Dumper
 
@@ -66,6 +68,8 @@ from minimax.kernels.dispatch_kernels import (
     chunked_score_dispatch_multi,
     prefill_attn_dispatch,
     attn_chunk_count,
+    minimax_moe_phase1,
+    minimax_moe_phase2,
     minimax_sparse_moe_phase1,
     minimax_sparse_moe_phase2,
 )
@@ -473,10 +477,10 @@ def calculate_peak_scratch[tp: Int]() -> Int:
         + scratch_block_bytes[S.EXPERTS_LOCAL * 4]()
         + scratch_block_bytes[(S.EXPERTS_LOCAL + 1) * 4]()
         + scratch_block_bytes[S.EXPERTS_LOCAL * 4]()
-        + scratch_block_bytes[P * C.TOP_K * 4]()
         + scratch_block_bytes[P * C.TOP_K * sparse_route_bytes]()
         + scratch_block_bytes[P * C.TOP_K * C.MOE_INTERMEDIATE * i8]()
         + scratch_block_bytes[P * C.TOP_K * MOE_DOWN_NUM_BLK * f32]()
+        + scratch_block_bytes[P * C.HIDDEN * f32]()
     )
     comptime moe_expert_stage_extra = (
         expert_stage_extra
@@ -779,6 +783,366 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
         for rank in range(Self.tp):
             worker_init_dispatch[C.HPG](self.main_pools[rank]).join()
         print("state initialized")
+
+    def moe_phase_decode[
+        moe_i8_origin: MutOrigin,
+        moe_scale_origin: MutOrigin,
+        normed_origin: MutOrigin,
+    ](
+        mut self,
+        layer_idx: Int,
+        seq_len: Int,
+        ref [moe_i8_origin] moe_i8_lease: ScratchLease,
+        ref [moe_scale_origin] moe_scale_lease: ScratchLease,
+        ref [normed_origin] normed_bf16_lease: ScratchLease,
+    ) -> PhaseTiming:
+        """Decode-shaped MoE: route one token, run selected expert GEMVs, combine."""
+        var topos = self.topos
+        var routing_lease = self.scratch.borrow[TopKResult[C.TOP_K], 1]()
+        var candidates_lease = self.scratch.borrow[
+            RouterCandidate, C.TOP_K]()
+
+        var t_moe0 = Int(perf_counter_ns())
+
+        @parameter
+        def do_router_fused[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
+            var lb = topo.layers.base(topo.arena.base, layer_idx)
+            var layer = topo.layers.proto
+            var sb = topo.arena.scratch_base()
+            comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
+            var expert_base = rank * experts_per_rank
+            return router_fused_dispatch[experts_per_rank, C.HIDDEN, C.TOP_K](
+                normed_bf16_lease.view[
+                    BF16, Shape[1, C.HIDDEN]](sb, 1),
+                layer.body.router_proj.bound(lb),
+                layer.body.router_gauge.bound(lb),
+                layer.body.router_bias.bound(lb),
+                candidates_lease.as_ptr[RouterCandidate](sb),
+                pool,
+                expert_base)
+        _ = timed_tp_parallel[Self.tp,do_router_fused](
+            topos, self.main_pools)
+
+        var candidate_ptrs = InlineArray[
+            UnsafePointer[RouterCandidate, MutAnyOrigin], Self.tp](
+            uninitialized=True)
+        var candidate_counts = InlineArray[Int, Self.tp](uninitialized=True)
+        for r in range(Self.tp):
+            var sb_r = topos[r].arena.scratch_base()
+            candidate_ptrs[r] = candidates_lease.as_ptr[RouterCandidate](sb_r)
+            candidate_counts[r] = C.TOP_K
+        var host_sb = topos[HOST_RANK].arena.scratch_base()
+        router_merge_multi_and_renorm[C.TOP_K, Self.tp](
+            candidate_ptrs, candidate_counts,
+            routing_lease.as_ptr[TopKResult[C.TOP_K]](host_sb))
+        var routing = routing_lease.as_ptr[
+            TopKResult[C.TOP_K]](host_sb)[]
+        self.profile.record_moe_route[C.TOP_K](
+            layer_idx, C.NUM_LAYERS, C.NUM_EXPERTS, Self.tp,
+            routing.indices, routing.weights)
+        for r in range(Self.tp):
+            var sb_r = topos[r].arena.scratch_base()
+            routing_lease.as_ptr[TopKResult[C.TOP_K]](sb_r)[] = routing
+
+        candidates_lease^.release()
+
+        var expert_qi_lease = self.scratch.borrow[
+            Scalar[DType.int8], C.TOP_K * C.MOE_INTERMEDIATE]()
+        var expert_blk_scale_lease = self.scratch.borrow[
+            Float32, C.TOP_K * MOE_DOWN_NUM_BLK]()
+        var expert_out_lease = self.scratch.borrow[
+            Scalar[DType.bfloat16], C.TOP_K * C.HIDDEN]()
+        var local_count_lease = self.scratch.borrow[Int32, 1]()
+
+        @parameter
+        def do_expert_phase1[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
+            var lb = topo.layers.base(topo.arena.base, layer_idx)
+            var layer = topo.layers.proto
+            var sb = topo.arena.scratch_base()
+            var routing = routing_lease.as_ptr[TopKResult[C.TOP_K]](sb)[]
+            comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
+            var expert_base = rank * experts_per_rank
+            var lc = 0
+            for s in range(C.TOP_K):
+                var eid = routing.indices[s]
+                if eid >= expert_base and eid < expert_base + experts_per_rank:
+                    lc += 1
+            local_count_lease.as_ptr[Int32](sb)[] = Int32(lc)
+            return minimax_moe_phase1[
+                C.MOE_INTERMEDIATE, C.HIDDEN, FWHT_BLK,
+                C.TOP_K, C.NUM_EXPERTS, Self.tp](
+                moe_i8_lease.view[I8, Shape[1, C.HIDDEN]](sb, 1),
+                moe_scale_lease.view[F32, Shape[1, 1]](sb, 1),
+                routing,
+                layer.body.experts_w1.bound(lb),
+                C.MOE_INTERMEDIATE * C.HIDDEN,
+                layer.body.experts_w1_sc.bound(lb),
+                C.MOE_INTERMEDIATE * 4,
+                layer.body.experts_w1_colsum.bound(lb),
+                C.MOE_INTERMEDIATE * 4,
+                layer.body.experts_w3.bound(lb),
+                C.MOE_INTERMEDIATE * C.HIDDEN,
+                layer.body.experts_w3_sc.bound(lb),
+                C.MOE_INTERMEDIATE * 4,
+                layer.body.experts_w3_colsum.bound(lb),
+                C.MOE_INTERMEDIATE * 4,
+                expert_qi_lease.view[
+                    I8, Shape[C.TOP_K, C.MOE_INTERMEDIATE]](sb, C.TOP_K),
+                expert_blk_scale_lease.view[
+                    F32, Shape[C.TOP_K, MOE_DOWN_NUM_BLK]](sb, C.TOP_K),
+                rank, pool)
+        _ = timed_tp_parallel[Self.tp,do_expert_phase1](
+            topos, self.main_pools)
+
+        @parameter
+        def do_expert_phase2[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
+            var lb = topo.layers.base(topo.arena.base, layer_idx)
+            var layer = topo.layers.proto
+            var sb = topo.arena.scratch_base()
+            var routing = routing_lease.as_ptr[TopKResult[C.TOP_K]](sb)[]
+            return minimax_moe_phase2[
+                C.HIDDEN, C.MOE_INTERMEDIATE, FWHT_BLK_MOE_DOWN,
+                C.TOP_K, C.NUM_EXPERTS, Self.tp](
+                expert_qi_lease.view[
+                    I8, Shape[C.TOP_K, C.MOE_INTERMEDIATE]](sb, C.TOP_K),
+                expert_blk_scale_lease.view[
+                    F32, Shape[C.TOP_K, MOE_DOWN_NUM_BLK]](sb, C.TOP_K),
+                routing,
+                layer.body.experts_w2.bound(lb),
+                C.HIDDEN * C.MOE_INTERMEDIATE,
+                layer.body.experts_w2_sc.bound(lb),
+                C.HIDDEN * 4,
+                layer.body.experts_w2_colsum.bound(lb),
+                C.HIDDEN * MOE_DOWN_NUM_BLK * 4,
+                expert_out_lease.view[
+                    BF16, Shape[C.TOP_K, C.HIDDEN]](sb, C.TOP_K),
+                rank, pool)
+        _ = timed_tp_parallel[Self.tp,do_expert_phase2](
+            topos, self.main_pools)
+
+        for r in range(Self.tp):
+            var topo_r = topos[r]
+            var sb = topo_r.arena.scratch_base()
+            var lc = Int(local_count_lease.as_ptr[Int32](sb)[])
+            accumulate_expert_outputs[C.HIDDEN, C.TOP_K](
+                expert_out_lease.view[
+                    BF16, Shape[C.TOP_K, C.HIDDEN]](
+                    sb, C.TOP_K).as_ptr[DType.bfloat16](),
+                lc,
+                topo_r.activations.x_residual.bound_dyn(
+                    topo_r.arena.base, seq_len
+                ).as_ptr[DType.bfloat16]())
+
+        var elapsed = PhaseTiming.opaque(Int(perf_counter_ns()) - t_moe0)
+        local_count_lease^.release()
+        expert_out_lease^.release()
+        expert_blk_scale_lease^.release()
+        expert_qi_lease^.release()
+        routing_lease^.release()
+        return elapsed
+
+    def moe_phase_prefill[
+        moe_i8_origin: MutOrigin,
+        moe_scale_origin: MutOrigin,
+        normed_origin: MutOrigin,
+    ](
+        mut self,
+        mut sample: ForwardSample,
+        layer_idx: Int,
+        seq_len: Int,
+        ref [moe_i8_origin] moe_i8_lease: ScratchLease,
+        ref [moe_scale_origin] moe_scale_lease: ScratchLease,
+        ref [normed_origin] normed_bf16_lease: ScratchLease,
+    ) -> PhaseTiming:
+        """Prefill-shaped MoE: route the chunk, bucket local routes, sparse compute."""
+        var topos = self.topos
+        var routing_lease = self.scratch.borrow[
+            TopKResult[C.TOP_K], PREFILL_CHUNK_SIZE]()
+        var candidates_lease = self.scratch.borrow[
+            RouterCandidate, PREFILL_CHUNK_SIZE * C.TOP_K]()
+
+        var t_moe0 = Int(perf_counter_ns())
+
+        @parameter
+        def do_router_fused[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
+            var lb = topo.layers.base(topo.arena.base, layer_idx)
+            var layer = topo.layers.proto
+            var sb = topo.arena.scratch_base()
+            comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
+            var expert_base = rank * experts_per_rank
+            return router_fused_dispatch[experts_per_rank, C.HIDDEN, C.TOP_K](
+                normed_bf16_lease.view[
+                    BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](sb, seq_len),
+                layer.body.router_proj.bound(lb),
+                layer.body.router_gauge.bound(lb),
+                layer.body.router_bias.bound(lb),
+                candidates_lease.as_ptr[RouterCandidate](sb),
+                pool,
+                expert_base)
+        sample.add(
+            self.profile.phase("moe_router"),
+            timed_tp_parallel[Self.tp,do_router_fused](
+                topos, self.main_pools))
+
+        var t_merge0 = Int(perf_counter_ns())
+        for token_idx in range(seq_len):
+            var candidate_ptrs = InlineArray[
+                UnsafePointer[RouterCandidate, MutAnyOrigin], Self.tp](
+                uninitialized=True)
+            var candidate_counts = InlineArray[Int, Self.tp](uninitialized=True)
+            for r in range(Self.tp):
+                var sb_r = topos[r].arena.scratch_base()
+                var candidates = candidates_lease.as_ptr[RouterCandidate](sb_r)
+                candidate_ptrs[r] = candidates + token_idx * C.TOP_K
+                candidate_counts[r] = C.TOP_K
+            var host_sb = topos[HOST_RANK].arena.scratch_base()
+            router_merge_multi_and_renorm[C.TOP_K, Self.tp](
+                candidate_ptrs, candidate_counts,
+                routing_lease.as_ptr[TopKResult[C.TOP_K]](
+                    host_sb, token_idx))
+            var routing = routing_lease.as_ptr[
+                TopKResult[C.TOP_K]](host_sb, token_idx)[]
+            if token_idx == seq_len - 1:
+                self.profile.record_moe_route[C.TOP_K](
+                    layer_idx, C.NUM_LAYERS, C.NUM_EXPERTS, Self.tp,
+                    routing.indices, routing.weights)
+            for r in range(Self.tp):
+                var sb_r = topos[r].arena.scratch_base()
+                routing_lease.as_ptr[
+                    TopKResult[C.TOP_K]](sb_r, token_idx)[] = routing
+        sample.add(
+            self.profile.phase("moe_route_merge"),
+            PhaseTiming.opaque(Int(perf_counter_ns()) - t_merge0))
+
+        candidates_lease^.release()
+
+        comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
+        var route_counts_lease = self.scratch.borrow[Int32, experts_per_rank]()
+        var route_offsets_lease = self.scratch.borrow[
+            Int32, experts_per_rank + 1]()
+        var route_cursors_lease = self.scratch.borrow[Int32, experts_per_rank]()
+        var routes_lease = self.scratch.borrow[
+            SparseRoute, PREFILL_CHUNK_SIZE * C.TOP_K]()
+        var expert_qi_lease = self.scratch.borrow[
+            Scalar[DType.int8],
+            PREFILL_CHUNK_SIZE * C.TOP_K * C.MOE_INTERMEDIATE]()
+        var expert_blk_scale_lease = self.scratch.borrow[
+            Float32, PREFILL_CHUNK_SIZE * C.TOP_K * MOE_DOWN_NUM_BLK]()
+        var moe_accum_lease = self.scratch.borrow[
+            Float32, PREFILL_CHUNK_SIZE * C.HIDDEN]()
+
+        var t_schedule0 = Int(perf_counter_ns())
+        for r in range(Self.tp):
+            var sb = topos[r].arena.scratch_base()
+            _ = build_sparse_route_schedule[C.TOP_K, experts_per_rank](
+                routing_lease.as_ptr[TopKResult[C.TOP_K]](sb),
+                seq_len,
+                r,
+                route_counts_lease.as_ptr[Int32](sb),
+                route_offsets_lease.as_ptr[Int32](sb),
+                route_cursors_lease.as_ptr[Int32](sb),
+                routes_lease.as_ptr[SparseRoute](sb),
+            )
+        sample.add(
+            self.profile.phase("moe_route_schedule"),
+            PhaseTiming.opaque(Int(perf_counter_ns()) - t_schedule0))
+
+        @parameter
+        def do_sparse_expert_phase1[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
+            var lb = topo.layers.base(topo.arena.base, layer_idx)
+            var layer = topo.layers.proto
+            var sb = topo.arena.scratch_base()
+            return minimax_sparse_moe_phase1[
+                experts_per_rank, C.MOE_INTERMEDIATE, C.HIDDEN, FWHT_BLK](
+                moe_i8_lease.view[
+                    I8, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](sb, seq_len),
+                moe_scale_lease.view[
+                    F32, Shape[C.MAX_SEQ_LEN, 1]](sb, seq_len),
+                route_offsets_lease.as_ptr[Int32](sb),
+                routes_lease.as_ptr[SparseRoute](sb),
+                layer.body.experts_w1.bound(lb),
+                C.MOE_INTERMEDIATE * C.HIDDEN,
+                layer.body.experts_w1_sc.bound(lb),
+                C.MOE_INTERMEDIATE,
+                layer.body.experts_w3.bound(lb),
+                C.MOE_INTERMEDIATE * C.HIDDEN,
+                layer.body.experts_w3_sc.bound(lb),
+                C.MOE_INTERMEDIATE,
+                expert_qi_lease.view[
+                    I8,
+                    Shape[
+                        PREFILL_CHUNK_SIZE * C.TOP_K,
+                        C.MOE_INTERMEDIATE,
+                    ],
+                ](sb, PREFILL_CHUNK_SIZE * C.TOP_K),
+                expert_blk_scale_lease.view[
+                    F32,
+                    Shape[
+                        PREFILL_CHUNK_SIZE * C.TOP_K,
+                        MOE_DOWN_NUM_BLK,
+                    ],
+                ](sb, PREFILL_CHUNK_SIZE * C.TOP_K),
+                pool)
+        sample.add(
+            self.profile.phase("moe_phase1"),
+            timed_tp_parallel[Self.tp,do_sparse_expert_phase1](
+                topos, self.main_pools))
+
+        @parameter
+        def do_sparse_expert_phase2[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
+            var lb = topo.layers.base(topo.arena.base, layer_idx)
+            var layer = topo.layers.proto
+            var sb = topo.arena.scratch_base()
+            return minimax_sparse_moe_phase2[
+                experts_per_rank, C.HIDDEN,
+                C.MOE_INTERMEDIATE, FWHT_BLK_MOE_DOWN](
+                route_offsets_lease.as_ptr[Int32](sb),
+                routes_lease.as_ptr[SparseRoute](sb),
+                expert_qi_lease.view[
+                    I8,
+                    Shape[
+                        PREFILL_CHUNK_SIZE * C.TOP_K,
+                        C.MOE_INTERMEDIATE,
+                    ],
+                ](sb, PREFILL_CHUNK_SIZE * C.TOP_K),
+                expert_blk_scale_lease.view[
+                    F32,
+                    Shape[
+                        PREFILL_CHUNK_SIZE * C.TOP_K,
+                        MOE_DOWN_NUM_BLK,
+                    ],
+                ](sb, PREFILL_CHUNK_SIZE * C.TOP_K),
+                layer.body.experts_w2.bound(lb),
+                C.HIDDEN * C.MOE_INTERMEDIATE,
+                layer.body.experts_w2_sc.bound(lb),
+                C.HIDDEN,
+                layer.body.experts_w2_colsum.bound(lb),
+                C.HIDDEN * MOE_DOWN_NUM_BLK,
+                moe_accum_lease.view[
+                    F32,
+                    Shape[
+                        PREFILL_CHUNK_SIZE,
+                        C.HIDDEN,
+                    ],
+                ](sb, seq_len),
+                topo.activations.x_residual.bound_dyn(
+                    topo.arena.base, seq_len),
+                pool)
+        sample.add(
+            self.profile.phase("moe_phase2"),
+            timed_tp_parallel[Self.tp,do_sparse_expert_phase2](
+                topos, self.main_pools))
+
+        var elapsed = PhaseTiming.opaque(Int(perf_counter_ns()) - t_moe0)
+        moe_accum_lease^.release()
+        expert_blk_scale_lease^.release()
+        expert_qi_lease^.release()
+        routes_lease^.release()
+        route_cursors_lease^.release()
+        route_offsets_lease^.release()
+        route_counts_lease^.release()
+        routing_lease^.release()
+        return elapsed
 
     @staticmethod
     def load(
@@ -1295,167 +1659,16 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
 
             moe_work_lease^.release()
 
-            var routing_lease = self.scratch.borrow[
-                TopKResult[C.TOP_K], PREFILL_CHUNK_SIZE]()
-            var candidates_lease = self.scratch.borrow[
-                RouterCandidate, PREFILL_CHUNK_SIZE * C.TOP_K]()
-
-            var t_moe0 = Int(perf_counter_ns())
-
-            @parameter
-            def do_router_fused[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
-                var lb = topo.layers.base(topo.arena.base, layer_idx)
-                var layer = topo.layers.proto
-                var sb = topo.arena.scratch_base()
-                comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
-                var expert_base = rank * experts_per_rank
-                return router_fused_dispatch[experts_per_rank, C.HIDDEN, C.TOP_K](
-                    normed_bf16_lease.view[
-                        BF16, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](sb, seq_len),
-                    layer.body.router_proj.bound(lb),
-                    layer.body.router_gauge.bound(lb),
-                    layer.body.router_bias.bound(lb),
-                    candidates_lease.as_ptr[RouterCandidate](sb),
-                    pool,
-                    expert_base)
-            _ = timed_tp_parallel[Self.tp,do_router_fused](topos, self.main_pools)
-
-            for token_idx in range(seq_len):
-                var candidate_ptrs = InlineArray[
-                    UnsafePointer[RouterCandidate, MutAnyOrigin], Self.tp](
-                    uninitialized=True)
-                var candidate_counts = InlineArray[Int, Self.tp](uninitialized=True)
-                for r in range(Self.tp):
-                    var sb_r = topos[r].arena.scratch_base()
-                    var candidates = candidates_lease.as_ptr[RouterCandidate](sb_r)
-                    candidate_ptrs[r] = candidates + token_idx * C.TOP_K
-                    candidate_counts[r] = C.TOP_K
-                var host_sb = topos[HOST_RANK].arena.scratch_base()
-                router_merge_multi_and_renorm[C.TOP_K, Self.tp](
-                    candidate_ptrs, candidate_counts,
-                    routing_lease.as_ptr[TopKResult[C.TOP_K]](
-                        host_sb, token_idx))
-                var routing = routing_lease.as_ptr[
-                    TopKResult[C.TOP_K]](host_sb, token_idx)[]
-                if token_idx == seq_len - 1:
-                    self.profile.record_moe_route[C.TOP_K](
-                        layer_idx, C.NUM_LAYERS, C.NUM_EXPERTS, Self.tp,
-                        routing.indices, routing.weights)
-                for r in range(Self.tp):
-                    var sb_r = topos[r].arena.scratch_base()
-                    routing_lease.as_ptr[
-                        TopKResult[C.TOP_K]](sb_r, token_idx)[] = routing
-
-            candidates_lease^.release()
-
-            comptime experts_per_rank = C.NUM_EXPERTS // Self.tp
-            var route_counts_lease = self.scratch.borrow[Int32, experts_per_rank]()
-            var route_offsets_lease = self.scratch.borrow[Int32, experts_per_rank + 1]()
-            var route_cursors_lease = self.scratch.borrow[Int32, experts_per_rank]()
-            var route_indices_lease = self.scratch.borrow[
-                Int32, PREFILL_CHUNK_SIZE * C.TOP_K]()
-            var routes_lease = self.scratch.borrow[
-                SparseRoute, PREFILL_CHUNK_SIZE * C.TOP_K]()
-            var expert_qi_lease = self.scratch.borrow[
-                Scalar[DType.int8],
-                PREFILL_CHUNK_SIZE * C.TOP_K * C.MOE_INTERMEDIATE]()
-            var expert_blk_scale_lease = self.scratch.borrow[
-                Float32, PREFILL_CHUNK_SIZE * C.TOP_K * MOE_DOWN_NUM_BLK]()
-
-            for r in range(Self.tp):
-                var sb = topos[r].arena.scratch_base()
-                _ = build_sparse_route_schedule[C.TOP_K, experts_per_rank](
-                    routing_lease.as_ptr[TopKResult[C.TOP_K]](sb),
-                    seq_len,
-                    r,
-                    route_counts_lease.as_ptr[Int32](sb),
-                    route_offsets_lease.as_ptr[Int32](sb),
-                    route_cursors_lease.as_ptr[Int32](sb),
-                    route_indices_lease.as_ptr[Int32](sb),
-                    routes_lease.as_ptr[SparseRoute](sb),
-                )
-
-            @parameter
-            def do_sparse_expert_phase1[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
-                var lb = topo.layers.base(topo.arena.base, layer_idx)
-                var layer = topo.layers.proto
-                var sb = topo.arena.scratch_base()
-                return minimax_sparse_moe_phase1[
-                    experts_per_rank, C.MOE_INTERMEDIATE, C.HIDDEN, FWHT_BLK](
-                    moe_i8_lease.view[
-                        I8, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](sb, seq_len),
-                    moe_scale_lease.view[
-                        F32, Shape[C.MAX_SEQ_LEN, 1]](sb, seq_len),
-                    route_counts_lease.as_ptr[Int32](sb),
-                    route_offsets_lease.as_ptr[Int32](sb),
-                    routes_lease.as_ptr[SparseRoute](sb),
-                    layer.body.experts_w1.bound(lb),
-                    C.MOE_INTERMEDIATE * C.HIDDEN,
-                    layer.body.experts_w1_sc.bound(lb),
-                    C.MOE_INTERMEDIATE,
-                    layer.body.experts_w1_colsum.bound(lb),
-                    C.MOE_INTERMEDIATE,
-                    layer.body.experts_w3.bound(lb),
-                    C.MOE_INTERMEDIATE * C.HIDDEN,
-                    layer.body.experts_w3_sc.bound(lb),
-                    C.MOE_INTERMEDIATE,
-                    layer.body.experts_w3_colsum.bound(lb),
-                    C.MOE_INTERMEDIATE,
-                    expert_qi_lease.view[
-                        I8,
-                        Shape[
-                            PREFILL_CHUNK_SIZE * C.TOP_K,
-                            C.MOE_INTERMEDIATE,
-                        ],
-                    ](sb, PREFILL_CHUNK_SIZE * C.TOP_K),
-                    expert_blk_scale_lease.view[
-                        F32,
-                        Shape[
-                            PREFILL_CHUNK_SIZE * C.TOP_K,
-                            MOE_DOWN_NUM_BLK,
-                        ],
-                    ](sb, PREFILL_CHUNK_SIZE * C.TOP_K),
-                    pool)
-            _ = timed_tp_parallel[Self.tp,do_sparse_expert_phase1](
-                topos, self.main_pools)
-
-            @parameter
-            def do_sparse_expert_phase2[rank: Int, origin: MutOrigin](topo: MiniMaxM27Topology[Self.tp], ref [origin] pool: Self.Pool) -> PoolFence[Self.Pool, origin]:
-                var lb = topo.layers.base(topo.arena.base, layer_idx)
-                var layer = topo.layers.proto
-                var sb = topo.arena.scratch_base()
-                return minimax_sparse_moe_phase2[
-                    C.TOP_K, experts_per_rank,
-                    C.HIDDEN, C.MOE_INTERMEDIATE, FWHT_BLK_MOE_DOWN](
-                    route_indices_lease.as_ptr[Int32](sb),
-                    routes_lease.as_ptr[SparseRoute](sb),
-                    expert_qi_lease.view[
-                        I8,
-                        Shape[
-                            PREFILL_CHUNK_SIZE * C.TOP_K,
-                            C.MOE_INTERMEDIATE,
-                        ],
-                    ](sb, PREFILL_CHUNK_SIZE * C.TOP_K),
-                    expert_blk_scale_lease.view[
-                        F32,
-                        Shape[
-                            PREFILL_CHUNK_SIZE * C.TOP_K,
-                            MOE_DOWN_NUM_BLK,
-                        ],
-                    ](sb, PREFILL_CHUNK_SIZE * C.TOP_K),
-                    layer.body.experts_w2.bound(lb),
-                    C.HIDDEN * C.MOE_INTERMEDIATE,
-                    layer.body.experts_w2_sc.bound(lb),
-                    C.HIDDEN,
-                    layer.body.experts_w2_colsum.bound(lb),
-                    C.HIDDEN * MOE_DOWN_NUM_BLK,
-                    topo.activations.x_residual.bound_dyn(
-                        topo.arena.base, seq_len),
-                    pool)
-            _ = timed_tp_parallel[Self.tp,do_sparse_expert_phase2](
-                topos, self.main_pools)
-
-            sample.add(self.profile.phase("moe"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_moe0))
+            if seq_len == 1:
+                sample.add(
+                    self.profile.phase("moe"),
+                    self.moe_phase_decode(
+                        layer_idx, seq_len,
+                        moe_i8_lease, moe_scale_lease, normed_bf16_lease))
+            else:
+                _ = self.moe_phase_prefill(
+                    sample, layer_idx, seq_len,
+                    moe_i8_lease, moe_scale_lease, normed_bf16_lease)
 
             var t_ffn_reduce0 = Int(perf_counter_ns())
             small_allreduce[BF16, XShape, Self.tp, residual_add=True](
@@ -1475,14 +1688,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                                 + dump_row * C.HIDDEN,
                             C.HIDDEN)
 
-            expert_blk_scale_lease^.release()
-            expert_qi_lease^.release()
-            routes_lease^.release()
-            route_indices_lease^.release()
-            route_cursors_lease^.release()
-            route_offsets_lease^.release()
-            route_counts_lease^.release()
-            routing_lease^.release()
             normed_bf16_lease^.release()
             moe_scale_lease^.release()
             moe_i8_lease^.release()

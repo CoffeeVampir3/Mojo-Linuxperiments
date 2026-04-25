@@ -132,7 +132,6 @@ def build_sparse_route_schedule[k: Int, experts_per_rank: Int](
     counts: UnsafePointer[Int32, MutAnyOrigin],
     offsets: UnsafePointer[Int32, MutAnyOrigin],
     cursors: UnsafePointer[Int32, MutAnyOrigin],
-    route_indices: UnsafePointer[Int32, MutAnyOrigin],
     routes: UnsafePointer[SparseRoute, MutAnyOrigin],
 ) -> Int:
     """Counting-sort final routes into rank-local expert buckets.
@@ -145,14 +144,11 @@ def build_sparse_route_schedule[k: Int, experts_per_rank: Int](
       counts[e]  = route count for local expert e
       offsets[e] = prefix start for local expert e
       routes[offsets[e] : offsets[e + 1]] are that expert's token routes
-      route_indices[token, slot] = compact route id, or -1 for remote routes
     Returns the total number of local routes for this rank.
     """
     var expert_base = rank * experts_per_rank
     for e in range(experts_per_rank):
         counts[e] = Int32(0)
-    for i in range(seq_len * k):
-        route_indices[i] = Int32(-1)
 
     for token in range(seq_len):
         var r = routing[token]
@@ -179,7 +175,6 @@ def build_sparse_route_schedule[k: Int, experts_per_rank: Int](
                 routes[dst] = SparseRoute(
                     Int32(token), Int32(slot), Int32(local_expert),
                     r.weights[slot])
-                route_indices[token * k + slot] = Int32(dst)
                 cursors[local_expert] = cursors[local_expert] + Int32(1)
 
     return total
