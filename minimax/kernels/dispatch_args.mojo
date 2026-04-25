@@ -262,18 +262,13 @@ struct SparseRoute(Copyable, ImplicitlyCopyable):
       routes[offsets[expert] : offsets[expert + 1]]
 
     Phase2 consumes the same expert buckets and scatters weighted rows back to
-    the owning token. The local expert is stored explicitly so bucket workers
-    never need to recover it from the offsets table.
+    the owning token. The bucket range itself identifies the local expert.
     """
     var token: Int32
-    var slot: Int32
-    var local_expert: Int32
     var weight: Float32
 
     def __init__(out self):
         self.token = Int32(-1)
-        self.slot = Int32(-1)
-        self.local_expert = Int32(-1)
         self.weight = Float32(0)
 
 
@@ -333,12 +328,10 @@ struct SparseMoePhase2Args(Copyable, ImplicitlyCopyable):
     var expert_blk_scale: F32Ptr
     var down_packed: I8Ptr
     var down_scale: F32Ptr
-    var down_colsum: F32Ptr
     var accum: F32Ptr
     var dst: BF16Ptr
     var expert_stride: Int  # i8 elements per local expert
     var scale_stride: Int   # f32 elements per local expert
-    var colsum_stride: Int  # f32 elements per local expert
     var seq_len: Int
     var hidden_start: Int
     var hidden_count: Int
@@ -350,12 +343,10 @@ struct SparseMoePhase2Args(Copyable, ImplicitlyCopyable):
         self.expert_blk_scale = F32Ptr()
         self.down_packed = I8Ptr()
         self.down_scale = F32Ptr()
-        self.down_colsum = F32Ptr()
         self.accum = F32Ptr()
         self.dst = BF16Ptr()
         self.expert_stride = 0
         self.scale_stride = 0
-        self.colsum_stride = 0
         self.seq_len = 0
         self.hidden_start = 0
         self.hidden_count = 0

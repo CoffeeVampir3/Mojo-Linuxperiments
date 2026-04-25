@@ -1116,8 +1116,6 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                 C.HIDDEN * C.MOE_INTERMEDIATE,
                 layer.body.experts_w2_sc.bound(lb),
                 C.HIDDEN,
-                layer.body.experts_w2_colsum.bound(lb),
-                C.HIDDEN * MOE_DOWN_NUM_BLK,
                 moe_accum_lease.view[
                     F32,
                     Shape[

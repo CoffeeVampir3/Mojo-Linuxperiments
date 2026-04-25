@@ -498,7 +498,7 @@ def minimax_sparse_moe_phase1[
 
 def minimax_sparse_moe_phase2[
     QiT: DynamicTensor, BScT: DynamicTensor,
-    DnT: StaticTensor, DnScT: StaticTensor, DnCsT: StaticTensor,
+    DnT: StaticTensor, DnScT: StaticTensor,
     AccT: DynamicTensor, OutT: DynamicTensor,
     P: BurstThreadPool, origin: MutOrigin, //,
     experts_per_rank: Int, hidden: Int, intermediate: Int, fwht_blk: Int,
@@ -509,7 +509,6 @@ def minimax_sparse_moe_phase2[
     expert_blk_scale: BScT,
     down: DnT, down_stride_elems: Int,
     down_sc: DnScT, down_sc_stride_elems: Int,
-    down_bcs: DnCsT, down_bcs_stride_elems: Int,
     accum: AccT,
     dst: OutT,
     ref [origin] pool: P,
@@ -519,13 +518,10 @@ def minimax_sparse_moe_phase2[
     comptime assert BScT.DTYPE == DType.float32, "sparse_moe_phase2: expert_blk_scale must be f32"
     comptime assert DnT.DTYPE == DType.int8, "sparse_moe_phase2: down must be i8"
     comptime assert DnScT.DTYPE == DType.float32, "sparse_moe_phase2: down_sc must be f32"
-    comptime assert DnCsT.DTYPE == DType.float32, "sparse_moe_phase2: down_bcs must be f32"
     comptime assert AccT.DTYPE == DType.float32, "sparse_moe_phase2: accum must be f32"
     comptime assert OutT.DTYPE == DType.bfloat16, "sparse_moe_phase2: dst must be bf16"
     debug_assert(down_sc_stride_elems == hidden,
         "sparse_moe_phase2: down scale stride must be hidden")
-    debug_assert(down_bcs_stride_elems == hidden * (intermediate // fwht_blk),
-        "sparse_moe_phase2: down colsum stride must be hidden*num_blocks")
 
     var seq_len = dst.seq_len()
     if seq_len == 0:
@@ -543,7 +539,6 @@ def minimax_sparse_moe_phase2[
     var expert_blk_scale_p = expert_blk_scale.as_ptr[DType.float32]()
     var down_p = I8Ptr(unsafe_from_address=down.addr())
     var down_sc_p = F32Ptr(unsafe_from_address=down_sc.addr())
-    var down_bcs_p = F32Ptr(unsafe_from_address=down_bcs.addr())
     var accum_p = accum.as_ptr[DType.float32]()
     var dst_p = dst.as_ptr[DType.bfloat16]()
 
@@ -558,8 +553,8 @@ def minimax_sparse_moe_phase2[
         jobs[actual] = SparseMoePhase2Args(
             offsets, routes,
             expert_qi_p, expert_blk_scale_p,
-            down_p, down_sc_p, down_bcs_p, accum_p, dst_p,
-            down_stride_elems, down_sc_stride_elems, down_bcs_stride_elems,
+            down_p, down_sc_p, accum_p, dst_p,
+            down_stride_elems, down_sc_stride_elems,
             seq_len, n_start, n_count)
         actual += 1
 

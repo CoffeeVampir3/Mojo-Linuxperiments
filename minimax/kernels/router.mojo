@@ -144,6 +144,9 @@ def build_sparse_route_schedule[k: Int, experts_per_rank: Int](
       counts[e]  = route count for local expert e
       offsets[e] = prefix start for local expert e
       routes[offsets[e] : offsets[e + 1]] are that expert's token routes
+
+    Each stored route only needs the source token and normalized gate weight;
+    the enclosing bucket identifies the local expert.
     Returns the total number of local routes for this rank.
     """
     var expert_base = rank * experts_per_rank
@@ -173,8 +176,7 @@ def build_sparse_route_schedule[k: Int, experts_per_rank: Int](
                 var local_expert = eid - expert_base
                 var dst = Int(cursors[local_expert])
                 routes[dst] = SparseRoute(
-                    Int32(token), Int32(slot), Int32(local_expert),
-                    r.weights[slot])
+                    Int32(token), r.weights[slot])
                 cursors[local_expert] = cursors[local_expert] + Int32(1)
 
     return total

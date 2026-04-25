@@ -5,14 +5,13 @@ from kernels.vnni import VNNI_N_STEP, VNNI_K_STEP, VNNI_TILE_N, VNNI_BLK, comput
 from experimental3.kernels.dot_prod import act_broadcast_vnni, dot_vnni_broadcasted
 from experimental3.kernels.fwht import fwht_block
 from experimental3.kernels.quantize import absmax_quantize_i8
-from experimental3.common_math import I8Ptr, F32Ptr, BF16Ptr
+from experimental3.common_math import I8Ptr, F32Ptr
 from experimental3.amx import (
     TILE_M as AMX_TILE_M, TILE_N as AMX_TILE_N, K_STEP as AMX_K_STEP,
     TILE_BYTES as AMX_TILE_BYTES,
     tilezero, tileload, tilestore, tdpbssd,
 )
 from notstdcollections import AlignedInlineArray
-from simd_math.matrixops import pick_port_unroll, tree_reduce_accs
 from minimax.kernels.activations import silu_mul
 from minimax.kernels.dispatch_args import (
     FusedW1W3SiluArgs, SparseMoePhase1Args, SparseMoePhase2Args,
@@ -462,83 +461,6 @@ def sparse_moe_phase1_worker[
         expert += args.num_workers
 
 
-@always_inline
-def gemv_row_blocked_accumulate_f32[N: Int, K: Int, fwht_block_size: Int](
-    act_row: I8Ptr,
-    wpacked: I8Ptr,
-    block_scales: F32Ptr,
-    wsc: F32Ptr,
-    block_colsums: F32Ptr,
-    acc: F32Ptr,
-    output_scale: Float32,
-    subrange: Int = N,
-    colsum_stride: Int = N,
-):
-    """Blocked int8 GEMV that accumulates weighted f32 into an existing slice."""
-    debug_assert(K % fwht_block_size == 0,
-        "gemv_row_blocked_accumulate_f32: K must be a multiple of fwht_block_size")
-    debug_assert(fwht_block_size >= VNNI_K_STEP,
-        "gemv_row_blocked_accumulate_f32: fwht_block_size must be >= VNNI_K_STEP")
-    debug_assert(subrange % VNNI_N_STEP == 0,
-        "gemv_row_blocked_accumulate_f32: subrange must be a multiple of VNNI_N_STEP")
-    comptime num_blocks = K // fwht_block_size
-    comptime width = simd_width_of[DType.int32]()
-    comptime passes_per_subtile = VNNI_TILE_N // width
-    comptime bytes_per_pass = width * VNNI_BLK
-    comptime acc_count = VNNI_N_STEP // width
-    comptime dc_count = VNNI_K_STEP // VNNI_BLK
-    comptime tile_dc_bytes = VNNI_TILE_N * VNNI_BLK
-    comptime tile_ks_bytes = dc_count * tile_dc_bytes
-
-    var n_block = compute_n_block(subrange, K)
-    var packed_off = 0
-    var route_scale = SIMD[DType.float32, width](output_scale)
-
-    for nb in range(0, subrange, n_block):
-        var nb_size = min(n_block, subrange - nb)
-        for ns in range(0, nb_size, VNNI_N_STEP):
-            var f32_acc = InlineArray[SIMD[DType.float32, width], acc_count](
-                fill=SIMD[DType.float32, width](0))
-            for blk in range(num_blocks):
-                var i32_acc = InlineArray[SIMD[DType.int32, width], acc_count](
-                    fill=SIMD[DType.int32, width](0))
-                for ks in range(0, fwht_block_size, VNNI_K_STEP):
-                    for dc in range(dc_count):
-                        var k_pos = blk * fwht_block_size + ks + dc * VNNI_BLK
-                        var act_bytes = act_broadcast_vnni[width](act_row, k_pos)
-                        var t0 = packed_off + dc * tile_dc_bytes
-                        var t1 = t0 + tile_ks_bytes
-                        comptime for p in range(passes_per_subtile):
-                            var off = t0 + p * bytes_per_pass
-                            i32_acc[p] = dot_vnni_broadcasted[width](
-                                i32_acc[p], act_bytes, wpacked + off)
-                        comptime for p in range(passes_per_subtile):
-                            var off = t1 + p * bytes_per_pass
-                            i32_acc[passes_per_subtile + p] = dot_vnni_broadcasted[width](
-                                i32_acc[passes_per_subtile + p],
-                                act_bytes, wpacked + off)
-                    packed_off += 2 * tile_ks_bytes
-                var blk_dequant = block_scales[blk] / 127.0
-                for a in range(acc_count):
-                    var n_base = nb + ns + a * width
-                    var corrected = (
-                        i32_acc[a].cast[DType.float32]()
-                        - 128.0 * (
-                            block_colsums + blk * colsum_stride + n_base
-                        ).load[width=width]()
-                    )
-                    f32_acc[a] += corrected * blk_dequant
-            for a in range(acc_count):
-                var n_base = nb + ns + a * width
-                var weighted = (
-                    f32_acc[a]
-                    * (wsc + n_base).load[width=width]()
-                    * route_scale
-                )
-                var old = (acc + n_base).load[width=width]()
-                (acc + n_base).store(old + weighted)
-
-
 def sparse_moe_phase2_worker[
     experts_per_rank: Int, hidden: Int, intermediate: Int, fwht_blk: Int,
 ](
@@ -636,39 +558,3 @@ def sparse_moe_phase2_worker[
             dst[h] = Scalar[DType.bfloat16](
                 args.accum[token * hidden + args.hidden_start + h])
             h += 1
-
-
-# ============================================================================
-# f32 GEMV — bf16 activation × f32 weight → f32 output (router projection)
-# ============================================================================
-
-
-@always_inline
-def f32_gemv_row[K: Int](
-    act: BF16Ptr, weight_row: F32Ptr,
-) -> Float32:
-    """Dot product: bf16[K] · f32[K] → f32 scalar."""
-    comptime width = simd_width_of[DType.float32]()
-    comptime port_unroll = pick_port_unroll[width, K]()
-    comptime step = port_unroll * width
-    var accs = InlineArray[SIMD[DType.float32, width], port_unroll](
-        uninitialized=True)
-    comptime for i in range(port_unroll):
-        var off = i * width
-        var a = (act + off).load[width=width]().cast[DType.float32]()
-        var w = (weight_row + off).load[width=width, non_temporal=True]()
-        accs[i] = a * w
-    var k = step
-    while k + step <= K:
-        comptime for i in range(port_unroll):
-            var off = k + i * width
-            var a = (act + off).load[width=width]().cast[DType.float32]()
-            var w = (weight_row + off).load[width=width, non_temporal=True]()
-            accs[i] = a.fma(w, accs[i])
-        k += step
-    while k + width <= K:
-        var a = (act + k).load[width=width]().cast[DType.float32]()
-        var w = (weight_row + k).load[width=width, non_temporal=True]()
-        accs[0] = a.fma(w, accs[0])
-        k += width
-    return tree_reduce_accs(accs)
