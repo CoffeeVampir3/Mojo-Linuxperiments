@@ -293,6 +293,7 @@ struct M27Session(Movable, Writable):
         self.stream_user_block = String("")
         self.stream_generated = List[Int]()
         self.stream_decoder = StreamTextDecoder()
+        self.sleep_workers()
 
     @staticmethod
     def py_init(
@@ -333,6 +334,15 @@ struct M27Session(Movable, Writable):
         self.stream_user_block = String("")
         self.stream_generated = List[Int]()
         self.stream_decoder = StreamTextDecoder()
+        self.sleep_workers()
+
+    def wake_workers(mut self):
+        for rank in range(TP):
+            self.model.main_pools[rank].wake()
+
+    def sleep_workers(mut self):
+        for rank in range(TP):
+            self.model.main_pools[rank].sleep()
 
     def start_turn(mut self, user_text: String, max_new_tokens: Int) raises:
         if self.stream_active:
@@ -354,6 +364,7 @@ struct M27Session(Movable, Writable):
         var next_id = 0
         var tp_ptr = self.model.token_buffer()
 
+        self.wake_workers()
         var prefilled = reuse_tokens
         while prefilled < prompt_len:
             var chunk_len = min(PREFILL_CHUNK_SIZE, prompt_len - prefilled)
@@ -379,6 +390,7 @@ struct M27Session(Movable, Writable):
         self.stream_user_block = ub^
         self.stream_generated = List[Int]()
         self.stream_decoder = StreamTextDecoder()
+        self.sleep_workers()
 
     def finish_turn(mut self) raises -> PythonObject:
         var tail = self.stream_decoder.finish()
@@ -393,6 +405,7 @@ struct M27Session(Movable, Writable):
         self.stream_next_id = MiniMaxM27Config.EOS_TOKEN_ID
         self.stream_user_block = String("")
         self.stream_generated = List[Int]()
+        self.sleep_workers()
 
         if tail.byte_length() > 0:
             return PythonObject(tail^)
@@ -402,6 +415,7 @@ struct M27Session(Movable, Writable):
         if not self.stream_active:
             return PythonObject()
 
+        self.wake_workers()
         var tp_ptr = self.model.token_buffer()
         while True:
             if (
@@ -428,6 +442,7 @@ struct M27Session(Movable, Writable):
             var out = stream_token_text(
                 self.tok, self.stream_decoder, self.stream_next_id)
             if out.byte_length() > 0:
+                self.sleep_workers()
                 return PythonObject(out^)
 
     def generate(mut self, user_text: String, max_new_tokens: Int) raises -> String:
@@ -448,6 +463,7 @@ struct M27Session(Movable, Writable):
         var next_id = 0
         var tp_ptr = self.model.token_buffer()
 
+        self.wake_workers()
         var prefilled = reuse_tokens
         while prefilled < prompt_len:
             var chunk_len = min(PREFILL_CHUNK_SIZE, prompt_len - prefilled)
@@ -489,6 +505,7 @@ struct M27Session(Movable, Writable):
         var assistant_text = self.tok.decode(generated)
         var assistant_content = assistant_content_for_history(assistant_text)
         self.history = self.history + ub + "]~b]ai\n" + assistant_content + "[e~[\n"
+        self.sleep_workers()
         return assistant_text^
 
     @staticmethod
