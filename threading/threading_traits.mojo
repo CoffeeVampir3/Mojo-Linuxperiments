@@ -4,7 +4,12 @@
 from std.memory import UnsafePointer
 
 
-trait BurstThreadPool(Movable, ImplicitlyDestructible):
+trait SleepableThreadPool:
+    def wake(mut self): ...
+    def sleep(mut self): ...
+
+
+trait BurstThreadPool(Movable, ImplicitlyDestructible, SleepableThreadPool):
     def get_capacity(self) -> Int: ...
 
     def dispatch[Args: Copyable & ImplicitlyCopyable,
@@ -19,8 +24,3 @@ trait BurstThreadPool(Movable, ImplicitlyDestructible):
 trait CheapSmallPhaseDispatchPool(BurstThreadPool):
     """Pool whose hot-path dispatch is cheap enough for tiny phases."""
     pass
-
-
-trait SleepableThreadPool:
-    def wake(mut self): ...
-    def sleep(mut self): ...

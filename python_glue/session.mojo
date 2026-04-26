@@ -336,6 +336,19 @@ struct M27Session(Movable, Writable):
         self.stream_decoder = StreamTextDecoder()
         self.sleep_workers()
 
+    def sync_history(mut self, system_prompt: String, history: String) raises:
+        if self.stream_active:
+            raise Error("cannot sync history while stream is active")
+        self.system_prompt = system_prompt
+        self.history = history
+        self.stream_pos = 0
+        self.stream_step = 0
+        self.stream_limit = 0
+        self.stream_next_id = MiniMaxM27Config.EOS_TOKEN_ID
+        self.stream_user_block = String("")
+        self.stream_generated = List[Int]()
+        self.stream_decoder = StreamTextDecoder()
+
     def wake_workers(mut self):
         for rank in range(TP):
             self.model.main_pools[rank].wake()
@@ -390,7 +403,6 @@ struct M27Session(Movable, Writable):
         self.stream_user_block = ub^
         self.stream_generated = List[Int]()
         self.stream_decoder = StreamTextDecoder()
-        self.sleep_workers()
 
     def finish_turn(mut self) raises -> PythonObject:
         var tail = self.stream_decoder.finish()
@@ -415,7 +427,6 @@ struct M27Session(Movable, Writable):
         if not self.stream_active:
             return PythonObject()
 
-        self.wake_workers()
         var tp_ptr = self.model.token_buffer()
         while True:
             if (
@@ -442,7 +453,6 @@ struct M27Session(Movable, Writable):
             var out = stream_token_text(
                 self.tok, self.stream_decoder, self.stream_next_id)
             if out.byte_length() > 0:
-                self.sleep_workers()
                 return PythonObject(out^)
 
     def generate(mut self, user_text: String, max_new_tokens: Int) raises -> String:
@@ -551,6 +561,16 @@ struct M27Session(Movable, Writable):
     def py_reset(py_self: PythonObject, system_prompt: PythonObject) raises -> PythonObject:
         var self_ptr = py_self.downcast_value_ptr[Self]()
         self_ptr[].reset(String(system_prompt))
+        return PythonObject()
+
+    @staticmethod
+    def py_sync_history(
+        py_self: PythonObject,
+        system_prompt: PythonObject,
+        history: PythonObject,
+    ) raises -> PythonObject:
+        var self_ptr = py_self.downcast_value_ptr[Self]()
+        self_ptr[].sync_history(String(system_prompt), String(history))
         return PythonObject()
 
     def write_to[W: Writer](self, mut writer: W):

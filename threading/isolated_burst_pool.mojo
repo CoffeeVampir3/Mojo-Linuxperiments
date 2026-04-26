@@ -24,15 +24,15 @@ import linux.sys as linux
 from std.atomic import Atomic, Ordering
 from numa import NumaInfo, CpuMask
 from notstdcollections import HeapMoveArray
-from .threading_traits import (
-    BurstThreadPool, CheapSmallPhaseDispatchPool, SleepableThreadPool,
-)
+from .threading_traits import CheapSmallPhaseDispatchPool
 from .threading_shared import (
     AtomicInt32, KernelFn, JoinFlag, SlotLayout,
     MAILBOX_DATA_SLOTS, MAILBOX_DATA_BYTES,
     typed_trampoline,
     compute_slot_size, ptr,
 )
+
+comptime SPIN_PAUSES_PER_CYCLE = 33
 
 
 # ============================================================================
@@ -105,9 +105,7 @@ struct WorkerSlot(Movable):
 # IsolatedBurstPool
 # ============================================================================
 
-struct IsolatedBurstPool[mask_size: Int = 128](
-    CheapSmallPhaseDispatchPool, SleepableThreadPool,
-):
+struct IsolatedBurstPool[mask_size: Int = 128](CheapSmallPhaseDispatchPool):
     """Dual-mailbox burst pool for isolated cores.
 
     Workers spin on local mailboxes. Join polls local flags.
@@ -459,6 +457,7 @@ def isolated_worker_main[mask_size: Int](stack_head_ptr: Int):
                 var parked_ptr = UnsafePointer(to=shared[].parked.value)
                 _ = sys.sys_futex_wait(Int(parked_ptr), 1, futex_flags)
             else:
-                sys.arch_cpu_relax()
+                comptime for _ in range(0, SPIN_PAUSES_PER_CYCLE):
+                    sys.arch_cpu_relax()
 
     sys.sys_exit()

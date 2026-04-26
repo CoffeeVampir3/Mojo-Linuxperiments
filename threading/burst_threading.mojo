@@ -383,6 +383,12 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
                 max_ts = ts
         return max_ts
 
+    def wake(mut self):
+        pass
+
+    def sleep(mut self):
+        pass
+
     # ----------------------------------------------------------------
     # Shutdown
     # ----------------------------------------------------------------

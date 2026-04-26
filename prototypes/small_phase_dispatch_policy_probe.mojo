@@ -191,6 +191,12 @@ struct MockPool(BurstThreadPool):
     def last_worker_timestamp(self) -> Int:
         return self.worker_done_ns
 
+    def wake(mut self):
+        pass
+
+    def sleep(mut self):
+        pass
+
 
 struct MockIsolatedPool(MockSmallPhaseDispatchPool):
     var capacity: Int
@@ -222,6 +228,12 @@ struct MockIsolatedPool(MockSmallPhaseDispatchPool):
 
     def last_worker_timestamp(self) -> Int:
         return self.worker_done_ns
+
+    def wake(mut self):
+        pass
+
+    def sleep(mut self):
+        pass
 
 
 def main():

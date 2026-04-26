@@ -71,6 +71,20 @@ def assistant_content_for_history(assistant_text: String) -> String:
     )
 
 
+def wake_model_workers[P: BurstThreadPool, //, tp: Int](
+    mut model: MiniMaxM27ButterQuant[tp, P],
+):
+    for rank in range(tp):
+        model.main_pools[rank].wake()
+
+
+def sleep_model_workers[P: BurstThreadPool, //, tp: Int](
+    mut model: MiniMaxM27ButterQuant[tp, P],
+):
+    for rank in range(tp):
+        model.main_pools[rank].sleep()
+
+
 @always_inline
 def is_utf8_continuation_byte(b: Byte) -> Bool:
     return b >= Byte(0x80) and b <= Byte(0xBF)
@@ -278,6 +292,7 @@ def load_and_chat[
     var cache = HistoryCache()
     print("MiniMax-M2.7 chat. Type /quit, quit, or exit to stop.")
     print()
+    sleep_model_workers(model)
 
     while True:
         var user_text: String
@@ -300,6 +315,7 @@ def load_and_chat[
             print("context is full; restart the program for a fresh chat")
             continue
 
+        wake_model_workers(model)
         var max_new_tokens = min(
             MAX_NEW_TOKENS, MiniMaxM27Config.MAX_SEQ_LEN - prompt_len)
         model.reset_profile()
@@ -384,6 +400,7 @@ def load_and_chat[
 
         var assistant_content = assistant_content_for_history(assistant_text)
         history = history + user_block + "]~b]ai\n" + assistant_content + "[e~[\n"
+        sleep_model_workers(model)
 
 
 def main() raises:
@@ -406,7 +423,7 @@ def main() raises:
         + String(len(numa.isolated_cpus)) + " isolated cpus")
 
     if numa.has_isolation():
-        print("mode: isolated (spin-only)")
+        print("mode: isolated (explicit sleep)")
         var pool_start_ns = perf_counter_ns()
         var pools = HeapMoveArray[IsolatedBurstPool[]](TP)
         for rank in range(TP):

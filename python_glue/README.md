@@ -64,23 +64,26 @@ inspect `kwargs`.
 Do not set `MOJO_ENABLE_RUNTIME=0` for this path. Python is importing and
 calling a Mojo extension, so Mojo runtime initialization must be available.
 
+## Python Split
+
+The root-level Python layer is split into:
+
+- `m27_mojo_bridge.py`: imports the Mojo extension and serializes access to one
+  `M27Session`.
+- `m27_openai_server.py`: owns HTTP, auth, OpenAI-compatible request parsing,
+  and SSE streaming.
+
 ## Worker Pool Edge
 
 The bridge currently uses `IsolatedBurstPool` because that matches the remote
 benchmark machine. This pool is deliberately spin-oriented for latency. Idle
 workers will consume CPU unless they are explicitly parked.
 
-`M27Session` wakes workers around model work and parks them when control returns
-to Python:
+`M27Session` wakes workers for a turn and parks them between turns:
 
 - after model initialization
-- after `start_turn()` finishes prefill
-- before each `next_chunk()` generation step
-- before returning a chunk to Python
+- after reset
 - when a turn completes
-
-This matters for an API server because Python may wait on network backpressure
-between streamed chunks.
 
 ## Streaming Shape
 
@@ -101,6 +104,16 @@ update prompt history using the official MiniMax template behavior.
 
 The blocking `send()` and `send_with_limit()` methods remain for smoke testing,
 but API streaming should prefer `start_turn()` / `next_chunk()`.
+
+## History Reconciliation
+
+`M27Session.sync_history(system_prompt, history)` replaces the rendered MiniMax
+history without clearing `HistoryCache`. The next turn tokenizes the synced
+history plus the new user message and reuses the existing KV prefix until the
+first token mismatch.
+
+The HTTP bridge uses this before every OpenAI-compatible request so frontend
+edits, deletes, and regenerations are reflected in the next generation.
 
 ## Text Chunking
 
@@ -134,7 +147,4 @@ This is intentionally a single-session POC:
 - one `M27Session`
 - one active generation at a time
 - no multi-conversation KV slot manager
-- no Python-side HTTP server in this module
-
-The clean next layer is a Python API wrapper with a process-global `M27Session`
-and a lock around `start_turn()` / `next_chunk()`.
+- reconciliation assumes the frontend sends the full current transcript

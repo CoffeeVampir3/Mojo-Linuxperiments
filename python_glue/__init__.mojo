@@ -29,6 +29,9 @@ def PyInit_python_glue() -> PythonObject:
         ).def_method[M27Session.py_reset](
             "reset",
             docstring="Reset prompt history and set a new system prompt.",
+        ).def_method[M27Session.py_sync_history](
+            "sync_history",
+            docstring="Replace rendered prompt history while preserving KV reuse state.",
         )
         return module.finalize()
     except e:
