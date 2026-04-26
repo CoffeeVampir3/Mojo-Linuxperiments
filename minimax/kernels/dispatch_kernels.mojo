@@ -11,7 +11,6 @@ from kernels.vnni import VNNI_N_STEP
 from experimental3.kv_cache import CACHE_WIDTH
 from minimax.kernels.amx_attention import amx_chunked_attn_kernel
 
-from minimax.kernels.qk_prep import prep_q_head
 from minimax.kernels.dispatch_args import (
     FusedW1W3SiluArgs,
     SparseRoute,

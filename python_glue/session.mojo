@@ -252,6 +252,7 @@ struct M27Session(Movable, Writable):
     var stream_limit: Int
     var stream_next_id: Int
     var stream_user_block: String
+    var stream_assistant_prefix: String
     var stream_generated: List[Int]
     var stream_decoder: StreamTextDecoder
 
@@ -291,6 +292,7 @@ struct M27Session(Movable, Writable):
         self.stream_limit = 0
         self.stream_next_id = MiniMaxM27Config.EOS_TOKEN_ID
         self.stream_user_block = String("")
+        self.stream_assistant_prefix = String("")
         self.stream_generated = List[Int]()
         self.stream_decoder = StreamTextDecoder()
         self.sleep_workers()
@@ -332,6 +334,7 @@ struct M27Session(Movable, Writable):
         self.stream_limit = 0
         self.stream_next_id = MiniMaxM27Config.EOS_TOKEN_ID
         self.stream_user_block = String("")
+        self.stream_assistant_prefix = String("")
         self.stream_generated = List[Int]()
         self.stream_decoder = StreamTextDecoder()
         self.sleep_workers()
@@ -346,6 +349,7 @@ struct M27Session(Movable, Writable):
         self.stream_limit = 0
         self.stream_next_id = MiniMaxM27Config.EOS_TOKEN_ID
         self.stream_user_block = String("")
+        self.stream_assistant_prefix = String("")
         self.stream_generated = List[Int]()
         self.stream_decoder = StreamTextDecoder()
 
@@ -401,12 +405,68 @@ struct M27Session(Movable, Writable):
         self.stream_limit = limit
         self.stream_next_id = next_id
         self.stream_user_block = ub^
+        self.stream_assistant_prefix = String("")
+        self.stream_generated = List[Int]()
+        self.stream_decoder = StreamTextDecoder()
+
+    def start_turn_with_prefix(
+        mut self,
+        user_text: String,
+        assistant_prefill: String,
+        max_new_tokens: Int,
+    ) raises:
+        if self.stream_active:
+            raise Error("stream already active")
+        if max_new_tokens <= 0:
+            raise Error("max_new_tokens must be positive")
+
+        var ub = user_block(user_text)
+        var prefill = String(assistant_prefill)
+        var prompt = self.history + ub + String("]~b]ai\n") + prefill
+        var token_ids = self.tok.encode(prompt)
+        var prompt_len = len(token_ids)
+        if prompt_len >= MiniMaxM27Config.MAX_SEQ_LEN:
+            raise Error("context is full; create a new M27Session")
+
+        var limit = min(
+            max_new_tokens, MiniMaxM27Config.MAX_SEQ_LEN - prompt_len)
+        var reuse_tokens = self.cache.last_common_prefix(token_ids)
+        var prefill_tokens = prompt_len - reuse_tokens
+        var next_id = 0
+        var tp_ptr = self.model.token_buffer()
+
+        self.wake_workers()
+        var prefilled = reuse_tokens
+        while prefilled < prompt_len:
+            var chunk_len = min(PREFILL_CHUNK_SIZE, prompt_len - prefilled)
+            for i in range(chunk_len):
+                tp_ptr[i] = Scalar[DType.int32](token_ids[prefilled + i])
+            var is_last_prefill_chunk = prefilled + chunk_len == prompt_len
+            next_id = Int(self.model.forward(
+                Int(tp_ptr), prefilled, chunk_len, is_last_prefill_chunk))
+            prefilled += chunk_len
+
+        if prefill_tokens == 0:
+            tp_ptr[0] = Scalar[DType.int32](token_ids[prompt_len - 1])
+            next_id = Int(self.model.forward(
+                Int(tp_ptr), prompt_len - 1, 1, True))
+
+        self.cache.replace_with(token_ids)
+        self.stream_active = True
+        self.stream_pos = prompt_len
+        self.stream_step = 0
+        self.stream_limit = limit
+        self.stream_next_id = next_id
+        self.stream_user_block = ub^
+        self.stream_assistant_prefix = prefill^
         self.stream_generated = List[Int]()
         self.stream_decoder = StreamTextDecoder()
 
     def finish_turn(mut self) raises -> PythonObject:
         var tail = self.stream_decoder.finish()
-        var assistant_text = self.tok.decode(self.stream_generated)
+        var assistant_text = (
+            self.stream_assistant_prefix + self.tok.decode(self.stream_generated)
+        )
         var assistant_content = assistant_content_for_history(assistant_text)
         self.history = self.history + self.stream_user_block + "]~b]ai\n" + assistant_content + "[e~[\n"
 
@@ -416,12 +476,34 @@ struct M27Session(Movable, Writable):
         self.stream_limit = 0
         self.stream_next_id = MiniMaxM27Config.EOS_TOKEN_ID
         self.stream_user_block = String("")
+        self.stream_assistant_prefix = String("")
         self.stream_generated = List[Int]()
+        self.stream_decoder = StreamTextDecoder()
         self.sleep_workers()
 
         if tail.byte_length() > 0:
             return PythonObject(tail^)
         return PythonObject()
+
+    def finish_turn_with_text(mut self, assistant_text: String):
+        if not self.stream_active:
+            self.sleep_workers()
+            return
+
+        var full_assistant_text = self.stream_assistant_prefix + assistant_text
+        var assistant_content = assistant_content_for_history(full_assistant_text)
+        self.history = self.history + self.stream_user_block + "]~b]ai\n" + assistant_content + "[e~[\n"
+
+        self.stream_active = False
+        self.stream_pos = 0
+        self.stream_step = 0
+        self.stream_limit = 0
+        self.stream_next_id = MiniMaxM27Config.EOS_TOKEN_ID
+        self.stream_user_block = String("")
+        self.stream_assistant_prefix = String("")
+        self.stream_generated = List[Int]()
+        self.stream_decoder = StreamTextDecoder()
+        self.sleep_workers()
 
     def next_chunk(mut self) raises -> PythonObject:
         if not self.stream_active:
@@ -553,9 +635,33 @@ struct M27Session(Movable, Writable):
         return PythonObject()
 
     @staticmethod
+    def py_start_turn_with_prefix(
+        py_self: PythonObject,
+        user_text: PythonObject,
+        assistant_prefill: PythonObject,
+        max_new_tokens: PythonObject,
+    ) raises -> PythonObject:
+        var self_ptr = py_self.downcast_value_ptr[Self]()
+        self_ptr[].start_turn_with_prefix(
+            String(user_text),
+            String(assistant_prefill),
+            Int(py=max_new_tokens),
+        )
+        return PythonObject()
+
+    @staticmethod
     def py_next_chunk(py_self: PythonObject) raises -> PythonObject:
         var self_ptr = py_self.downcast_value_ptr[Self]()
         return self_ptr[].next_chunk()
+
+    @staticmethod
+    def py_finish_turn_with_text(
+        py_self: PythonObject,
+        assistant_text: PythonObject,
+    ) raises -> PythonObject:
+        var self_ptr = py_self.downcast_value_ptr[Self]()
+        self_ptr[].finish_turn_with_text(String(assistant_text))
+        return PythonObject()
 
     @staticmethod
     def py_reset(py_self: PythonObject, system_prompt: PythonObject) raises -> PythonObject:

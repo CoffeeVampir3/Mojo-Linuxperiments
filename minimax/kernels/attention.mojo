@@ -11,6 +11,9 @@ from experimental3.amx import (
 from experimental3.kv_cache import Gemma4KVCache, CACHE_WIDTH
 from experimental3.kernels.dot_prod import vpdpbusd
 from experimental3.kernels.quantize import absmax_quantize_i8
+from experimental3.kernels.full_chunked_attention_fused import (
+    partial_head_stride, partial_chunk_stride,
+)
 from experimental3.common_math import F32Ptr, BF16Ptr, I8Ptr, U8Ptr
 from notstdcollections import AlignedInlineArray
 from minimax.kernels.qk_prep import prep_q_head, write_k_head, write_v_direct
@@ -87,14 +90,6 @@ def q_prep_batch_kernel[
 # ============================================================================
 # Phase C: local merge + quantize — replaces cross-rank cp_gather
 # ============================================================================
-
-
-def partial_head_stride[head_dim: Int]() -> Int:
-    return 2 + head_dim
-
-
-def partial_chunk_stride[head_dim: Int, heads_per_group: Int]() -> Int:
-    return heads_per_group * partial_head_stride[head_dim]()
 
 
 def merge_and_quantize_kernel[head_dim: Int, heads_per_group: Int, max_attn_chunks: Int](

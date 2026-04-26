@@ -51,6 +51,31 @@ def _completion_id() -> str:
     return "cmpl-" + uuid.uuid4().hex
 
 
+def _stop_strings(data: dict[str, Any]) -> list[str]:
+    values = []
+    for key in ("stop", "stopping_strings"):
+        value = data.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str):
+            values.append(value)
+            continue
+        if isinstance(value, list):
+            values.extend(value)
+            continue
+        raise ValueError(key + " must be a string or list of strings")
+
+    stops = []
+    seen = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError("stop values must be strings")
+        if value and value not in seen:
+            stops.append(value)
+            seen.add(value)
+    return stops
+
+
 class M27OpenAIHandler(BaseHTTPRequestHandler):
     bridge: M27MojoBridge
     server_version = "M27OpenAI/0.1"
@@ -114,14 +139,15 @@ class M27OpenAIHandler(BaseHTTPRequestHandler):
                 prompt = prompt[0]
             rendered = render_text_completion_prompt(prompt)
             max_new_tokens = _max_tokens(data)
+            stop_strings = _stop_strings(data)
         except Exception as exc:
             self._send_json(400, {"error": {"message": str(exc)}})
             return
 
         if data.get("stream", False):
-            self._stream_completion(rendered, max_new_tokens)
+            self._stream_completion(rendered, max_new_tokens, stop_strings)
         else:
-            self._complete_completion(rendered, max_new_tokens)
+            self._complete_completion(rendered, max_new_tokens, stop_strings)
 
     def _handle_chat_completion(self) -> None:
         if self._check_auth() is None:
@@ -134,38 +160,15 @@ class M27OpenAIHandler(BaseHTTPRequestHandler):
                 raise ValueError("messages must be a list")
             rendered = render_openai_messages(messages)
             max_new_tokens = _max_tokens(data)
+            stop_strings = _stop_strings(data)
         except Exception as exc:
             self._send_json(400, {"error": {"message": str(exc)}})
             return
 
         if data.get("stream", False):
-            self._stream_chat(rendered, max_new_tokens)
+            self._stream_chat(rendered, max_new_tokens, stop_strings)
         else:
-            self._complete_chat(rendered, max_new_tokens)
-
-    def _unused(self) -> None:
-        path = urlparse(self.path).path
-        if path != "/v1/chat/completions":
-            self._send_json(404, {"error": {"message": "not found"}})
-            return
-        if self._check_auth() is None:
-            return
-
-        try:
-            data = self._read_json()
-            messages = data.get("messages")
-            if not isinstance(messages, list):
-                raise ValueError("messages must be a list")
-            rendered = render_openai_messages(messages)
-            max_new_tokens = _max_tokens(data)
-        except Exception as exc:
-            self._send_json(400, {"error": {"message": str(exc)}})
-            return
-
-        if data.get("stream", False):
-            self._stream_chat(rendered, max_new_tokens)
-        else:
-            self._complete_chat(rendered, max_new_tokens)
+            self._complete_chat(rendered, max_new_tokens, stop_strings)
 
     def _read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
@@ -174,14 +177,21 @@ class M27OpenAIHandler(BaseHTTPRequestHandler):
 
     def _complete_completion(
         self,
-        rendered: tuple[str, str, str],
+        rendered: tuple[str, str, str, str],
         max_new_tokens: int,
+        stop_strings: list[str],
     ) -> None:
         request_id = _completion_id()
         created = int(time.time())
+        system_prompt, history, user_text, assistant_prefill = rendered
         try:
             text = self.bridge.generate_rendered(
-                *rendered, max_new_tokens=max_new_tokens
+                system_prompt,
+                history,
+                user_text,
+                max_new_tokens=max_new_tokens,
+                stop_strings=stop_strings,
+                assistant_prefill=assistant_prefill,
             )
         except Exception as exc:
             self._send_json(500, {"error": {"message": str(exc)}})
@@ -198,6 +208,7 @@ class M27OpenAIHandler(BaseHTTPRequestHandler):
                     {
                         "index": 0,
                         "text": text,
+                        "logprobs": None,
                         "finish_reason": "stop",
                     }
                 ],
@@ -206,12 +217,14 @@ class M27OpenAIHandler(BaseHTTPRequestHandler):
 
     def _stream_completion(
         self,
-        rendered: tuple[str, str, str],
+        rendered: tuple[str, str, str, str],
         max_new_tokens: int,
+        stop_strings: list[str],
     ) -> None:
         request_id = _completion_id()
         created = int(time.time())
         connected = True
+        system_prompt, history, user_text, assistant_prefill = rendered
 
         self.send_response(200)
         self._send_cors_headers()
@@ -221,26 +234,34 @@ class M27OpenAIHandler(BaseHTTPRequestHandler):
         self.send_header("X-Accel-Buffering", "no")
         self.end_headers()
 
+        stream = self.bridge.stream_rendered(
+            system_prompt,
+            history,
+            user_text,
+            max_new_tokens=max_new_tokens,
+            stop_strings=stop_strings,
+            assistant_prefill=assistant_prefill,
+        )
         try:
-            for chunk in self.bridge.stream_rendered(
-                *rendered, max_new_tokens=max_new_tokens
-            ):
-                if connected:
-                    connected = self._write_sse(
-                        {
-                            "id": request_id,
-                            "object": "text_completion",
-                            "created": created,
-                            "model": MODEL_ID,
-                            "choices": [
-                                {
-                                    "index": 0,
-                                    "text": chunk,
-                                    "finish_reason": None,
-                                }
-                            ],
-                        }
-                    )
+            for chunk in stream:
+                connected = self._write_sse(
+                    {
+                        "id": request_id,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": MODEL_ID,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "text": chunk,
+                                "logprobs": None,
+                                "finish_reason": None,
+                            }
+                        ],
+                    }
+                )
+                if not connected:
+                    break
 
             if connected:
                 connected = self._write_sse(
@@ -250,7 +271,12 @@ class M27OpenAIHandler(BaseHTTPRequestHandler):
                         "created": created,
                         "model": MODEL_ID,
                         "choices": [
-                            {"index": 0, "text": "", "finish_reason": "stop"}
+                            {
+                                "index": 0,
+                                "text": "",
+                                "logprobs": None,
+                                "finish_reason": "stop",
+                            }
                         ],
                     }
                 )
@@ -259,17 +285,22 @@ class M27OpenAIHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             if connected:
                 self._write_sse({"error": {"message": str(exc)}})
+        finally:
+            stream.close()
 
     def _complete_chat(
         self,
         rendered: tuple[str, str, str],
         max_new_tokens: int,
+        stop_strings: list[str],
     ) -> None:
         request_id = _chat_id()
         created = int(time.time())
         try:
             content = self.bridge.generate_rendered(
-                *rendered, max_new_tokens=max_new_tokens
+                *rendered,
+                max_new_tokens=max_new_tokens,
+                stop_strings=stop_strings,
             )
         except Exception as exc:
             self._send_json(500, {"error": {"message": str(exc)}})
@@ -296,6 +327,7 @@ class M27OpenAIHandler(BaseHTTPRequestHandler):
         self,
         rendered: tuple[str, str, str],
         max_new_tokens: int,
+        stop_strings: list[str],
     ) -> None:
         request_id = _chat_id()
         created = int(time.time())
@@ -325,11 +357,16 @@ class M27OpenAIHandler(BaseHTTPRequestHandler):
                     ],
                 }
             )
+            if not connected:
+                return
 
-            for chunk in self.bridge.stream_rendered(
-                *rendered, max_new_tokens=max_new_tokens
-            ):
-                if connected:
+            stream = self.bridge.stream_rendered(
+                *rendered,
+                max_new_tokens=max_new_tokens,
+                stop_strings=stop_strings,
+            )
+            try:
+                for chunk in stream:
                     connected = self._write_sse(
                         {
                             "id": request_id,
@@ -345,6 +382,10 @@ class M27OpenAIHandler(BaseHTTPRequestHandler):
                             ],
                         }
                     )
+                    if not connected:
+                        break
+            finally:
+                stream.close()
 
             if connected:
                 connected = self._write_sse(

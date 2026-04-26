@@ -18,9 +18,8 @@ from std.collections import InlineArray
 from threading.threading_traits import BurstThreadPool
 
 from modeling.model_spec import (
-    Encoding, Shaped, Aligned, HasPtr, Dynamic,
     StaticTensor, DynamicTensor,
-    StaticView, DynamicView, Shape, BF16,
+    StaticView, Shape, BF16,
 )
 from kernels.kernel_ops import PoolFence, MAX_POOL_CAPACITY
 
@@ -52,7 +51,7 @@ from experimental3.kernels.dispatch_args import (
 from experimental3.kernels.gemm import (
     int8_gemv_decode_worker,
     int8_gemv_blocked_worker, int8_gemv_blocked_decode_worker,
-    int8_gemv_blocked_wa_worker,
+    int8_gemv_blocked_subblock_worker,
     fused_gu_gelu_tanh_worker,
     lm_head_worker,
 )
@@ -60,7 +59,7 @@ from experimental3.kernels.gemm_amx import (
     int8_gemm_amx_worker, int8_gemm_blocked_amx_worker,
 )
 from experimental3.kernels.dispatch_helpers import tile_and_dispatch
-from kernels.vnni import VNNI_N_STEP
+from kernels.vnni import VNNI_N_STEP, VNNI_K_STEP
 from experimental3.moe import router_topk_kernel
 from experimental3.kernels.sliding_attention import sliding_attn_group_kernel
 from experimental3.kernels.full_chunked_attention_fused import (
@@ -79,13 +78,6 @@ from experimental3.kernels.rmsnorm import (
     dense_norm_kernel,
     post_reduce_kernel,
 )
-
-
-# ============================================================================
-# Shared fence helper — every dispatch function returns one of these.
-# ============================================================================
-
-
 
 
 # ============================================================================
@@ -176,8 +168,11 @@ def int8_gemv_blocked[
 ) -> PoolFence[P, origin]:
     """Dispatch int8 GEMV with per-block activation scales.
 
-    Decode (seq_len=1): N-split across workers.
-    Prefill (seq_len>1): M-split across workers.
+    fwht_blk >= VNNI_K_STEP: standard K-block path.
+      Decode (seq_len=1): N-split across workers (VNNI).
+      Prefill (seq_len>1): M-split across workers (AMX).
+    fwht_blk < VNNI_K_STEP: subblock path (multiple FWHT sub-blocks per
+      VNNI K-step). M-split across workers (VNNI), used for any seq_len.
     """
     comptime assert AT.DTYPE == DType.int8, "int8_gemv_blocked: act must be i8"
     comptime assert WT.DTYPE == DType.int8, "int8_gemv_blocked: wpacked must be i8"
@@ -199,89 +194,60 @@ def int8_gemv_blocked[
 
     comptime num_blocks = K // fwht_blk
 
-    if seq_len == 1:
-        var num_workers = min(N // VNNI_N_STEP, pool.get_capacity())
-        var n_per_worker = ((N // VNNI_N_STEP + num_workers - 1) // num_workers) * VNNI_N_STEP
+    comptime if fwht_blk >= VNNI_K_STEP:
+        if seq_len == 1:
+            var num_workers = min(N // VNNI_N_STEP, pool.get_capacity())
+            var n_per_worker = ((N // VNNI_N_STEP + num_workers - 1) // num_workers) * VNNI_N_STEP
+            var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](
+                fill=Int8GemvBlockedArgs())
+            var actual = 0
+            for i in range(num_workers):
+                var n_start = i * n_per_worker
+                if n_start >= N:
+                    break
+                var n_count = min(n_per_worker, N - n_start)
+                jobs[actual] = Int8GemvBlockedArgs(
+                    act_p, wpacked_p + n_start * K, blk_scale_p,
+                    wscale_p + n_start, blk_colsum_p + n_start,
+                    dst_p + n_start, output_scale, n_count, N, 1)
+                actual += 1
+            pool.dispatch[Int8GemvBlockedArgs,
+                int8_gemv_blocked_decode_worker[N, K, fwht_blk]](
+                UnsafePointer(to=jobs[0]), actual)
+            return PoolFence[P, origin].over(pool)
+
+        @parameter
+        def factory(start: Int, count: Int) -> Int8GemvBlockedArgs:
+            return Int8GemvBlockedArgs(
+                act_p + start * K, wpacked_p,
+                blk_scale_p + start * num_blocks, wscale_p, blk_colsum_p,
+                dst_p + start * N, output_scale, N, N, count)
+        return tile_and_dispatch[
+            kernel=int8_gemm_blocked_amx_worker[N, K, fwht_blk], factory=factory,
+        ](seq_len, pool)
+    else:
+        var num_jobs = min(seq_len, pool.get_capacity())
+        var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
+
         var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](
             fill=Int8GemvBlockedArgs())
         var actual = 0
-        for i in range(num_workers):
-            var n_start = i * n_per_worker
-            if n_start >= N:
+        for i in range(num_jobs):
+            var start = i * rows_per_job
+            if start >= seq_len:
                 break
-            var n_count = min(n_per_worker, N - n_start)
+            var end = min(start + rows_per_job, seq_len)
             jobs[actual] = Int8GemvBlockedArgs(
-                act_p, wpacked_p + n_start * K, blk_scale_p,
-                wscale_p + n_start, blk_colsum_p + n_start,
-                dst_p + n_start, output_scale, n_count, N, 1)
+                act_p + start * K, wpacked_p,
+                blk_scale_p + start * num_blocks,
+                wscale_p, blk_colsum_p,
+                dst_p + start * N, output_scale, N, N, end - start)
             actual += 1
+
         pool.dispatch[Int8GemvBlockedArgs,
-            int8_gemv_blocked_decode_worker[N, K, fwht_blk]](
+            int8_gemv_blocked_subblock_worker[N, K, fwht_blk]](
             UnsafePointer(to=jobs[0]), actual)
         return PoolFence[P, origin].over(pool)
-
-    @parameter
-    def factory(start: Int, count: Int) -> Int8GemvBlockedArgs:
-        return Int8GemvBlockedArgs(
-            act_p + start * K, wpacked_p,
-            blk_scale_p + start * num_blocks, wscale_p, blk_colsum_p,
-            dst_p + start * N, output_scale, N, N, count)
-    return tile_and_dispatch[
-        kernel=int8_gemm_blocked_amx_worker[N, K, fwht_blk], factory=factory,
-    ](seq_len, pool)
-
-
-def int8_gemv_blocked_wa[
-    AT: DynamicTensor, WT: StaticTensor, BScT: DynamicTensor,
-    WsT: StaticTensor, BCsT: StaticTensor, DstT: DynamicTensor,
-    P: BurstThreadPool, origin: MutOrigin, //,
-    N: Int, K: Int, fwht_blk: Int,
-](
-    act: AT, wpacked: WT, blk_scale: BScT,
-    wscale: WsT, blk_colsum: BCsT, dst: DstT,
-    ref [origin] pool: P,
-) -> PoolFence[P, origin]:
-    """Dispatch workaround blocked GEMV for sub-VNNI_K_STEP block sizes."""
-    comptime assert AT.DTYPE == DType.int8, "int8_gemv_blocked_wa: act must be i8"
-    comptime assert WT.DTYPE == DType.int8, "int8_gemv_blocked_wa: wpacked must be i8"
-    comptime assert BScT.DTYPE == DType.float32, "int8_gemv_blocked_wa: blk_scale must be f32"
-    comptime assert WsT.DTYPE == DType.float32, "int8_gemv_blocked_wa: wscale must be f32"
-    comptime assert BCsT.DTYPE == DType.float32, "int8_gemv_blocked_wa: blk_colsum must be f32"
-    comptime assert DstT.DTYPE == DType.bfloat16, "int8_gemv_blocked_wa: dst must be bf16"
-
-    var seq_len = act.seq_len()
-    if seq_len == 0:
-        return PoolFence[P, origin].over(pool)
-
-    var act_p = act.as_ptr[DType.int8]()
-    var wpacked_p = wpacked.as_ptr[DType.int8]()
-    var blk_scale_p = blk_scale.as_ptr[DType.float32]()
-    var wscale_p = wscale.as_ptr[DType.float32]()
-    var blk_colsum_p = blk_colsum.as_ptr[DType.float32]()
-    var dst_p = dst.as_ptr[DType.bfloat16]()
-
-    var num_jobs = min(seq_len, pool.get_capacity())
-    var rows_per_job = (seq_len + num_jobs - 1) // num_jobs
-    comptime num_blocks = K // fwht_blk
-
-    var jobs = InlineArray[Int8GemvBlockedArgs, MAX_POOL_CAPACITY](
-        fill=Int8GemvBlockedArgs())
-    var actual = 0
-    for i in range(num_jobs):
-        var start = i * rows_per_job
-        if start >= seq_len:
-            break
-        var end = min(start + rows_per_job, seq_len)
-        jobs[actual] = Int8GemvBlockedArgs(
-            act_p + start * K, wpacked_p,
-            blk_scale_p + start * num_blocks,
-            wscale_p, blk_colsum_p,
-            dst_p + start * N, Float32(1.0), N, N, end - start)
-        actual += 1
-
-    pool.dispatch[Int8GemvBlockedArgs, int8_gemv_blocked_wa_worker[N, K, fwht_blk]](
-        UnsafePointer(to=jobs[0]), actual)
-    return PoolFence[P, origin].over(pool)
 
 
 # ============================================================================

@@ -19,17 +19,12 @@ from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 from std.collections import InlineArray
 
-from kernels.vnni import VNNI_N_STEP
 from kernels.moe import fused_gateup_quant_row
-from experimental3.kernels.dot_prod import vpdpbusd
 from experimental3.kernels.gemv import (
-    gemv_row, gemv_row_blocked_bf16_scaled, gemv_row_blocked_wa,
+    gemv_row, gemv_row_blocked_bf16_scaled, gemv_row_blocked_subblock,
     lm_head_row_dot,
 )
-from experimental3.kernels.fwht import fwht_block
-from experimental3.kernels.quantize import absmax_quantize_i8
 from experimental3.kernels.gelu_tanh_fwht_quantize import gelu_tanh_f32
-from experimental3.common_math import I8Ptr, U8Ptr, F32Ptr, BF16Ptr
 from experimental3.kernels.dispatch_args import (
     WorkerConfig, Int8GemvBlockedArgs, FusedGuGeluTanhArgs, LmHeadArgs,
 )
@@ -71,7 +66,7 @@ def int8_gemv_decode_worker[N: Int, K: Int](cfg: WorkerConfig):
 
 
 # ============================================================================
-# int8_gemv_blocked workers (standard + _wa variant)
+# int8_gemv_blocked workers
 # ============================================================================
 
 
@@ -97,7 +92,7 @@ def int8_gemv_blocked_decode_worker[N: Int, K: Int, fwht_blk: Int](
         args.output_scale, args.n_out, args.colsum_stride)
 
 
-def int8_gemv_blocked_wa_worker[N: Int, K: Int, fwht_blk: Int](
+def int8_gemv_blocked_subblock_worker[N: Int, K: Int, fwht_blk: Int](
     args: Int8GemvBlockedArgs,
 ):
     comptime width = simd_width_of[DType.float32]()
@@ -105,7 +100,7 @@ def int8_gemv_blocked_wa_worker[N: Int, K: Int, fwht_blk: Int](
     for m in range(args.row_count):
         var dst_buf = InlineArray[Float32, N](fill=Float32(0))
         var dp = UnsafePointer(to=dst_buf).bitcast[Float32]()
-        gemv_row_blocked_wa[N, K, fwht_blk](
+        gemv_row_blocked_subblock[N, K, fwht_blk](
             args.act + m * K, args.wpacked, args.blk_scale + m * num_blocks,
             args.wscale, args.blk_colsum, dp)
 

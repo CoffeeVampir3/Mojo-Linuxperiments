@@ -97,7 +97,7 @@ def render_openai_messages(messages: list[dict[str, Any]]) -> tuple[str, str, st
     return system_prompt, history, latest_user
 
 
-def render_text_completion_prompt(prompt: str) -> tuple[str, str, str]:
+def render_text_completion_prompt(prompt: str) -> tuple[str, str, str, str]:
     if not isinstance(prompt, str):
         raise ValueError("prompt must be a string")
 
@@ -112,6 +112,7 @@ def render_text_completion_prompt(prompt: str) -> tuple[str, str, str]:
     history = _chat_preamble(system_prompt)
     pos = first_user
     latest_user = None
+    assistant_prefill = ""
 
     while pos < len(prompt):
         if not prompt.startswith(USER_MARKER, pos):
@@ -128,6 +129,7 @@ def render_text_completion_prompt(prompt: str) -> tuple[str, str, str]:
 
         if next_user < 0:
             latest_user = user_text
+            assistant_prefill = prompt[after_assistant:].strip("\n")
             break
 
         assistant_text = prompt[after_assistant:next_user].strip("\n")
@@ -138,7 +140,74 @@ def render_text_completion_prompt(prompt: str) -> tuple[str, str, str]:
     if latest_user is None or latest_user.strip() == "":
         raise ValueError("latest user turn is empty")
 
-    return system_prompt, history, latest_user
+    return system_prompt, history, latest_user, assistant_prefill
+
+
+def _normalize_stop_strings(stop_strings: list[str] | None) -> list[str]:
+    if not stop_strings:
+        return []
+    stops = []
+    seen = set()
+    for stop in stop_strings:
+        if not isinstance(stop, str):
+            raise ValueError("stop values must be strings")
+        if stop and stop not in seen:
+            stops.append(stop)
+            seen.add(stop)
+    return stops
+
+
+class _StopFilter:
+    def __init__(self, stop_strings: list[str]) -> None:
+        self.stop_strings = stop_strings
+        self.max_stop_len = max(len(stop) for stop in stop_strings)
+        self.pending = ""
+        self.text = ""
+        self.stopped = False
+
+    def _stop_index(self) -> int | None:
+        first = None
+        for stop in self.stop_strings:
+            index = self.pending.find(stop)
+            if index >= 0 and (first is None or index < first):
+                first = index
+        return first
+
+    def push(self, chunk: str) -> str:
+        if self.stopped:
+            return ""
+
+        self.pending += chunk
+        index = self._stop_index()
+        if index is not None:
+            out = self.pending[:index]
+            self.text += out
+            self.pending = ""
+            self.stopped = True
+            return out
+
+        keep = self.max_stop_len - 1
+        if keep <= 0:
+            out = self.pending
+            self.pending = ""
+            self.text += out
+            return out
+        if len(self.pending) <= keep:
+            return ""
+
+        out = self.pending[:-keep]
+        self.pending = self.pending[-keep:]
+        self.text += out
+        return out
+
+    def finish(self) -> str:
+        out = self.pending
+        self.pending = ""
+        self.text += out
+        return out
+
+    def generated_text(self) -> str:
+        return self.text + self.pending
 
 
 class M27MojoBridge:
@@ -199,9 +268,12 @@ class M27MojoBridge:
         self,
         messages: list[dict[str, Any]],
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        stop_strings: list[str] | None = None,
     ) -> Iterator[str]:
         system_prompt, history, user_text = render_openai_messages(messages)
-        yield from self.stream_rendered(system_prompt, history, user_text, max_new_tokens)
+        yield from self.stream_rendered(
+            system_prompt, history, user_text, max_new_tokens, stop_strings
+        )
 
     def stream_rendered(
         self,
@@ -209,23 +281,67 @@ class M27MojoBridge:
         history: str,
         user_text: str,
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        stop_strings: list[str] | None = None,
+        assistant_prefill: str = "",
     ) -> Iterator[str]:
+        stops = _normalize_stop_strings(stop_strings)
+        stop_filter = _StopFilter(stops) if stops else None
+        generated_text = ""
+        completed = False
+
         with self._lock:
             self.sync_history(system_prompt, history)
-            self._session.start_turn_with_limit(user_text, int(max_new_tokens))
-            while True:
-                chunk = self._session.next_chunk()
-                if chunk is None:
-                    break
-                yield str(chunk)
+            if assistant_prefill:
+                self._session.start_turn_with_prefix(
+                    user_text, assistant_prefill, int(max_new_tokens)
+                )
+            else:
+                self._session.start_turn_with_limit(user_text, int(max_new_tokens))
+            try:
+                while True:
+                    chunk = self._session.next_chunk()
+                    if chunk is None:
+                        completed = True
+                        if stop_filter is not None:
+                            tail = stop_filter.finish()
+                            if tail:
+                                yield tail
+                        break
+
+                    text = str(chunk)
+                    if stop_filter is None:
+                        generated_text += text
+                        yield text
+                        continue
+
+                    out = stop_filter.push(text)
+                    if stop_filter.stopped:
+                        generated_text = stop_filter.text
+                        self._session.finish_turn_with_text(generated_text)
+                        completed = True
+                        if out:
+                            yield out
+                        return
+                    if out:
+                        yield out
+
+                completed = True
+            finally:
+                if not completed:
+                    if stop_filter is not None:
+                        generated_text = stop_filter.generated_text()
+                    self._session.finish_turn_with_text(generated_text)
 
     def generate_messages(
         self,
         messages: list[dict[str, Any]],
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        stop_strings: list[str] | None = None,
     ) -> str:
         system_prompt, history, user_text = render_openai_messages(messages)
-        return self.generate_rendered(system_prompt, history, user_text, max_new_tokens)
+        return self.generate_rendered(
+            system_prompt, history, user_text, max_new_tokens, stop_strings
+        )
 
     def generate_rendered(
         self,
@@ -233,7 +349,21 @@ class M27MojoBridge:
         history: str,
         user_text: str,
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        stop_strings: list[str] | None = None,
+        assistant_prefill: str = "",
     ) -> str:
+        if stop_strings or assistant_prefill:
+            return "".join(
+                self.stream_rendered(
+                    system_prompt,
+                    history,
+                    user_text,
+                    max_new_tokens,
+                    stop_strings,
+                    assistant_prefill,
+                )
+            )
+
         with self._lock:
             self.sync_history(system_prompt, history)
             return str(self._session.send_with_limit(user_text, int(max_new_tokens)))
@@ -242,14 +372,34 @@ class M27MojoBridge:
         self,
         prompt: str,
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        stop_strings: list[str] | None = None,
     ) -> Iterator[str]:
-        system_prompt, history, user_text = render_text_completion_prompt(prompt)
-        yield from self.stream_rendered(system_prompt, history, user_text, max_new_tokens)
+        system_prompt, history, user_text, assistant_prefill = (
+            render_text_completion_prompt(prompt)
+        )
+        yield from self.stream_rendered(
+            system_prompt,
+            history,
+            user_text,
+            max_new_tokens,
+            stop_strings,
+            assistant_prefill,
+        )
 
     def generate_completion_prompt(
         self,
         prompt: str,
         max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        stop_strings: list[str] | None = None,
     ) -> str:
-        system_prompt, history, user_text = render_text_completion_prompt(prompt)
-        return self.generate_rendered(system_prompt, history, user_text, max_new_tokens)
+        system_prompt, history, user_text, assistant_prefill = (
+            render_text_completion_prompt(prompt)
+        )
+        return self.generate_rendered(
+            system_prompt,
+            history,
+            user_text,
+            max_new_tokens,
+            stop_strings,
+            assistant_prefill,
+        )

@@ -119,67 +119,7 @@ def main():
         return
     var tok = tok_opt.take()
 
-    var user_prompt = """prompt  | 42 tokens | 466 ms | 90 t/s
-prompt forward profile
-  samples:   1
-  positions: 0..0
-  wall / token
-    avg      466.073 ms    stddev     0.000 ms
-    p50      466.073 ms    p90      466.073 ms
-    p99      466.073 ms    max      466.073 ms
-  phase-sum / token
-    avg      465.865 ms    overlap-counted   100.0% of wall
-  hot path:  moe_phase1 40.8%  moe_phase2 17.1%  attn_proj 14.1%  o_proj 10.4%  kv_write 3.4%
-  note: phase timings are local elapsed times; overlapped phases can sum above 100% of wall.
-  phases
-    phase                vs wall        avg        p99        max | dispatch avg/p99 | kernel avg/p99 | join avg/p99  [ms]
-                        --------  ---------  ---------  --------- | ---------------- | -------------- | ------------
-    moe_phase1             40.8%    189.984    189.984    189.984 |    0.000/   0.000 |  189.946/ 189.946 |    0.038/   0.038
-    moe_phase2             17.1%     79.894     79.894     79.894 |    0.000/   0.000 |   79.819/  79.819 |    0.074/   0.074
-    attn_proj              14.1%     65.803     65.803     65.803 |    0.000/   0.000 |   65.722/  65.722 |    0.080/   0.080
-    o_proj                 10.4%     48.413     48.413     48.413 |    0.000/   0.000 |   48.357/  48.357 |    0.056/   0.056
-    kv_write                3.4%     15.955     15.955     15.955 |    0.000/   0.000 |   15.923/  15.923 |    0.031/   0.031
-    q_prep                  2.5%     11.757     11.757     11.757 |    0.000/   0.000 |   11.757/  11.757 |    0.000/   0.000
-    attn_reduce             2.1%      9.840      9.840      9.840 |    0.000/   0.000 |    9.840/   9.840 |    0.000/   0.000
-    ffn_reduce              2.0%      9.408      9.408      9.408 |    0.000/   0.000 |    9.408/   9.408 |    0.000/   0.000
-    dual_norm               1.7%      8.134      8.134      8.134 |    0.027/   0.027 |    8.072/   8.072 |    0.034/   0.034
-    attn_quantize           1.6%      7.259      7.259      7.259 |    0.013/   0.013 |    7.205/   7.205 |    0.040/   0.040
-    moe_router              1.4%      6.506      6.506      6.506 |    0.000/   0.000 |    6.451/   6.451 |    0.055/   0.055
-    lm_head                 0.9%      4.250      4.250      4.250 |    0.000/   0.000 |    4.249/   4.249 |    0.001/   0.001
-    attention               0.7%      3.490      3.490      3.490 |    0.000/   0.000 |    3.441/   3.441 |    0.048/   0.048
-    norm_prep               0.6%      2.926      2.926      2.926 |    0.000/   0.000 |    2.926/   2.926 |    0.000/   0.000
-    moe_route_schedule      0.2%      0.941      0.941      0.941 |    0.000/   0.000 |    0.941/   0.941 |    0.000/   0.000
-    moe_route_merge         0.2%      0.923      0.923      0.923 |    0.000/   0.000 |    0.923/   0.923 |    0.000/   0.000
-    lm_argmax               0.1%      0.309      0.309      0.309 |    0.000/   0.000 |    0.309/   0.309 |    0.000/   0.000
-    omitted tiny phases: broadcast, embed, final_norm, lm_act_bcast
-  moe routing
-    layer-events: 62  slots: 496  experts/layer: 256  top-k: 8  tp: 4
-    max rank load/event: ideal 2.000  avg 3.451  p90 4.000  p99 5.000  max 5.000  active-ranks avg 3.596
-    random occupancy baseline: max-load avg 3.512  p90 5  p99 6
-    same-rank expert pairs/event: ideal 4.000  random 6.918  avg 6.774  p90 9.000  p99 11.000  max 11.000
-    rank slot share: r0 23.0% r1 27.0% r2 25.2% r3 24.8%
-    most imbalanced layers
-      L 7 rank 1 avg-load 5.000 share 62.5%
-      L24 rank 2 avg-load 5.000 share 62.5%
-      L27 rank 1 avg-load 5.000 share 62.5%
-      L42 rank 2 avg-load 5.000 share 62.5%
-      L60 rank 2 avg-load 5.000 share 62.5%
-    most concentrated layers
-      L 0 top E 13 hit 100.0%  top8-cover 100.0%  max-load 4.000  same-rank-pairs 9.000
-      L 1 top E  3 hit 100.0%  top8-cover 100.0%  max-load 4.000  same-rank-pairs 9.000
-      L 2 top E 99 hit 100.0%  top8-cover 100.0%  max-load 4.000  same-rank-pairs 8.000
-      L 3 top E  8 hit 100.0%  top8-cover 100.0%  max-load 3.000  same-rank-pairs 6.000
-      L 4 top E  9 hit 100.0%  top8-cover 100.0%  max-load 3.000  same-rank-pairs 7.000
-    hottest experts
-      L 0:E 13 rank 0 hits 1/1 (100.0% of layer routes)
-      L 0:E 46 rank 0 hits 1/1 (100.0% of layer routes)
-      L 0:E 61 rank 0 hits 1/1 (100.0% of layer routes)
-      L 0:E 63 rank 0 hits 1/1 (100.0% of layer routes)
-      L 0:E129 rank 2 hits 1/1 (100.0% of layer routes)
-      L 0:E193 rank 3 hits 1/1 (100.0% of layer routes)
-      L 0:E197 rank 3 hits 1/1 (100.0% of layer routes)
-      L 0:E206 rank 3 hits 1/1 (100.0% of layer routes)
-"""
+    var user_prompt = """The capital of france is"""
     var prompt = (
         "]~!b[]~b]system\n"
         + "You are a helpful assistant. Your name is MiniMax-M2.7 and is built by MiniMax."

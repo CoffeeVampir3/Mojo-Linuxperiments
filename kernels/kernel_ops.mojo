@@ -1,17 +1,11 @@
 from std.math import sqrt
 from std.memory import UnsafePointer, Pointer
 from std.sys.info import simd_width_of
-from std.time import perf_counter_ns
 from threading.threading_traits import BurstThreadPool
 from threading.threading_shared import ptr as tptr
 from notstdcollections import HeapMoveArray
-import linux.sys as linux
 
-from modeling.model_spec import (
-    Encoding, Shaped, Aligned, HasPtr, Dynamic,
-    StaticTensor, DynamicTensor,
-    StaticView, DynamicView,
-)
+from modeling.model_spec import StaticTensor, DynamicTensor
 from simd_math import exp_f32
 
 

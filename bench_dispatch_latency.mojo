@@ -62,7 +62,7 @@ from simd_math import set_subnormal_zeroing
 from experimental3.common_math import I8Ptr, F32Ptr, BF16Ptr
 from modeling.model_spec import DEFAULT_ALIGNMENT
 
-from minimax.kernels.rmsnorm import rmsnorm_dual_output_row
+from kernels.rmsnorm import rmsnorm_i8_and_bf16_row
 
 
 # =============================================================================
@@ -107,10 +107,10 @@ struct SmallPhaseArgs(Copyable, ImplicitlyCopyable):
 
 
 def small_phase_worker(args: SmallPhaseArgs):
-    rmsnorm_dual_output_row[HIDDEN, FWHT_BLK](
+    rmsnorm_i8_and_bf16_row[HIDDEN, FWHT_BLK](
         args.src, args.gamma_a, args.gamma_b,
-        args.qi, args.work, args.scale, args.normed,
-        args.eps)
+        args.qi, args.scale, args.normed,
+        args.work, args.eps)
 
 
 # =============================================================================

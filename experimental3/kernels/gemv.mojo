@@ -5,10 +5,12 @@ seq_len/N/expert (and so handle GEMM-shaped work as M-parallel GEMVs) live
 in gemm.mojo. Pure dot primitives live in dot_prod.mojo.
 
 Three blocked-dequant variants:
-  gemv_row             per-row weight scale, per-row act scale
+  gemv_row                   per-row weight scale, per-row act scale
   gemv_row_blocked_bf16_scaled
-                       per-row weight scale, per-K-block act scale, direct bf16
-  gemv_row_blocked_wa  same as above, supports fwht_blk < VNNI_K_STEP
+                             per-row weight scale, per-K-block act scale,
+                             direct bf16; requires fwht_blk >= VNNI_K_STEP
+  gemv_row_blocked_subblock  same as above for fwht_blk < VNNI_K_STEP
+                             (multiple sub-blocks per VNNI K-step)
 
 Plus:
   lm_head_row_dot      reduce-to-scalar per-K-block variant (decode lm head)
@@ -166,11 +168,11 @@ def gemv_row_blocked_bf16_scaled[N: Int, K: Int, fwht_block_size: Int](
 
 
 # ============================================================================
-# gemv_row_blocked_wa — supports fwht_blk <= VNNI_K_STEP
+# gemv_row_blocked_subblock — supports fwht_blk <= VNNI_K_STEP
 # ============================================================================
 
 
-def gemv_row_blocked_wa[N: Int, K: Int, fwht_blk: Int](
+def gemv_row_blocked_subblock[N: Int, K: Int, fwht_blk: Int](
     act_row: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     wpacked: UnsafePointer[Scalar[DType.int8], MutAnyOrigin],
     block_scales: UnsafePointer[Float32, MutAnyOrigin],

@@ -23,9 +23,13 @@ def PyInit_python_glue() -> PythonObject:
         ).def_method[M27Session.py_start_turn_with_limit](
             "start_turn_with_limit",
             docstring="Start a streamed assistant response with a token limit.",
+        ).def_method[M27Session.py_start_turn_with_prefix](
+            "start_turn_with_prefix",
         ).def_method[M27Session.py_next_chunk](
             "next_chunk",
             docstring="Return the next streamed text chunk, or None when done.",
+        ).def_method[M27Session.py_finish_turn_with_text](
+            "finish_turn_with_text",
         ).def_method[M27Session.py_reset](
             "reset",
             docstring="Reset prompt history and set a new system prompt.",
