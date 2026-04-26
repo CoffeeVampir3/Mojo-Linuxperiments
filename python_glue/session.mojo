@@ -253,6 +253,7 @@ struct M27Session(Movable, Writable):
     var stream_next_id: Int
     var stream_user_block: String
     var stream_assistant_prefix: String
+    var stream_generated_text: String
     var stream_generated: List[Int]
     var stream_decoder: StreamTextDecoder
 
@@ -293,6 +294,7 @@ struct M27Session(Movable, Writable):
         self.stream_next_id = MiniMaxM27Config.EOS_TOKEN_ID
         self.stream_user_block = String("")
         self.stream_assistant_prefix = String("")
+        self.stream_generated_text = String("")
         self.stream_generated = List[Int]()
         self.stream_decoder = StreamTextDecoder()
         self.sleep_workers()
@@ -335,6 +337,7 @@ struct M27Session(Movable, Writable):
         self.stream_next_id = MiniMaxM27Config.EOS_TOKEN_ID
         self.stream_user_block = String("")
         self.stream_assistant_prefix = String("")
+        self.stream_generated_text = String("")
         self.stream_generated = List[Int]()
         self.stream_decoder = StreamTextDecoder()
         self.sleep_workers()
@@ -350,6 +353,7 @@ struct M27Session(Movable, Writable):
         self.stream_next_id = MiniMaxM27Config.EOS_TOKEN_ID
         self.stream_user_block = String("")
         self.stream_assistant_prefix = String("")
+        self.stream_generated_text = String("")
         self.stream_generated = List[Int]()
         self.stream_decoder = StreamTextDecoder()
 
@@ -406,6 +410,7 @@ struct M27Session(Movable, Writable):
         self.stream_next_id = next_id
         self.stream_user_block = ub^
         self.stream_assistant_prefix = String("")
+        self.stream_generated_text = String("")
         self.stream_generated = List[Int]()
         self.stream_decoder = StreamTextDecoder()
 
@@ -459,14 +464,18 @@ struct M27Session(Movable, Writable):
         self.stream_next_id = next_id
         self.stream_user_block = ub^
         self.stream_assistant_prefix = prefill^
+        self.stream_generated_text = String("")
         self.stream_generated = List[Int]()
         self.stream_decoder = StreamTextDecoder()
 
     def finish_turn(mut self) raises -> PythonObject:
         var tail = self.stream_decoder.finish()
-        var assistant_text = (
-            self.stream_assistant_prefix + self.tok.decode(self.stream_generated)
-        )
+        if tail.byte_length() > 0:
+            self.stream_generated_text += tail
+
+        self.sleep_workers()
+
+        var assistant_text = self.stream_assistant_prefix + self.stream_generated_text
         var assistant_content = assistant_content_for_history(assistant_text)
         self.history = self.history + self.stream_user_block + "]~b]ai\n" + assistant_content + "[e~[\n"
 
@@ -477,9 +486,9 @@ struct M27Session(Movable, Writable):
         self.stream_next_id = MiniMaxM27Config.EOS_TOKEN_ID
         self.stream_user_block = String("")
         self.stream_assistant_prefix = String("")
+        self.stream_generated_text = String("")
         self.stream_generated = List[Int]()
         self.stream_decoder = StreamTextDecoder()
-        self.sleep_workers()
 
         if tail.byte_length() > 0:
             return PythonObject(tail^)
@@ -489,6 +498,8 @@ struct M27Session(Movable, Writable):
         if not self.stream_active:
             self.sleep_workers()
             return
+
+        self.sleep_workers()
 
         var full_assistant_text = self.stream_assistant_prefix + assistant_text
         var assistant_content = assistant_content_for_history(full_assistant_text)
@@ -501,15 +512,16 @@ struct M27Session(Movable, Writable):
         self.stream_next_id = MiniMaxM27Config.EOS_TOKEN_ID
         self.stream_user_block = String("")
         self.stream_assistant_prefix = String("")
+        self.stream_generated_text = String("")
         self.stream_generated = List[Int]()
         self.stream_decoder = StreamTextDecoder()
-        self.sleep_workers()
 
     def next_chunk(mut self) raises -> PythonObject:
         if not self.stream_active:
             return PythonObject()
 
         var tp_ptr = self.model.token_buffer()
+        var silent_tokens = 0
         while True:
             if (
                 self.stream_step >= self.stream_limit
@@ -529,13 +541,22 @@ struct M27Session(Movable, Writable):
                 if self.stream_next_id == MiniMaxM27Config.EOS_TOKEN_ID:
                     return self.finish_turn()
 
+            if not self.tok.id_to_token(self.stream_next_id):
+                print("M27Session: stopping on undecodable token", self.stream_next_id)
+                return self.finish_turn()
+
             self.stream_generated.append(self.stream_next_id)
             self.stream_step += 1
 
             var out = stream_token_text(
                 self.tok, self.stream_decoder, self.stream_next_id)
             if out.byte_length() > 0:
+                self.stream_generated_text += out
                 return PythonObject(out^)
+            silent_tokens += 1
+            if silent_tokens >= 64:
+                print("M27Session: stopping after 64 generated tokens produced no text")
+                return self.finish_turn()
 
     def generate(mut self, user_text: String, max_new_tokens: Int) raises -> String:
         if max_new_tokens <= 0:
@@ -577,8 +598,15 @@ struct M27Session(Movable, Writable):
         self.cache.replace_with(token_ids)
 
         var generated = List[Int]()
-        if next_id != MiniMaxM27Config.EOS_TOKEN_ID:
+        if (
+            next_id != MiniMaxM27Config.EOS_TOKEN_ID
+            and self.tok.id_to_token(next_id)
+        ):
             generated.append(next_id)
+        else:
+            if next_id != MiniMaxM27Config.EOS_TOKEN_ID:
+                print("M27Session: stopping on undecodable token", next_id)
+            next_id = MiniMaxM27Config.EOS_TOKEN_ID
 
         var pos = prompt_len
         var step = 1
@@ -592,12 +620,16 @@ struct M27Session(Movable, Writable):
 
             if next_id == MiniMaxM27Config.EOS_TOKEN_ID:
                 break
+            if not self.tok.id_to_token(next_id):
+                print("M27Session: stopping on undecodable token", next_id)
+                break
             generated.append(next_id)
+
+        self.sleep_workers()
 
         var assistant_text = self.tok.decode(generated)
         var assistant_content = assistant_content_for_history(assistant_text)
         self.history = self.history + ub + "]~b]ai\n" + assistant_content + "[e~[\n"
-        self.sleep_workers()
         return assistant_text^
 
     @staticmethod

@@ -8,7 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant. Your name is MiniMax-M2.7 and is built by MiniMax."
 )
-DEFAULT_MAX_NEW_TOKENS = 1024
+DEFAULT_MAX_NEW_TOKENS = 4096
 DEFAULT_TOKENIZER_PATH = "checkpoints/Minimax-M2.7/tokenizer.json"
 USER_MARKER = "<｜User｜>"
 ASSISTANT_MARKER = "<｜Assistant｜>"

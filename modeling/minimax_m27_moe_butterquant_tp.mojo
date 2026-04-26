@@ -105,10 +105,14 @@ struct MiniMaxM27Config:
     comptime TOP_K = 8
 
     comptime VOCAB_SIZE = 200064
+    # tokenizer.json defines IDs 0..200053. The checkpoint exposes ten
+    # additional LM-head rows, but those IDs have no token text and must not be
+    # emitted during generation.
+    comptime GENERATION_VOCAB_SIZE = 200054
     comptime EOS_TOKEN_ID = 200020
     comptime RMS_NORM_EPS = 1e-6
 
-    comptime MAX_SEQ_LEN = 4096
+    comptime MAX_SEQ_LEN = 1024 * 128
 
     # Comptime ceiling on how many parallel workers the chunked-attention
     # dispatcher will fan out to for a single KV group. Sizes stack arrays in
@@ -1625,9 +1629,10 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
             for j in range(0, VOCAB_LOCAL, width):
                 var v = (local_logits + j).load[width=width]().cast[DType.float32]()
                 for k in range(width):
-                    if v[k] > best_val:
+                    var global_idx = vocab_base + j + k
+                    if global_idx < C.GENERATION_VOCAB_SIZE and v[k] > best_val:
                         best_val = v[k]
-                        best_idx = Int32(vocab_base + j + k)
+                        best_idx = Int32(global_idx)
         sample.add(self.profile.phase("lm_argmax"), PhaseTiming.opaque(Int(perf_counter_ns()) - t_argmax0))
         logit_lease^.release()
         lm_act_blk_scale_lease^.release()
