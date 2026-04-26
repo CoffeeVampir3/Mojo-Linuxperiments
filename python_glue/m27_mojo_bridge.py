@@ -4,12 +4,14 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SYSTEM_PROMPT = (
     "You are a helpful assistant. Your name is MiniMax-M2.7 and is built by MiniMax."
 )
 DEFAULT_MAX_NEW_TOKENS = 1024
 DEFAULT_TOKENIZER_PATH = "checkpoints/Minimax-M2.7/tokenizer.json"
+USER_MARKER = "<｜User｜>"
+ASSISTANT_MARKER = "<｜Assistant｜>"
 
 
 def _load_python_glue():
@@ -91,6 +93,50 @@ def render_openai_messages(messages: list[dict[str, Any]]) -> tuple[str, str, st
     latest_user = _message_content_text(messages[latest_user_index].get("content"))
     if not latest_user:
         raise ValueError("latest user message must not be empty")
+
+    return system_prompt, history, latest_user
+
+
+def render_text_completion_prompt(prompt: str) -> tuple[str, str, str]:
+    if not isinstance(prompt, str):
+        raise ValueError("prompt must be a string")
+
+    first_user = prompt.find(USER_MARKER)
+    if first_user < 0:
+        raise ValueError("prompt is missing <｜User｜> marker")
+
+    system_prompt = prompt[:first_user].strip()
+    if not system_prompt:
+        system_prompt = DEFAULT_SYSTEM_PROMPT
+
+    history = _chat_preamble(system_prompt)
+    pos = first_user
+    latest_user = None
+
+    while pos < len(prompt):
+        if not prompt.startswith(USER_MARKER, pos):
+            raise ValueError("prompt must alternate <｜User｜> and <｜Assistant｜> markers")
+
+        user_start = pos + len(USER_MARKER)
+        assistant_pos = prompt.find(ASSISTANT_MARKER, user_start)
+        if assistant_pos < 0:
+            raise ValueError("prompt is missing final <｜Assistant｜> marker")
+
+        user_text = prompt[user_start:assistant_pos].strip("\n")
+        after_assistant = assistant_pos + len(ASSISTANT_MARKER)
+        next_user = prompt.find(USER_MARKER, after_assistant)
+
+        if next_user < 0:
+            latest_user = user_text
+            break
+
+        assistant_text = prompt[after_assistant:next_user].strip("\n")
+        history += _user_block(user_text)
+        history += _assistant_history_block(assistant_text)
+        pos = next_user
+
+    if latest_user is None or latest_user.strip() == "":
+        raise ValueError("latest user turn is empty")
 
     return system_prompt, history, latest_user
 
@@ -191,3 +237,19 @@ class M27MojoBridge:
         with self._lock:
             self.sync_history(system_prompt, history)
             return str(self._session.send_with_limit(user_text, int(max_new_tokens)))
+
+    def stream_completion_prompt(
+        self,
+        prompt: str,
+        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    ) -> Iterator[str]:
+        system_prompt, history, user_text = render_text_completion_prompt(prompt)
+        yield from self.stream_rendered(system_prompt, history, user_text, max_new_tokens)
+
+    def generate_completion_prompt(
+        self,
+        prompt: str,
+        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+    ) -> str:
+        system_prompt, history, user_text = render_text_completion_prompt(prompt)
+        return self.generate_rendered(system_prompt, history, user_text, max_new_tokens)

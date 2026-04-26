@@ -68,10 +68,15 @@ calling a Mojo extension, so Mojo runtime initialization must be available.
 
 The root-level Python layer is split into:
 
-- `m27_mojo_bridge.py`: imports the Mojo extension and serializes access to one
-  `M27Session`.
-- `m27_openai_server.py`: owns HTTP, auth, OpenAI-compatible request parsing,
-  and SSE streaming.
+- `python_glue/m27_mojo_bridge.py`: imports the Mojo extension and serializes
+  access to one `M27Session`.
+- `python_glue/m27_openai_server.py`: owns HTTP, auth, OpenAI-compatible
+  request parsing, and SSE streaming.
+
+Run the server by file path, not with `python -m python_glue...`; the module
+name `python_glue` is reserved for the Mojo extension import.
+
+The default OpenAI-compatible server port is `33322`.
 
 ## Worker Pool Edge
 

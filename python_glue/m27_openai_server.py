@@ -1,6 +1,7 @@
 import json
 import os
 import secrets
+import signal
 import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,12 +13,13 @@ from m27_mojo_bridge import (
     DEFAULT_SYSTEM_PROMPT,
     M27MojoBridge,
     render_openai_messages,
+    render_text_completion_prompt,
 )
 
 
 MODEL_ID = os.environ.get("M27_MODEL_ID", "minimax-m27-butterquant")
 HOST = os.environ.get("M27_HOST", "127.0.0.1")
-PORT = int(os.environ.get("M27_PORT", "5000"))
+PORT = int(os.environ.get("M27_PORT", "33322"))
 API_KEY = os.environ.get("M27_API_KEY")
 ADMIN_KEY = os.environ.get("M27_ADMIN_KEY")
 DISABLE_AUTH = os.environ.get("M27_DISABLE_AUTH", "").lower() in {
@@ -43,6 +45,10 @@ def _max_tokens(data: dict[str, Any]) -> int:
 
 def _chat_id() -> str:
     return "chatcmpl-" + uuid.uuid4().hex
+
+
+def _completion_id() -> str:
+    return "cmpl-" + uuid.uuid4().hex
 
 
 class M27OpenAIHandler(BaseHTTPRequestHandler):
@@ -87,6 +93,58 @@ class M27OpenAIHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/v1/completions":
+            self._handle_completion()
+            return
+        if path == "/v1/chat/completions":
+            self._handle_chat_completion()
+            return
+        self._send_json(404, {"error": {"message": "not found"}})
+
+    def _handle_completion(self) -> None:
+        if self._check_auth() is None:
+            return
+
+        try:
+            data = self._read_json()
+            prompt = data.get("prompt")
+            if isinstance(prompt, list):
+                if len(prompt) != 1:
+                    raise ValueError("only one prompt is supported")
+                prompt = prompt[0]
+            rendered = render_text_completion_prompt(prompt)
+            max_new_tokens = _max_tokens(data)
+        except Exception as exc:
+            self._send_json(400, {"error": {"message": str(exc)}})
+            return
+
+        if data.get("stream", False):
+            self._stream_completion(rendered, max_new_tokens)
+        else:
+            self._complete_completion(rendered, max_new_tokens)
+
+    def _handle_chat_completion(self) -> None:
+        if self._check_auth() is None:
+            return
+
+        try:
+            data = self._read_json()
+            messages = data.get("messages")
+            if not isinstance(messages, list):
+                raise ValueError("messages must be a list")
+            rendered = render_openai_messages(messages)
+            max_new_tokens = _max_tokens(data)
+        except Exception as exc:
+            self._send_json(400, {"error": {"message": str(exc)}})
+            return
+
+        if data.get("stream", False):
+            self._stream_chat(rendered, max_new_tokens)
+        else:
+            self._complete_chat(rendered, max_new_tokens)
+
+    def _unused(self) -> None:
+        path = urlparse(self.path).path
         if path != "/v1/chat/completions":
             self._send_json(404, {"error": {"message": "not found"}})
             return
@@ -113,6 +171,94 @@ class M27OpenAIHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         raw = self.rfile.read(length)
         return json.loads(raw.decode("utf-8"))
+
+    def _complete_completion(
+        self,
+        rendered: tuple[str, str, str],
+        max_new_tokens: int,
+    ) -> None:
+        request_id = _completion_id()
+        created = int(time.time())
+        try:
+            text = self.bridge.generate_rendered(
+                *rendered, max_new_tokens=max_new_tokens
+            )
+        except Exception as exc:
+            self._send_json(500, {"error": {"message": str(exc)}})
+            return
+
+        self._send_json(
+            200,
+            {
+                "id": request_id,
+                "object": "text_completion",
+                "created": created,
+                "model": MODEL_ID,
+                "choices": [
+                    {
+                        "index": 0,
+                        "text": text,
+                        "finish_reason": "stop",
+                    }
+                ],
+            },
+        )
+
+    def _stream_completion(
+        self,
+        rendered: tuple[str, str, str],
+        max_new_tokens: int,
+    ) -> None:
+        request_id = _completion_id()
+        created = int(time.time())
+        connected = True
+
+        self.send_response(200)
+        self._send_cors_headers()
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.send_header("X-Accel-Buffering", "no")
+        self.end_headers()
+
+        try:
+            for chunk in self.bridge.stream_rendered(
+                *rendered, max_new_tokens=max_new_tokens
+            ):
+                if connected:
+                    connected = self._write_sse(
+                        {
+                            "id": request_id,
+                            "object": "text_completion",
+                            "created": created,
+                            "model": MODEL_ID,
+                            "choices": [
+                                {
+                                    "index": 0,
+                                    "text": chunk,
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                    )
+
+            if connected:
+                connected = self._write_sse(
+                    {
+                        "id": request_id,
+                        "object": "text_completion",
+                        "created": created,
+                        "model": MODEL_ID,
+                        "choices": [
+                            {"index": 0, "text": "", "finish_reason": "stop"}
+                        ],
+                    }
+                )
+            if connected:
+                self._write_sse("[DONE]")
+        except Exception as exc:
+            if connected:
+                self._write_sse({"error": {"message": str(exc)}})
 
     def _complete_chat(
         self,
@@ -300,15 +446,33 @@ def main() -> None:
     model_dir = os.environ.get("M27_MODEL_DIR")
     system_prompt = os.environ.get("M27_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
 
+    print("Loading MiniMax-M2.7 Mojo session...", flush=True)
     M27OpenAIHandler.bridge = M27MojoBridge(
         system_prompt=system_prompt,
         tokenizer_path=tokenizer_path,
         model_dir=model_dir,
     )
+    print("MiniMax-M2.7 Mojo session ready", flush=True)
 
     httpd = ThreadingHTTPServer((HOST, PORT), M27OpenAIHandler)
-    print("Serving MiniMax-M2.7 OpenAI-compatible API at http://%s:%d/v1" % (HOST, PORT))
-    httpd.serve_forever()
+    print(
+        "Serving MiniMax-M2.7 OpenAI-compatible API at http://%s:%d/v1"
+        % (HOST, PORT),
+        flush=True,
+    )
+
+    def stop_server(signum: int, frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGINT, stop_server)
+    signal.signal(signal.SIGTERM, stop_server)
+
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        httpd.server_close()
 
 
 if __name__ == "__main__":

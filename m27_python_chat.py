@@ -1,3 +1,10 @@
+import sys
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(REPO_ROOT / "python_glue"))
+
 from m27_mojo_bridge import DEFAULT_SYSTEM_PROMPT, M27MojoBridge
 
 

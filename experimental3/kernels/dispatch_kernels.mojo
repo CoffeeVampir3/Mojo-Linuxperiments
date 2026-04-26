@@ -53,8 +53,7 @@ from experimental3.kernels.gemm import (
     int8_gemv_decode_worker,
     int8_gemv_blocked_worker, int8_gemv_blocked_decode_worker,
     int8_gemv_blocked_wa_worker,
-    fused_gu_gelu_tanh_worker, fused_gu_gelu_tanh_worker_wa,
-    GEMV_TILE,
+    fused_gu_gelu_tanh_worker,
     lm_head_worker,
 )
 from experimental3.kernels.gemm_amx import (
@@ -327,7 +326,8 @@ def fused_gu_gelu_tanh[
     var qi_out_p = qi_out.as_ptr[DType.int8]()
     var blk_scale_p = blk_scale.as_ptr[DType.float32]()
 
-    comptime n_tiles = intermediate // fwht_blk
+    comptime chunk_size = fwht_blk if fwht_blk >= VNNI_N_STEP else VNNI_N_STEP
+    comptime n_tiles = intermediate // chunk_size
     comptime num_blk_per_row = intermediate // fwht_blk
 
     var jobs = InlineArray[FusedGuGeluTanhArgs, MAX_POOL_CAPACITY](
@@ -339,13 +339,13 @@ def fused_gu_gelu_tanh[
         for i in range(num_workers):
             var tile_start = i * tiles_per_worker
             var tile_end = min(tile_start + tiles_per_worker, n_tiles)
-            var n_start = tile_start * fwht_blk
-            var n_count = (tile_end - tile_start) * fwht_blk
+            var n_start = tile_start * chunk_size
+            var n_count = (tile_end - tile_start) * chunk_size
             jobs[i] = FusedGuGeluTanhArgs(
                 act_i8_p, act_scale_p,
                 wpacked_p, wscale_p, wcolsum_p,
                 qi_out_p + n_start,
-                blk_scale_p + tile_start,
+                blk_scale_p + (n_start // fwht_blk),
                 n_start, n_count, 1)
         pool.dispatch[FusedGuGeluTanhArgs, fused_gu_gelu_tanh_worker[intermediate, K, fwht_blk, fwht]](
             UnsafePointer(to=jobs[0]), num_workers)
@@ -363,80 +363,6 @@ def fused_gu_gelu_tanh[
                 blk_scale_p + row_start * num_blk_per_row,
                 0, intermediate, row_count)
         pool.dispatch[FusedGuGeluTanhArgs, fused_gu_gelu_tanh_worker[intermediate, K, fwht_blk, fwht]](
-            UnsafePointer(to=jobs[0]), num_workers)
-
-    return PoolFence[P, origin].over(pool)
-
-
-def fused_gu_gelu_tanh_wa[
-    AT: DynamicTensor, AsT: DynamicTensor, WT: StaticTensor,
-    WsT: StaticTensor, WcT: StaticTensor,
-    QiT: DynamicTensor, BScT: DynamicTensor,
-    P: BurstThreadPool, origin: MutOrigin, //,
-    intermediate: Int, K: Int, fwht_blk: Int,
-](
-    act_i8: AT, act_scale: AsT,
-    wpacked: WT, wscale: WsT, wcolsum: WcT,
-    qi_out: QiT, blk_scale: BScT,
-    ref [origin] pool: P,
-) -> PoolFence[P, origin]:
-    """Dispatch workaround fused gate_up + GELU-tanh + FWHT(sub-block) + quantize."""
-    comptime assert AT.DTYPE == DType.int8, "fused_gu_gelu_tanh_wa: act_i8 must be i8"
-    comptime assert AsT.DTYPE == DType.float32, "fused_gu_gelu_tanh_wa: act_scale must be f32"
-    comptime assert WT.DTYPE == DType.int8, "fused_gu_gelu_tanh_wa: wpacked must be i8"
-    comptime assert WsT.DTYPE == DType.float32, "fused_gu_gelu_tanh_wa: wscale must be f32"
-    comptime assert WcT.DTYPE == DType.float32, "fused_gu_gelu_tanh_wa: wcolsum must be f32"
-    comptime assert QiT.DTYPE == DType.int8, "fused_gu_gelu_tanh_wa: qi_out must be i8"
-    comptime assert BScT.DTYPE == DType.float32, "fused_gu_gelu_tanh_wa: blk_scale must be f32"
-
-    var seq_len = act_i8.seq_len()
-    if seq_len == 0:
-        return PoolFence[P, origin].over(pool)
-
-    var act_i8_p = act_i8.as_ptr[DType.int8]()
-    var act_scale_p = act_scale.as_ptr[DType.float32]()
-    var wpacked_p = wpacked.as_ptr[DType.int8]()
-    var wscale_p = wscale.as_ptr[DType.float32]()
-    var wcolsum_p = wcolsum.as_ptr[DType.float32]()
-    var qi_out_p = qi_out.as_ptr[DType.int8]()
-    var blk_scale_p = blk_scale.as_ptr[DType.float32]()
-
-    comptime n_tiles = intermediate // GEMV_TILE
-    comptime num_blk_per_row = intermediate // fwht_blk
-
-    var jobs = InlineArray[FusedGuGeluTanhArgs, MAX_POOL_CAPACITY](
-        fill=FusedGuGeluTanhArgs())
-
-    if seq_len == 1:
-        var num_workers = min(n_tiles, pool.get_capacity())
-        var tiles_per_worker = (n_tiles + num_workers - 1) // num_workers
-        for i in range(num_workers):
-            var tile_start = i * tiles_per_worker
-            var tile_end = min(tile_start + tiles_per_worker, n_tiles)
-            var n_start = tile_start * GEMV_TILE
-            var n_count = (tile_end - tile_start) * GEMV_TILE
-            jobs[i] = FusedGuGeluTanhArgs(
-                act_i8_p, act_scale_p, wpacked_p, wscale_p, wcolsum_p,
-                qi_out_p + n_start,
-                blk_scale_p + (n_start // fwht_blk),
-                n_start, n_count, 1)
-        pool.dispatch[FusedGuGeluTanhArgs,
-            fused_gu_gelu_tanh_worker_wa[intermediate, K, fwht_blk]](
-            UnsafePointer(to=jobs[0]), num_workers)
-    else:
-        var num_workers = min(seq_len, pool.get_capacity())
-        var rows_per_worker = (seq_len + num_workers - 1) // num_workers
-        for i in range(num_workers):
-            var row_start = i * rows_per_worker
-            var row_count = min(rows_per_worker, seq_len - row_start)
-            jobs[i] = FusedGuGeluTanhArgs(
-                act_i8_p + row_start * K, act_scale_p + row_start,
-                wpacked_p, wscale_p, wcolsum_p,
-                qi_out_p + row_start * intermediate,
-                blk_scale_p + row_start * num_blk_per_row,
-                0, intermediate, row_count)
-        pool.dispatch[FusedGuGeluTanhArgs,
-            fused_gu_gelu_tanh_worker_wa[intermediate, K, fwht_blk]](
             UnsafePointer(to=jobs[0]), num_workers)
 
     return PoolFence[P, origin].over(pool)

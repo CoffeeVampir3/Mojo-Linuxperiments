@@ -19,7 +19,8 @@ from std.memory import UnsafePointer
 from std.sys.info import simd_width_of
 from std.collections import InlineArray
 
-from kernels.vnni import VNNI_N_STEP, VNNI_K_STEP, VNNI_TILE_N, VNNI_BLK, compute_n_block
+from kernels.vnni import VNNI_N_STEP
+from kernels.moe import fused_gateup_quant_row
 from experimental3.kernels.dot_prod import vpdpbusd
 from experimental3.kernels.gemv import (
     gemv_row, gemv_row_blocked_bf16_scaled, gemv_row_blocked_wa,
@@ -117,7 +118,7 @@ def int8_gemv_blocked_wa_worker[N: Int, K: Int, fwht_blk: Int](
 
 
 # ============================================================================
-# fused_gu_gelu_tanh workers (standard + _wa variant)
+# fused_gu_gelu_tanh worker
 # ============================================================================
 
 
@@ -125,128 +126,23 @@ def fused_gu_gelu_tanh_worker[intermediate: Int, K: Int, fwht_blk: Int,
     fwht: Bool = True](
     args: FusedGuGeluTanhArgs,
 ):
-    """N-tiled gate+up GEMV -> GELU-tanh -> [FWHT] -> per-block i8.
-
-    Processes row_count activation rows, each over N-range [n_start, n_start + n_count).
-    Tiles the N-range in fwht_blk-sized chunks. Each tile does:
-      gate GEMV[fwht_blk, K] + up GEMV[fwht_blk, K] -> gelu_tanh -> [FWHT] -> i8.
-    When fwht=False, skips the FWHT rotation (channelwise quantization).
-    Activation must be pre-quantized by caller.
-    Fused weight is [2*intermediate, K]: gate = [0:intermediate], up = [intermediate:].
-    """
     debug_assert(intermediate % fwht_blk == 0,
         "fused_gu_gelu_tanh: intermediate must be a multiple of fwht_blk")
     debug_assert(K % 64 == 0,
         "fused_gu_gelu_tanh: K must be a multiple of 64 (VNNI_K_STEP)")
-    comptime width = simd_width_of[DType.float32]()
     comptime num_blk_per_row = intermediate // fwht_blk
 
     for m in range(args.row_count):
-        var act_i8 = args.act_i8 + m * K
-        var dequant = args.act_scale[m] / 127.0
-        var qi_row = args.qi_out + m * intermediate
-        var blk_row = args.blk_scale + m * num_blk_per_row
-
-        var local_n = 0
-        while local_n < args.n_count:
-            var n_off = args.n_start + local_n
-
-            var gate_buf = InlineArray[Float32, fwht_blk](fill=Float32(0))
-            var gate = UnsafePointer(to=gate_buf).bitcast[Float32]()
-            gemv_row[fwht_blk, K, DType.float32](
-                act_i8,
-                args.wpacked + n_off * K,
-                dequant,
-                args.wscale + n_off,
-                args.wcolsum + n_off,
-                gate)
-
-            var up_buf = InlineArray[Float32, fwht_blk](fill=Float32(0))
-            var up = UnsafePointer(to=up_buf).bitcast[Float32]()
-            gemv_row[fwht_blk, K, DType.float32](
-                act_i8,
-                args.wpacked + (intermediate + n_off) * K,
-                dequant,
-                args.wscale + intermediate + n_off,
-                args.wcolsum + intermediate + n_off,
-                up)
-
-            var k = 0
-            while k + width <= fwht_blk:
-                var g = (gate + k).load[width=width]()
-                var u = (up + k).load[width=width]()
-                (gate + k).store(gelu_tanh_f32[width](g) * u)
-                k += width
-
-            comptime if fwht:
-                fwht_block[fwht_blk](gate)
-            blk_row[local_n // fwht_blk] = absmax_quantize_i8[fwht_blk](
-                gate, qi_row + local_n)
-
-            local_n += fwht_blk
-
-
-# GEMV_TILE is shared with dispatch_kernels.mojo — the _wa worker uses the
-# VNNI_N_STEP as its GEMV tile size while the outer dispatch iterates sub-blocks.
-comptime GEMV_TILE = VNNI_N_STEP
-
-
-def fused_gu_gelu_tanh_worker_wa[intermediate: Int, K: Int, fwht_blk: Int](
-    args: FusedGuGeluTanhArgs,
-):
-    """Workaround: decouples GEMV tile (VNNI_N_STEP) from FWHT block (fwht_blk).
-
-    Tiles the gate/up GEMV at GEMV_TILE for VNNI compatibility, then applies
-    FWHT and quantize in fwht_blk-sized sub-blocks within each tile.
-    """
-    debug_assert(intermediate % fwht_blk == 0,
-        "intermediate must be a multiple of fwht_blk")
-    debug_assert(GEMV_TILE % fwht_blk == 0,
-        "GEMV_TILE must be a multiple of fwht_blk")
-    debug_assert(K % 64 == 0, "K must be a multiple of 64")
-    comptime width = simd_width_of[DType.float32]()
-    comptime sub_blocks_per_tile = GEMV_TILE // fwht_blk
-    comptime num_blk_per_row = intermediate // fwht_blk
-
-    for m in range(args.row_count):
-        var act_i8 = args.act_i8 + m * K
-        var dequant = args.act_scale[m] / 127.0
-        var qi_row = args.qi_out + m * intermediate
-        var blk_row = args.blk_scale + m * num_blk_per_row
-
-        var local_n = 0
-        while local_n < args.n_count:
-            var n_off = args.n_start + local_n
-
-            var gate_buf = InlineArray[Float32, GEMV_TILE](fill=Float32(0))
-            var gate = UnsafePointer(to=gate_buf).bitcast[Float32]()
-            gemv_row[GEMV_TILE, K, DType.float32](
-                act_i8, args.wpacked + n_off * K, dequant,
-                args.wscale + n_off, args.wcolsum + n_off,
-                gate)
-
-            var up_buf = InlineArray[Float32, GEMV_TILE](fill=Float32(0))
-            var up = UnsafePointer(to=up_buf).bitcast[Float32]()
-            gemv_row[GEMV_TILE, K, DType.float32](
-                act_i8, args.wpacked + (intermediate + n_off) * K, dequant,
-                args.wscale + intermediate + n_off,
-                args.wcolsum + intermediate + n_off,
-                up)
-
-            var k = 0
-            while k + width <= GEMV_TILE:
-                var g = (gate + k).load[width=width]()
-                var u = (up + k).load[width=width]()
-                (gate + k).store(gelu_tanh_f32[width](g) * u)
-                k += width
-
-            for sb in range(sub_blocks_per_tile):
-                var sb_off = sb * fwht_blk
-                fwht_block[fwht_blk](gate + sb_off)
-                blk_row[(local_n + sb_off) // fwht_blk] = absmax_quantize_i8[fwht_blk](
-                    gate + sb_off, qi_row + local_n + sb_off)
-
-            local_n += GEMV_TILE
+        var act_dequant = args.act_scale[m] / Float32(127)
+        fused_gateup_quant_row[fwht_blk, K, fwht, gelu_tanh_f32](
+            args.act_i8 + m * K,
+            args.wpacked, args.wscale, args.wcolsum,
+            args.wpacked + intermediate * K,
+            args.wscale + intermediate, args.wcolsum + intermediate,
+            act_dequant,
+            args.qi_out + m * intermediate,
+            args.blk_scale + m * num_blk_per_row,
+            args.n_start, args.n_count)
 
 
 # ============================================================================

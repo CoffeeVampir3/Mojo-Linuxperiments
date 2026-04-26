@@ -36,7 +36,7 @@ from experimental3.kernels.dispatch_kernels import (
     dense_norm_dispatch,
     post_reduce_dispatch,
     int8_gemv,
-    fused_gu_gelu_tanh, fused_gu_gelu_tanh_wa,
+    fused_gu_gelu_tanh,
     int8_gemv_blocked, int8_gemv_blocked_wa,
     lm_head_gemv,
     gemma4_moe_phase1, gemma4_moe_phase2, router_topk_dispatch,
@@ -1343,7 +1343,7 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                 var lb = topo.full.base(topo.arena.base, full_idx) if is_full else topo.sliding.base(topo.arena.base, sliding_idx)
                 var body = topo.full.proto.body if is_full else topo.sliding.proto.body
                 var sb = topo.arena.scratch_base()
-                return fused_gu_gelu_tanh_wa[DENSE_INT_LOCAL, C.HIDDEN, FWHT_BLK_DENSE_DOWN](
+                return fused_gu_gelu_tanh[DENSE_INT_LOCAL, C.HIDDEN, FWHT_BLK_DENSE_DOWN](
                     act_i8_lease.view[I8, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](sb, seq_len),
                     act_scale_lease.view[F32, Shape[C.MAX_SEQ_LEN, 1]](sb, seq_len),
                     body.gate_proj.bound(lb),
