@@ -436,6 +436,100 @@ MoE phase1 is the right probe because it contains obvious removable facts: exper
 strides and bound weight companions. Attention should come second because the
 KV/Q prep contract is also useful, but it is entangled with more phases.
 
+## API Probe Results
+
+The Mojo API experiments changed the design in a useful way.
+
+`StaticView` and `ScratchView` should not be stored directly in fieldwise
+contract structs. A prototype that did this failed because those view types do
+not expose copy/move conformance. The better contract stores copyable model refs,
+bases, and safe pointers to leases, then materializes views inside the lowering
+method.
+
+`Pointer[T, origin]` works as a safe contract carrier for stack or lease-backed
+objects. `prototypes/pointer_contract_api_probe.mojo` validates that a copyable
+contract can store a `Pointer` to a non-copyable token and later call methods on
+the pointee through the preserved origin.
+
+`prototypes/m27_moe_phase1_lowering_probe.mojo` now uses that pattern:
+
+```mojo
+struct M27DenseMoeScratch[
+    input_origin: MutOrigin,
+    scale_origin: MutOrigin,
+    qi_origin: MutOrigin,
+    block_scale_origin: MutOrigin,
+](Copyable, ImplicitlyCopyable):
+    var scratch_base: Int
+    var input_i8_lease: Pointer[ScratchLease, Self.input_origin]
+    var input_scale_lease: Pointer[ScratchLease, Self.scale_origin]
+    var expert_qi_lease: Pointer[ScratchLease, Self.qi_origin]
+    var expert_block_scale_lease: Pointer[ScratchLease, Self.block_scale_origin]
+```
+
+That keeps scratch lifetime tied to the lease values while still giving the
+contract a compact copyable shape.
+
+`Span[T, origin]` works cleanly for stack row buffers. This is a better fit for
+`inv_rms_q_arr` and `inv_rms_k_arr` than manual pointer construction:
+
+```mojo
+@fieldwise_init
+struct F32Rows[origin: MutOrigin](Copyable, ImplicitlyCopyable):
+    var rows: Span[Float32, Self.origin]
+
+    @always_inline
+    def ptr(self) -> F32Ptr:
+        return self.rows.unsafe_ptr()
+```
+
+`prototypes/span_lowering_api_probe.mojo` validates this. For attention, this
+suggests replacing:
+
+```mojo
+UnsafePointer(to=inv_rms_k_arr[0]).bitcast[Float32]().as_any_origin()
+```
+
+with a named contract:
+
+```mojo
+var inv_rms_k = F32Rows(Span(inv_rms_k_arr))
+...
+inv_rms_k.ptr()
+```
+
+`prototypes/m27_attention_lowering_probe.mojo` applies the same idea to the M27
+KV-write path. Its lowered call shape is:
+
+```mojo
+return kv_write_dispatch[...](
+    qkv.base_ptr(),
+    rank_layer.k_norm(),
+    rank_layer.rope_cos0(),
+    rank_layer.rope_sin0(),
+    inv_rms_k.ptr(),
+    rank_layer.kv_cache_base(),
+    start_pos,
+    seq_len,
+    pool,
+)
+```
+
+This is still calling the existing kernel wrapper, but the forward-side ceremony
+has a better division:
+
+- `M27AttentionLayer` owns layer base, rope row binding, norm binding, and KV
+  cache base math.
+- `M27QkvScratch` owns qkv lease-to-pointer lowering.
+- `M27InvRmsRows` owns stack row-span-to-pointer lowering.
+
+The fully generic associated-type trait form was less useful. A trait that says
+"I lower to some pointer type" is too broad for a generic caller to pass the
+result into a concrete pointer ABI. A trait that lowers directly to an erased
+`MutAnyOrigin` pointer compiles, but that makes the trait itself the erasure
+boundary. That can still be useful for tiny leaf APIs, but the stronger pattern
+for M27 forward is concrete contracts with named `phase` or `dispatch` methods.
+
 ## Rejected Shape
 
 This is the adapter shape that should not come back:

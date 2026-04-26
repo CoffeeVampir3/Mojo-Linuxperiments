@@ -1434,7 +1434,11 @@ struct MiniMaxM27ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movab
                     merge_quant_jobs[r] = MergeQuantArgs(
                         partial_lease.view[F32, Shape[1, PARTIAL_F32S]](
                             sb, 1).as_ptr[DType.float32](),
-                        attn_chunk_count(context_len, C.MAX_ATTN_CHUNKS),
+                        attn_chunk_count(
+                            context_len,
+                            Int(self.main_pools[r].get_capacity()),
+                            KV_PER_RANK,
+                            C.MAX_ATTN_CHUNKS),
                         attn_qi_lease.view[
                             I8, Shape[1, KV_PER_RANK * HPG * C.HEAD_DIM]](
                             sb, 1).as_ptr[DType.int8](),

@@ -179,18 +179,21 @@ comptime ATTN_PG_PER_WORKER = 32
 
 
 @always_inline
-def attn_chunk_count(context_len: Int, max_attn_chunks: Int) -> Int:
+def attn_chunk_count(
+    context_len: Int, pool_capacity: Int, kv_count: Int, max_attn_chunks: Int,
+) -> Int:
     """Number of page chunks per KV head.
 
-    This is the logical attention partition used by both score dispatch and
-    merge. Worker dispatch may use fewer physical jobs than logical chunks.
+    The score phase dispatches one physical job for every (KV head, chunk).
+    Cap per-head chunks so the total job count fits the worker pool.
     """
     var num_pg = (context_len + CACHE_WIDTH - 1) // CACHE_WIDTH
     var padded_pg = (num_pg + 3) & ~3
-    if padded_pg <= 0:
+    if padded_pg <= 0 or kv_count <= 0:
         return 0
     var raw_chunks = (padded_pg + ATTN_PG_PER_WORKER - 1) // ATTN_PG_PER_WORKER
     var chunk_cap = max_attn_chunks
+    chunk_cap = min(chunk_cap, pool_capacity // kv_count)
     chunk_cap = min(chunk_cap, padded_pg // 4)
     var capped = min(raw_chunks, chunk_cap)
     if capped < 1:
@@ -248,11 +251,12 @@ def chunked_score_dispatch_multi[
     """Pack all (kv, chunk) work items into one pool dispatch + fence."""
     var num_pg = (context_len + CACHE_WIDTH - 1) // CACHE_WIDTH
     var padded_pg = (num_pg + 3) & ~3
-    var num_chunks = attn_chunk_count(context_len, max_attn_chunks)
+    var num_chunks = attn_chunk_count(
+        context_len, pool_capacity, kv_count, max_attn_chunks)
     if num_chunks <= 0 or kv_count <= 0:
         return PoolFence[P, origin].over(pool)
     var total_jobs = num_chunks * kv_count
-    var num_workers = min(total_jobs, pool_capacity)
+    var num_workers = total_jobs
     if num_workers <= 0:
         return PoolFence[P, origin].over(pool)
     var pg_blocks = padded_pg // 4

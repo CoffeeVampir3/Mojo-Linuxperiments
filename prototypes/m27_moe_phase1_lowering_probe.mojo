@@ -1,9 +1,11 @@
+from std.memory import Pointer
 from threading.threading_traits import BurstThreadPool
 
 from kernels.kernel_ops import PoolFence
 from modeling.linear_borrow_pool import ScratchLease
 from modeling.model_spec import F32, I8, Shape, ScratchView, StaticView
 from modeling.minimax_m27_moe_butterquant_tp import (
+    BodyRefs,
     C,
     FWHT_BLK,
     MOE_DOWN_NUM_BLK,
@@ -39,15 +41,7 @@ struct M27RankLayer[tp: Int](Copyable, ImplicitlyCopyable):
     @always_inline
     def gate_up_experts(self) -> M27GateUpExpertSlab[Self.tp]:
         var layer = self.layer()
-        var lb = self.layer_base()
-        return M27GateUpExpertSlab[Self.tp](
-            layer.body.experts_w1.bound(lb),
-            layer.body.experts_w1_sc.bound(lb),
-            layer.body.experts_w1_colsum.bound(lb),
-            layer.body.experts_w3.bound(lb),
-            layer.body.experts_w3_sc.bound(lb),
-            layer.body.experts_w3_colsum.bound(lb),
-        )
+        return M27GateUpExpertSlab[Self.tp](layer.body, self.layer_base())
 
 
 @fieldwise_init
@@ -57,10 +51,37 @@ struct M27DenseMoeScratch[
     qi_origin: MutOrigin,
     block_scale_origin: MutOrigin,
 ](Copyable, ImplicitlyCopyable):
-    var input_i8: ScratchView[I8, Shape[1, C.HIDDEN], Self.input_origin]
-    var input_scale: ScratchView[F32, Shape[1, 1], Self.scale_origin]
-    var expert_qi: ScratchView[I8, Shape[C.TOP_K, C.MOE_INTERMEDIATE], Self.qi_origin]
-    var expert_block_scale: ScratchView[F32, Shape[C.TOP_K, MOE_DOWN_NUM_BLK], Self.block_scale_origin]
+    var scratch_base: Int
+    var input_i8_lease: Pointer[ScratchLease, Self.input_origin]
+    var input_scale_lease: Pointer[ScratchLease, Self.scale_origin]
+    var expert_qi_lease: Pointer[ScratchLease, Self.qi_origin]
+    var expert_block_scale_lease: Pointer[ScratchLease, Self.block_scale_origin]
+
+    @always_inline
+    def input_i8(self) -> ScratchView[I8, Shape[1, C.HIDDEN], Self.input_origin]:
+        return self.input_i8_lease[].view[I8, Shape[1, C.HIDDEN]](
+            self.scratch_base, 1)
+
+    @always_inline
+    def input_scale(self) -> ScratchView[F32, Shape[1, 1], Self.scale_origin]:
+        return self.input_scale_lease[].view[F32, Shape[1, 1]](
+            self.scratch_base, 1)
+
+    @always_inline
+    def expert_qi(self) -> ScratchView[
+        I8, Shape[C.TOP_K, C.MOE_INTERMEDIATE], Self.qi_origin,
+    ]:
+        return self.expert_qi_lease[].view[
+            I8, Shape[C.TOP_K, C.MOE_INTERMEDIATE]](
+            self.scratch_base, C.TOP_K)
+
+    @always_inline
+    def expert_block_scale(self) -> ScratchView[
+        F32, Shape[C.TOP_K, MOE_DOWN_NUM_BLK], Self.block_scale_origin,
+    ]:
+        return self.expert_block_scale_lease[].view[
+            F32, Shape[C.TOP_K, MOE_DOWN_NUM_BLK]](
+            self.scratch_base, C.TOP_K)
 
 
 @always_inline
@@ -81,12 +102,11 @@ def bind_dense_moe_scratch[
     return M27DenseMoeScratch[
         input_origin, scale_origin, qi_origin, block_scale_origin,
     ](
-        input_i8_lease.view[I8, Shape[1, C.HIDDEN]](scratch_base, 1),
-        input_scale_lease.view[F32, Shape[1, 1]](scratch_base, 1),
-        expert_qi_lease.view[I8, Shape[C.TOP_K, C.MOE_INTERMEDIATE]](
-            scratch_base, C.TOP_K),
-        expert_block_scale_lease.view[F32, Shape[C.TOP_K, MOE_DOWN_NUM_BLK]](
-            scratch_base, C.TOP_K),
+        scratch_base,
+        Pointer(to=input_i8_lease),
+        Pointer(to=input_scale_lease),
+        Pointer(to=expert_qi_lease),
+        Pointer(to=expert_block_scale_lease),
     )
 
 
@@ -96,12 +116,44 @@ struct M27GateUpExpertSlab[tp: Int](Copyable, ImplicitlyCopyable):
     comptime weight_stride = C.MOE_INTERMEDIATE * C.HIDDEN
     comptime aux_stride = C.MOE_INTERMEDIATE * F32.ELEMENT_BYTES
 
-    var w1: StaticView[I8, Shape[C.NUM_EXPERTS * C.MOE_INTERMEDIATE, C.HIDDEN]]
-    var w1_scale: StaticView[F32, Shape[Self.S.EXPERTS_LOCAL * C.MOE_INTERMEDIATE, 1]]
-    var w1_colsum: StaticView[F32, Shape[Self.S.EXPERTS_LOCAL * C.MOE_INTERMEDIATE, 1]]
-    var w3: StaticView[I8, Shape[C.NUM_EXPERTS * C.MOE_INTERMEDIATE, C.HIDDEN]]
-    var w3_scale: StaticView[F32, Shape[Self.S.EXPERTS_LOCAL * C.MOE_INTERMEDIATE, 1]]
-    var w3_colsum: StaticView[F32, Shape[Self.S.EXPERTS_LOCAL * C.MOE_INTERMEDIATE, 1]]
+    var body: BodyRefs[Self.tp]
+    var layer_base: Int
+
+    @always_inline
+    def w1(self) -> StaticView[
+        I8, Shape[C.NUM_EXPERTS * C.MOE_INTERMEDIATE, C.HIDDEN],
+    ]:
+        return self.body.experts_w1.bound(self.layer_base)
+
+    @always_inline
+    def w1_scale(self) -> StaticView[
+        F32, Shape[Self.S.EXPERTS_LOCAL * C.MOE_INTERMEDIATE, 1],
+    ]:
+        return self.body.experts_w1_sc.bound(self.layer_base)
+
+    @always_inline
+    def w1_colsum(self) -> StaticView[
+        F32, Shape[Self.S.EXPERTS_LOCAL * C.MOE_INTERMEDIATE, 1],
+    ]:
+        return self.body.experts_w1_colsum.bound(self.layer_base)
+
+    @always_inline
+    def w3(self) -> StaticView[
+        I8, Shape[C.NUM_EXPERTS * C.MOE_INTERMEDIATE, C.HIDDEN],
+    ]:
+        return self.body.experts_w3.bound(self.layer_base)
+
+    @always_inline
+    def w3_scale(self) -> StaticView[
+        F32, Shape[Self.S.EXPERTS_LOCAL * C.MOE_INTERMEDIATE, 1],
+    ]:
+        return self.body.experts_w3_sc.bound(self.layer_base)
+
+    @always_inline
+    def w3_colsum(self) -> StaticView[
+        F32, Shape[Self.S.EXPERTS_LOCAL * C.MOE_INTERMEDIATE, 1],
+    ]:
+        return self.body.experts_w3_colsum.bound(self.layer_base)
 
     @always_inline
     def phase1[
@@ -124,23 +176,23 @@ struct M27GateUpExpertSlab[tp: Int](Copyable, ImplicitlyCopyable):
             C.MOE_INTERMEDIATE, C.HIDDEN, FWHT_BLK,
             C.TOP_K, C.NUM_EXPERTS, Self.tp,
         ](
-            scratch.input_i8,
-            scratch.input_scale,
+            scratch.input_i8(),
+            scratch.input_scale(),
             routing,
-            self.w1,
+            self.w1(),
             Self.weight_stride,
-            self.w1_scale,
+            self.w1_scale(),
             Self.aux_stride,
-            self.w1_colsum,
+            self.w1_colsum(),
             Self.aux_stride,
-            self.w3,
+            self.w3(),
             Self.weight_stride,
-            self.w3_scale,
+            self.w3_scale(),
             Self.aux_stride,
-            self.w3_colsum,
+            self.w3_colsum(),
             Self.aux_stride,
-            scratch.expert_qi,
-            scratch.expert_block_scale,
+            scratch.expert_qi(),
+            scratch.expert_block_scale(),
             rank,
             pool,
         )
@@ -175,3 +227,7 @@ def dense_moe_phase1_probe[
         rank_layer.scratch_base(),
     )
     return rank_layer.gate_up_experts().phase1(scratch, routing, rank_id, pool)
+
+
+def main():
+    pass
