@@ -220,6 +220,38 @@ struct MergeQuantArgs(Copyable, ImplicitlyCopyable):
 
 
 @fieldwise_init
+struct ChunkedScoreMultiArgs(Copyable, ImplicitlyCopyable):
+    var q_i8_base: I8Ptr
+    var qi_biases_base: F32Ptr
+    var q_scales_base: F32Ptr
+    var cache_base: U8Ptr
+    var partial_out_base: F32Ptr
+    var kv_start: Int
+    var kv_count: Int
+    var context_len: Int
+    var num_chunks: Int
+    var blocks_per_chunk: Int
+    var extra_blocks: Int
+    var worker_id: Int
+    var num_workers: Int
+
+    def __init__(out self):
+        self.q_i8_base = I8Ptr()
+        self.qi_biases_base = F32Ptr()
+        self.q_scales_base = F32Ptr()
+        self.cache_base = U8Ptr()
+        self.partial_out_base = F32Ptr()
+        self.kv_start = 0
+        self.kv_count = 0
+        self.context_len = 0
+        self.num_chunks = 0
+        self.blocks_per_chunk = 0
+        self.extra_blocks = 0
+        self.worker_id = 0
+        self.num_workers = 0
+
+
+@fieldwise_init
 struct RouterCandidate(Copyable, ImplicitlyCopyable):
     """One (expert_id, score, raw) entry in a worker-local top-K buffer.
 

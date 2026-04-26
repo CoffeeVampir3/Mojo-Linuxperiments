@@ -322,11 +322,7 @@ def run_attention_comparison[P: BurstThreadPool, //, tp: Int](
             merge_jobs[r] = MergeQuantArgs(
                 partial_lease.view[F32, Shape[1, PARTIAL_F32S]](
                     sb, 1).as_ptr[DType.float32](),
-                attn_chunk_count(
-                    context_len,
-                    Int(model.main_pools[r].get_capacity()),
-                    C.MAX_ATTN_CHUNKS,
-                ),
+                attn_chunk_count(context_len, C.MAX_ATTN_CHUNKS),
                 ref_qi_lease.view[
                     I8, Shape[1, KV_PER_RANK * HPG * HEAD_DIM]](
                     sb, 1, element_offset=pos * Q_LOCAL).as_ptr[DType.int8](),

@@ -19,6 +19,7 @@ Join:     poll local JoinFlags (zero cross-NUMA reads).
 
 from std.sys.info import size_of
 from std.memory import UnsafePointer, memcpy
+from std.os import abort
 from std.time import perf_counter_ns
 import linux.sys as linux
 from std.atomic import Ordering, fence
@@ -314,9 +315,26 @@ struct BurstPool[mask_size: Int = 128](BurstThreadPool):
         comptime assert size_of[Args]() <= MAILBOX_DATA_BYTES, "args exceed mailbox capacity"
 
         var jobs = num_jobs if num_jobs >= 0 else self.capacity
-        debug_assert(jobs <= self.capacity, "num_jobs must be <= pool capacity")
         if jobs <= 0:
             return
+        if jobs > self.capacity:
+            print(
+                "BurstPool.dispatch invalid job count jobs",
+                jobs,
+                "capacity",
+                self.capacity,
+            )
+            abort("BurstPool.dispatch: num_jobs exceeds pool capacity")
+
+        debug_assert(jobs <= self.capacity, "num_jobs must be <= pool capacity")
+        if self.active_jobs != 0:
+            print(
+                "BurstPool.dispatch invalid while jobs active active_jobs",
+                self.active_jobs,
+                "capacity",
+                self.capacity,
+            )
+            abort("BurstPool.dispatch: previous dispatch still in flight")
 
         debug_assert(self.active_jobs == 0,
             "previous dispatch still in flight; call join() first")
