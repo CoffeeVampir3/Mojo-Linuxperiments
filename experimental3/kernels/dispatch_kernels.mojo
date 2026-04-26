@@ -1013,7 +1013,7 @@ def rmsnorm_fwht_quantize[
 def rmsnorm_dual_gamma_fwht_quantize[
     InT: DynamicTensor, GaT: StaticTensor, GbT: StaticTensor,
     QiAT: DynamicTensor, QiBT: DynamicTensor,
-    WkAT: DynamicTensor, WkBT: DynamicTensor,
+    WkT: DynamicTensor,
     ScAT: DynamicTensor, ScBT: DynamicTensor,
     P: BurstThreadPool, origin: MutOrigin, //,
     cols: Int, block: Int,
@@ -1021,7 +1021,7 @@ def rmsnorm_dual_gamma_fwht_quantize[
     input: InT,
     gamma_a: GaT, gamma_b: GbT,
     qi_a: QiAT, qi_b: QiBT,
-    work_a: WkAT, work_b: WkBT,
+    work: WkT,
     scale_a: ScAT, scale_b: ScBT,
     eps: Float32, ref [origin] pool: P,
 ) -> PoolFence[P, origin]:
@@ -1031,8 +1031,7 @@ def rmsnorm_dual_gamma_fwht_quantize[
     comptime assert GbT.DTYPE == DType.bfloat16, "rmsnorm_dual_gamma: gamma_b must be bf16"
     comptime assert QiAT.DTYPE == DType.int8, "rmsnorm_dual_gamma: qi_a must be i8"
     comptime assert QiBT.DTYPE == DType.int8, "rmsnorm_dual_gamma: qi_b must be i8"
-    comptime assert WkAT.DTYPE == DType.float32, "rmsnorm_dual_gamma: work_a must be f32"
-    comptime assert WkBT.DTYPE == DType.float32, "rmsnorm_dual_gamma: work_b must be f32"
+    comptime assert WkT.DTYPE == DType.float32, "rmsnorm_dual_gamma: work must be f32"
     comptime assert ScAT.DTYPE == DType.float32, "rmsnorm_dual_gamma: scale_a must be f32"
     comptime assert ScBT.DTYPE == DType.float32, "rmsnorm_dual_gamma: scale_b must be f32"
 
@@ -1048,8 +1047,7 @@ def rmsnorm_dual_gamma_fwht_quantize[
     var gamma_b_p = gamma_b.as_ptr[DType.bfloat16]()
     var qi_a_p = qi_a.as_ptr[DType.int8]()
     var qi_b_p = qi_b.as_ptr[DType.int8]()
-    var work_a_p = work_a.as_ptr[DType.float32]()
-    var work_b_p = work_b.as_ptr[DType.float32]()
+    var work_p = work.as_ptr[DType.float32]()
     var scale_a_p = scale_a.as_ptr[DType.float32]()
     var scale_b_p = scale_b.as_ptr[DType.float32]()
     var jobs = InlineArray[RmsNormDualGammaFwhtArgs, MAX_POOL_CAPACITY](
@@ -1060,8 +1058,7 @@ def rmsnorm_dual_gamma_fwht_quantize[
         jobs[i] = RmsNormDualGammaFwhtArgs(
             inp, gamma_a_p, gamma_b_p,
             qi_a_p, qi_b_p,
-            work_a_p + i * cols,
-            work_b_p + i * cols,
+            work_p + i * cols,
             scale_a_p, scale_b_p,
             eps, start, end)
 

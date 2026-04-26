@@ -326,8 +326,7 @@ struct RmsNormDualGammaFwhtArgs(Copyable, ImplicitlyCopyable):
     var gamma_b_ptr: BF16Ptr
     var qi_a_ptr: I8Ptr
     var qi_b_ptr: I8Ptr
-    var work_a_ptr: F32Ptr
-    var work_b_ptr: F32Ptr
+    var work_ptr: F32Ptr
     var scale_a_ptr: F32Ptr
     var scale_b_ptr: F32Ptr
     var eps: Float32
@@ -340,8 +339,7 @@ struct RmsNormDualGammaFwhtArgs(Copyable, ImplicitlyCopyable):
         self.gamma_b_ptr = BF16Ptr()
         self.qi_a_ptr = I8Ptr()
         self.qi_b_ptr = I8Ptr()
-        self.work_a_ptr = F32Ptr()
-        self.work_b_ptr = F32Ptr()
+        self.work_ptr = F32Ptr()
         self.scale_a_ptr = F32Ptr()
         self.scale_b_ptr = F32Ptr()
         self.eps = 0.0

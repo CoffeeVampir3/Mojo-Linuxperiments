@@ -427,7 +427,6 @@ def calculate_peak_scratch[tp: Int]() -> Int:
     comptime ffn_peak = persistent + (
         scratch_block_bytes[C.HIDDEN * i8]()
         + scratch_block_bytes[C.HIDDEN * f32]()
-        + scratch_block_bytes[C.HIDDEN * f32]()
         + scratch_block_bytes[C.HIDDEN * i8]()
         + scratch_block_bytes[f32]()
         + scratch_block_bytes[C.NUM_EXPERTS * bf16]()
@@ -1241,7 +1240,6 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
 
             var act_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.HIDDEN]()
             var act_work_lease = self.scratch.borrow[Float32, C.HIDDEN]()
-            var act_work2_lease = self.scratch.borrow[Float32, C.HIDDEN]()
             var expert_act_i8_lease = self.scratch.borrow[Scalar[DType.int8], C.HIDDEN]()
             var expert_act_scale_lease = self.scratch.borrow[Float32, 1]()
 
@@ -1305,7 +1303,6 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
                     act_i8_lease.view[I8, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](sb, seq_len),
                     expert_act_i8_lease.view[I8, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](sb, seq_len),
                     act_work_lease.view[F32, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](sb, seq_len),
-                    act_work2_lease.view[F32, Shape[C.MAX_SEQ_LEN, C.HIDDEN]](sb, seq_len),
                     act_scale_lease.view[F32, Shape[C.MAX_SEQ_LEN, 1]](sb, seq_len),
                     expert_act_scale_lease.view[F32, Shape[C.MAX_SEQ_LEN, 1]](sb, seq_len),
                     EPS, pool)
@@ -1454,7 +1451,6 @@ struct Gemma4ButterQuant[tp: Int, Pool: BurstThreadPool = BurstPool[]](Movable):
             router_logits_lease^.release()
             expert_act_scale_lease^.release()
             expert_act_i8_lease^.release()
-            act_work2_lease^.release()
             act_work_lease^.release()
             act_i8_lease^.release()
 
